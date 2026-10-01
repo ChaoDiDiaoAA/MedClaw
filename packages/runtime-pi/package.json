@@ -1,0 +1,17 @@
+{
+  "name": "@medclaw/runtime-pi",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./model-runtime": "./src/model-runtime.ts",
+    "./credential-store": "./src/credential-store.ts",
+    "./model-call-recorder": "./src/model-call-recorder.ts",
+    "./agent-runtime": "./src/agent-runtime.ts"
+  },
+  "dependencies": {
+    "@medclaw/contracts": "workspace:*",
+    "zod": "4.6.5",
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@earendil-works/pi-ai": "0.87.1"
+  }
+}

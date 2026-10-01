@@ -1,0 +1,12 @@
+{
+  "name": "@medclaw/host",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@medclaw/contracts": "workspace:*",
+    "@medclaw/core": "workspace:*",
+    "@medclaw/runtime-pi": "workspace:*",
+    "@medclaw/storage": "workspace:*",
+    "@medclaw/logging": "workspace:*"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "@medclaw/logging",
+  "private": true,
+  "type": "module",
+  "dependencies": { "@medclaw/contracts": "workspace:*" }
+}

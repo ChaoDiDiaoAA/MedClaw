@@ -1,0 +1,7 @@
+{
+  "name": "@medclaw/storage",
+  "private": true,
+  "type": "module",
+  "exports": { "./database": "./src/database.ts", "./repositories": "./src/repositories.ts" },
+  "dependencies": { "@medclaw/contracts": "workspace:*", "zod": "4.6.5" }
+}

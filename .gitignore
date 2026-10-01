@@ -1,3 +1,14 @@
 __pycache__/
 *.py[cod]
 /data/
+node_modules/
+/.build/
+/.medclaw-dev/
+/.superpowers/
+/test-results/
+/playwright-report/
+**/credentials.enc.json
+**/auth.json
+**/pi-model-cache.json
+.env
+.env.local

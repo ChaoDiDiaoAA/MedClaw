@@ -1,0 +1,14 @@
+{
+  "name": "@medclaw/contracts",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./error": "./src/error.ts",
+    "./model": "./src/model.ts",
+    "./run": "./src/run.ts",
+    "./session": "./src/session.ts",
+    "./workspace": "./src/workspace.ts",
+    "./protocol": "./src/protocol.ts"
+  },
+  "dependencies": { "zod": "4.6.5" }
+}

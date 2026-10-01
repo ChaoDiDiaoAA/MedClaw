@@ -1,0 +1,7 @@
+{
+  "name": "@medclaw/core",
+  "private": true,
+  "type": "module",
+  "exports": { "./application": "./src/application.ts", "./runtime": "./src/runtime/runtime-service.ts", "./session": "./src/session/session-service.ts", "./workspace": "./src/workspace/workspace-service.ts" },
+  "dependencies": { "@medclaw/contracts": "workspace:*" }
+}
