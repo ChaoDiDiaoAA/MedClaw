@@ -4,15 +4,16 @@ import { z } from "zod";
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, safeError, type AppError } from "../../contracts/src/error";
 import { NewSessionInputSchema, NewSessionResultSchema, SelectSessionInputSchema, SessionViewSchema, ListSessionsRequestSchema, SubmitInputSchema, ReadSubmissionRequestSchema,
   type NewSessionInput, type NewSessionResult, type SelectSessionInput, type SessionView, type SessionPage, type ReadSubmissionRequest, type SubmitResult } from "../../contracts/src/session";
-import { WorkspaceViewSchema, type WorkspaceView } from "../../contracts/src/workspace";
+import { WorkspaceViewSchema, WorkspaceChangeSchema, RevisionSchema, type WorkspaceView, type WorkspaceChange, type BatchRef } from "../../contracts/src/workspace";
+import { businessToolSchemas } from "../../contracts/src/business-tools";
 import {
-  DiagnoseRequestSchema, ModelSelectionSchema, ProviderRequestSchema, RequestPolicySchema,
+  DiagnoseRequestSchema, ModelSelectionSchema, ProviderRequestSchema, RequestPolicySchema, ReferenceDateSchema, TimezoneSchema,
   type ProviderAccepted, type ProviderRequest,
 } from "../../contracts/src/model";
 import {
-  ModelCallViewSchema, ReadRunRequestSchema, RunViewSchema, RecentRunViewSchema, RunCleanupRecordSchema, P2AgentOptionsSchema, canonicalRequest, sliceOutput, sliceText, safePreview,
+  ModelCallViewSchema, ReadRunRequestSchema, RunViewSchema, RecentRunViewSchema, RunCleanupRecordSchema, P2AgentOptionsSchema, RunScopeSchema, canonicalRequest, sliceOutput, sliceText, safePreview,
   type ModelCallView, type ReadRunResult, type RunView, type RegisterProviderInput,
-  type ProviderOperation, type FinalProviderFact, type ProviderRunStore, type RegisterAgentInput, type FinalAgentFact, type StoredOperation, type RunCleanupRecord,
+  type ProviderOperation, type FinalProviderFact, type ProviderRunStore, type RegisterAgentInput, type FinalAgentFact, type StoredOperation, type RunCleanupRecord, type RunScope,
 } from "../../contracts/src/run";
 export type { RegisterProviderInput, ProviderOperation, FinalCallFact, FinalProviderFact } from "../../contracts/src/run";
 const usageSchema = z.object({
@@ -38,8 +39,8 @@ const providerConfigSchema = z.object({
   selection: ModelSelectionSchema, policy: RequestPolicySchema,
 }).strict();
 const agentConfigSchema = z.strictObject({ selection: ModelSelectionSchema, policy: RequestPolicySchema,
-  referenceDate: z.string(), timezone: z.string(), agent: P2AgentOptionsSchema.extend({ stage: z.literal("P2"), nativeSessionId: OpaqueIdSchema,
-    tools: z.tuple([]), autoCompaction: z.literal(false), autoRetry: z.literal(false), cacheWarming: z.literal("off") }) });
+  referenceDate: z.string(), timezone: z.string(), agent: P2AgentOptionsSchema.extend({ stage: z.enum(["P2", "P3"]), nativeSessionId: OpaqueIdSchema,
+    tools: z.array(z.string()), autoCompaction: z.literal(false), autoRetry: z.literal(false), cacheWarming: z.literal("off") }) });
 const commonConfigSchema = z.object({ selection: ModelSelectionSchema, policy: RequestPolicySchema });
 const scope = { batchIds: [], deviceIds: null, allowedToolNames: [], allowedResourceRefs: [], artifactIds: [], readOnly: true };
 type RunRow = {
@@ -50,6 +51,7 @@ type RunRow = {
   reference_date: string; timezone: string; created_at: string; started_at: string | null;
   cancel_requested_at: string | null; stopped_at: string | null; ended_at: string | null;
   error_json: string | null; cleanup_json: string | null; usage_json: string | null;
+  scope_json: string;
 };
 type CallRow = {
   id: number; call_id: string; kind: "main" | "diagnostic"; model_json: string;
@@ -74,7 +76,10 @@ function timestamp(value: string | null) {
 }
 
 export class Repositories implements ProviderRunStore {
-  constructor(private readonly db: Database, private readonly beforeCommit?: () => void) {}
+  private readonly p3: boolean;
+  constructor(private readonly db: Database, private readonly beforeCommit?: () => void) {
+    this.p3 = this.db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name='answers'").get() !== null;
+  }
 
   private row(runId: number): RunRow | null {
     return this.db.query<RunRow, [number]>("SELECT * FROM runs WHERE id=?").get(runId);
@@ -114,7 +119,8 @@ export class Repositories implements ProviderRunStore {
       model: config.selection, policy: config.policy, priorRunId: row.prior_run_id,
       referenceDate: row.reference_date, timezone: row.timezone, createdAt: row.created_at,
       startedAt: row.started_at, cancelRequestedAt: row.cancel_requested_at, stoppedAt: row.stopped_at,
-      endedAt: row.ended_at, error: decoded(row.error_json), cleanup: cleanup.success ? cleanup.data : null, answerRef: null,
+      endedAt: row.ended_at, error: decoded(row.error_json), cleanup: cleanup.success ? cleanup.data : null,
+      answerRef: this.p3 ? this.db.query<{ id: number }, [number]>("SELECT id FROM answers WHERE run_id=?").get(row.id)?.id ?? null : null,
       output,
       calls: row.kind === "provider" ? calls : calls.slice(callOffset, callOffset + callLimit), persistence: "committed",
       ...(agent ? { clientSequence: row.submission_client_sequence, nativeSessionId: agent.agent.nativeSessionId,
@@ -145,10 +151,73 @@ export class Repositories implements ProviderRunStore {
   }
 
   readWorkspace(): WorkspaceView {
-    const row = this.db.query<{ active_session_id: number | null; revision: number }, []>("SELECT active_session_id,revision FROM workspace WHERE id=1").get();
+    const row = this.db.query<{ active_session_id: number | null; revision: number; material_version: string | null;
+      batch_refs_json: string; device_ids_json: string; active_query_id: number | null; active_view: string; selection_json: string | null }, []>("SELECT * FROM workspace WHERE id=1").get();
     if (!row) fail("storage_read_failed");
-    return checked(WorkspaceViewSchema, { revision: row.revision, sessionId: row.active_session_id, materialVersion: null,
-      batchRefs: [], deviceIds: [], queryId: null, activeView: "data", selection: null }, "storage_read_failed");
+    return checked(WorkspaceViewSchema, { revision: row.revision, sessionId: row.active_session_id, materialVersion: row.material_version ?? null,
+      batchRefs: row.batch_refs_json === undefined ? [] : decoded(row.batch_refs_json), deviceIds: row.device_ids_json === undefined ? [] : decoded(row.device_ids_json),
+      queryId: row.active_query_id ?? null, activeView: row.active_view ?? "data", selection: row.selection_json === undefined ? null : decoded(row.selection_json) }, "storage_read_failed");
+  }
+
+  private batchReferences(ids: number[]): { refs: BatchRef[]; materialVersion: string | null } {
+    const rows = ids.map(batchId => {
+      const row = this.db.query<{ id: number; content_hash: string; snapshot_date: string; scope_key: string; material_version: string }, [number]>(
+        "SELECT id,content_hash,snapshot_date,scope_key,material_version FROM batches WHERE id=?").get(batchId);
+      if (!row) fail("access_denied");
+      return row;
+    });
+    const versions = new Set(rows.map(row => row.material_version));
+    if (versions.size > 1) fail("invalid_argument");
+    return { refs: rows.map(row => ({ id: row.id, contentHash: row.content_hash, snapshotDate: row.snapshot_date, scopeKey: row.scope_key })),
+      materialVersion: rows[0]?.material_version ?? null };
+  }
+
+  updateWorkspace(change: WorkspaceChange, expectedRevision: number, time: string): WorkspaceView {
+    const request = checked(WorkspaceChangeSchema, change); checked(RevisionSchema, expectedRevision); timestamp(time);
+    return this.db.transaction(() => {
+      const old = this.readWorkspace();
+      if (old.revision !== expectedRevision) fail("workspace_revision_mismatch");
+      const batchIds = request.batchIds ?? old.batchRefs.map(batch => batch.id), batches = this.batchReferences(batchIds);
+      const deviceIds = request.deviceIds ?? old.deviceIds;
+      for (const deviceId of deviceIds) {
+        if (!batchIds.some(batchId => this.db.query("SELECT id FROM snapshots WHERE batch_id=? AND device_id=?").get(batchId, deviceId))) fail("access_denied");
+      }
+      const queryId = request.queryId !== undefined ? request.queryId : request.batchIds !== undefined || request.deviceIds !== undefined ? null : old.queryId;
+      if (queryId !== null) {
+        const query = this.db.query<{ session_id: number; batch_ids_json: string; result_json: string }, [number]>("SELECT session_id,batch_ids_json,result_json FROM queries WHERE id=?").get(queryId);
+        const queryBatches = query ? checked(z.array(PositiveIdSchema), decoded(query.batch_ids_json), "storage_read_failed") : [];
+        const result = query ? checked(z.object({ scopeDeviceIds: z.array(PositiveIdSchema).nullable() }), decoded(query.result_json), "storage_read_failed") : null;
+        if (!query || query.session_id !== old.sessionId || queryBatches.some(batchId => !batchIds.includes(batchId))
+          || deviceIds.length > 0 && (result?.scopeDeviceIds === null || result?.scopeDeviceIds.some(deviceId => !deviceIds.includes(deviceId)))) fail("access_denied");
+      }
+      const next = checked(WorkspaceViewSchema, { ...old, batchRefs: batches.refs, materialVersion: batches.materialVersion, deviceIds, queryId,
+        activeView: request.activeView ?? old.activeView, selection: null });
+      if (isDeepStrictEqual(old, next)) return old;
+      next.revision++;
+      const saved = this.db.query(`UPDATE workspace SET material_version=?,batch_refs_json=?,device_ids_json=?,active_query_id=?,active_view=?,selection_json=NULL,
+        revision=?,updated_at=? WHERE id=1 AND revision=?`).run(next.materialVersion, JSON.stringify(next.batchRefs), JSON.stringify(next.deviceIds), next.queryId,
+          next.activeView, next.revision, time, expectedRevision);
+      if (saved.changes !== 1) fail("workspace_revision_mismatch");
+      this.beforeCommit?.();
+      return next;
+    }).immediate();
+  }
+
+  freezeAgentScope(workspace: WorkspaceView, toolNames: readonly string[]): RunScope {
+    const selected = checked(WorkspaceViewSchema, workspace), ids = selected.batchRefs.map(batch => batch.id);
+    const batches = this.batchReferences(ids);
+    if (!isDeepStrictEqual(batches.refs, selected.batchRefs) || batches.materialVersion !== selected.materialVersion) fail("access_denied");
+    const names = [...toolNames], supported = new Set([...Object.keys(businessToolSchemas), "read", "grep", "find", "ls", "edit", "write", "bash", "powershell"]);
+    if (new Set(names).size !== names.length || names.some(name => !supported.has(name))) fail("invalid_argument");
+    for (const deviceId of selected.deviceIds) {
+      if (!ids.some(batchId => this.db.query("SELECT id FROM snapshots WHERE batch_id=? AND device_id=?").get(batchId, deviceId))) fail("access_denied");
+    }
+    const artifacts = ids.flatMap(batchId => {
+      const row = this.db.query<{ artifact_id: number | null }, [number]>("SELECT i.artifact_id FROM batches b JOIN imports i ON i.id=b.import_id WHERE b.id=?").get(batchId);
+      return row?.artifact_id === null || row === null ? [] : [row.artifact_id];
+    });
+    return { batchIds: [...ids], deviceIds: selected.deviceIds.length ? [...selected.deviceIds] : null, allowedToolNames: names,
+      allowedResourceRefs: [], artifactIds: [...new Set(artifacts)], readOnly: !names.some(name => ["edit", "write", "bash", "powershell"].includes(name)) };
   }
 
   readSession(sessionId: number): SessionView | null {
@@ -179,12 +248,12 @@ export class Repositories implements ProviderRunStore {
       if (workspace.revision !== request.expectedWorkspaceRevision) fail("workspace_revision_mismatch");
       const sessionId = (this.db.query<{ n: number | null }, []>("SELECT MAX(id) AS n FROM sessions").get()?.n ?? 0) + 1;
       checked(PositiveIdSchema, sessionId);
-      const result = checked(NewSessionResultSchema, { session: { id: sessionId, title: `新会话 ${sessionId}`, nativeSessionId,
+      const result = checked(NewSessionResultSchema, { session: { id: sessionId, title: `New Session ${sessionId}`, nativeSessionId,
         kind: "user", status: "active", storageVersion: 0, leafId: null, nextSubmissionSequence: 1 },
-        workspace: { ...workspace, sessionId, revision: workspace.revision + 1 } });
+        workspace: { ...workspace, sessionId, queryId: null, selection: null, revision: workspace.revision + 1 } });
       this.db.query(`INSERT INTO sessions(id,native_session_id,creation_operation_ref,creation_request_json,creation_result_json,title,created_at,updated_at)
         VALUES(?,?,?,?,?,?,?,?)`).run(sessionId, nativeSessionId, operationRef, canonicalRequest(request), JSON.stringify(result), result.session.title, time, time);
-      this.db.query("UPDATE workspace SET active_session_id=?,revision=?,updated_at=? WHERE id=1 AND revision=?")
+      this.db.query(`UPDATE workspace SET active_session_id=?,revision=?,updated_at=?${this.p3 ? ',active_query_id=NULL,selection_json=NULL' : ''} WHERE id=1 AND revision=?`)
         .run(sessionId, result.workspace.revision, time, workspace.revision);
       this.beforeCommit?.();
       return result;
@@ -198,8 +267,8 @@ export class Repositories implements ProviderRunStore {
       if (workspace.revision !== request.expectedWorkspaceRevision) fail("workspace_revision_mismatch");
       if (!this.readSession(request.sessionId)) fail("session_not_found");
       if (workspace.sessionId === request.sessionId) return workspace;
-      const selected = checked(WorkspaceViewSchema, { ...workspace, sessionId: request.sessionId, revision: workspace.revision + 1 });
-      this.db.query("UPDATE workspace SET active_session_id=?,revision=?,updated_at=? WHERE id=1 AND revision=?")
+      const selected = checked(WorkspaceViewSchema, { ...workspace, sessionId: request.sessionId, queryId: null, selection: null, revision: workspace.revision + 1 });
+      this.db.query(`UPDATE workspace SET active_session_id=?,revision=?,updated_at=?${this.p3 ? ',active_query_id=NULL,selection_json=NULL' : ''} WHERE id=1 AND revision=?`)
         .run(request.sessionId, selected.revision, time, workspace.revision);
       this.beforeCommit?.();
       return selected;
@@ -231,20 +300,26 @@ export class Repositories implements ProviderRunStore {
       if (request.clientSequence < session.nextSubmissionSequence || request.clientSequence === Number.MAX_SAFE_INTEGER) fail("state_conflict");
       const workspace = this.readWorkspace();
       if (workspace.sessionId !== session.id || workspace.revision !== request.expectedRevision || !isDeepStrictEqual(workspace, input.workspace)) fail("workspace_revision_mismatch");
+      if (!isDeepStrictEqual(workspace.batchRefs.map(batch => batch.id), request.expectedBatchIds) || workspace.queryId !== request.expectedQueryId) fail("workspace_revision_mismatch");
+      if (this.p3) for (const batch of workspace.batchRefs) {
+        const row = this.db.query<{ metadata_json: string }, [number]>('SELECT metadata_json FROM batches WHERE id=?').get(batch.id);
+        const metadata = checked(z.object({ referenceDate: ReferenceDateSchema, timezone: TimezoneSchema }), decoded(row?.metadata_json ?? null), 'storage_read_failed');
+        if (request.timezone !== metadata.timezone) fail('invalid_argument');
+      }
       if (this.active()) fail("runtime_busy");
       if (input.sessionId !== session.id || input.inputId !== null || input.goal !== "answer" || input.text !== request.text
         || input.referenceDate !== request.referenceDate || input.timezone !== request.timezone || input.timeoutMs !== input.policy.timeoutMs
-        || !isDeepStrictEqual(scope, input.scope) || input.model.provider !== request.model.provider
+        || !isDeepStrictEqual(this.freezeAgentScope(workspace, input.scope.allowedToolNames), input.scope) || input.model.provider !== request.model.provider
         || input.model.modelId !== request.model.modelId || input.model.configVersion !== request.model.expectedConfigVersion) fail("invalid_argument");
       checked(OpaqueIdSchema, input.instanceId);
       const config = checked(agentConfigSchema, { selection: input.model, policy: input.policy, referenceDate: request.referenceDate,
-        timezone: request.timezone, agent: { ...input.agentOptions, stage: "P2", nativeSessionId: session.nativeSessionId, tools: [],
+        timezone: request.timezone, agent: { ...input.agentOptions, stage: input.scope.allowedToolNames.length ? "P3" : "P2", nativeSessionId: session.nativeSessionId, tools: input.scope.allowedToolNames,
           autoCompaction: false, autoRetry: false, cacheWarming: "off" } });
       const result = this.db.query(`INSERT INTO runs(session_id,input_id,kind,instance_id,submission_operation_ref,submission_client_sequence,
         submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at)
         VALUES(?,NULL,'agent',?,?,?,?,'created','answer',?,?,?,?,?,?,?)`)
         .run(session.id, input.instanceId, operationRef, request.clientSequence, canonicalRequest(request), request.text, JSON.stringify(config),
-          JSON.stringify(scope), JSON.stringify(workspace), request.referenceDate, request.timezone, input.createdAt);
+          JSON.stringify(input.scope), JSON.stringify(workspace), request.referenceDate, request.timezone, input.createdAt);
       this.beforeCommit?.();
       return { sessionId: session.id, clientSequence: request.clientSequence, inputId: null, runId: Number(result.lastInsertRowid) };
     }).immediate();
@@ -372,6 +447,27 @@ export class Repositories implements ProviderRunStore {
         error_json=?,cleanup_json=?,usage_json=? WHERE id=?`)
         .run(terminal ? row.status : fact.status, row.output_text ?? fact.outputText, fact.stoppedAt, fact.endedAt, cancelRequestedAt,
           terminal ? row.error_json : json(error), json(cleanup), row.usage_json ?? json(usage), runId);
+      if (this.p3 && row.kind === "agent" && fact.status === "completed" && checked(agentConfigSchema, decoded(row.config_json), "storage_read_failed").agent.stage === "P3") {
+        const frozen = checked(RunScopeSchema, decoded(row.scope_json), "storage_read_failed");
+        const queries = this.db.query<{ id: number; session_id: number; batch_ids_json: string; result_json: string }, [number]>(
+          "SELECT id,session_id,batch_ids_json,result_json FROM queries WHERE run_id=? ORDER BY id").all(runId);
+        for (const query of queries) {
+          const batches = checked(z.array(PositiveIdSchema), decoded(query.batch_ids_json), "storage_read_failed");
+          const result = checked(z.object({ scopeDeviceIds: z.array(PositiveIdSchema).nullable() }), decoded(query.result_json), "storage_read_failed");
+          if (query.session_id !== row.session_id || batches.some(batch => !frozen.batchIds.includes(batch))
+            || frozen.deviceIds !== null && (result.scopeDeviceIds === null || result.scopeDeviceIds.some(device => !frozen.deviceIds!.includes(device)))) fail("access_denied");
+        }
+        const queryIds = queries.map(query => query.id), text = fact.outputText ?? "";
+        const priorAnswer = this.db.query<{ id: number; text: string; query_ids_json: string }, [number]>("SELECT id,text,query_ids_json FROM answers WHERE run_id=?").get(runId);
+        if (priorAnswer) {
+          if (priorAnswer.text !== text || !isDeepStrictEqual(decoded(priorAnswer.query_ids_json), queryIds)) fail("state_conflict");
+        } else {
+          const saved = this.db.query("INSERT INTO answers(run_id,session_id,input_id,kind,text,query_ids_json,missing_slots_json,native_leaf_id,created_at) VALUES(?,?,NULL,'result',?,?,'[]',NULL,?)")
+            .run(runId, row.session_id, text, JSON.stringify(queryIds), fact.endedAt);
+          this.db.query("INSERT INTO business_events(operation_ref,type,actor,session_id,run_id,details_json,occurred_at) VALUES(?,'answer_committed','agent',?,?,?,?)")
+            .run(`answer:${runId}`, row.session_id, runId, JSON.stringify({ answerId: Number(saved.lastInsertRowid), queryIds }), fact.endedAt);
+        }
+      }
       const run = this.view(this.row(runId)!);
       this.beforeCommit?.();
       return run;
@@ -386,6 +482,10 @@ export class Repositories implements ProviderRunStore {
       || row.output_text !== fact.outputText || row.stopped_at !== fact.stoppedAt || row.ended_at !== fact.endedAt
       || row.cancel_requested_at !== (fact.cancelRequestedAt ?? null) || !isDeepStrictEqual(decoded(row.error_json), fact.error)
       || !isDeepStrictEqual(decoded(row.usage_json), fact.usage ?? null) || !isDeepStrictEqual(decoded(row.cleanup_json), fact.cleanup ?? null)) return false;
+    if (this.p3 && row.kind === "agent" && fact.status === "completed" && checked(agentConfigSchema, decoded(row.config_json), "storage_read_failed").agent.stage === "P3") {
+      const answer = this.db.query<{ text: string }, [number]>("SELECT text FROM answers WHERE run_id=?").get(runId);
+      if (!answer || answer.text !== (fact.outputText ?? "")) return false;
+    }
     const saved = this.calls(runId), expected = "calls" in fact ? fact.calls : fact.call ? [fact.call] : [];
     return saved.length === expected.length && expected.every(call => {
       const original = saved.find(item => item.callId === call.callId);
@@ -425,8 +525,64 @@ export class Repositories implements ProviderRunStore {
       const released = cleanup.success && (cleanup.data.executionStarted === false || cleanup.data.stopConfirmed === true)
         && cleanup.data.requiredPersistenceComplete === true && cleanup.data.inputsSettled === true
         && cleanup.data.resourcesReleased === true && cleanup.data.unconfirmedItems.length === 0;
-      return row.status === "created" || row.status === "running" || !released ? [this.view(row)] : [];
+      const toolGap = this.p3 && this.db.query(`SELECT 1 FROM tool_calls WHERE run_id=? AND (
+        status IN ('requested','running') OR (effect='LOCAL_WRITE' AND json_extract(result_json,'$.outcomeUnknown')=1)
+        OR (tool_name IN ('bash','powershell','grep','find') AND started_at IS NOT NULL AND stopped_at IS NULL AND ?<>1)) LIMIT 1`)
+        .get(row.id, cleanup.success && cleanup.data.stopConfirmed === true ? 1 : 0) !== null;
+      return row.status === "created" || row.status === "running" || !released || toolGap ? [this.view(row)] : [];
     });
+  }
+
+  verifyPriorToolFacts(runId: number, previousProcessExited: boolean, time: string): {
+    stopConfirmed: boolean | null; requiredPersistenceComplete: boolean; unconfirmedItems: string[];
+  } {
+    id(runId); timestamp(time);
+    return this.db.transaction(() => {
+      const run = this.row(runId);
+      if (!run) fail('run_not_found');
+      const prior = RunCleanupRecordSchema.safeParse(decoded(run.cleanup_json));
+      const unconfirmed = new Set(prior.success ? prior.data.unconfirmedItems.filter(item =>
+        ['tool_persistence', 'tool_effect_unknown', 'tool_results_unknown'].includes(item)) : []);
+      let stopConfirmed: boolean | null = previousProcessExited || prior.success && prior.data.stopConfirmed === true ? true : null;
+      let changed = false;
+      if (this.p3) {
+        const tools = this.db.query<{
+          id: number; tool_name: string; effect: string; status: string; started_at: string | null;
+          stopped_at: string | null; result_json: string | null;
+        }, [number]>('SELECT id,tool_name,effect,status,started_at,stopped_at,result_json FROM tool_calls WHERE run_id=? ORDER BY id').all(runId);
+        for (const tool of tools) {
+          const spawned = ['bash', 'powershell', 'grep', 'find'].includes(tool.tool_name);
+          // The owning Host exiting proves neither a spawned child's stop nor its original result.
+          if (spawned && tool.status === 'running') {
+            stopConfirmed = null;
+            unconfirmed.add('tool_results_unknown');
+            continue;
+          }
+          if (spawned && tool.started_at !== null && tool.stopped_at === null && !(prior.success && prior.data.stopConfirmed === true)) stopConfirmed = null;
+          if (tool.status === 'requested' || tool.status === 'running') {
+            if (!previousProcessExited) {
+              unconfirmed.add('tool_results_unknown');
+              continue;
+            }
+            const result = tool.status === 'running'
+              ? { outcomeUnknown: true, recoveredAfterHostExit: true }
+              : { executionStarted: false, recoveredAfterHostExit: true };
+            const error = safeError('runtime_interrupted', undefined, { runId, toolCallId: tool.id });
+            this.db.query(`UPDATE tool_calls SET status='failed',result_json=?,error_json=?,ended_at=? WHERE id=? AND status=?`)
+              .run(JSON.stringify(result), JSON.stringify(error), time, tool.id, tool.status);
+            changed = true;
+            if (tool.status === 'running' && tool.effect === 'LOCAL_WRITE') unconfirmed.add('tool_effect_unknown');
+          } else if (tool.effect === 'LOCAL_WRITE') {
+            const result = decoded(tool.result_json);
+            if (typeof result === 'object' && result !== null && 'outcomeUnknown' in result && result.outcomeUnknown === true) unconfirmed.add('tool_effect_unknown');
+          }
+        }
+        if (previousProcessExited && !tools.some(tool => ['bash', 'powershell', 'grep', 'find'].includes(tool.tool_name) && tool.status === 'running')) unconfirmed.delete('tool_results_unknown');
+      }
+      if (stopConfirmed !== true) { unconfirmed.add('stop'); unconfirmed.add('resources'); }
+      if (changed) this.beforeCommit?.();
+      return { stopConfirmed, requiredPersistenceComplete: ![...unconfirmed].some(item => item.startsWith('tool_')), unconfirmedItems: [...unconfirmed] };
+    }).immediate();
   }
 
   read(request: z.input<typeof ReadRunRequestSchema>): ReadRunResult {
@@ -469,11 +625,19 @@ export class Repositories implements ProviderRunStore {
       for (const row of rows) {
         const error = safeError(row.kind === "provider" ? "host_interrupted" : "runtime_interrupted", undefined, { runId: row.id,
           operationRef: row.kind === "provider" ? this.providerConfig(row).providerRequest.operationRef : row.submission_operation_ref ?? undefined });
+        const prior = RunCleanupRecordSchema.safeParse(decoded(row.cleanup_json));
+        const facts = row.kind === 'agent' && this.p3 ? this.verifyPriorToolFacts(row.id, true, time) : null;
+        const cleanup = facts ? checked(RunCleanupRecordSchema, {
+          contract: 'medclaw.run-cleanup/v1', executionStarted: prior.success ? prior.data.executionStarted : null,
+          stopConfirmed: facts.stopConfirmed, requiredPersistenceComplete: facts.requiredPersistenceComplete,
+          inputsSettled: true, resourcesReleased: facts.stopConfirmed, unconfirmedItems: facts.unconfirmedItems,
+          secondaryErrors: prior.success ? prior.data.secondaryErrors : [], verifiedAt: facts.stopConfirmed === true ? time : prior.success ? prior.data.verifiedAt : null,
+        }) : { previousInstanceId: row.instance_id, oldProcessExited: true, observationGap: true };
         if (row.kind === "provider") this.db.query("UPDATE model_calls SET state='failed',error_json=?,unavailable_reason='host_interrupted' WHERE run_id=? AND state='started'")
           .run(JSON.stringify(error), row.id);
         this.db.query(`UPDATE runs SET status='failed',ended_at=?,error_json=?,cleanup_json=?
           WHERE id=? AND status IN ('created','running')`)
-          .run(time, JSON.stringify(error), JSON.stringify({ previousInstanceId: row.instance_id, oldProcessExited: true, observationGap: true }), row.id);
+          .run(time, JSON.stringify(error), JSON.stringify(cleanup), row.id);
       }
       if (rows.length) this.beforeCommit?.();
       return rows.length;

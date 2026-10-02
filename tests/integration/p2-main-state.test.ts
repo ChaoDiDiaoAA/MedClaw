@@ -12,7 +12,7 @@ import type { PublicMethod, PublicPayload, PublicReturn } from "../../packages/c
 const handlers = new Map<string, (...args: unknown[]) => unknown>();
 let invoke: (channel: string, payload: unknown) => Promise<unknown> = async () => null;
 let bridge: { request<M extends PublicMethod>(method: M, payload: PublicPayload<M>, op?: string): Promise<Result<PublicReturn<M>>> };
-mock.module("electron", () => ({ ipcMain: { handle: (name: string, handler: (...args: unknown[]) => unknown) => handlers.set(name, handler), removeHandler: (name: string) => handlers.delete(name) }, shell: { openExternal: async () => {} },
+mock.module("electron", () => ({ ipcMain: { handle: (name: string, handler: (...args: unknown[]) => unknown) => handlers.set(name, handler), removeHandler: (name: string) => handlers.delete(name) }, shell: { openExternal: async () => {} }, dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
   ipcRenderer: { on: () => {}, send: () => {}, invoke: (name: string, payload: unknown) => invoke(name, payload) }, contextBridge: { exposeInMainWorld: (_name: string, value: typeof bridge) => { bridge = value; } } }));
 const roots: string[] = [];
 afterEach(() => { handlers.clear(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });

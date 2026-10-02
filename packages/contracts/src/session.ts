@@ -2,7 +2,7 @@ import { z } from "zod";
 import { OpaqueIdSchema, PositiveIdSchema } from "./error";
 import { ModelChoiceSchema, ReferenceDateSchema, TimezoneSchema } from "./model";
 import { RevisionSchema, WorkspaceViewSchema } from "./workspace";
-import type { WorkspaceView } from "./workspace";
+import type { WorkspaceView, WorkspaceChange } from "./workspace";
 import type { StoredOperation, RunHandle } from "./run";
 
 export const NewSessionInputSchema = z.strictObject({ selectOnCreate: z.literal(true).default(true), expectedWorkspaceRevision: RevisionSchema });
@@ -25,7 +25,9 @@ export const SessionDetailSchema = z.strictObject({
 });
 export const SubmitInputSchema = z.strictObject({
   clientSequence: PositiveIdSchema, sessionId: PositiveIdSchema, text: z.string().refine(text => text.trim().length > 0, "Text must not be blank"),
-  mode: z.literal("send"), expectedRevision: RevisionSchema, expectedBatchIds: z.tuple([]), expectedQueryId: z.null(),
+  mode: z.literal("send"), expectedRevision: RevisionSchema,
+  expectedBatchIds: z.array(PositiveIdSchema).max(10000).refine(ids => new Set(ids).size === ids.length, 'Duplicate batches'),
+  expectedQueryId: PositiveIdSchema.nullable(),
   model: ModelChoiceSchema, referenceDate: ReferenceDateSchema, timezone: TimezoneSchema,
 });
 export const SubmitResultSchema = z.strictObject({ sessionId: PositiveIdSchema, clientSequence: PositiveIdSchema, inputId: z.null(), runId: PositiveIdSchema });
@@ -52,6 +54,7 @@ export interface SessionStore {
   readSession(sessionId: number): SessionView | null;
   listSessions(input: { beforeSessionId?: number; limit?: number }): SessionPage;
   readWorkspace(): WorkspaceView;
+  updateWorkspace(change: WorkspaceChange, expectedRevision: number, time: string): WorkspaceView;
   findOperation(operationRef: string): StoredOperation | null;
   findSubmission(input: ReadSubmissionRequest): SubmitResult | null;
   active(): RunHandle | null;

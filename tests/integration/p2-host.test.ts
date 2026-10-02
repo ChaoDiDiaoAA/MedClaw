@@ -12,6 +12,7 @@ import { RuntimeControlViewSchema, ReadRunResultSchema } from "../../packages/co
 import { WorkspaceViewSchema } from "../../packages/contracts/src/workspace";
 import { safeError, type Result } from "../../packages/contracts/src/error";
 import type { DesktopNotice } from "../../packages/contracts/src/protocol";
+import { DATABASE_SCHEMA_VERSION } from "../../packages/contracts/src/protocol";
 import { providerFixture } from "../fixtures/p1-provider";
 
 function unwrap<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
@@ -31,7 +32,7 @@ async function setup(mode: Parameters<typeof providerFixture>[0] = "success") {
     models: [{ id: "fixture", name: "Fixture", input: ["text"], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }] };
   atomicWriteJson(host.paths.settingsPath, PublishedSettingsSchema.parse({ ...initial, model: { provider: "p2-fixture", modelId: "fixture" },
     customProviders: [{ definition, credentialRef: null }], requestPolicy: { timeoutMs: mode === "slow" ? 10000 : 5000, maxRetries: 0, maxRetryDelayMs: 2000 } }));
-  expect(await host.start()).toMatchObject({ state: "ready", schemaVersion: 2, error: null });
+  expect(await host.start()).toMatchObject({ state: "ready", schemaVersion: DATABASE_SCHEMA_VERSION, error: null });
   async function workspace() { return WorkspaceViewSchema.parse(unwrap(await host.request("workspace.read", {}))); }
   async function create(op: string = crypto.randomUUID()) { return NewSessionResultSchema.parse(unwrap(await host.request("session.create", { expectedWorkspaceRevision: (await workspace()).revision }, op))); }
   async function select(sessionId: number) { return WorkspaceViewSchema.parse(unwrap(await host.request("session.select", { sessionId, expectedWorkspaceRevision: (await workspace()).revision }))); }

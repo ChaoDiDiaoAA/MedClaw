@@ -4,6 +4,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { HostController } from "./host-controller.ts";
 import { MainCredentials, SecretInputs } from "./credentials.ts";
 import { MainSettings } from "./settings.ts";
+import { FileTokens } from "./file-tokens.ts";
 import { privateCredentialRequest, registerIpc } from "./ipc-handlers.ts";
 import { safeError, type Result } from "../../../../packages/contracts/src/error.ts";
 import { HOST_PROTOCOL_VERSION, type DesktopNotice, type DiagnosticsView } from "../../../../packages/contracts/src/protocol.ts";
@@ -26,6 +27,7 @@ let ipc: ReturnType<typeof registerIpc> | null = null;
 const dataRoot = explicitRoot ?? app.getPath("userData");
 mkdirSync(join(dataRoot, "data"), { recursive: true }); mkdirSync(join(dataRoot, "runtime"), { recursive: true });
 const credentials = new MainCredentials(join(dataRoot, "data", "credentials.enc.json"), safeStorage);
+const fileTokens = new FileTokens();
 const notify = (notice: DesktopNotice) => {
   const frame = { ...notice, instanceId: host.read().instanceId };
   if (notice.type === "provider.preview") lastPreview = frame;
@@ -38,7 +40,7 @@ if (!isAbsolute(hostEntry)) throw new Error("Controlled Host entry must be absol
 const host = new HostController({ dataRoot, hostEntry, bunExecutable: process.env.MEDCLAW_BUN_EXECUTABLE,
   onStarting: instanceId => credentials.attachInstance(instanceId),
   onExit: instanceId => { credentials.confirmHostExit(instanceId); if (shuttingDown) app.exit(0); },
-  onCredentialRequest: frame => privateCredentialRequest(credentials, frame),
+  onCredentialRequest: frame => privateCredentialRequest(credentials, frame, fileTokens, window && !window.isDestroyed() ? window.id : undefined),
   onError: error => errors.add(error),
   onNotice: notice => {
     notify(notice);
@@ -65,7 +67,7 @@ void app.whenReady().then(async () => {
   window = new BrowserWindow({ width: 1440, height: 900, minWidth: 1100, minHeight: 720, backgroundColor: "#faf9f6", title: "MedClaw", webPreferences: { preload: join(desktopEntryDir, "../preload/index.cjs"), contextIsolation: true, sandbox: true, nodeIntegration: false } });
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-navigate", event => event.preventDefault());
-  ipc = registerIpc({ window, host, settings, credentials, inputs: new SecretInputs(), diagnostics, report: error => errors.add(error), notify });
+  ipc = registerIpc({ window, host, settings, credentials, inputs: new SecretInputs(), fileTokens, diagnostics, report: error => errors.add(error), notify });
   ipcMain.on("medclaw:subscribe", event => { if (window && event.sender.id === window.webContents.id && event.senderFrame === event.sender.mainFrame) { event.sender.send("medclaw:notice", { type: "host.status", host: host.read(), instanceId: host.read().instanceId }); if (lastPreview) event.sender.send("medclaw:notice", lastPreview); } });
   await window.loadFile(join(desktopEntryDir, "../renderer/index.html"));
   runtimeLog.add("host_start");

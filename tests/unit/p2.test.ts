@@ -1,9 +1,54 @@
 import { describe, expect, test } from "bun:test";
-import { parsePublicPayload, publicMethodSchemas, HostRequestSchema, NoticeFrameSchema } from "../../packages/contracts/src/protocol";
+import { parsePublicPayload, publicMethodSchemas, HostRequestSchema, NoticeFrameSchema, HOST_PROTOCOL_VERSION } from "../../packages/contracts/src/protocol";
 import { ReadRunRequestSchema, RunViewSchema } from "../../packages/contracts/src/run";
+import { safeError, type AppError } from "../../packages/contracts/src/error";
+import { RuntimeLog, safeStageMessage } from "../../packages/logging/src/runtime-log";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+test("legacy default Session titles project to English without renaming user titles", async () => {
+  const helpers = await import("../../apps/desktop/src/renderer/session-list");
+  expect(helpers).toHaveProperty("sessionDisplayTitle");
+  for (const [id, title, display] of [[7, "新会话 7", "New Session 7"], [7, "新会话 8", "新会话 8"],
+    [7, "新会话 07", "新会话 07"], [7, "新会话 7 自定义😀", "新会话 7 自定义😀"], [7, "我的会话😀", "我的会话😀"]] as const) {
+    const session = Object.freeze({ id, title });
+    expect(helpers.sessionDisplayTitle(session)).toBe(display);
+    expect(session).toEqual({ id, title });
+  }
+});
+
+test("safe English error projection preserves legacy facts and reason mappings", async () => {
+  const helpers = await import("../../packages/contracts/src/error");
+  expect(helpers).toHaveProperty("errorMessage");
+  for (const [code, reason, display] of [
+    ["state_conflict", "runtime_busy", "An operation is still running. Wait or stop it before trying again."],
+    ["state_conflict", "workspace_revision_mismatch", "The current view has changed. Read it again before selecting."],
+    ["input_invalid", "session_not_found", "Session not found."],
+    ["run_timeout", undefined, "The model request exceeded the runtime limit."],
+    ["future_error", undefined, "Operation failed. Check diagnostics."],
+  ] as const) {
+    const legacy: AppError = { code, category: "runtime", message: "旧错误😀 CANARY-SECRET", retryable: false,
+      operationRef: "original-op", runId: 3, sessionId: 7, toolCallId: 11, ...(reason ? { reason } : {}) };
+    const before = structuredClone(legacy);
+    expect(helpers.errorMessage(Object.freeze(legacy))).toBe(display);
+    expect(legacy).toEqual(before);
+  }
+  expect(safeError("tool_cancelled", new Error("CANARY-SECRET"), { toolCallId: 11 })).toEqual({
+    code: "tool_cancelled", category: "tool", message: "The tool call was cancelled. Committed query facts remain available under their original identity.", retryable: false, toolCallId: 11,
+  });
+});
+
+test("safe diagnostics use English summaries and suppress native stderr", () => {
+  expect(safeStageMessage("run_saved", { inputChars: 12, outputChars: 4 })).toBe("Run facts saved inputChars=12 outputChars=4");
+  expect(safeStageMessage("CANARY-SECRET", { inputChars: -1 })).toBe("Diagnostic content omitted");
+  const log = new RuntimeLog();
+  log.addStderr("CANARY-SECRET token=abc");
+  log.addStderr("run_timeout");
+  expect(log.stderrTail()).toBe("Host diagnostic output omitted (23 characters)\nThe model request exceeded the runtime limit.\n");
+  expect(log.read().every(entry => entry.message === "Host failure")).toBe(true);
+  expect(JSON.stringify(log.read())).not.toContain("CANARY-SECRET");
+});
 
 test("P2 runner discovers only its stage and rejects empty, skipped, failed and loading-error runs", async () => {
   const { discoverTests, runStage } = await import("../run");
@@ -30,7 +75,7 @@ test("P2 runner discovers only its stage and rejects empty, skipped, failed and 
       writeFileSync(file, source);
       expect(await runStage("unit", "P2", { root })).toMatchObject(expected);
     }
-    for (const args of [["unit"], ["unit", "--stage", "P3"], ["unit", "--stage", "P2", "--extra"], ["invalid", "--stage", "P2"]]) {
+    for (const args of [["unit"], ["unit", "--stage", "P4"], ["unit", "--stage", "P2", "--extra"], ["invalid", "--stage", "P2"]]) {
       const child = Bun.spawn([process.execPath, join(import.meta.dir, "../run.ts"), ...args], { stdout: "pipe", stderr: "pipe" });
       expect(await child.exited).not.toBe(0);
       expect(await new Response(child.stderr).text()).toMatch(/Unknown|Usage/);
@@ -42,7 +87,12 @@ test("late model callback keeps its captured Session and rejects an old Host or 
   const helpers = await import("../../apps/desktop/src/renderer/session-list");
   expect(helpers).toHaveProperty("selectSessionModelDraft");
   const context = { instanceId: "host-1", configVersion: "1", session: { id: 1, title: "A", nativeSessionId: "native-a", kind: "user" as const, status: "active" as const, storageVersion: 0 as const, leafId: null, nextSubmissionSequence: 1 } };
-  const original = helpers.newSessionDraft({ provider: "fixture", modelId: "first", expectedConfigVersion: "1" }), choice = { provider: "fixture", modelId: "second", expectedConfigVersion: "1" };
+  const dataDefaults = { batchCount: 2, referenceDate: "2026-01-02", timezone: "Asia/Shanghai" };
+  const original = helpers.newSessionDraft({ provider: "fixture", modelId: "first", expectedConfigVersion: "1" }, dataDefaults), choice = { provider: "fixture", modelId: "second", expectedConfigVersion: "1" };
+  expect(original).toMatchObject({ referenceDate: "2026-01-02", timezone: "Asia/Shanghai" });
+  expect(helpers.newSessionDraft(null, { batchCount: 2, referenceDate: null, timezone: null })).toMatchObject({ referenceDate: "", timezone: "" });
+  expect(helpers.newSessionDraft(null, { batchCount: 0, referenceDate: null, timezone: null })).toMatchObject({ referenceDate: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/), timezone: expect.any(String) });
+  expect(helpers.selectSessionModelDraft({ ...original, referenceDate: "2026-01-01" }, context, { instanceId: "host-1", sessionId: 1 }, choice)).toMatchObject({ referenceDate: "2026-01-01", timezone: "Asia/Shanghai" });
   expect(helpers.selectSessionModelDraft(original, context, { instanceId: "host-1", sessionId: 1 }, choice)?.model).toEqual(choice);
   expect(original.model?.modelId).toBe("first");
   expect(helpers.selectSessionModelDraft(original, context, { instanceId: "old-host", sessionId: 1 }, choice)).toBeNull();
@@ -87,9 +137,9 @@ describe("P2 session and trust contracts", () => {
     const long = { ...submit, text: "医疗器械😀".repeat(10000) };
     expect(parsePublicPayload("session.submit", long)).toHaveProperty("text", long.text);
   });
-  test("Send rejects queues, business scope, unsafe identities and forged runtime fields", () => {
+  test("Send rejects queues, invalid selected references, unsafe identities and forged runtime fields", () => {
     const schema = method("session.submit").input;
-    for (const patch of [{ mode: "steer" }, { mode: "follow_up" }, { expectedBatchIds: [1] }, { expectedQueryId: 1 },
+    for (const patch of [{ mode: "steer" }, { mode: "follow_up" }, { expectedBatchIds: [0] }, { expectedQueryId: 0 },
       { sessionId: 0 }, { clientSequence: Number.MAX_SAFE_INTEGER + 1 }, { clientSequence: 0 }, { expectedRevision: -1 },
       { text: " \n" }, { scope: {} }, { inputId: 1 }, { credentialRef: "forged" }, { maxOutputTokens: 1 },
       { referenceDate: "2026-02-30" }, { timezone: "Not/AZone" }]) expect(schema.safeParse({ ...submit, ...patch }).success).toBe(false);
@@ -108,7 +158,7 @@ describe("P2 session and trust contracts", () => {
       expect(() => parsePublicPayload(name, {})).toThrow();
   });
   test("P2 frames authenticate method and instance without accepting future execution fields", () => {
-    const frame = { protocolVersion: "medclaw.host/p2-v1", kind: "request", requestId: "request-1", instanceId: "host-1",
+    const frame = { protocolVersion: HOST_PROTOCOL_VERSION, kind: "request", requestId: "request-1", instanceId: "host-1",
       operationRef: "operation-1", method: "session.submit", payload: submit };
     expect(HostRequestSchema.safeParse(frame).success).toBe(true);
     expect(HostRequestSchema.safeParse({ ...frame, protocolVersion: "medclaw.host/p1-v1" }).success).toBe(false);
@@ -144,7 +194,7 @@ describe("P2 run/control and temporary projection contracts", () => {
     expect(ReadRunRequestSchema.safeParse({ recent: true, sessionId: 1, kind: "agent" }).success).toBe(true);
   });
   test("Agent snapshots carry local sequence and original session/run; no durable event disguise", () => {
-    const frame = { protocolVersion: "medclaw.host/p2-v1", kind: "notice", instanceId: "host-1",
+    const frame = { protocolVersion: HOST_PROTOCOL_VERSION, kind: "notice", instanceId: "host-1",
       notice: { type: "agent.preview", sessionId: 1, runId: 1, noticeSequence: 1, text: "hello", truncated: false } };
     expect(NoticeFrameSchema.safeParse(frame).success).toBe(true);
     expect(NoticeFrameSchema.safeParse({ ...frame, notice: { ...frame.notice, noticeSequence: 0 } }).success).toBe(false);

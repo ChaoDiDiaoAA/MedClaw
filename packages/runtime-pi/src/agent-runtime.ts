@@ -2,14 +2,20 @@ import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsMana
 import { clampThinkingLevel } from "@earendil-works/pi-ai/compat";
 import { performance } from "node:perf_hooks";
 import { isAbsolute, join } from "node:path";
+import { mkdir } from "node:fs/promises";
 import { safeError } from "../../contracts/src/error";
 import { safePreview, type AgentExecutionObservation, type AgentRuntimePort, type FinalCallFact, type ProviderOutcome } from "../../contracts/src/run";
 import type { NativeSessionBindings, NativeSessionPreview } from "../../contracts/src/session";
 import { outcomeOf, textOf, type PiModelRuntime, type ResolvedModel } from "./model-runtime";
+import { createPiNativeTools, createPiToolDefinitions, observePiToolDelivery } from "./pi-tool-adapter";
+import type { ToolRegistry } from "../../core/src/tools/registry";
+import type { ToolExecutor } from "../../core/src/tools/executor";
+import type { ToolRecorder } from "../../core/src/tools/recorder";
+import type { ToolExecutionContext } from "../../contracts/src/tool";
 
 type ExecutionInput = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[0];
 type Callbacks = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[1];
-type Binding = { manager: SessionManager; session?: AgentSession; available: boolean; execution?: { input: ExecutionInput; callbacks: Callbacks;
+type Binding = { manager: SessionManager; session?: AgentSession; bindTools?: () => () => void; available: boolean; execution?: { input: ExecutionInput; callbacks: Callbacks; toolCalls: Set<string>;
   observers: Promise<void>[]; facts: (FinalCallFact | null)[]; lastOutcome: ProviderOutcome | null; unsupported: boolean;
   registrationFailed: boolean; abort: () => void } };
 const unavailable = (reason: "host_restart" | "native_state_invalid"): NativeSessionPreview => ({ available: false, reason, leafId: null, messages: [], truncated: false });
@@ -18,10 +24,16 @@ const unobservedFailure = (code: string): ProviderOutcome => ({ sdkStopReason: "
 
 export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSessionBindings {
   private readonly sessions = new Map<number, Binding>();
-  constructor(private readonly runtime: PiModelRuntime, private readonly dataRoot: string) {
+  readonly toolNames?: readonly string[];
+  constructor(private readonly runtime: PiModelRuntime, private readonly dataRoot: string,
+    private readonly tools?: { registry: ToolRegistry; recorder: ToolRecorder; executor: ToolExecutor }) {
     if (!isAbsolute(dataRoot)) throw new Error("invalid_argument");
+    if (tools) this.toolNames = Object.freeze([...tools.registry.definitions.map(tool => tool.name), "read", "grep", "find", "ls", "edit", "write", "bash", "powershell"]);
   }
   describe(resolved: ResolvedModel) { return { requestedThinkingLevel: "off" as const, effectiveThinkingLevel: clampThinkingLevel(resolved.model, "off") }; }
+  toolPersistencePending(runId: number) { return this.tools?.recorder.persistencePending(runId) ?? false; }
+  retryToolPersistence(runId: number) { this.tools?.recorder.retryPersistence(runId); }
+  releaseToolFacts(runId: number) { this.tools?.recorder.release(runId); }
   allocate() {
     const binding: Binding = { manager: SessionManager.inMemory(this.dataRoot), available: true }; let published = false, discarded = false;
     return { nativeSessionId: binding.manager.getSessionId(), bind: (sessionId: number) => {
@@ -43,16 +55,38 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
 
   private async prepare(binding: Binding, resolved: ResolvedModel) {
     if (!binding.session) {
+      const workdir = () => {
+        if (!binding.execution) throw new Error("state_conflict");
+        return join(this.dataRoot, "runtime", String(binding.execution.input.runId), "work", "scratch");
+      };
+      const getContext = (nativeToolCallId: string, sdkSignal?: AbortSignal): ToolExecutionContext => {
+        const input = binding.execution?.input;
+        if (!input?.scope || !input.referenceDate || !input.timezone) throw new Error("state_conflict");
+        return { runId: input.runId, sessionId: input.sessionId, nativeToolCallId, scope: input.scope,
+          referenceDate: input.referenceDate, timezone: input.timezone, signal: sdkSignal ? AbortSignal.any([input.signal, sdkSignal]) : input.signal };
+      };
+      const native = this.tools ? createPiNativeTools(workdir, this.tools.recorder, getContext) : null;
+      const definitions = this.tools ? [...createPiToolDefinitions(this.tools.registry, this.tools.executor, getContext), ...native!.definitions] : [];
       const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off",
         defaultTools: [], packages: [], extensions: [], skills: [], prompts: [], themes: [], enableAnalytics: false, enableInstallTelemetry: false });
       const resourceLoader = new DefaultResourceLoader({ cwd: this.dataRoot, agentDir: join(this.dataRoot, "runtime", "pi"), settingsManager,
         noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
         additionalExtensionPaths: [], additionalSkillPaths: [], additionalPromptTemplatePaths: [], additionalThemePaths: [], extensionFactories: [],
-        systemPrompt: "你是 MedClaw 医疗器械数据助手。当前阶段仅进行对话，没有工具和业务数据访问能力。", appendSystemPrompt: [] });
+        systemPrompt: this.tools ? `You are MedClaw, a medical device data assistant. Read the frozen data scope before querying in each run. Use business tools for data calculations and retain query and evidence identities in your answer. Native tools use the current run's work directory. Never invent missing data or import results.
+Explicit user dates take precedence over the default frozen referenceDate. Resolve "today", "now", and "current" against the frozen referenceDate and timezone, and explicitly state that anchor. Never silently substitute the system clock. If the user expressly means actual calendar today, distinguish that request from the frozen default; disclose uncertainty if trusted context does not establish its date.
+Use the returned interpretation to report requestedDate and requestedTime, actual dataDates, referenceDate and timezone, snapshotMode, basis, status, quantity and unit, and isStale. State unknown values as unknown. If data is stale for the requested date, report the latest known data dates and quantities and say the target-date quantity is unknown. Never describe stale observations as the actual quantity on that target date.
+State whether the basis counts snapshot records, device identifiers deduplicated by data scope, or change events. These counts are not physical units or inventory. Without a reliable stock quantity field, stock quantity is unknown; a pricing unit does not provide stock quantity. When status is omitted, include all statuses and say so; do not silently restrict results to active devices.
+as_of (latest snapshot) selects the latest allowed batch per data scope before the exclusive cutoff; it is not cumulative history. Never sum counts across dates or batches and call them distinct devices. Compare device sets or claim changes only when evidence supports them: equal counts do not prove the same scoped set of identifiers.`
+          : "你是 MedClaw 医疗器械数据助手。当前阶段仅进行对话，没有工具和业务数据访问能力。", appendSystemPrompt: [] });
       await resourceLoader.reload(); binding.execution?.input.signal.throwIfAborted();
       const { session } = await createAgentSession({ cwd: this.dataRoot, agentDir: join(this.dataRoot, "runtime", "pi"), modelRuntime: this.runtime.native,
-        model: resolved.model, thinkingLevel: "off", noTools: "all", tools: [], customTools: [], resourceLoader, sessionManager: binding.manager, settingsManager });
+        model: resolved.model, thinkingLevel: "off", ...(this.tools ? {} : { noTools: "all" as const }), tools: [...(this.toolNames ?? [])],
+        customTools: definitions, resourceLoader, sessionManager: binding.manager, settingsManager });
       binding.session = session;
+      if (this.tools) binding.bindTools = () => {
+        const stopBusiness = observePiToolDelivery(session, this.tools!.registry, this.tools!.recorder, getContext), stopNative = native!.bind(session);
+        return () => { stopBusiness(); stopNative(); };
+      };
       const original = session.agent.streamFunction;
       session.agent.streamFunction = async (model, context, options) => {
         const execution = binding.execution;
@@ -60,6 +94,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
         const { input, callbacks } = execution;
         input.signal.throwIfAborted(); options?.signal?.throwIfAborted();
         if (execution.unsupported) throw new Error("agent_response_unsupported");
+        if (execution.facts.length >= 50) { callbacks.fatal?.(safeError("agent_call_limit")); execution.abort(); throw new Error("agent_call_limit"); }
         if (performance.now() >= input.deadlineAt) throw new Error("run_timeout");
         let recorder;
         try { recorder = callbacks.startCall(new Date().toISOString()); }
@@ -75,12 +110,20 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
           execution.facts[index] = recorder.finish(outcome, new Date().toISOString());
           throw new Error("provider_request_failed");
         }
+        if (this.tools && recorder.callId) {
+          for (const message of context.messages) {
+            if (message.role !== 'toolResult' || !execution.toolCalls.has(message.toolCallId)) continue;
+            try { this.tools.recorder.recordConsumption(getContext(message.toolCallId), recorder.callId); }
+            catch { callbacks.fatal?.(safeError('storage_write_failed')); execution.abort(); }
+          }
+        }
         // Observe result() without consuming a second iterator; Pi owns the stream.
         const observed = stream.result().then(message => {
           const outcome = outcomeOf(message, input.resolved.pricingKnown);
           execution.lastOutcome = outcome;
           execution.facts[index] = recorder.finish(outcome, new Date().toISOString());
-          if (message.stopReason === "toolUse" || message.stopReason === "deferred" || message.content.some(part => part.type === "toolCall")) {
+          for (const part of message.content) if (part.type === "toolCall") execution.toolCalls.add(part.id);
+          if (message.stopReason === "deferred" || !this.tools && (message.stopReason === "toolUse" || message.content.some(part => part.type === "toolCall"))) {
             execution.unsupported = true; binding.available = false; execution.abort();
           }
         });
@@ -98,9 +141,9 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     const binding = this.sessions.get(input.sessionId);
     if (!binding || !binding.available) throw new Error("session_history_invalid");
     if (binding.execution) throw new Error("state_conflict");
-    let abortTask: Promise<void> | null = null, unsubscribe: (() => void) | undefined, terminalEmitted = false, prepared = false;
+    let abortTask: Promise<void> | null = null, unsubscribe: (() => void) | undefined, unsubscribeTools: (() => void) | undefined, terminalEmitted = false, prepared = false;
     const abort = () => { if (binding.session && !abortTask) abortTask = binding.session.abort(); };
-    const execution: NonNullable<Binding["execution"]> = { input, callbacks, observers: [], facts: [], lastOutcome: null, unsupported: false, registrationFailed: false, abort };
+    const execution: NonNullable<Binding["execution"]> = { input, callbacks, observers: [], facts: [], toolCalls: new Set(), lastOutcome: null, unsupported: false, registrationFailed: false, abort };
     binding.execution = execution; input.signal.addEventListener("abort", abort, { once: true });
     const terminal = () => {
       if (execution.registrationFailed) execution.lastOutcome = unobservedFailure("storage_write_failed");
@@ -109,9 +152,12 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     };
     try {
       input.signal.throwIfAborted();
+      if (this.tools) await Promise.all([mkdir(join(this.dataRoot, "runtime", String(input.runId), "work", "materials"), { recursive: true }),
+        mkdir(join(this.dataRoot, "runtime", String(input.runId), "work", "scratch"), { recursive: true })]);
       await this.prepare(binding, input.resolved); prepared = true; input.signal.throwIfAborted();
       if (performance.now() >= input.deadlineAt) throw new Error("run_timeout");
       const session = binding.session!;
+      unsubscribeTools = binding.bindTools?.();
       unsubscribe = session.subscribe(event => {
         if (event.type === "message_update" && event.message.role === "assistant") {
           try { callbacks.preview(textOf(event.message)); } catch { /* Optional preview does not change the execution. */ }
@@ -130,7 +176,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
         await binding.session?.waitForIdle(); await abortTask; await Promise.all(execution.observers);
         if (binding.session && !binding.session.isIdle) throw new Error("stop_unconfirmed");
         terminal();
-      } finally { unsubscribe?.(); input.signal.removeEventListener("abort", abort); binding.execution = undefined; }
+      } finally { unsubscribe?.(); unsubscribeTools?.(); input.signal.removeEventListener("abort", abort); binding.execution = undefined; }
     }
     return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []) };
   }

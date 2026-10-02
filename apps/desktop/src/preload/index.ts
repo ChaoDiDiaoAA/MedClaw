@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import { DesktopNoticeSchema, publicMethodSchemas, PublicMethodSchema, DesktopSecretInputSchema, DesktopSecretInputResultSchema, isReadOnlyMethod, type PublicMethod, type PublicPayload, type PublicReturn, type DesktopNotice, type DesktopSecretInput } from "../../../../packages/contracts/src/protocol.ts";
+import { DesktopNoticeSchema, publicMethodSchemas, PublicMethodSchema, DesktopSecretInputSchema, DesktopSecretInputResultSchema, DesktopImportDirectorySchema, DesktopImportDirectoryResultSchema, isReadOnlyMethod, type PublicMethod, type PublicPayload, type PublicReturn, type DesktopNotice, type DesktopSecretInput } from "../../../../packages/contracts/src/protocol.ts";
 import { resultSchema, OpaqueIdSchema, safeError, type Result } from "../../../../packages/contracts/src/error.ts";
 import { AuthLinkUrlSchema } from "../../../../packages/contracts/src/model.ts";
 
@@ -28,5 +28,8 @@ const bridge = {
   async secretInput(input: DesktopSecretInput) { return resultSchema(DesktopSecretInputResultSchema).parse(await ipcRenderer.invoke("medclaw:secret-input", DesktopSecretInputSchema.parse(input))); },
   async discardSecret(token: string) { await ipcRenderer.invoke("medclaw:secret-discard", { token: OpaqueIdSchema.parse(token) }); },
   async openAuthLink(url: string): Promise<Result<null>> { return await ipcRenderer.invoke("medclaw:open-auth-link", AuthLinkUrlSchema.parse(url)) as Result<null>; },
+  async pickImportDirectory(operationRef: string) {
+    return resultSchema(DesktopImportDirectoryResultSchema).parse(await ipcRenderer.invoke("medclaw:import-directory", DesktopImportDirectorySchema.parse({ operationRef })));
+  },
 };
 contextBridge.exposeInMainWorld("medclaw", bridge);

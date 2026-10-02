@@ -1,17 +1,22 @@
-import { ipcMain, shell, type BrowserWindow } from "electron";
+import { ipcMain, shell, dialog, type BrowserWindow } from "electron";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
-import { publicMethodSchemas, PublicMethodSchema, DesktopSecretInputSchema, DesktopSecretDiscardSchema, isReadOnlyMethod, type PublicMethod, type PrivateCredentialFrame, type DiagnosticsView, type RuntimeNotice } from "../../../../packages/contracts/src/protocol.ts";
+import { publicMethodSchemas, PublicMethodSchema, DesktopSecretInputSchema, DesktopSecretDiscardSchema, DesktopImportDirectorySchema, isReadOnlyMethod, type PublicMethod, type PrivateCredentialFrame, type DiagnosticsView, type RuntimeNotice } from "../../../../packages/contracts/src/protocol.ts";
 import { AppErrorSchema, OpaqueIdSchema, safeError, type Result } from "../../../../packages/contracts/src/error.ts";
 import { AuthLinkUrlSchema, type PublishedSettings } from "../../../../packages/contracts/src/model.ts";
 import { HostController } from "./host-controller.ts";
 import { MainSettings, type PublishOptions } from "./settings.ts";
 import { MainCredentials, SecretInputs } from "./credentials.ts";
+import { FileTokens } from "./file-tokens.ts";
 
-export async function privateCredentialRequest(credentials: MainCredentials, frame: PrivateCredentialFrame): Promise<Result<unknown>> {
+export async function privateCredentialRequest(credentials: MainCredentials, frame: PrivateCredentialFrame, fileTokens?: FileTokens, windowId?: number): Promise<Result<unknown>> {
   try {
     let data: unknown;
     switch (frame.method) {
+      case "file.resolve": {
+        if (!fileTokens || windowId === undefined) throw new Error("file_token_invalid");
+        data = fileTokens.resolve(frame.payload.fileToken, windowId, frame.instanceId, frame.payload.operationRef); break;
+      }
       case "credential.read": data = await credentials.read(frame.instanceId, frame.payload); break;
       case "credential.list": data = await credentials.list(frame.instanceId); break;
       case "credential.delete": data = await credentials.delete(frame.instanceId, frame.payload); break;
@@ -22,7 +27,7 @@ export async function privateCredentialRequest(credentials: MainCredentials, fra
     return { ok: true, data };
   } catch (error) { return { ok: false, error: safeError(error instanceof Error ? error.message : "credential_read_failed", error) }; }
 }
-export function registerIpc(options: { window: BrowserWindow; host: HostController; settings: MainSettings; credentials: MainCredentials; inputs: SecretInputs; diagnostics(categories: string[]): Promise<DiagnosticsView>; report(error: ReturnType<typeof safeError>): void; notify(notice: RuntimeNotice): void }) {
+export function registerIpc(options: { window: BrowserWindow; host: HostController; settings: MainSettings; credentials: MainCredentials; inputs: SecretInputs; fileTokens?: FileTokens; diagnostics(categories: string[]): Promise<DiagnosticsView>; report(error: ReturnType<typeof safeError>): void; notify(notice: RuntimeNotice): void }) {
   const { window, host, settings, credentials, inputs } = options;
   const operations = new Map<string, { method: PublicMethod; payload: unknown }>();
   const trusted = (event: Electron.IpcMainInvokeEvent) => {
@@ -138,6 +143,7 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
         if (payload && typeof payload === "object" && !Array.isArray(payload)) payload = { referenceDate: new Date().toLocaleDateString("sv-SE"), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, ...payload };
       }
       const parsed = JSON.parse(JSON.stringify(publicMethodSchemas[method].input.parse(payload))) as unknown;
+      if ((method === "import.preview" || method === "import.commit") && (parsed as { operationRef: string }).operationRef !== operationRef) throw new Error("state_conflict");
       if (method === "model.request" || method === "model.diagnose" || method === "session.submit" || method === "session.create") {
         const old = operations.get(operationRef);
         if (old && (old.method !== method || !isDeepStrictEqual(old.payload, parsed))) throw new Error("state_conflict");
@@ -154,7 +160,17 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
   ipcMain.handle("medclaw:secret-input", (event, raw): Result<unknown> => { try { trusted(event); return { ok: true, data: inputs.issue(window.id, DesktopSecretInputSchema.parse(raw)) }; } catch (error) { return { ok: false, error: safeError(error instanceof Error ? error.message : "invalid_argument", error) }; } });
   ipcMain.handle("medclaw:secret-discard", (event, raw) => { trusted(event); inputs.discard(DesktopSecretDiscardSchema.parse(raw).token, window.id); });
   ipcMain.handle("medclaw:open-auth-link", async (event, raw): Promise<Result<null>> => { try { trusted(event); await shell.openExternal(AuthLinkUrlSchema.parse(raw)); return { ok: true, data: null }; } catch { return { ok: false, error: safeError("invalid_argument") }; } });
-  window.on("closed", () => { inputs.closeWindow(window.id); ["medclaw:request", "medclaw:secret-input", "medclaw:secret-discard", "medclaw:open-auth-link"].forEach(channel => ipcMain.removeHandler(channel)); });
+  ipcMain.handle("medclaw:import-directory", async (event, raw): Promise<Result<unknown>> => {
+    try {
+      trusted(event); requireHost();
+      const request = DesktopImportDirectorySchema.parse(raw), instanceId = host.read().instanceId!;
+      const selected = await dialog.showOpenDialog(window, { title: "Select a data package directory", properties: ["openDirectory"] });
+      if (selected.canceled || selected.filePaths.length === 0) return { ok: true, data: null };
+      if (host.read().instanceId !== instanceId || window.isDestroyed() || !options.fileTokens) throw new Error("file_token_invalid");
+      return { ok: true, data: options.fileTokens.issue(window.id, instanceId, request.operationRef, selected.filePaths[0]!) };
+    } catch (error) { return { ok: false, error: safeError(error instanceof Error ? error.message : "file_token_invalid") }; }
+  });
+  window.on("closed", () => { inputs.closeWindow(window.id); options.fileTokens?.closeWindow(window.id); ["medclaw:request", "medclaw:secret-input", "medclaw:secret-discard", "medclaw:open-auth-link", "medclaw:import-directory"].forEach(channel => ipcMain.removeHandler(channel)); });
   return { synchronize, publishCredentials: async () => {
     const current = settings.read(), refs = credentials.captureRefs();
     if (isDeepStrictEqual(current.credentialRefs, refs)) return;

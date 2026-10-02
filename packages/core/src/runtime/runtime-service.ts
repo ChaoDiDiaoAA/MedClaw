@@ -7,13 +7,15 @@ import { canonicalRequest, RuntimeControlViewSchema, safePreview, type AgentRunt
   type FinalProviderFact, type ModelCallRecorderPort, type ModelCallStarter, type ProviderOutcome, type RuntimeRunStore, type RunCleanupRecord,
   type RunHandle, type RunView, type StartRunInput } from "../../../contracts/src/run";
 import { SubmitInputSchema, type NativeSessionBindings, type SubmitInput, type SubmitResult } from "../../../contracts/src/session";
+import type { QueryExecutionContext } from '../../../contracts/src/query';
+import type { RunScope } from '../../../contracts/src/run';
 
 type Execution = { handle: RunHandle; operationRef: string; abort: AbortController; nativeTerminal: boolean; cause: "user" | "deadline" | "shutdown" | null;
   cancelAt: string | null; stopped: boolean; executionStarted: boolean | null; fact: FinalProviderFact | FinalAgentFact | null;
-  primaryError: AppError | null; failureAt: string | null; secondaryErrors: AppError[]; pendingSave: boolean; sequence: number; task: Promise<void> };
+  primaryError: AppError | null; failureAt: string | null; secondaryErrors: AppError[]; pendingSave: boolean; sequence: number; task: Promise<void>;
+  scope?: RunScope; referenceDate?: string; timezone?: string; toolGap: boolean };
 type Recovery = { run: RunView; cleanup: RunCleanupRecord; verified: boolean; at: string };
 const now = () => new Date().toISOString();
-const scope = { batchIds: [], deviceIds: null, allowedToolNames: [], allowedResourceRefs: [], artifactIds: [], readOnly: true };
 
 /** The one owner of root admission and lifecycle, shared by Provider and Agent. */
 export class RuntimeService<Resolved extends ResolvedProviderSelection> {
@@ -29,6 +31,23 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   get activeHandle(): RunHandle | null { return this.execution?.handle ?? null; }
   get persistencePending() { return this.execution?.pendingSave ?? this.recoveries.size > 0; }
   get stopPending() { return !!this.execution?.cause && !this.execution.stopped; }
+  failToolPersistence(runId: number, error: AppError): void {
+    const execution = this.execution;
+    if (!execution || execution.handle.runId !== runId || execution.stopped) return;
+    execution.toolGap = true;
+    this.checkpoint(execution, error); execution.abort.abort();
+  }
+  bindQueryContext(operationRef: string, expectedRevision: number): QueryExecutionContext {
+    const execution = this.execution, workspace = this.store.readWorkspace();
+    if (workspace.revision !== expectedRevision) throw new Error('state_conflict');
+    if (!execution || execution.handle.kind !== 'agent' || execution.handle.sessionId !== workspace.sessionId || !execution.scope
+      || !execution.referenceDate || !execution.timezone || execution.primaryError || execution.abort.signal.aborted || execution.stopped || execution.nativeTerminal) throw new Error('state_conflict');
+    if (!isDeepStrictEqual(workspace.batchRefs.map(batch => batch.id), execution.scope.batchIds)
+      || !isDeepStrictEqual(workspace.deviceIds.length ? workspace.deviceIds : null, execution.scope.deviceIds)) throw new Error('state_conflict');
+    return { runId: execution.handle.runId, inputId: null, sessionId: execution.handle.sessionId!, source: 'user_form',
+      callRef: `${execution.handle.runId}:${operationRef}`, scope: structuredClone(execution.scope), referenceDate: execution.referenceDate,
+      timezone: execution.timezone, signal: execution.abort.signal, basedOnQueryId: workspace.queryId, workspaceRevision: expectedRevision };
+  }
   get busy() { return this.closing || this.modelControlBusy() || this.reservation !== null || this.execution !== null
     || this.recoveryError !== null || this.recoveries.size > 0 || this.store.active() !== null || this.store.recoveryCandidates(this.instanceId).length > 0; }
   read(input: Parameters<RuntimeRunStore["read"]>[0]) { return serviceResult(() => this.store.read(input), "storage_read_failed"); }
@@ -43,8 +62,9 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       if (this.closing || this.modelControlBusy() || this.reservation || this.execution || root) reasons.push(safeError("state_conflict", undefined, { reason: "runtime_busy" }));
       if (this.execution?.cause && !this.execution.stopped) reasons.push(safeError("stop_unconfirmed", undefined, { runId: this.execution.handle.runId }));
       if (this.execution?.pendingSave) reasons.push(safeError("storage_write_failed", undefined, { runId: this.execution.handle.runId }));
-      for (const gap of gaps) reasons.push(safeError(this.recoveries.get(gap.id)?.verified ? "storage_write_failed" : "stop_unconfirmed", undefined, { runId: gap.id }));
-      for (const recovery of this.recoveries.values()) if (!gaps.some(gap => gap.id === recovery.run.id)) reasons.push(safeError("storage_write_failed", undefined, { runId: recovery.run.id }));
+      const recoveryCode = (recovery?: Recovery) => !recovery?.verified ? 'stop_unconfirmed' : recovery.cleanup.requiredPersistenceComplete === false ? 'run_save_unavailable' : 'storage_write_failed';
+      for (const gap of gaps) reasons.push(safeError(recoveryCode(this.recoveries.get(gap.id)), undefined, { runId: gap.id }));
+      for (const recovery of this.recoveries.values()) if (!gaps.some(gap => gap.id === recovery.run.id)) reasons.push(safeError(recoveryCode(recovery), undefined, { runId: recovery.run.id }));
       if (reasons.length > 32) throw new Error("frame_too_large");
       return RuntimeControlViewSchema.parse({ instanceId: this.instanceId, activeRootRun: this.activeHandle, acceptingNewRuns: reasons.length === 0, blockReasons: reasons });
     }, "storage_read_failed");
@@ -79,8 +99,9 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const config = this.settings(), resolved = await this.modelRuntime.resolve(request.model, config.configVersion,
           config.credentialRefs[request.model.provider] ?? null, config.requestPolicy, true);
         this.recheck(context.operationRef, config.configVersion);
+        const workspace = this.store.readWorkspace(), scope = this.store.freezeAgentScope(workspace, this.agent.toolNames ?? []);
         const started = await this.start({ sessionId: request.sessionId, inputId: null, text: request.text, model: resolved.selection, policy: resolved.policy, goal: "answer",
-          workspace: this.store.readWorkspace(), scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: resolved.policy.timeoutMs,
+          workspace, scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: resolved.policy.timeoutMs,
           agentOptions: this.agent.describe(resolved), submission: { operationRef: context.operationRef, originalSubmitInput: request }, resolved });
         if (!started.ok) throw started.error;
         return { sessionId: request.sessionId, clientSequence: request.clientSequence, inputId: null, runId: started.data.runId } satisfies SubmitResult;
@@ -104,6 +125,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         accepted = saved.result;
       }
       const execution = this.begin({ runId: accepted.runId, kind: "agent", sessionId: input.sessionId }, op);
+      execution.scope = structuredClone(input.scope); execution.referenceDate = input.referenceDate; execution.timezone = input.timezone;
       this.reservation = null;
       execution.task = this.runAgent(execution, input);
       return execution.handle;
@@ -132,13 +154,13 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   }
   private begin(handle: RunHandle, operationRef: string): Execution {
     const execution: Execution = { handle, operationRef, abort: new AbortController(), nativeTerminal: false, cause: null, cancelAt: null, stopped: false,
-      executionStarted: null, fact: null, primaryError: null, failureAt: null, secondaryErrors: [], pendingSave: false, sequence: 0, task: Promise.resolve() };
+      executionStarted: null, fact: null, primaryError: null, failureAt: null, secondaryErrors: [], pendingSave: false, sequence: 0, task: Promise.resolve(), toolGap: false };
     this.execution = execution; return execution;
   }
   private cleanup(execution: Execution, complete: boolean): RunCleanupRecord {
     return { contract: "medclaw.run-cleanup/v1", executionStarted: execution.executionStarted, stopConfirmed: execution.stopped,
       requiredPersistenceComplete: complete, inputsSettled: true, resourcesReleased: execution.stopped,
-      unconfirmedItems: complete && execution.stopped ? [] : ["stop", "persistence", "resources"], secondaryErrors: execution.secondaryErrors, verifiedAt: complete && execution.stopped ? now() : null };
+      unconfirmedItems: [...(execution.stopped ? [] : ['stop', 'resources']), ...(complete ? [] : ['persistence']), ...(execution.toolGap && !complete ? ['tool_persistence'] : [])], secondaryErrors: execution.secondaryErrors, verifiedAt: complete && execution.stopped ? now() : null };
   }
   private deadline(execution: Execution, timeout: number) {
     return setTimeout(() => {
@@ -174,8 +196,10 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     const timer = this.deadline(execution, input.timeoutMs), deadlineAt = performance.now() + input.timeoutMs; let entered = false;
     try {
       const observed = await this.credentials({ purpose: "runtime", operationRef: execution.operationRef, credentialRef: input.model.credentialRef }, () => { entered = true; return this.agent!.execute({
-        runId: execution.handle.runId, sessionId: input.sessionId, text: input.text, resolved: input.resolved, agentOptions: input.agentOptions, signal: execution.abort.signal, deadlineAt }, {
+        runId: execution.handle.runId, sessionId: input.sessionId, text: input.text, resolved: input.resolved, agentOptions: input.agentOptions,
+        scope: input.scope, referenceDate: input.referenceDate, timezone: input.timezone, signal: execution.abort.signal, deadlineAt }, {
         startCall: time => this.startCall(execution.handle.runId, "main", time), preview: text => this.preview(execution, text),
+        fatal: error => { this.checkpoint(execution, error); execution.abort.abort(); },
         nativeTerminal: outcome => { execution.nativeTerminal = true; if (outcome.error && !execution.cause) this.checkpoint(execution, outcome.error); },
       }); });
       execution.stopped = observed.nativeIdle;
@@ -222,6 +246,13 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     const fact = execution.fact;
     if (!fact || !execution.stopped) throw new Error("state_conflict");
     let saved = false;
+    if (execution.handle.kind === 'agent' && this.agent?.toolPersistencePending?.(execution.handle.runId)) {
+      this.persistenceFailure(execution); fact.cleanup = this.cleanup(execution, false);
+      this.emit({ type: 'agent.persistence_failed', sessionId: execution.handle.sessionId!, runId: execution.handle.runId,
+        noticeSequence: ++execution.sequence, error: safeError('storage_write_failed') });
+      return;
+    }
+    fact.cleanup = this.cleanup(execution, true);
     try {
       if ("calls" in fact) this.store.finalizeAgent(execution.handle.runId, fact); else this.store.finalizeProvider(execution.handle.runId, fact);
       saved = true;
@@ -229,6 +260,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       try { saved = this.store.isFinalSaved(execution.handle.runId, fact); } catch { /* Unknown remains blocked. */ }
     }
     if (saved) {
+      this.agent?.releaseToolFacts?.(execution.handle.runId);
       execution.pendingSave = false; if (this.execution === execution) this.execution = null;
       this.emit(execution.handle.kind === "agent" ? { type: "agent.settled", sessionId: execution.handle.sessionId!, runId: execution.handle.runId,
         noticeSequence: ++execution.sequence, status: fact.status } : { type: "provider.settled", runId: execution.handle.runId });
@@ -264,10 +296,12 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     const execution = this.execution, recovery = this.recoveries.get(runId);
     if (recovery) {
       if (!recovery.verified) throw new Error("stop_unconfirmed");
+      if (recovery.cleanup.requiredPersistenceComplete !== true) throw new Error('run_save_unavailable');
       this.saveRecovery(recovery);
       if (this.recoveries.has(runId)) throw new Error("storage_write_failed");
     } else {
       if (!execution || execution.handle.runId !== runId || !execution.pendingSave || !execution.stopped || !execution.fact) throw new Error("run_save_unavailable");
+      if (execution.handle.kind === 'agent') this.agent?.retryToolPersistence?.(runId);
       this.saveFinal(execution); if (execution.pendingSave) throw new Error("storage_write_failed");
     }
     const result = this.store.read({ runId }); if (result.kind !== "one" || !result.run) throw new Error("run_not_found"); return result.run;
@@ -276,10 +310,16 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   recoverInterrupted(previousProcessExited: boolean) {
     try {
       const candidates = this.store.recoveryCandidates(this.instanceId), at = now();
-      for (const run of candidates) this.recoveries.set(run.id, { run, at, verified: previousProcessExited,
-        cleanup: { contract: "medclaw.run-cleanup/v1", executionStarted: run.cleanup?.executionStarted ?? null, stopConfirmed: previousProcessExited ? true : null,
-          requiredPersistenceComplete: true, inputsSettled: true, resourcesReleased: previousProcessExited ? true : null,
-          unconfirmedItems: previousProcessExited ? [] : ["stop", "resources"], secondaryErrors: run.cleanup?.secondaryErrors ?? [], verifiedAt: previousProcessExited ? at : null } });
+      for (const run of candidates) {
+        const facts = this.store.verifyPriorToolFacts?.(run.id, previousProcessExited, at) ?? {
+          stopConfirmed: previousProcessExited ? true : null, requiredPersistenceComplete: true,
+          unconfirmedItems: previousProcessExited ? [] : ['stop', 'resources'],
+        };
+        this.recoveries.set(run.id, { run, at, verified: facts.stopConfirmed === true,
+          cleanup: { contract: "medclaw.run-cleanup/v1", executionStarted: run.cleanup?.executionStarted ?? null, stopConfirmed: facts.stopConfirmed,
+            requiredPersistenceComplete: facts.requiredPersistenceComplete, inputsSettled: true, resourcesReleased: facts.stopConfirmed,
+            unconfirmedItems: facts.unconfirmedItems, secondaryErrors: run.cleanup?.secondaryErrors ?? [], verifiedAt: facts.stopConfirmed === true ? at : run.cleanup?.verifiedAt ?? null } });
+      }
       if (previousProcessExited) for (const recovery of [...this.recoveries.values()]) this.saveRecovery(recovery);
       this.recoveryError = null;
     } catch { this.recoveryError = safeError("storage_read_failed"); }
@@ -289,7 +329,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       if (recovery.run.status === "created" || recovery.run.status === "running") this.store.checkpointFailure(recovery.run.id,
         safeError(recovery.run.kind === "provider" ? "host_interrupted" : "runtime_interrupted", undefined, { runId: recovery.run.id }), recovery.cleanup, recovery.at);
       else this.store.saveRunCleanup(recovery.run.id, recovery.cleanup);
-      this.recoveries.delete(recovery.run.id);
+      if (recovery.cleanup.stopConfirmed === true && recovery.cleanup.requiredPersistenceComplete === true) this.recoveries.delete(recovery.run.id);
     } catch { this.report(safeError("storage_write_failed", undefined, { runId: recovery.run.id })); }
   }
   async shutdown() {

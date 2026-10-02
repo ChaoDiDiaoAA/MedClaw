@@ -10,14 +10,17 @@ import {
 import { ActiveRunViewSchema, CancelRunResultSchema, ReadRunRequestSchema, ReadRunResultSchema, RunViewSchema, RuntimeControlViewSchema } from "./run";
 import { ListSessionsRequestSchema, NewSessionInputSchema, NewSessionResultSchema, ReadSubmissionRequestSchema, SelectSessionInputSchema,
   SessionDetailSchema, SessionPageSchema, SubmitInputSchema, SubmitResultSchema } from "./session";
-import { WorkspaceViewSchema } from "./workspace";
+import { WorkspaceViewSchema, UpdateWorkspaceRequestSchema } from "./workspace";
+import { ImportPreviewRequestSchema, ImportCommitRequestSchema, ImportPreviewSchema, ImportOperationSchema, ImportReferenceSchema, ArtifactSchema, DataCatalogSchema, DataRowsSchema } from "./data";
+import { EvidenceViewSchema, PageSchema, QueryParamsSchema, QuerySummarySchema, QueryViewSchema } from './query';
+import { RunToolsViewSchema } from './tool';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p2-v1" as const;
-export const DATABASE_SCHEMA_VERSION = 2 as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p3-v1" as const;
+export const DATABASE_SCHEMA_VERSION = 3 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
-  return method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method === "run.active" || method === "workspace.restore";
+  return method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method.startsWith('evidence.read') || method === 'data.rows' || method === 'tool.read' || method === "run.active" || method === "workspace.restore";
 }
 export const EmptyPayloadSchema = z.strictObject({});
 const accepted = z.strictObject({ accepted: z.literal(true) });
@@ -89,6 +92,21 @@ export const publicMethodSchemas = {
   "session.readSubmission": { input: ReadSubmissionRequestSchema, output: SubmitResultSchema.nullable() },
   "workspace.read": { input: EmptyPayloadSchema, output: WorkspaceViewSchema },
   "workspace.restore": { input: EmptyPayloadSchema, output: WorkspaceViewSchema },
+  "workspace.update": { input: UpdateWorkspaceRequestSchema, output: WorkspaceViewSchema },
+  'data.read': { input: PageSchema, output: DataCatalogSchema },
+  'data.rows': { input: z.strictObject({ kind: z.enum(['devices', 'changes']), batchId: PositiveIdSchema, page: z.number().int().positive().default(1), pageSize: z.number().int().min(1).max(100).default(50) }), output: DataRowsSchema },
+  'query.execute': { input: z.strictObject({ params: QueryParamsSchema, expectedRevision: z.number().int().nonnegative() }), output: QueryViewSchema },
+  'query.read': { input: PageSchema.extend({ queryId: PositiveIdSchema }), output: QueryViewSchema },
+  'query.list': { input: z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: z.number().int().min(1).max(50).default(20) }), output: z.strictObject({ items: z.array(QuerySummarySchema).max(50), nextBeforeQueryId: PositiveIdSchema.nullable() }) },
+  'evidence.read': { input: z.strictObject({ queryId: PositiveIdSchema, evidenceId: PositiveIdSchema, page: z.number().int().positive().default(1), pageSize: z.number().int().min(1).max(100).default(50) }), output: EvidenceViewSchema },
+  'tool.read': { input: z.strictObject({ runId: PositiveIdSchema, page: z.number().int().positive().default(1), pageSize: z.number().int().min(1).max(50).default(20) }), output: RunToolsViewSchema },
+  "import.preview": { input: ImportPreviewRequestSchema, output: ImportPreviewSchema },
+  "import.commit": { input: ImportCommitRequestSchema, output: ImportOperationSchema },
+  "import.read": { input: ImportReferenceSchema, output: ImportOperationSchema.nullable() },
+  "import.cancel": { input: ImportReferenceSchema, output: ImportOperationSchema },
+  "import.recover": { input: ImportReferenceSchema, output: ImportOperationSchema },
+  "evidence.readOperation": { input: z.strictObject({ kind: z.literal("import"), operationRef: OpaqueIdSchema }), output: ImportOperationSchema.nullable() },
+  "evidence.readArtifact": { input: z.strictObject({ artifactId: PositiveIdSchema }), output: ArtifactSchema.nullable() },
   "run.control.read": { input: EmptyPayloadSchema, output: RuntimeControlViewSchema },
   "run.active": { input: EmptyPayloadSchema, output: ActiveRunViewSchema.nullable() },
   "run.read": { input: ReadRunRequestSchema, output: ReadRunResultSchema },
@@ -170,6 +188,21 @@ export const PublicHostRequestSchema = z.discriminatedUnion("method", [
   hostRequest("session.readSubmission", publicMethodSchemas["session.readSubmission"].input),
   hostRequest("workspace.read", publicMethodSchemas["workspace.read"].input),
   hostRequest("workspace.restore", publicMethodSchemas["workspace.restore"].input),
+  hostRequest("workspace.update", publicMethodSchemas["workspace.update"].input),
+  hostRequest('data.read', publicMethodSchemas['data.read'].input),
+  hostRequest('data.rows', publicMethodSchemas['data.rows'].input),
+  hostRequest('query.execute', publicMethodSchemas['query.execute'].input),
+  hostRequest('query.read', publicMethodSchemas['query.read'].input),
+  hostRequest('query.list', publicMethodSchemas['query.list'].input),
+  hostRequest('evidence.read', publicMethodSchemas['evidence.read'].input),
+  hostRequest('tool.read', publicMethodSchemas['tool.read'].input),
+  hostRequest("import.preview", publicMethodSchemas["import.preview"].input),
+  hostRequest("import.commit", publicMethodSchemas["import.commit"].input),
+  hostRequest("import.read", publicMethodSchemas["import.read"].input),
+  hostRequest("import.cancel", publicMethodSchemas["import.cancel"].input),
+  hostRequest("import.recover", publicMethodSchemas["import.recover"].input),
+  hostRequest("evidence.readOperation", publicMethodSchemas["evidence.readOperation"].input),
+  hostRequest("evidence.readArtifact", publicMethodSchemas["evidence.readArtifact"].input),
   hostRequest("run.control.read", publicMethodSchemas["run.control.read"].input),
   hostRequest("run.active", publicMethodSchemas["run.active"].input),
   hostRequest("run.read", publicMethodSchemas["run.read"].input),
@@ -232,6 +265,7 @@ const credentialCommit = z.discriminatedUnion("changed", [
   z.strictObject({ ...leaseId, expectedVersion: ConfigVersionSchema, changed: z.literal(true), next: CredentialSchema }),
 ]);
 export const privateCredentialMethodSchemas = {
+  "file.resolve": { input: z.strictObject({ fileToken: OpaqueIdSchema, operationRef: OpaqueIdSchema }), output: AbsolutePathSchema },
   "credential.read": { input: z.strictObject(credentialProvider), output: CredentialSchema.nullable() },
   "credential.list": { input: EmptyPayloadSchema, output: z.array(CredentialInfoSchema).max(10000) },
   "credential.delete": { input: z.strictObject(credentialProvider), output: z.null() },
@@ -248,6 +282,7 @@ export type PrivateCredentialReturn<M extends PrivateCredentialMethod> = z.infer
 const privateFields = { protocolVersion: z.literal(HOST_PROTOCOL_VERSION), kind: z.literal("private"), instanceId: OpaqueIdSchema, requestId: OpaqueIdSchema, secret: z.literal(true) };
 const privateRequest = <M extends string, S extends z.ZodType>(method: M, payload: S) => z.strictObject({ ...privateFields, method: z.literal(method), payload });
 export const PrivateCredentialFrameSchema = z.discriminatedUnion("method", [
+  privateRequest("file.resolve", privateCredentialMethodSchemas["file.resolve"].input),
   privateRequest("credential.read", privateCredentialMethodSchemas["credential.read"].input),
   privateRequest("credential.list", privateCredentialMethodSchemas["credential.list"].input),
   privateRequest("credential.delete", privateCredentialMethodSchemas["credential.delete"].input),
@@ -257,6 +292,7 @@ export const PrivateCredentialFrameSchema = z.discriminatedUnion("method", [
 ]);
 const privateReply = <M extends string, S extends z.ZodType>(method: M, output: S) => z.strictObject({ ...privateFields, method: z.literal(method), result: resultSchema(output) });
 export const PrivateCredentialReplySchema = z.discriminatedUnion("method", [
+  privateReply("file.resolve", privateCredentialMethodSchemas["file.resolve"].output),
   privateReply("credential.read", privateCredentialMethodSchemas["credential.read"].output),
   privateReply("credential.list", privateCredentialMethodSchemas["credential.list"].output),
   privateReply("credential.delete", privateCredentialMethodSchemas["credential.delete"].output),
@@ -266,6 +302,8 @@ export const PrivateCredentialReplySchema = z.discriminatedUnion("method", [
 ]);
 /** New input only: Main binds the returned one-use token to the invoking window/provider. */
 export const DesktopSecretInputSchema = z.strictObject({ providerId: ProviderIdSchema, purpose: z.literal("custom_api_key"), value: z.string().min(1).max(4096) });
+export const DesktopImportDirectorySchema = z.strictObject({ operationRef: OpaqueIdSchema });
+export const DesktopImportDirectoryResultSchema = z.strictObject({ fileToken: OpaqueIdSchema, directoryName: z.string().min(1) }).nullable();
 export const DesktopSecretInputResultSchema = z.strictObject({ token: SecretInputTokenSchema, expiresAt: TimestampSchema });
 export const DesktopSecretDiscardSchema = z.strictObject({ token: SecretInputTokenSchema });
 

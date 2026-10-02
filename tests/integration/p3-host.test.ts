@@ -1,0 +1,147 @@
+import { expect, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
+import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, renameSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { HostController } from '../../apps/desktop/src/main/host-controller';
+import { FileTokens } from '../../apps/desktop/src/main/file-tokens';
+import { MainSettings, atomicWriteJson } from '../../apps/desktop/src/main/settings';
+import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
+import { DATABASE_SCHEMA_VERSION, type PrivateCredentialFrame } from '../../packages/contracts/src/protocol';
+import { ImportPreviewSchema, ImportOperationSchema } from '../../packages/contracts/src/data';
+import { NewSessionResultSchema, SessionDetailSchema, SubmitResultSchema } from '../../packages/contracts/src/session';
+import { WorkspaceViewSchema } from '../../packages/contracts/src/workspace';
+import { RuntimeControlViewSchema, ReadRunResultSchema } from '../../packages/contracts/src/run';
+import { safeError, type Result } from '../../packages/contracts/src/error';
+import { QueryParamsSchema, QueryViewSchema } from '../../packages/contracts/src/query';
+
+function unwrap<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
+async function until(check: () => Promise<boolean>, timeout = 15000) {
+  const end = Date.now() + timeout;
+  while (!await check()) { if (Date.now() > end) throw new Error('Host condition timed out'); await Bun.sleep(20); }
+}
+function singleDayPackage(root: string) {
+  mkdirSync(root);
+  const input = resolve('data/agent-input');
+  for (const name of ['entity-lineage.csv', 'source-lock.json', 'adjustment-lineage.csv', 'validation-report.json', 'selection-report.json', '使用说明.md', 'zhejiang_2026-01-01.csv', 'zhejiang_2026-01-01.metadata.json']) copyFileSync(join(input, name), join(root, name));
+  const files = readdirSync(root).sort().map(path => { const bytes = readFileSync(join(root, path)); return { path, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') }; });
+  writeFileSync(join(root, 'manifest.json'), JSON.stringify({ status: 'complete', files, businessFiles: 1, businessRows: 813, businessBytes: files.find(file => file.path === 'zhejiang_2026-01-01.csv')!.bytes, totalPayloadBytes: files.reduce((sum, file) => sum + file.bytes, 0) }));
+}
+async function setup(holdFinal = false) {
+  const root = mkdtempSync(join(tmpdir(), 'medclaw-p3-host-')), source = join(root, 'source'); singleDayPackage(source);
+  const requests: Record<string, unknown>[] = [], privateRequests: PrivateCredentialFrame[] = [];
+  let releaseFinal!: () => void;
+  const finalGate = new Promise<void>(resolve => { releaseFinal = resolve; });
+  const provider = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    const body = await request.json() as Record<string, unknown>; requests.push(body);
+    const messages = body.messages as { role: string }[];
+    const toolReturned = messages.some(message => message.role === 'tool');
+    if (toolReturned && holdFinal) await finalGate;
+    const chunks = toolReturned
+      ? [{ id: 'p3-fixture', choices: [{ index: 0, delta: { role: 'assistant', content: 'There are 813 devices in the imported snapshot.' }, finish_reason: 'stop' }] }]
+      : [{ id: 'p3-fixture', choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'current-call', type: 'function', function: { name: 'query_current_devices', arguments: JSON.stringify({ batchIds: [1], time: { start: '2026-01-01', endExclusive: '2026-01-02' } }) } }] }, finish_reason: 'tool_calls' }] }];
+    return new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const tokens = new FileTokens(), host = new HostController({ dataRoot: root, hostEntry: resolve('apps/host/src/main.ts'), bunExecutable: process.execPath, onCredentialRequest: async frame => {
+    privateRequests.push(frame);
+    if (frame.method === 'file.resolve') {
+      try { return { ok: true, data: tokens.resolve(frame.payload.fileToken, 7, host.read().instanceId!, frame.payload.operationRef) }; }
+      catch { return { ok: false, error: safeError('file_token_invalid') }; }
+    }
+    if (frame.method === 'credential.list') return { ok: true, data: [{ providerId: 'p3-fixture', type: 'api_key' }] };
+    if (frame.method === 'credential.read') return { ok: true, data: frame.payload.providerId === 'p3-fixture' ? { type: 'api_key', key: 'fixture-only' } : null };
+    return { ok: false, error: safeError('access_denied') };
+  } });
+  const settings = new MainSettings(host.paths.settingsPath).read();
+  atomicWriteJson(host.paths.settingsPath, PublishedSettingsSchema.parse({ ...settings, model: { provider: 'p3-fixture', modelId: 'fixture' }, customProviders: [{ credentialRef: null, definition: { providerId: 'p3-fixture', name: 'Fixture', api: 'openai-completions', baseUrl: `http://127.0.0.1:${provider.port}/v1`, models: [{ id: 'fixture', name: 'Fixture', input: ['text'], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }] } }], requestPolicy: { timeoutMs: 10000, maxRetries: 0, maxRetryDelayMs: 2000 } }));
+  expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion: DATABASE_SCHEMA_VERSION, error: null });
+  const issue = (operationRef: string) => tokens.issue(7, host.read().instanceId!, operationRef, source).fileToken;
+  const workspace = async () => WorkspaceViewSchema.parse(unwrap(await host.request('workspace.read', {})));
+  const preview = async (operationRef: string, fileToken = issue(operationRef)) => ({ fileToken, preview: ImportPreviewSchema.parse(unwrap(await host.request('import.preview', { operationRef, fileToken, mappingVersion: 'medclaw.snapshot/v1' }, operationRef))) });
+  const close = async () => { releaseFinal(); try { if (host.read().instanceId && !host.read().canStart) await host.stop(host.read().instanceId!); } finally { provider.stop(true); rmSync(root, { recursive: true, force: true }); } };
+  return { root, source, host, tokens, issue, workspace, preview, requests, privateRequests, close, releaseFinal };
+}
+
+test('P3 production Host imports through Main tokens, freezes trusted scope and executes an actual Pi business tool', async () => {
+  const f = await setup(); try {
+    const { preview, fileToken } = await f.preview('import-1'); expect(preview).toMatchObject({ canCommit: true, rowCount: 813, entityCount: 813, batchCount: 1 });
+    const before = await f.workspace(); expect(before.batchRefs).toEqual([]);
+    const result = ImportOperationSchema.parse(unwrap(await f.host.request('import.commit', { operationRef: 'import-1', previewHash: preview.previewHash, fileToken }, 'import-1')));
+    expect(result.state).toBe('imported'); expect(result.result?.acceptedRows).toBe(813);
+    expect((await f.workspace()).batchRefs).toEqual([]); expect(f.requests).toHaveLength(0);
+    const session = NewSessionResultSchema.parse(unwrap(await f.host.request('session.create', { expectedWorkspaceRevision: (await f.workspace()).revision }, 'new-session')));
+    const selected = WorkspaceViewSchema.parse(unwrap(await f.host.request('workspace.update', { expectedRevision: (await f.workspace()).revision, change: { batchIds: result.result!.batchIds } }, 'select-data')));
+    expect(selected.batchRefs.map(batch => batch.id)).toEqual([1]);
+    const detail = SessionDetailSchema.parse(unwrap(await f.host.request('session.read', { sessionId: session.session.id })));
+    const input = { sessionId: session.session.id, clientSequence: detail.session.nextSubmissionSequence, text: 'List the imported devices on 2026-01-01.', mode: 'send', expectedRevision: selected.revision, expectedBatchIds: [1], expectedQueryId: null, model: { provider: 'p3-fixture', modelId: 'fixture', expectedConfigVersion: '1' }, referenceDate: '2026-01-02', timezone: 'Asia/Shanghai' };
+    await expect(f.host.request('session.submit', { ...input, referenceDate: '2026-02-30' }, 'invalid-date')).rejects.toThrow('Expected a real YYYY-MM-DD date');
+    expect(await f.host.request('session.submit', { ...input, timezone: 'UTC' }, 'mismatched-timezone')).toMatchObject({ ok: false, error: { code: 'invalid_argument' } });
+    expect(f.requests).toHaveLength(0);
+    const accepted = SubmitResultSchema.parse(unwrap(await f.host.request('session.submit', input, 'ask-devices')));
+    await until(async () => RuntimeControlViewSchema.parse(unwrap(await f.host.request('run.control.read', {}))).acceptingNewRuns);
+    const run = ReadRunResultSchema.parse(unwrap(await f.host.request('run.read', { runId: accepted.runId }))); expect(run).toMatchObject({ kind: 'one', run: { status: 'completed', referenceDate: '2026-01-02', timezone: 'Asia/Shanghai' } });
+    expect(await f.host.request('session.submit', { ...input, referenceDate: '2026-01-01' }, 'ask-devices')).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(await f.host.request('session.submit', input, 'ask-devices')).toMatchObject({ ok: true, data: accepted });
+    expect(f.requests).toHaveLength(2);
+    const tools = f.requests[0]!.tools as { function: { name: string } }[]; expect(tools).toHaveLength(23); expect(tools.some(tool => tool.function.name === 'query_current_devices')).toBe(true);
+    const messages = f.requests[1]!.messages as { role: string; content: string }[];
+    expect(JSON.parse(messages.find(message => message.role === 'tool')!.content)).toMatchObject({ queryId: 1, totalRows: 813, interpretation: { referenceDate: '2026-01-02', requestedDate: '2026-01-01', dataDates: ['2026-01-01'], isStale: false } });
+    const db = new Database(f.host.paths.databasePath, { readonly: true }); try {
+      expect(db.query('SELECT tool_name,status FROM tool_calls').all()).toEqual([{ tool_name: 'query_current_devices', status: 'succeeded' }]);
+      expect(db.query('SELECT source FROM queries').all()).toEqual([{ source: 'agent_tool' }]);
+      expect(db.query('SELECT count(*) n FROM query_evidence').get()).toEqual({ n: 1 });
+      expect(db.query('SELECT reference_date, json_extract(config_json, \'$.referenceDate\') config_reference_date FROM runs').all()).toEqual([{ reference_date: '2026-01-02', config_reference_date: '2026-01-02' }]);
+    } finally { db.close(); }
+    renameSync(f.source, `${f.source}-moved`);
+    expect(await f.host.request('import.recover', { operationRef: 'import-1' })).toMatchObject({ ok: true, data: { state: 'imported' } });
+    const old = f.host.read().instanceId!; expect(await f.host.restart(old)).toMatchObject({ state: 'ready', schemaVersion: DATABASE_SCHEMA_VERSION, error: null });
+    expect(await f.host.request('import.read', { operationRef: 'import-1' })).toMatchObject({ ok: true, data: { state: 'imported' } });
+  } finally { await f.close(); }
+}, 30000);
+
+test('manual queries bind the original active Agent Run and replay after completion without a new model request', async () => {
+  const f = await setup(true); try {
+    const { preview, fileToken } = await f.preview('import');
+    const imported = ImportOperationSchema.parse(unwrap(await f.host.request('import.commit', { operationRef: 'import', previewHash: preview.previewHash, fileToken }, 'import')));
+    const session = NewSessionResultSchema.parse(unwrap(await f.host.request('session.create', { expectedWorkspaceRevision: (await f.workspace()).revision }, 'session-a')));
+    const selected = WorkspaceViewSchema.parse(unwrap(await f.host.request('workspace.update', { expectedRevision: (await f.workspace()).revision, change: { batchIds: imported.result!.batchIds } })));
+    const params = QueryParamsSchema.parse({ kind: 'aggregate', population: 'snapshot', snapshotMode: 'exact_date', batchIds: [1], metric: 'count' });
+    expect(await f.host.request('query.execute', { params, expectedRevision: selected.revision }, 'before-run')).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    const accepted = SubmitResultSchema.parse(unwrap(await f.host.request('session.submit', { sessionId: session.session.id, clientSequence: 1, text: 'List imported devices.', mode: 'send',
+      expectedRevision: selected.revision, expectedBatchIds: [1], expectedQueryId: null, model: { provider: 'p3-fixture', modelId: 'fixture', expectedConfigVersion: '1' }, referenceDate: '2026-01-01', timezone: 'Asia/Shanghai' }, 'ask')));
+    await until(async () => f.requests.length === 2);
+    const request = { params, expectedRevision: selected.revision };
+    const manual = QueryViewSchema.parse(unwrap(await f.host.request('query.execute', request, 'manual-query')));
+    expect(manual).toMatchObject({ query: { runId: accepted.runId, sessionId: session.session.id, source: 'user_form', callRef: `${accepted.runId}:manual-query`, totalRows: 1 }, page: { rows: [{ value: 813 }] } });
+    expect('rows' in manual.query).toBe(false);
+    expect('snapshotIds' in manual.query).toBe(false);
+    expect(f.requests).toHaveLength(2);
+    f.releaseFinal();
+    await until(async () => RuntimeControlViewSchema.parse(unwrap(await f.host.request('run.control.read', {}))).acceptingNewRuns);
+    expect(QueryViewSchema.parse(unwrap(await f.host.request('query.execute', request, 'manual-query'))).query).toEqual(manual.query);
+    expect(await f.host.request('query.execute', { ...request, expectedRevision: selected.revision + 1 }, 'manual-query')).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(QueryViewSchema.parse(unwrap(await f.host.request('query.read', { queryId: manual.query.id }))).query.resultHash).toBe(manual.query.resultHash);
+    const next = NewSessionResultSchema.parse(unwrap(await f.host.request('session.create', { expectedWorkspaceRevision: (await f.workspace()).revision }, 'session-b')));
+    expect(next.workspace.queryId).toBeNull();
+    expect(await f.host.request('query.read', { queryId: manual.query.id })).toMatchObject({ ok: false, error: { code: 'access_denied' } });
+    expect(await f.host.request('tool.read', { runId: accepted.runId })).toMatchObject({ ok: true, data: { runId: accepted.runId, scope: { batchIds: [1] }, items: [{ name: 'query_current_devices', status: 'succeeded' }] } });
+    expect(f.requests).toHaveLength(2);
+  } finally { await f.close(); }
+}, 30000);
+
+test('P3 Host rejects forged directory paths, mismatched operation identities and old Host tokens', async () => {
+  const f = await setup(); try {
+    const token = f.issue('original');
+    expect(await f.host.request('import.preview', { operationRef: 'original', fileToken: token, mappingVersion: 'medclaw.snapshot/v1' }, 'other-envelope')).toMatchObject({ ok: false, error: { code: 'invalid_argument' } });
+    expect(await f.host.request('import.read', { operationRef: 'original' })).toEqual({ ok: true, data: null });
+    await expect(f.host.request('import.preview', { operationRef: 'extra-path', fileToken: token, mappingVersion: 'medclaw.snapshot/v1', directory: f.source }, 'extra-path')).rejects.toThrow();
+    expect(await f.host.request('import.preview', { operationRef: 'wrong-token-operation', fileToken: token, mappingVersion: 'medclaw.snapshot/v1' }, 'wrong-token-operation')).toMatchObject({ ok: false, error: { code: 'file_token_invalid' } });
+    await expect(f.host.request('import.preview', { operationRef: 'raw-path', fileToken: f.source, mappingVersion: 'medclaw.snapshot/v1' }, 'raw-path')).rejects.toThrow();
+    const old = f.host.read().instanceId!; await f.host.restart(old);
+    expect(await f.host.request('import.preview', { operationRef: 'original', fileToken: token, mappingVersion: 'medclaw.snapshot/v1' }, 'original')).toMatchObject({ ok: false, error: { code: 'file_token_invalid' } });
+    expect(f.requests).toHaveLength(0);
+    expect(f.privateRequests.filter(frame => frame.method === 'file.resolve').every(frame => frame.secret)).toBe(true);
+    const db = new Database(f.host.paths.databasePath, { readonly: true }); try { expect(db.query('SELECT count(*) n FROM batches').get()).toEqual({ n: 0 }); expect(db.query('SELECT count(*) n FROM runs').get()).toEqual({ n: 0 }); } finally { db.close(); }
+  } finally { await f.close(); }
+}, 30000);

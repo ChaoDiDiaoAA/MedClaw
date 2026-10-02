@@ -2,6 +2,6 @@
   "name": "@medclaw/core",
   "private": true,
   "type": "module",
-  "exports": { "./application": "./src/application.ts", "./runtime": "./src/runtime/runtime-service.ts", "./session": "./src/session/session-service.ts", "./workspace": "./src/workspace/workspace-service.ts" },
-  "dependencies": { "@medclaw/contracts": "workspace:*" }
+  "exports": { "./application": "./src/application.ts", "./runtime": "./src/runtime/runtime-service.ts", "./session": "./src/session/session-service.ts", "./workspace": "./src/workspace/workspace-service.ts", "./tools": "./src/tools/tools.ts", "./tools/registry": "./src/tools/registry.ts", "./tools/executor": "./src/tools/executor.ts", "./tools/recorder": "./src/tools/recorder.ts", "./data/catalog": "./src/data/catalog-service.ts", "./data/query": "./src/data/query-service.ts", "./evidence": "./src/evidence/evidence-reader.ts", "./data/import-service": "./src/data/import-service.ts", "./data/diff-service": "./src/data/diff-service.ts" },
+  "dependencies": { "@medclaw/contracts": "workspace:*", "zod": "4.6.5" }
 }

@@ -45,7 +45,7 @@ const runFields = {
   inputText: z.string().max(65536), inputPage: InputPageSchema, model: ModelSelectionSchema, policy: RequestPolicySchema, priorRunId: PositiveIdSchema.nullable(),
   referenceDate: ReferenceDateSchema, timezone: TimezoneSchema, createdAt: TimestampSchema, startedAt: TimestampSchema.nullable(),
   cancelRequestedAt: TimestampSchema.nullable(), stoppedAt: TimestampSchema.nullable(), endedAt: TimestampSchema.nullable(), error: AppErrorSchema.nullable(),
-  cleanup: RunCleanupRecordSchema.nullable(), answerRef: z.null(), output: OutputPageSchema, persistence: z.literal("committed"),
+  cleanup: RunCleanupRecordSchema.nullable(), answerRef: PositiveIdSchema.nullable(), output: OutputPageSchema, persistence: z.literal("committed"),
 };
 export const ProviderRunViewSchema = z.strictObject({ ...runFields, kind: z.literal("provider"), sessionId: z.null(),
   goal: z.enum(["answer", "verify"]), calls: z.array(ModelCallViewSchema).max(1) });
@@ -145,9 +145,15 @@ export type StartRunInput<Resolved> = AgentStartFields & { resolved: Resolved };
 export type RegisterAgentInput = AgentStartFields & { instanceId: string; createdAt: string };
 export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[] };
 export type AgentRuntimePort<Resolved> = {
+  readonly toolNames?: readonly string[];
+  toolPersistencePending?: (runId: number) => boolean;
+  retryToolPersistence?: (runId: number) => void;
+  releaseToolFacts?: (runId: number) => void;
   describe: (resolved: Resolved) => P2AgentOptions;
-  execute: (input: { runId: number; sessionId: number; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number },
-    callbacks: { startCall: (time: string) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void }) => Promise<AgentExecutionObservation>;
+  execute: (input: { runId: number; sessionId: number; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number;
+    scope?: RunScope; referenceDate?: string; timezone?: string },
+    callbacks: { startCall: (time: string) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
+      fatal?: (error: AppError) => void }) => Promise<AgentExecutionObservation>;
 };
 export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord };
 export type StoredOperation = ProviderOperation
@@ -168,15 +174,20 @@ export interface ProviderRunStore {
   active(): RunHandle | null;
 }
 export interface RuntimeRunStore extends ProviderRunStore, SessionStore {
+  freezeAgentScope(workspace: WorkspaceView, toolNames: readonly string[]): RunScope;
   registerAgent(input: RegisterAgentInput): SubmitResult;
   finalizeAgent(runId: number, fact: FinalAgentFact): RunView;
   isFinalSaved(runId: number, fact: FinalProviderFact | FinalAgentFact): boolean;
   checkpointFailure(runId: number, error: AppError, cleanup: RunCleanupRecord, time: string): void;
   saveRunCleanup(runId: number, cleanup: RunCleanupRecord): void;
   recoveryCandidates(instanceId: string): RunView[];
+  verifyPriorToolFacts?(runId: number, previousProcessExited: boolean, time: string): {
+    stopConfirmed: boolean | null; requiredPersistenceComplete: boolean; unconfirmedItems: string[];
+  };
   recoverInterrupted(instanceId: string, time: string): number;
 }
 export interface ModelCallRecorderPort {
+  readonly callId?: string;
   finish(outcome: ProviderOutcome, endedAt: string): FinalCallFact;
 }
 export type ModelCallStarter = (runId: number, kind: "main" | "diagnostic", time: string) => ModelCallRecorderPort;

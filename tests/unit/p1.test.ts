@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DATABASE_SCHEMA_VERSION, HOST_PROTOCOL_VERSION } from "../../packages/contracts/src/protocol";
 
 describe("P1 stage runner", () => {
   test("rejects unknown suite/stage and an empty discovered suite", async () => {
@@ -9,7 +10,7 @@ describe("P1 stage runner", () => {
     const root = mkdtempSync(join(tmpdir(), "medclaw-p1-empty-"));
     try {
       expect(() => discoverTests("invalid" as "unit", "P1", root)).toThrow();
-      expect(() => discoverTests("unit", "P3", root)).toThrow();
+      expect(() => discoverTests("unit", "P4", root)).toThrow();
       expect(discoverTests("unit", "P1", root)).toEqual([]);
       const result = await runStage("unit", "P1", { root });
       expect(result.discovered).toBe(0);
@@ -191,7 +192,7 @@ describe("P1 read and usage boundaries", () => {
 });
 
 describe("P1 public and private protocol", () => {
-  test("public dispatch retains P1 methods in the P2 whitelist", async () => {
+  test("public dispatch retains P1 methods in the P3 whitelist", async () => {
     const { publicMethodSchemas, parsePublicPayload } = await import("../../packages/contracts/src/protocol");
     expect(Object.keys(publicMethodSchemas).sort()).toEqual([
       "model.list", "model.read", "model.refresh", "operation.cancel", "model.auth.start", "model.auth.respond",
@@ -199,8 +200,10 @@ describe("P1 public and private protocol", () => {
       "model.config.read", "model.config.rollback", "model.request", "model.diagnose", "run.active", "run.read", "run.cancel", "run.retrySave",
       "session.create", "session.select", "session.list", "session.read", "session.submit", "session.readSubmission", "workspace.read", "workspace.restore", "run.control.read",
       "settings.ui.read", "settings.ui.update", "diagnostics.read", "host.read", "host.start", "host.stop", "host.restart",
+      "workspace.update", "data.read", "data.rows", "query.execute", "query.read", "query.list", "evidence.read", "tool.read",
+      "import.preview", "import.commit", "import.read", "import.cancel", "import.recover", "evidence.readOperation", "evidence.readArtifact",
     ].sort());
-    for (const method of ["credential.read", "credential.modify.begin", "settings.prepare", "host.shutdown", "diagnostics.export", "executeShell", "__proto__"]) {
+    for (const method of ["credential.read", "credential.modify.begin", "file.resolve", "settings.prepare", "host.shutdown", "diagnostics.export", "executeShell", "__proto__"]) {
       expect(() => parsePublicPayload(method, {})).toThrow();
     }
     expect(() => parsePublicPayload("run.retrySave", { runId: 1, outputText: "forged", usage: {} })).toThrow();
@@ -212,7 +215,7 @@ describe("P1 public and private protocol", () => {
 
   test("typed host frames validate protocol, caller identity and method payload", async () => {
     const { HostRequestSchema, parseHostFrame } = await import("../../packages/contracts/src/protocol");
-    const frame = { protocolVersion: "medclaw.host/p2-v1", kind: "request", requestId: "req-1", instanceId: "instance-1",
+    const frame = { protocolVersion: HOST_PROTOCOL_VERSION, kind: "request", requestId: "req-1", instanceId: "instance-1",
       operationRef: "op-1", method: "model.request", payload: request };
     expect(HostRequestSchema.safeParse(frame).success).toBe(true);
     expect(HostRequestSchema.safeParse({ ...frame, protocolVersion: "medclaw.host/p2" }).success).toBe(false);
@@ -224,7 +227,7 @@ describe("P1 public and private protocol", () => {
 
   test("JSONL frame cap counts UTF-8 bytes and notices forbid future event sequence", async () => {
     const { encodeHostFrame, parseHostFrame, NoticeFrameSchema, MAX_FRAME_BYTES } = await import("../../packages/contracts/src/protocol");
-    const notice = { protocolVersion: "medclaw.host/p2-v1", kind: "notice", instanceId: "instance-1",
+    const notice = { protocolVersion: HOST_PROTOCOL_VERSION, kind: "notice", instanceId: "instance-1",
       notice: { type: "provider.preview", runId: 1, text: "hi", truncated: false } } as const;
     expect(encodeHostFrame(notice).endsWith("\n")).toBe(true);
     expect(parseHostFrame(encodeHostFrame(notice), "instance-1")).toEqual(notice);
@@ -236,7 +239,7 @@ describe("P1 public and private protocol", () => {
 
   test("private credential leases require typed bodies and never enter public dispatch", async () => {
     const { PrivateCredentialFrameSchema, privateCredentialMethodSchemas, DesktopSecretInputSchema } = await import("../../packages/contracts/src/protocol");
-    const base = { protocolVersion: "medclaw.host/p2-v1", kind: "private", instanceId: "instance-1", requestId: "req-1", secret: true };
+    const base = { protocolVersion: HOST_PROTOCOL_VERSION, kind: "private", instanceId: "instance-1", requestId: "req-1", secret: true };
     expect(PrivateCredentialFrameSchema.safeParse({ ...base, method: "credential.modify.begin", payload: {
       providerId: "openai", context: { purpose: "auth", operationRef: "op-1", authAttemptId: "auth-1" }, operationId: "modify-1", expectedCredentialRef: null,
     } }).success).toBe(true);
@@ -251,13 +254,13 @@ describe("P1 public and private protocol", () => {
 
   test("private hello paths and SDK/schema handshake versions are strict", async () => {
     const { HostHelloSchema, HostReadySchema } = await import("../../packages/contracts/src/protocol");
-    const hello = { protocolVersion: "medclaw.host/p2-v1", instanceId: "instance-1", startupToken: "startup-token-1", sdkVersion: "0.87.1", expectedSchemaVersion: 2,
+    const hello = { protocolVersion: HOST_PROTOCOL_VERSION, instanceId: "instance-1", startupToken: "startup-token-1", sdkVersion: "0.87.1", expectedSchemaVersion: DATABASE_SCHEMA_VERSION,
       paths: { dataRoot: "D:/isolated", databasePath: "D:/isolated/data/app.sqlite", settingsPath: "D:/isolated/data/settings.json",
         cachePath: "D:/isolated/data/pi-model-cache.json", lockPath: "D:/isolated/runtime/host.lock" } };
     expect(HostHelloSchema.safeParse(hello).success).toBe(true);
     expect(HostHelloSchema.safeParse({ ...hello, paths: { ...hello.paths, databasePath: "relative/app.sqlite" } }).success).toBe(false);
     expect(HostHelloSchema.safeParse({ ...hello, sdkVersion: "0.87.0" }).success).toBe(false);
-    expect(HostReadySchema.safeParse({ protocolVersion: "medclaw.host/p2-v1", instanceId: "instance-1", sdkVersion: "0.87.1", schemaVersion: 1, configVersion: "1", dataRoot: "D:/isolated" }).success).toBe(false);
+    expect(HostReadySchema.safeParse({ protocolVersion: HOST_PROTOCOL_VERSION, instanceId: "instance-1", sdkVersion: "0.87.1", schemaVersion: 1, configVersion: "1", dataRoot: "D:/isolated" }).success).toBe(false);
   });
 });
 
@@ -323,7 +326,7 @@ describe("P1 bounded safe diagnostics", () => {
   test("partial diagnostics default to safe operational entries without prompt traces", async () => {
     const { composeDiagnostics } = await import("../../packages/logging/src/diagnostics");
     const host = { instanceId: null, state: "stopped" as const, canStart: true, sdkVersion: null, schemaVersion: null, error: null };
-    const versions = { sdkVersion: "0.87.1" as const, protocolVersion: "medclaw.host/p2-v1" as const, schemaVersion: null, configVersion: "1", bunVersion: null, electronVersion: "44.5.1" };
+    const versions = { sdkVersion: "0.87.1" as const, protocolVersion: HOST_PROTOCOL_VERSION, schemaVersion: null, configVersion: "1", bunVersion: null, electronVersion: "44.5.1" };
     const at = "2026-09-30T00:00:00.000Z";
     const result = composeDiagnostics({ host, versions, hostAvailable: false, mainEntries: [
       { category: "runtime", source: "main", at, message: "Host 已就绪" },

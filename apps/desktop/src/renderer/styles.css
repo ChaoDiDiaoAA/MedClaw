@@ -91,6 +91,28 @@ legend { padding: 0 6px; font-weight: 600; }
 .facts { display: grid; grid-template-columns: minmax(95px, .4fr) minmax(0, 1fr); gap: 9px 16px; margin: 16px 0 24px; font-size: .9rem; }
 .facts dt { color: var(--muted); }
 .facts dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.data-layout, .query-layout, .query-history-layout { display: flex; flex-direction: column; gap: 20px; max-width: 1160px; margin: 0 auto; }
+.operation-lookup, .selection-fields { display: flex; align-items: end; gap: 12px; margin: 18px 0; }
+.operation-lookup label, .selection-fields label { flex: 1; }
+.import-operation { margin-top: 20px; border-top: 1px solid var(--line); padding-top: 18px; }
+.import-issues { max-height: 260px; overflow: auto; margin-bottom: 18px; }
+.table-scroll { overflow: auto; margin: 16px 0; max-height: 520px; border: 1px solid var(--line); border-radius: 6px; }
+.table-scroll table { width: 100%; border-collapse: collapse; font-size: .86rem; font-variant-numeric: tabular-nums; }
+.table-scroll th { position: sticky; top: 0; z-index: 1; text-align: left; color: var(--muted); background: #f4f1ec; font-weight: 600; }
+.table-scroll td, .table-scroll th { padding: 10px 12px; border-bottom: 1px solid var(--line); min-width: 90px; vertical-align: top; overflow-wrap: anywhere; }
+.table-scroll tbody tr:last-child td { border-bottom: 0; }
+.table-scroll tbody tr:hover { background: #faf7f1; }
+.query-history-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin: 16px 0; }
+.query-history-list button { text-align: left; display: flex; flex-direction: column; align-items: start; gap: 5px; padding: 12px; }
+.query-history-list button.selected { border-color: var(--accent); background: #faf3ef; }
+.query-warning { border-left: 3px solid #b48b40; padding: 8px 12px; background: #faf7f1; font-size: .9rem; }
+.json-facts { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 280px; overflow: auto; font-size: .8rem; background: #faf9f7; padding: 12px; border: 1px solid var(--line); border-radius: 5px; }
+.context-panel details { margin: 12px 0; }
+.chat-data-context { margin: 12px 0 0; padding-top: 10px; border-top: 1px solid var(--line); }
+.tool-call-summary { margin: 14px 0; border-top: 1px solid var(--line); padding: 14px 0; }
+.tool-call-summary .facts { font-size: .82rem; }
+.tool-result-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; font-size: .85rem; }
+@media (max-width: 800px) { .operation-lookup, .selection-fields { align-items: stretch; flex-direction: column; } .query-layout .form-grid { grid-template-columns: minmax(0, 1fr); } }
 .chat-layout { display: flex; flex-direction: column; height: 100%; min-height: 0; position: relative; }
 .reading-width { width: min(100%, 840px); margin: 0 auto; }
 .messages { overflow-y: auto; min-height: 0; flex: 1; padding: 30px 32px; overscroll-behavior: contain; }
@@ -105,9 +127,13 @@ legend { padding: 0 6px; font-weight: 600; }
 .composer-wrap { padding: 12px 32px 18px; flex-shrink: 0; background: #faf9f7; border-top: 1px solid var(--line); max-height: 55%; overflow-y: auto; }
 .composer { background: white; border: 1px solid #d9d3c8; border-radius: 10px; padding: 12px 16px; }
 .composer-model { display: flex; justify-content: space-between; align-items: center; gap: 10px; color: var(--muted); font-size: .85rem; margin-bottom: 8px; }
-.composer-model select { flex: 1; width: 0; min-height: 34px; border: 0; padding-left: 0; background: transparent; text-overflow: ellipsis; }
+.composer-model-choice { flex: 1; min-width: 0; }
+.composer-model select { min-height: 34px; border: 0; padding-left: 0; background: transparent; text-overflow: ellipsis; }
+.composer-model-choice span { display: block; overflow-wrap: anywhere; }
 .composer-model button { flex-shrink: 0; }
-.composer textarea { border: 0; border-radius: 0; resize: none; min-height: 54px; max-height: 160px; padding: 5px 0; background: transparent; }
+.composer textarea { border: 2px solid #8c8275; border-radius: 8px; resize: none; min-height: 76px; max-height: 160px; padding: 10px 12px; background: #faf8f4; }
+.composer textarea::placeholder { color: var(--muted); opacity: 1; }
+.composer textarea:focus { border-color: var(--accent); background: #fff; }
 .composer-bottom { display: flex; align-items: center; gap: 14px; justify-content: space-between; flex-wrap: wrap; margin-top: 8px; }
 .composer-reason { color: #9a5947; font-size: .82rem; margin: 10px 0 0; }
 .reference-fields { color: var(--muted); font-size: .82rem; margin-top: 10px; }

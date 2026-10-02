@@ -1,0 +1,283 @@
+import type { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
+import { AppErrorSchema, PositiveIdSchema, safeError, type AppError } from "../../contracts/src/error";
+import { ChangesQuerySchema, CurrentQuerySchema, QueryParamsSchema, EvidenceSchema, QueryRecordSchema, type Evidence, type QueryRecord, type QueryStore, type QueryContext } from "../../contracts/src/query";
+import { canonicalRequest, RunScopeSchema } from "../../contracts/src/run";
+import { ToolCallRecordSchema, ToolContextIdentitySchema, ToolExecutionModeSchema, ToolSdkDeliverySchema, type ToolCallIdentity, type ToolCallRecord,
+  type ToolCallStore, type ToolExecutionContext, type ToolResult, type ToolSdkDelivery } from "../../contracts/src/tool";
+
+const knownErrors = new Set(["invalid_argument", "access_denied", "state_conflict", "operation_not_found", "runtime_interrupted", "storage_read_failed", "storage_write_failed"]);
+function fail(code: string): never { throw new Error(code); }
+function protect<T>(action: () => T, fallback: string): T {
+  try { return action(); }
+  catch (error) { if (error instanceof Error && knownErrors.has(error.message)) throw error; return fail(fallback); }
+}
+function json(value: unknown): string {
+  return protect(() => {
+    const text = JSON.stringify(value);
+    if (text === undefined || !isDeepStrictEqual(value, JSON.parse(text))) fail("invalid_argument");
+    return canonicalRequest(value);
+  }, "invalid_argument");
+}
+function decode(text: string): unknown { return protect(() => JSON.parse(text), "storage_read_failed"); }
+function id(value: number) { if (!PositiveIdSchema.safeParse(value).success) fail("invalid_argument"); }
+function cancelled(context: QueryContext) { if (context.signal.aborted) fail("runtime_interrupted"); }
+const terminal = (status: ToolCallRecord["status"]) => status === "succeeded" || status === "failed" || status === "cancelled";
+
+/** Explicit isolated-DB entry point. Do not append these tables to a daily P2 database:
+ * openDatabase validates its exact table set until a P3 migration is registered. */
+export function initializeToolStorage(db: Database): void {
+  protect(() => {
+    if (db.query<{ foreign_keys: number }, []>("PRAGMA foreign_keys").get()?.foreign_keys !== 1) fail("invalid_argument");
+    db.transaction(() => db.exec(readFileSync(new URL("./tool-schema.sql", import.meta.url), "utf8"))).immediate();
+  }, "storage_write_failed");
+}
+
+type CallRow = { id: number; run_id: number; session_id: number; native_tool_call_id: string; tool_name: string; tool_version: string; model_call_id?: number | null; stopped_at?: string | null;
+  effect: string; execution_mode: string; args_json: string; status: ToolCallRecord["status"]; result_json: string | null;
+  error_json: string | null; delivery_json: string | null };
+type QueryRow = { id: number; session_id: number; run_id: number; call_ref: string; kind: QueryRecord["kind"];
+  params_json: string; batch_ids_json: string; result_json: string; result_hash: string; created_at: string;
+  source?: QueryRecord['source']; catalog_revision?: number; material_version?: string; based_on_query_id?: number | null };
+type EvidenceRow = { id: number; query_id: number; batch_ids_json: string; snapshot_ids_json: string; event_ids_json: string;
+  source_row_refs_json: string; calculation_version: string; material_version: string; source_bundle_id: string; source_lock_hash: string; result_hash: string;
+  filters_json?: string; provenance?: string };
+
+export class SqliteToolStore implements ToolCallStore, QueryStore {
+  private readonly p3: boolean;
+  constructor(private readonly db: Database) {
+    this.p3 = db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name='catalog_state'").get() !== null;
+  }
+  withQueryTransaction<T>(action: () => T): T {
+    try { return this.db.transaction(action).immediate(); }
+    catch (error) { if (error instanceof Error && error.name === 'SQLiteError') fail('storage_write_failed'); throw error; }
+  }
+
+  private identity(context: QueryContext, active: boolean): void {
+    const { signal: _signal, ...identity } = context;
+    if (!("nativeToolCallId" in identity ? ToolContextIdentitySchema : ToolContextIdentitySchema.omit({ nativeToolCallId: true })).safeParse(identity).success) fail("invalid_argument");
+    if ("source" in context && (!["agent_tool", "intent", "user_form"].includes(context.source) || context.inputId !== null || !context.callRef)) fail("invalid_argument");
+    const run = this.db.query<{ session_id: number; status: string; scope_json: string; reference_date: string; timezone: string }, [number]>(
+      "SELECT session_id,status,scope_json,reference_date,timezone FROM runs WHERE id=?").get(context.runId);
+    if (!run || run.session_id !== context.sessionId || run.reference_date !== context.referenceDate || run.timezone !== context.timezone) fail("access_denied");
+    const scope = RunScopeSchema.safeParse(decode(run.scope_json));
+    if (!scope.success || !isDeepStrictEqual(scope.data, context.scope)) fail("access_denied");
+    if (active && run.status !== "running") fail("state_conflict");
+  }
+
+  assertContext(context: QueryContext): void { protect(() => this.identity(context, true), "storage_read_failed"); }
+  assertReadContext(context: QueryContext): void { protect(() => this.identity(context, false), "storage_read_failed"); }
+
+  private call(row: CallRow): ToolCallRecord {
+    const delivery = row.delivery_json === null ? null : decode(row.delivery_json);
+    if (delivery !== null && (typeof delivery !== "object" || !Object.hasOwn(delivery, "sdkReturned") || !Object.hasOwn(delivery, "nativeEntryId"))) fail("storage_read_failed");
+    const receipt = delivery as { sdkReturned: boolean; nativeEntryId: string; message?: ToolSdkDelivery; nextModelCallId?: string | null; consumedAt?: string | null } | null;
+    const model = row.model_call_id ? this.db.query<{ call_id: string }, [number]>("SELECT call_id FROM model_calls WHERE id=?").get(row.model_call_id) : null;
+    const parsed = ToolCallRecordSchema.safeParse({ id: row.id, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id,
+      name: row.tool_name, version: row.tool_version, executionMode: row.execution_mode, input: decode(row.args_json), status: row.status,
+      data: row.result_json === null ? null : decode(row.result_json), error: row.error_json === null ? null : decode(row.error_json),
+      sdkReturned: receipt?.sdkReturned ?? false, nativeEntryId: receipt?.nativeEntryId ?? null,
+      ...(receipt?.message ? { sdkDelivery: receipt.message } : {}), ...(model ? { modelCallId: model.call_id } : {}),
+      ...(row.stopped_at ? { stoppedAt: row.stopped_at } : {}), ...(receipt?.nextModelCallId ? { nextModelCallId: receipt.nextModelCallId } : {}),
+      ...(receipt?.consumedAt ? { consumedAt: receipt.consumedAt } : {}) });
+    return parsed.success ? parsed.data : fail("storage_read_failed");
+  }
+  private callRow(context: ToolExecutionContext): CallRow | null {
+    const row = this.db.query<CallRow, [number, string]>("SELECT * FROM tool_calls WHERE session_id=? AND native_tool_call_id=?").get(context.sessionId, context.nativeToolCallId);
+    if (row && row.run_id !== context.runId) fail("state_conflict");
+    return row;
+  }
+  readCall(context: ToolExecutionContext): ToolCallRecord | null {
+    return protect(() => { this.identity(context, false); const row = this.callRow(context); return row ? this.call(row) : null; }, "storage_read_failed");
+  }
+  request(tool: ToolCallIdentity, input: unknown, context: ToolExecutionContext): ToolCallRecord {
+    return protect(() => this.db.transaction(() => {
+      this.identity(context, true);
+      const args = json(input);
+      const prior = this.callRow(context);
+      if (prior) {
+        if (prior.tool_name !== tool.name || prior.tool_version !== tool.version || prior.execution_mode !== tool.executionMode
+          || prior.effect !== tool.effect || prior.args_json !== args) fail("state_conflict");
+        return this.call(prior);
+      }
+      if (!ToolExecutionModeSchema.safeParse(tool.executionMode).success || !tool.name || !tool.version) fail("invalid_argument");
+      this.db.query(`INSERT INTO tool_calls(session_id,run_id,native_tool_call_id,tool_name,tool_version,effect,execution_mode,args_json,status,requested_at)
+        VALUES(?,?,?,?,?,?,?,?,'requested',?)`).run(context.sessionId, context.runId, context.nativeToolCallId, tool.name, tool.version, tool.effect, tool.executionMode, args, new Date().toISOString());
+      if (this.p3) this.db.query(`UPDATE tool_calls SET model_call_id=(SELECT MAX(id) FROM model_calls WHERE run_id=? AND session_id=?)
+        WHERE session_id=? AND native_tool_call_id=?`).run(context.runId, context.sessionId, context.sessionId, context.nativeToolCallId);
+      return this.call(this.callRow(context)!);
+    }).immediate(), "storage_write_failed");
+  }
+  recordFailedRequest(tool: ToolCallIdentity, input: unknown, context: ToolExecutionContext, error: AppError, requestedAt: string): void {
+    protect(() => this.db.transaction(() => {
+      this.identity(context, false);
+      if (this.callRow(context)) fail('state_conflict');
+      if (!ToolExecutionModeSchema.safeParse(tool.executionMode).success || !tool.name || !tool.version || !Number.isFinite(Date.parse(requestedAt))) fail('invalid_argument');
+      const problem = safeError(AppErrorSchema.parse(error).code, undefined, { runId: context.runId, sessionId: context.sessionId });
+      this.db.query(`INSERT INTO tool_calls(session_id,run_id,native_tool_call_id,tool_name,tool_version,effect,execution_mode,args_json,status,error_json,requested_at,ended_at${this.p3 ? ',model_call_id' : ''})
+        VALUES(?,?,?,?,?,?,?,?,'failed',?,?,?${this.p3 ? ',(SELECT MAX(id) FROM model_calls WHERE run_id=?)' : ''})`).run(context.sessionId, context.runId, context.nativeToolCallId, tool.name,
+          tool.version, tool.effect, tool.executionMode, json(input), json(problem), requestedAt, new Date().toISOString(), ...(this.p3 ? [context.runId] : []));
+    }).immediate(), 'storage_write_failed');
+  }
+  transition(callId: number, from: ToolCallRecord["status"], to: ToolCallRecord["status"], result?: ToolResult<unknown>): ToolCallRecord {
+    return protect(() => this.db.transaction(() => {
+      id(callId);
+      const row = this.db.query<CallRow, [number]>("SELECT * FROM tool_calls WHERE id=?").get(callId);
+      if (!row) fail("operation_not_found");
+      if (row.status !== from || terminal(from) || !(from === "requested" && ["running", "failed", "cancelled"].includes(to)
+        || from === "running" && terminal(to))) fail("state_conflict");
+      let data: string | null = null, error: string | null = null;
+      if (terminal(to)) {
+        if (!result || result.status !== to) fail("invalid_argument");
+        if (result.status === "succeeded") data = json(result.data);
+        else {
+          const parsed = AppErrorSchema.safeParse(result.error);
+          if (!parsed.success) fail("invalid_argument");
+          error = json(safeError(parsed.data.code, undefined, { runId: row.run_id, sessionId: row.session_id, toolCallId: row.id, reason: parsed.data.reason }));
+          if (result.data !== undefined) data = json(result.data);
+        }
+      } else if (result !== undefined) fail("invalid_argument");
+      const now = new Date().toISOString();
+      const updated = this.db.query(`UPDATE tool_calls SET status=?,result_json=?,error_json=?,started_at=CASE WHEN ?='running' THEN ? ELSE started_at END,
+        ended_at=CASE WHEN ?='running' THEN NULL ELSE ? END WHERE id=? AND status=?`).run(to, data, error, to, now, to, now, callId, from);
+      if (updated.changes !== 1) fail("state_conflict");
+      if (this.p3 && from === "running" && terminal(to)) this.db.query("UPDATE tool_calls SET stopped_at=? WHERE id=?").run(now, callId);
+      return this.call(this.db.query<CallRow, [number]>("SELECT * FROM tool_calls WHERE id=?").get(callId)!);
+    }).immediate(), "storage_write_failed");
+  }
+  recordDelivery(context: ToolExecutionContext, nativeEntryId: string, message?: ToolSdkDelivery): void {
+    protect(() => this.db.transaction(() => {
+      this.identity(context, false);
+      if (typeof nativeEntryId !== "string" || nativeEntryId.length < 1 || nativeEntryId.length > 256) fail("invalid_argument");
+      const row = this.callRow(context);
+      if (!row) fail("operation_not_found");
+      if (!terminal(row.status)) fail("state_conflict");
+      if (message !== undefined && (!ToolSdkDeliverySchema.safeParse(message).success
+        || message.toolCallId !== context.nativeToolCallId || message.toolName !== row.tool_name)) fail("invalid_argument");
+      const record = this.call(row);
+      if (record.sdkReturned) {
+        if (record.nativeEntryId !== nativeEntryId || message !== undefined && !isDeepStrictEqual(record.sdkDelivery, message)) fail("state_conflict");
+        return;
+      }
+      this.db.query("UPDATE tool_calls SET delivery_json=? WHERE id=?").run(json({ contract: "medclaw.tool-delivery/v1", resultRecorded: true, sdkReturned: true, nativeEntryId,
+        deliveredAt: new Date().toISOString(), nextModelCallId: null, consumedAt: null, error: null,
+        ...(message !== undefined ? { message } : {}) }), row.id);
+    }).immediate(), "storage_write_failed");
+  }
+
+  recordConsumption(context: ToolExecutionContext, nextCallId: string): void {
+    protect(() => this.db.transaction(() => {
+      this.identity(context, false);
+      const row = this.callRow(context);
+      if (!row || row.delivery_json === null) fail("state_conflict");
+      const receipt = decode(row.delivery_json);
+      if (receipt === null || typeof receipt !== "object") fail("storage_read_failed");
+      const next = this.db.query<{ id: number }, [string, number, number]>("SELECT id FROM model_calls WHERE call_id=? AND run_id=? AND session_id=?").get(nextCallId, context.runId, context.sessionId);
+      if (!next || row.model_call_id != null && next.id <= row.model_call_id) fail("state_conflict");
+      const previous = this.call(row);
+      if (previous.nextModelCallId) return;
+      this.db.query("UPDATE tool_calls SET delivery_json=? WHERE id=?").run(json({ ...receipt, nextModelCallId: nextCallId, consumedAt: new Date().toISOString() }), row.id);
+    }).immediate(), "storage_write_failed");
+  }
+
+  private query(row: QueryRow): QueryRecord {
+    const result = decode(row.result_json);
+    if (typeof result !== "object" || result === null) fail("storage_read_failed");
+    const parsed = QueryRecordSchema.safeParse({ ...result, id: row.id, sessionId: row.session_id, runId: row.run_id, callRef: row.call_ref,
+      kind: row.kind, params: decode(row.params_json), batchIds: decode(row.batch_ids_json), resultHash: row.result_hash, createdAt: row.created_at });
+    return parsed.success ? parsed.data : fail("storage_read_failed");
+  }
+  findQuery(callRef: string): QueryRecord | null {
+    return protect(() => { const row = this.db.query<QueryRow, [string]>("SELECT * FROM queries WHERE call_ref=?").get(callRef); return row ? this.query(row) : null; }, "storage_read_failed");
+  }
+  readQuery(queryId: number): QueryRecord | null {
+    return protect(() => { id(queryId); const row = this.db.query<QueryRow, [number]>("SELECT * FROM queries WHERE id=?").get(queryId); return row ? this.query(row) : null; }, "storage_read_failed");
+  }
+  private evidence(row: EvidenceRow): Evidence {
+    const parsed = EvidenceSchema.safeParse({ id: row.id, queryId: row.query_id, batchIds: decode(row.batch_ids_json), snapshotIds: decode(row.snapshot_ids_json),
+      eventIds: decode(row.event_ids_json), sourceRowRefs: decode(row.source_row_refs_json), calculationVersion: row.calculation_version,
+      materialVersion: row.material_version, sourceBundleId: row.source_bundle_id, sourceLockHash: row.source_lock_hash, resultHash: row.result_hash,
+      ...(row.filters_json ? { filters: decode(row.filters_json) } : {}), ...(row.provenance ? { provenance: row.provenance } : {}) });
+    return parsed.success ? parsed.data : fail("storage_read_failed");
+  }
+  readEvidence(evidenceId: number): Evidence | null {
+    return protect(() => { id(evidenceId); const row = this.db.query<EvidenceRow, [number]>("SELECT * FROM query_evidence WHERE id=?").get(evidenceId); return row ? this.evidence(row) : null; }, "storage_read_failed");
+  }
+  listEvidence(queryId: number): Evidence[] {
+    return protect(() => { id(queryId); return this.db.query<EvidenceRow, [number]>("SELECT * FROM query_evidence WHERE query_id=? ORDER BY id").all(queryId).map(row => this.evidence(row)); }, "storage_read_failed");
+  }
+  commitQuery(input: Omit<QueryRecord, "id">, inputEvidence: Omit<Evidence, "id" | "queryId">[], context: QueryContext): QueryRecord {
+    return protect(() => this.db.transaction(() => {
+      cancelled(context); this.identity(context, true);
+      if (input.runId !== context.runId || input.sessionId !== context.sessionId || input.callRef !== ("callRef" in context ? context.callRef : `${context.runId}:${context.nativeToolCallId}`)
+        || !input.batchIds.every(batch => context.scope.batchIds.includes(batch))) fail("access_denied");
+      const parsed = QueryRecordSchema.omit({ id: true }).safeParse(input);
+      const params = ("kind" in input.params ? QueryParamsSchema : input.kind === "current" ? CurrentQuerySchema : ChangesQuerySchema).safeParse(input.params);
+      if (!parsed.success || !params.success) fail("invalid_argument");
+      if ('kind' in params.data && params.data.kind !== input.kind) fail('invalid_argument');
+      const source = "source" in context ? context.source : "agent_tool";
+      if (input.source !== undefined && input.source !== source) fail("access_denied");
+      if (!params.data.batchIds.every(batch => context.scope.batchIds.includes(batch))) fail("access_denied");
+      if (!isDeepStrictEqual(input.scopeDeviceIds, params.data.deviceIds ?? context.scope.deviceIds)
+        || input.scopeDeviceIds?.some(device => context.scope.deviceIds !== null && !context.scope.deviceIds.includes(device))) fail("access_denied");
+      if (input.kind === "current" && !input.batchIds.every(batch => params.data.batchIds.includes(batch))) fail("invalid_argument");
+      const prior = this.findQuery(input.callRef);
+      if (prior) {
+        if (prior.sessionId !== input.sessionId || prior.runId !== input.runId || prior.kind !== input.kind || (prior.source ?? 'agent_tool') !== source
+          || json(prior.params) !== json(params.data) || json(prior.batchIds) !== json(input.batchIds)
+          || json(prior.scopeDeviceIds) !== json(input.scopeDeviceIds)) fail('state_conflict');
+        return prior;
+      }
+      const references = this.p3 ? this.db.query<{ id: number; material_version: string; source_bundle_id: string; source_lock_hash: string }, [string]>(
+        'SELECT id,material_version,source_bundle_id,source_lock_hash FROM batches WHERE id IN (SELECT value FROM json_each(?))').all(json(input.batchIds)) : [];
+      if (this.p3) {
+        const revision = this.db.query<{ revision: number }, []>('SELECT revision FROM catalog_state WHERE id=1').get()!.revision;
+        if (references.length !== input.batchIds.length || input.catalogRevision !== undefined && input.catalogRevision !== revision
+          || input.materialVersion !== undefined && input.materialVersion !== [...new Set(references.map(batch => batch.material_version))].sort().join(',')) fail('invalid_argument');
+        if ((input.basedOnQueryId ?? null) !== ('basedOnQueryId' in context ? context.basedOnQueryId ?? null : null)) fail('access_denied');
+        if (input.basedOnQueryId != null) {
+          const parent = this.readQuery(input.basedOnQueryId);
+          if (!parent || parent.sessionId !== context.sessionId || parent.batchIds.some(batchId => !context.scope.batchIds.includes(batchId))
+            || context.scope.deviceIds !== null && (parent.scopeDeviceIds === null || parent.scopeDeviceIds.some(deviceId => !context.scope.deviceIds!.includes(deviceId)))) fail('access_denied');
+        }
+      }
+      json(input);
+      const evidence = inputEvidence.map(value => {
+        const checked = EvidenceSchema.omit({ id: true, queryId: true }).safeParse(value);
+        if (!checked.success || checked.data.batchIds.some(batch => !input.batchIds.includes(batch))
+          || checked.data.snapshotIds.some(snapshot => !input.snapshotIds.includes(snapshot)) || checked.data.eventIds.some(event => !input.eventIds.includes(event))
+          || checked.data.resultHash !== input.resultHash || checked.data.calculationVersion !== input.calculationVersion) fail("invalid_argument");
+        if (checked.data.filters !== undefined && json(checked.data.filters) !== json(params.data)) fail('invalid_argument');
+        if (this.p3 && checked.data.batchIds.some(batchId => {
+          const batch = references.find(row => row.id === batchId)!;
+          return batch.material_version !== checked.data.materialVersion || batch.source_bundle_id !== checked.data.sourceBundleId || batch.source_lock_hash !== checked.data.sourceLockHash;
+        })) fail('invalid_argument');
+        json(value); return checked.data;
+      });
+      const result = { scopeDeviceIds: input.scopeDeviceIds, rows: input.rows, snapshotIds: input.snapshotIds, eventIds: input.eventIds, warnings: input.warnings, calculationVersion: input.calculationVersion,
+        ...(input.interpretation === undefined ? {} : { interpretation: input.interpretation }),
+        ...(input.source === undefined ? {} : { source: input.source }), ...(input.catalogRevision === undefined ? {} : { catalogRevision: input.catalogRevision }),
+        ...(input.materialVersion === undefined ? {} : { materialVersion: input.materialVersion }), ...(input.basedOnQueryId === undefined ? {} : { basedOnQueryId: input.basedOnQueryId }) };
+      const extraColumns = this.p3 ? ",source,catalog_revision,material_version,based_on_query_id" : "";
+      const extraValues = this.p3 ? ",?,?,?,?" : "";
+      const inserted = this.db.query(`INSERT INTO queries(session_id,run_id,call_ref,kind,params_hash,params_json,batch_ids_json,result_json,result_hash,created_at${extraColumns})
+        VALUES(?,?,?,?,?,?,?,?,?,?${extraValues})`).run(input.sessionId, input.runId, input.callRef, input.kind,
+        createHash("sha256").update(json(params.data)).digest("hex"), json(params.data), json(input.batchIds), json(result), input.resultHash, input.createdAt,
+        ...(this.p3 ? [source, input.catalogRevision ?? this.db.query<{ revision: number }, []>("SELECT revision FROM catalog_state WHERE id=1").get()!.revision,
+          input.materialVersion ?? inputEvidence.map(item => item.materialVersion).join(","), input.basedOnQueryId ?? null] : []));
+      const queryId = Number(inserted.lastInsertRowid);
+      for (const item of evidence) this.db.query(`INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,
+        calculation_version,material_version,source_bundle_id,source_lock_hash,result_hash${this.p3 ? ",filters_json,provenance" : ""}) VALUES(?,?,?,?,?,?,?,?,?,?${this.p3 ? ",?,?" : ""})`).run(queryId, json(item.batchIds),
+        json(item.snapshotIds), json(item.eventIds), json(item.sourceRowRefs), item.calculationVersion, item.materialVersion, item.sourceBundleId, item.sourceLockHash, item.resultHash,
+        ...(this.p3 ? [json(item.filters ?? params.data), item.provenance ?? "synthetic-derived"] : []));
+      if (this.p3) this.db.query("INSERT INTO business_events(operation_ref,type,actor,session_id,run_id,query_id,details_json,occurred_at) VALUES(?,'query_committed',?,?,?,?,?,?)")
+        .run(input.callRef, source === "user_form" ? "user" : "agent", input.sessionId, input.runId, queryId,
+          json({ queryId, kind: input.kind, resultHash: input.resultHash, source, rowCount: input.rows.length,
+            ...('workspaceRevision' in context ? { workspaceRevision: context.workspaceRevision } : {}) }), input.createdAt);
+      cancelled(context); this.identity(context, true);
+      return this.readQuery(queryId)!;
+    }).immediate(), "storage_write_failed");
+  }
+}

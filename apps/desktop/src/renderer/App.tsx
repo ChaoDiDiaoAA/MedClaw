@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import type { Result } from "../../../../packages/contracts/src/error";
+import { errorMessage, type Result } from "../../../../packages/contracts/src/error";
 import type { AuthAttemptView, AuthNotifyView, AuthPromptView, DesktopDisplayPreferences, HostView, ModelChoice, ModelDirectoryView, ProviderAccepted } from "../../../../packages/contracts/src/model";
 import type { DesktopNotice, DesktopSecretInput, DesktopSecretInputResult, PublicMethod, PublicPayload, PublicReturn } from "../../../../packages/contracts/src/protocol";
 import type { ActiveRunView, RunView, RuntimeControlView } from "../../../../packages/contracts/src/run";
 import type { NewSessionInput, SessionDetail, SessionView, SubmitInput, SubmitResult } from "../../../../packages/contracts/src/session";
-import type { WorkspaceView } from "../../../../packages/contracts/src/workspace";
+import type { WorkspaceChange, WorkspaceView } from "../../../../packages/contracts/src/workspace";
 import { Sidebar } from "./sidebar";
-import { SessionList, newSessionDraft, selectSessionModelDraft, acceptSubmissionDraft, type SessionDraft } from "./session-list";
+import { SessionList, sessionDisplayTitle, newSessionDraft, selectSessionModelDraft, acceptSubmissionDraft, type SessionDraft } from "./session-list";
 import { Chat } from "./chat";
 import { ModelsPage } from "./models-page";
 import { SettingsPage } from "./settings-page";
 import { RunDetails } from "./run-details";
+import { DataWorkspace } from "./data-workspace";
+import { QueryHistory } from "./query-history";
 import "./styles.css";
 
 export interface DesktopBridge {
@@ -20,9 +22,10 @@ export interface DesktopBridge {
   secretInput(input: DesktopSecretInput): Promise<Result<DesktopSecretInputResult>>;
   discardSecret(token: string): Promise<void>;
   openAuthLink(url: string): Promise<Result<null>>;
+  pickImportDirectory(operationRef: string): Promise<Result<{ fileToken: string; directoryName: string } | null>>;
 }
 declare global { interface Window { medclaw: DesktopBridge } }
-export type ViewPage = "chat" | "models" | "settings";
+export type ViewPage = "chat" | "data" | "queries" | "models" | "settings";
 const initialUi: DesktopDisplayPreferences = { navCollapsed: false, detailOpen: false, detailTab: "conditions" };
 const initialHost: HostView = { instanceId: null, state: "starting", canStart: false, sdkVersion: null, schemaVersion: null, error: null };
 const released = (run: RunView) => ["completed", "failed", "cancelled"].includes(run.status) && !!run.cleanup
@@ -35,28 +38,31 @@ export function App() {
   const [error, setError] = useState<string | null>(null), [active, setActive] = useState<ActiveRunView | null>(null), [control, setControl] = useState<RuntimeControlView | null>(null);
   const [run, setRun] = useState<RunView | null>(null), [preview, setPreview] = useState<{ text: string; truncated: boolean } | null>(null);
   const [workspace, setWorkspace] = useState<WorkspaceView | null>(null), [workspaceConfirmed, setWorkspaceConfirmed] = useState(false), [selecting, setSelecting] = useState(false);
+  const [catalog, setCatalog] = useState<PublicReturn<"data.read"> | null>(null), catalogRead = useRef(0);
+  const [requestedQuery, setRequestedQuery] = useState<number | null>(null);
   const [sessions, setSessions] = useState<SessionView[]>([]), [nextSession, setNextSession] = useState<number | null>(null);
   const [details, setDetails] = useState<Record<number, SessionDetail>>({}), [drafts, setDrafts] = useState<Record<number, SessionDraft>>({});
   const [creating, setCreating] = useState(false), [creationUnknown, setCreationUnknown] = useState(false), [sending, setSending] = useState<number | null>(null);
   const [prompt, setPrompt] = useState<AuthPromptView | null>(null), [authNotify, setAuthNotify] = useState<AuthNotifyView | null>(null), [authAttempt, setAuthAttempt] = useState<AuthAttemptView | null>(null);
-  const hostRef = useRef(host), runRef = useRef(run), workspaceRef = useRef(workspace), sessionsRef = useRef(sessions), draftsRef = useRef(drafts), directoryRef = useRef(directory);
+  const hostRef = useRef(host), runRef = useRef(run), workspaceRef = useRef(workspace), sessionsRef = useRef(sessions), draftsRef = useRef(drafts), directoryRef = useRef(directory), catalogRef = useRef(catalog);
   const selectedRuns = useRef(new Map<number, RunView>()), settled = useRef(new Set<number>());
   const previews = useRef(new Map<number, { sessionId: number | null; sequence: number; text: string; truncated: boolean }>());
   const selectBusy = useRef(false), desiredSession = useRef<number | null>(null), sendBusy = useRef<number | null>(null), createBusy = useRef(false);
   const creation = useRef<{ operationRef: string; input: NewSessionInput; model: ModelChoice | null } | null>(null);
   const directoryRead = useRef(0), activeRead = useRef(0), detailsButton = useRef<HTMLButtonElement>(null);
-  hostRef.current = host; runRef.current = run; workspaceRef.current = workspace; sessionsRef.current = sessions; draftsRef.current = drafts; directoryRef.current = directory;
+  const workspaceChangeBusy = useRef(false);
+  hostRef.current = host; runRef.current = run; workspaceRef.current = workspace; sessionsRef.current = sessions; draftsRef.current = drafts; directoryRef.current = directory; catalogRef.current = catalog;
 
   const editDraft = useCallback((sessionId: number, patch: Partial<SessionDraft>) => {
-    setDrafts(old => { const next = { ...old, [sessionId]: { ...(old[sessionId] ?? newSessionDraft(null)), ...patch } }; draftsRef.current = next; return next; });
+    setDrafts(old => { const next = { ...old, [sessionId]: { ...(old[sessionId] ?? newSessionDraft(null, catalogRef.current)), ...patch } }; draftsRef.current = next; return next; });
   }, []);
   const defaultModel = () => directoryRef.current?.selection ? { provider: directoryRef.current.selection.provider, modelId: directoryRef.current.selection.modelId, expectedConfigVersion: directoryRef.current.configVersion } : null;
   const ensureDraft = useCallback((sessionId: number, model?: ModelChoice | null) => {
-    if (!draftsRef.current[sessionId]) editDraft(sessionId, newSessionDraft(model === undefined ? defaultModel() : model));
+    if (!draftsRef.current[sessionId]) editDraft(sessionId, newSessionDraft(model ?? defaultModel(), catalogRef.current));
   }, [editDraft]);
   const readUi = useCallback(async () => {
     const result = await window.medclaw.request("settings.ui.read", {});
-    if (result.ok) { setUi(result.data.ui); setUiVersion(result.data.configVersion); } else setError(result.error.message);
+    if (result.ok) { setUi(result.data.ui); setUiVersion(result.data.configVersion); } else setError(errorMessage(result.error));
   }, []);
   const readDirectory = useCallback(async () => {
     const instance = hostRef.current.instanceId, order = ++directoryRead.current;
@@ -64,20 +70,29 @@ export function App() {
     if (instance !== hostRef.current.instanceId || order !== directoryRead.current) return;
     if (result.ok) {
       directoryRef.current = result.data; setDirectory(result.data); setDirectoryCurrent(true);
-      setDrafts(old => { const next = Object.fromEntries(Object.entries(old).map(([id, draft]) => [id, { ...draft, model: draft.model ? { ...draft.model, expectedConfigVersion: result.data.configVersion } : null }])); draftsRef.current = next; return next; });
-    } else { setDirectoryCurrent(false); setError(result.error.message); }
+      setDrafts(old => { const next = Object.fromEntries(Object.entries(old).map(([id, draft]) => {
+        const model = draft.model ?? result.data.selection;
+        return [id, { ...draft, model: model ? { provider: model.provider, modelId: model.modelId, expectedConfigVersion: result.data.configVersion } : null }];
+      })); draftsRef.current = next; return next; });
+    } else { setDirectoryCurrent(false); setError(errorMessage(result.error)); }
   }, []);
   const readActive = useCallback(async () => {
     const instance = hostRef.current.instanceId, order = ++activeRead.current;
     const [gate, current] = await Promise.all([window.medclaw.request("run.control.read", {}), window.medclaw.request("run.active", {})]);
     if (instance !== hostRef.current.instanceId || order !== activeRead.current) return;
-    if (gate.ok && gate.data.instanceId === instance) setControl(gate.data); else { setControl(null); if (!gate.ok) setError(gate.error.message); }
-    if (current.ok) setActive(current.data); else setError(current.error.message);
+    if (gate.ok && gate.data.instanceId === instance) setControl(gate.data); else { setControl(null); if (!gate.ok) setError(errorMessage(gate.error)); }
+    if (current.ok) setActive(current.data); else setError(errorMessage(current.error));
+  }, []);
+  const readCatalog = useCallback(async (page = 1) => {
+    const instance = hostRef.current.instanceId, order = ++catalogRead.current;
+    const result = await window.medclaw.request("data.read", { page, pageSize: 50 });
+    if (instance !== hostRef.current.instanceId || order !== catalogRead.current) return;
+    if (result.ok) { catalogRef.current = result.data; setCatalog(result.data); } else setError(errorMessage(result.error));
   }, []);
   const readRun = useCallback(async (runId: number) => {
     const instance = hostRef.current.instanceId, result = await window.medclaw.request("run.read", { runId });
     if (instance !== hostRef.current.instanceId) return;
-    if (!result.ok) { setError(result.error.message); return; }
+    if (!result.ok) { setError(errorMessage(result.error)); return; }
     if (result.data.kind !== "one" || !result.data.run) return;
     const value = result.data.run;
     if (value.kind === "agent") {
@@ -94,13 +109,13 @@ export function App() {
   const readSession = useCallback(async (sessionId: number) => {
     const instance = hostRef.current.instanceId, result = await window.medclaw.request("session.read", { sessionId });
     if (instance !== hostRef.current.instanceId) return;
-    if (!result.ok) { setError(result.error.message); return; }
+    if (!result.ok) { setError(errorMessage(result.error)); return; }
     if (result.data) { ensureDraft(sessionId); setDetails(old => ({ ...old, [sessionId]: result.data! })); }
   }, [ensureDraft]);
   const readSessions = useCallback(async (beforeSessionId?: number) => {
     const instance = hostRef.current.instanceId, result = await window.medclaw.request("session.list", { ...(beforeSessionId ? { beforeSessionId } : {}), limit: 20 });
     if (instance !== hostRef.current.instanceId) return;
-    if (!result.ok) { setError(result.error.message); return; }
+    if (!result.ok) { setError(errorMessage(result.error)); return; }
     setSessions(old => { const next = beforeSessionId ? [...old, ...result.data.sessions.filter(s => !old.some(known => known.id === s.id))] : result.data.sessions;
       sessionsRef.current = next; return next; });
     setNextSession(result.data.nextBeforeSessionId);
@@ -120,9 +135,16 @@ export function App() {
   const readWorkspace = useCallback(async () => {
     const instance = hostRef.current.instanceId, result = await window.medclaw.request("workspace.read", {});
     if (instance !== hostRef.current.instanceId) return;
-    if (result.ok) applyWorkspace(result.data, instance); else { setWorkspaceConfirmed(false); setError(result.error.message); }
+    if (result.ok) applyWorkspace(result.data, instance); else { setWorkspaceConfirmed(false); setError(errorMessage(result.error)); }
   }, [applyWorkspace]);
-  const changed = useCallback(async () => { await readUi(); if (hostRef.current.state === "ready") await Promise.all([readDirectory(), readActive(), readSessions(), readWorkspace()]); }, [readUi, readDirectory, readActive, readSessions, readWorkspace]);
+  const changed = useCallback(async () => {
+    await readUi(); if (hostRef.current.state !== "ready") return;
+    const instance = hostRef.current.instanceId;
+    await Promise.all([readDirectory(), readActive(), readSessions(), (async () => {
+      await readCatalog();
+      if (instance === hostRef.current.instanceId && hostRef.current.state === "ready") await readWorkspace();
+    })()]);
+  }, [readUi, readDirectory, readActive, readSessions, readWorkspace, readCatalog]);
 
   useEffect(() => window.medclaw.subscribe(notice => {
     if (notice.type === "host.status") {
@@ -131,6 +153,7 @@ export function App() {
       if (notice.host.instanceId !== prior) {
         setPrompt(null); setAuthNotify(null); setAuthAttempt(null); setDetails({}); setSessions([]); sessionsRef.current = [];
         setActive(null); setControl(null); setWorkspace(null); workspaceRef.current = null; setRun(null); runRef.current = null;
+        setCatalog(null); catalogRef.current = null; catalogRead.current++;
         previews.current.clear(); settled.current.clear(); selectedRuns.current.clear(); setPreview(null);
       } return;
     }
@@ -150,13 +173,13 @@ export function App() {
       if (runRef.current?.id === notice.runId) setPreview(null);
       void readActive(); void readRun(notice.runId);
       if (notice.type === "agent.settled") void readSession(notice.sessionId);
-    } else if (notice.type === "provider.persistence_failed" || notice.type === "agent.persistence_failed") { setError(notice.error.message); void readActive(); }
+    } else if (notice.type === "provider.persistence_failed" || notice.type === "agent.persistence_failed") { setError(errorMessage(notice.error)); void readActive(); }
     else if (notice.type === "auth.prompt") { setPrompt(notice.prompt); setPage("models"); }
     else if (notice.type === "auth.notify") setAuthNotify(notice.notification);
     else if (notice.type === "auth.finished") { setAuthAttempt(notice.attempt); setPrompt(null); setAuthNotify(null); void readDirectory(); }
     else if (notice.type === "config.changed") void changed();
   }), [changed, readActive, readDirectory, readRun, readSession]);
-  useEffect(() => { void readUi(); void window.medclaw.request("host.read", {}).then(result => { if (result.ok) { hostRef.current = result.data; setHost(result.data); } else setError(result.error.message); }); }, [readUi]);
+  useEffect(() => { void readUi(); void window.medclaw.request("host.read", {}).then(result => { if (result.ok) { hostRef.current = result.data; setHost(result.data); } else setError(errorMessage(result.error)); }); }, [readUi]);
   useEffect(() => { if (host.state === "ready") void changed(); }, [host.instanceId, host.state, changed]);
   useEffect(() => {
     if (host.state !== "ready") return;
@@ -165,7 +188,7 @@ export function App() {
   }, [host.state, readActive, readRun]);
 
   async function selectSession(sessionId: number) {
-    desiredSession.current = sessionId; if (selectBusy.current) return;
+    setRequestedQuery(null); desiredSession.current = sessionId; if (selectBusy.current || workspaceChangeBusy.current) return;
     selectBusy.current = true; setSelecting(true); const instance = hostRef.current.instanceId;
     try {
       while (desiredSession.current !== null && instance === hostRef.current.instanceId) {
@@ -174,13 +197,24 @@ export function App() {
         const result = await window.medclaw.request("session.select", { sessionId: target, expectedWorkspaceRevision: current.revision });
         if (instance !== hostRef.current.instanceId) break;
         if (result.ok) applyWorkspace(result.data, instance);
-        else { setWorkspaceConfirmed(false); setError(result.error.message); await readWorkspace(); }
+        else { setWorkspaceConfirmed(false); setError(errorMessage(result.error)); await readWorkspace(); }
       }
     } finally { selectBusy.current = false; setSelecting(false); }
   }
+  async function updateWorkspace(change: WorkspaceChange) {
+    const original = workspaceRef.current, instance = hostRef.current.instanceId;
+    if (!original || !workspaceConfirmed || workspaceChangeBusy.current || selectBusy.current || hostRef.current.state !== "ready") return false;
+    workspaceChangeBusy.current = true; setSelecting(true); setError(null);
+    try {
+      const result = await window.medclaw.request("workspace.update", { change, expectedRevision: original.revision }, crypto.randomUUID());
+      if (instance !== hostRef.current.instanceId) return false;
+      if (result.ok) { applyWorkspace(result.data, instance); return true; }
+      setWorkspaceConfirmed(false); setError(errorMessage(result.error)); await readWorkspace(); return false;
+    } finally { workspaceChangeBusy.current = false; setSelecting(false); if (desiredSession.current !== null) void selectSession(desiredSession.current); }
+  }
   async function createSession(retry = false) {
-    if (createBusy.current || !workspaceRef.current || !workspaceConfirmed) return;
-    if (!retry && creation.current) { setError("请先查回原创建操作。"); return; }
+    if (createBusy.current || selectBusy.current || workspaceChangeBusy.current || !workspaceRef.current || !workspaceConfirmed) return;
+    if (!retry && creation.current) { setError("Recover the original creation first."); return; }
     creation.current ??= { operationRef: crypto.randomUUID(), input: { expectedWorkspaceRevision: workspaceRef.current.revision, selectOnCreate: true }, model: defaultModel() };
     const original = creation.current, instance = hostRef.current.instanceId; createBusy.current = true; setCreating(true); setError(null);
     try {
@@ -189,11 +223,11 @@ export function App() {
       if (result.ok) {
         ensureDraft(result.data.session.id, original.model); applyWorkspace(result.data.workspace, instance);
         creation.current = null; setCreationUnknown(false); await Promise.all([readSessions(), readWorkspace(), readSession(result.data.session.id)]); setPage("chat");
-      } else { setError(result.error.message); if (result.error.code === "operation_result_unknown") setCreationUnknown(true); else { creation.current = null; setCreationUnknown(false); } }
+      } else { setError(errorMessage(result.error)); if (result.error.code === "operation_result_unknown") setCreationUnknown(true); else { creation.current = null; setCreationUnknown(false); } }
     } finally { createBusy.current = false; setCreating(false); }
   }
   async function acceptedAgent(value: SubmitResult, pending: NonNullable<SessionDraft["pending"]>) {
-    if (value.sessionId !== pending.input.sessionId || value.clientSequence !== pending.input.clientSequence) { setError("受理回复身份不匹配，请保留原提交并查回。"); return; }
+    if (value.sessionId !== pending.input.sessionId || value.clientSequence !== pending.input.clientSequence) { setError("The acceptance reply does not match the original submission. Keep it and read its result."); return; }
     const draft = draftsRef.current[value.sessionId];
     if (draft) { const next = acceptSubmissionDraft(draft, pending); if (next !== draft) editDraft(value.sessionId, next); }
     await Promise.all([readRun(value.runId), readSession(value.sessionId), readActive()]);
@@ -201,9 +235,9 @@ export function App() {
   async function sendSession(retry = false) {
     const sessionId = workspaceRef.current?.sessionId, draft = sessionId ? draftsRef.current[sessionId] : null, instance = hostRef.current.instanceId;
     if (!sessionId || !draft || !instance || sendBusy.current || selecting || !workspaceConfirmed) return;
-    if (!retry && (!draft.model || draft.pending || !control?.acceptingNewRuns || !draft.text.trim())) return;
+    if (!retry && (!draft.model || draft.pending || !control?.acceptingNewRuns || !draft.text.trim() || !draft.referenceDate || !draft.timezone.trim())) return;
     const pending = retry ? draft.pending : { operationRef: crypto.randomUUID(), input: { sessionId, clientSequence: details[sessionId]?.session.nextSubmissionSequence ?? 0,
-      text: draft.text, mode: "send", expectedRevision: workspaceRef.current!.revision, expectedBatchIds: [], expectedQueryId: null, model: draft.model!,
+      text: draft.text, mode: "send", expectedRevision: workspaceRef.current!.revision, expectedBatchIds: workspaceRef.current!.batchRefs.map(batch => batch.id), expectedQueryId: workspaceRef.current!.queryId, model: draft.model!,
       referenceDate: draft.referenceDate, timezone: draft.timezone } satisfies SubmitInput };
     if (!pending) return;
     editDraft(sessionId, { pending }); sendBusy.current = sessionId; setSending(sessionId); setError(null);
@@ -211,7 +245,7 @@ export function App() {
       const result = await window.medclaw.request("session.submit", pending.input, pending.operationRef);
       if (instance !== hostRef.current.instanceId) return;
       if (result.ok) await acceptedAgent(result.data, pending);
-      else { setError(result.error.message); if (result.error.code !== "operation_result_unknown") editDraft(sessionId, { pending: null }); }
+      else { setError(errorMessage(result.error)); if (result.error.code !== "operation_result_unknown") editDraft(sessionId, { pending: null }); }
     } finally { sendBusy.current = null; setSending(null); }
   }
   async function lookupSubmission() {
@@ -220,18 +254,18 @@ export function App() {
     const result = await window.medclaw.request("session.readSubmission", { sessionId: pending.input.sessionId, clientSequence: pending.input.clientSequence });
     if (instance !== hostRef.current.instanceId) return;
     if (result.ok && result.data) await acceptedAgent(result.data, pending);
-    else setError(result.ok ? "尚未查到原提交，请保留原身份；可同参重送原操作。" : result.error.message);
+    else setError(result.ok ? "The original submission was not found. Keep its identity; you can resend the original request." : errorMessage(result.error));
   }
   function useForSession(target: { instanceId: string; sessionId: number }, choice: ModelChoice) {
     const session = sessionsRef.current.find(s => s.id === target.sessionId) ?? details[target.sessionId]?.session;
     const next = selectSessionModelDraft(draftsRef.current[target.sessionId], { session, instanceId: hostRef.current.instanceId, configVersion: directoryRef.current?.configVersion }, target, choice);
-    if (!next) { setError("选模目标或目录已变化，请重新选择。"); return; }
+    if (!next) { setError("The session or model directory has changed. Select the model again."); return; }
     editDraft(target.sessionId, next); setError(null);
   }
   async function updateUi(patch: Partial<DesktopDisplayPreferences>) {
     const result = await window.medclaw.request("settings.ui.update", { expectedConfigVersion: uiVersion, patch });
     if (result.ok) { setUi(result.data.ui); setUiVersion(result.data.configVersion); if (hostRef.current.state === "ready") void readDirectory(); return true; }
-    setError(result.error.message); void readUi(); return false;
+    setError(errorMessage(result.error)); void readUi(); return false;
   }
   async function acceptedProvider(value: ProviderAccepted) {
     const result = await window.medclaw.request("run.read", { runId: value.runId });
@@ -241,28 +275,32 @@ export function App() {
   async function stop() {
     if (!active) return;
     const id = active.runId, result = await window.medclaw.request("run.cancel", { runId: id });
-    if (!result.ok) setError(result.error.message); await Promise.all([readActive(), readRun(id)]);
+    if (!result.ok) setError(errorMessage(result.error)); await Promise.all([readActive(), readRun(id)]);
   }
   async function closeDetails() { await updateUi({ detailOpen: false }); detailsButton.current?.focus(); }
   const current = workspace?.sessionId ?? null, currentDetail = current ? details[current] ?? null : null, draft = current ? drafts[current] ?? null : null;
   const runningSession = sessions.find(s => s.id === active?.sessionId);
   return <div className={"desktop " + (ui.navCollapsed ? "nav-collapsed " : "") + (ui.detailOpen ? "has-details" : "")}>
-    <Sidebar page={page} onPage={setPage} collapsed={ui.navCollapsed} onCollapse={() => void updateUi({ navCollapsed: true })} host={host}>
-      <SessionList sessions={sessions} current={current} running={active?.sessionId ?? null} creating={creating} canCreate={host.state === "ready" && workspaceConfirmed}
+    <Sidebar page={page} onPage={page => { setRequestedQuery(null); setPage(page); }} collapsed={ui.navCollapsed} onCollapse={() => void updateUi({ navCollapsed: true })} host={host}>
+      <SessionList sessions={sessions} current={current} running={active?.sessionId ?? null} creating={creating} canCreate={host.state === "ready" && workspaceConfirmed && !selecting}
         creationUnknown={creationUnknown} nextBefore={nextSession} onCreate={() => void createSession()} onRecoverCreate={() => void createSession(true)} onSelect={id => void selectSession(id)} onMore={() => void readSessions(nextSession!)} />
     </Sidebar>
     <main className="workspace">
-      <header className="page-header"><div className="header-title">{ui.navCollapsed && <button className="quiet" onClick={() => void updateUi({ navCollapsed: false })}>Expand navigation</button>}<h1>{{ chat: "Chat", models: "Models", settings: "Settings" }[page]}</h1></div><button ref={detailsButton} className="quiet" onClick={() => void updateUi({ detailOpen: !ui.detailOpen })}>查看运行详情</button></header>
-      {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="关闭提示" onClick={() => setError(null)}>×</button></div>}
+      <header className="page-header"><div className="header-title">{ui.navCollapsed && <button className="quiet" onClick={() => void updateUi({ navCollapsed: false })}>Expand navigation</button>}<h1>{{ chat: "Chat", data: "Data Workspace", queries: "Query History", models: "Models", settings: "Settings" }[page]}</h1></div><button ref={detailsButton} className="quiet" onClick={() => void updateUi({ detailOpen: !ui.detailOpen })}>View run details</button></header>
+      {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="Dismiss notice" onClick={() => setError(null)}>×</button></div>}
       <section className="page-content chat-page" hidden={page !== "chat"}><Chat directory={directory} directoryCurrent={directoryCurrent} host={host} active={active} control={control} run={run} preview={preview}
-        session={currentDetail} draft={draft} selecting={selecting || !workspaceConfirmed} sending={sending === current} runningTitle={runningSession?.title ?? null}
-        onDraft={patch => { if (current) editDraft(current, patch); }} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} /></section>
+        workspace={workspace} workspaceConfirmed={workspaceConfirmed} onWorkspace={updateWorkspace} dataDefaults={catalog}
+        session={currentDetail} draft={draft} selecting={selecting || !workspaceConfirmed} sending={sending === current} runningTitle={runningSession ? sessionDisplayTitle(runningSession) : null}
+        onDraft={patch => { if (current) editDraft(current, patch); }} onUseForSession={useForSession} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} /></section>
+      <section className="page-content" hidden={page !== "data"}><DataWorkspace host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} catalog={catalog} batches={catalog?.batches ?? []} onRefresh={page => void readCatalog(page)} onUpdate={updateWorkspace} onError={setError} /></section>
+      <section className="page-content" hidden={page !== "queries"}><QueryHistory visible={page === "queries"} requestedQueryId={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} active={active} onUpdate={updateWorkspace} onError={setError} /></section>
       <section className="page-content" hidden={page !== "models"}><ModelsPage directory={directory} directoryCurrent={directoryCurrent} host={host} active={active} control={control}
         sessionTarget={workspaceConfirmed && !selecting && current && currentDetail && host.instanceId ? { instanceId: host.instanceId, sessionId: current } : null} onUseForSession={useForSession}
         prompt={prompt} notification={authNotify} attempt={authAttempt} onChanged={changed} onAccepted={acceptedProvider} onError={setError} /></section>
       <section className="page-content" hidden={page !== "settings"}><SettingsPage ui={ui} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost} /></section>
     </main>
     {ui.detailOpen && <RunDetails run={run} host={host} viewSessionId={current} tab={ui.detailTab} active={active} control={control} onTab={tab => void updateUi({ detailTab: tab })} onClose={() => void closeDetails()} onError={setError}
+      onQuery={(queryId, sessionId) => { if (workspaceRef.current?.sessionId !== sessionId) void selectSession(sessionId); setRequestedQuery(queryId); setPage("queries"); }}
       onRun={value => { runRef.current = value; setRun(value); setPreview(null); }} onRetrySaved={() => void readActive()} />}
   </div>;
 }

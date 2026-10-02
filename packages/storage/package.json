@@ -2,6 +2,6 @@
   "name": "@medclaw/storage",
   "private": true,
   "type": "module",
-  "exports": { "./database": "./src/database.ts", "./repositories": "./src/repositories.ts" },
+  "exports": { "./database": "./src/database.ts", "./repositories": "./src/repositories.ts", "./tool-store": "./src/tool-store.ts", "./artifact-store": "./src/artifact-store.ts", "./import-store": "./src/import-store.ts", "./catalog-store": "./src/catalog-store.ts" },
   "dependencies": { "@medclaw/contracts": "workspace:*", "zod": "4.6.5" }
 }

@@ -4,23 +4,31 @@ import { readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
-export const SCHEMA_VERSION = 2;
-const migrations = ["001_p1.sql", "002_p2.sql"].map(name => {
+export const SCHEMA_VERSION = 3;
+const migrations = ["001_p1.sql", "002_p2.sql", "003_p3.sql"].map(name => {
   const sql = readFileSync(new URL(`./migrations/${name}`, import.meta.url));
   return { sql: sql.toString("utf8"), checksum: createHash("sha256").update(sql).digest("hex") };
 });
 const runColumns = "id,session_id,input_id,kind,prior_run_id,instance_id,status,goal,input_text,output_text,config_json,scope_json,workspace_json,reference_date,timezone,error_json,created_at,started_at,cancel_requested_at,stopped_at,ended_at,cleanup_json,usage_json";
+const schemaQuery = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name";
+const expectedSchemas = (() => {
+  const reference = new Database(":memory:", { strict: true });
+  try {
+    return migrations.map((migration, index) => {
+      if (index === 1) reference.exec("PRAGMA foreign_keys=OFF");
+      reference.exec(migration.sql);
+      return reference.query(schemaQuery).all();
+    });
+  } finally {
+    reference.close();
+  }
+})();
 function validate(db: Database, version: number) {
   const tables = db.query<{ name: string; strict: number }, []>("SELECT name,strict FROM pragma_table_list WHERE schema='main' AND name NOT LIKE 'sqlite_%' ORDER BY name").all();
-  const expected = version === 1 ? "model_calls,runs,schema_migrations" : "model_calls,runs,schema_migrations,sessions,workspace";
-  if (tables.map(row => row.name).join(",") !== expected || tables.some(row => row.strict !== 1)
+  if (!isDeepStrictEqual(db.query(schemaQuery).all(), expectedSchemas[version - 1]) || tables.some(row => row.strict !== 1)
     || db.query("PRAGMA foreign_key_check").all().length
     || db.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get()?.integrity_check !== "ok") throw new Error("storage_migration_failed");
-  const indexes = db.query<{ name: string }, []>("SELECT name FROM sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name").all();
-  if (indexes.map(row => row.name).join(",") !== (version === 1 ? "model_calls_run,runs_one_root,runs_provider_operation_ref" : "model_calls_run,runs_one_root,runs_provider_operation_ref,runs_session_recent")) throw new Error("storage_migration_failed");
-  const triggers = db.query<{ name: string }, []>("SELECT name FROM sqlite_schema WHERE type='trigger' ORDER BY name").all();
-  if (triggers.map(row => row.name).join(",") !== (version === 1 ? "" : "model_calls_owner_insert,model_calls_owner_update")) throw new Error("storage_migration_failed");
-  if (version === 2 && db.query("SELECT c.id FROM model_calls c JOIN runs r ON r.id=c.run_id WHERE c.session_id IS NOT r.session_id").all().length) throw new Error("storage_migration_failed");
+  if (version >= 2 && db.query("SELECT c.id FROM model_calls c JOIN runs r ON r.id=c.run_id WHERE c.session_id IS NOT r.session_id").all().length) throw new Error("storage_migration_failed");
 }
 
 // The Host verifies its root and exclusive process identity before calling this.
@@ -63,6 +71,23 @@ export function openDatabase(path: string, beforeMigrationCommit?: () => void): 
         db.exec("PRAGMA foreign_keys=ON");
         if (db.query<{ foreign_keys: number }, []>("PRAGMA foreign_keys").get()?.foreign_keys !== 1) throw new Error("storage_migration_failed");
       }
+      version = 2;
+    }
+    if (version === 2) {
+      const oldTables = ["runs", "model_calls", "sessions", "workspace"];
+      const oldRows = oldTables.map(name => db.query<Record<string, unknown>, []>(`SELECT * FROM ${name} ORDER BY id`).all());
+      db.transaction(() => {
+        db.exec(migrations[2]!.sql);
+        for (const [index, name] of oldTables.entries()) {
+          const before = oldRows[index]!;
+          const after = db.query<Record<string, unknown>, []>(`SELECT * FROM ${name} ORDER BY id`).all();
+          const projected = name === "workspace" ? after.map(row => Object.fromEntries(Object.keys(before[0]!).map(key => [key, row[key]]))) : after;
+          if (!isDeepStrictEqual(before, projected)) throw new Error("storage_migration_failed");
+        }
+        validate(db, 3);
+        beforeMigrationCommit?.();
+        db.query("INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(3,?,?)").run(migrations[2]!.checksum, new Date().toISOString());
+      }).immediate();
     }
     validate(db, SCHEMA_VERSION);
     return db;

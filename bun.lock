@@ -45,6 +45,7 @@
       "name": "@medclaw/core",
       "dependencies": {
         "@medclaw/contracts": "workspace:*",
+        "zod": "4.6.5",
       },
     },
     "packages/logging": {

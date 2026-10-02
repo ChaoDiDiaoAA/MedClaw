@@ -6,7 +6,8 @@
     "./model-runtime": "./src/model-runtime.ts",
     "./credential-store": "./src/credential-store.ts",
     "./model-call-recorder": "./src/model-call-recorder.ts",
-    "./agent-runtime": "./src/agent-runtime.ts"
+    "./agent-runtime": "./src/agent-runtime.ts",
+    "./pi-tool-adapter": "./src/pi-tool-adapter.ts"
   },
   "dependencies": {
     "@medclaw/contracts": "workspace:*",

@@ -8,7 +8,11 @@
     "./run": "./src/run.ts",
     "./session": "./src/session.ts",
     "./workspace": "./src/workspace.ts",
-    "./protocol": "./src/protocol.ts"
+    "./protocol": "./src/protocol.ts",
+    "./tool": "./src/tool.ts",
+    "./query": "./src/query.ts",
+    "./business-tools": "./src/business-tools.ts",
+    "./data": "./src/data.ts"
   },
   "dependencies": { "zod": "4.6.5" }
 }

@@ -39,11 +39,11 @@ function makeSession(repo: Repositories, op = "create-1", native = "native-1") {
   return repo.createSession({ expectedWorkspaceRevision: repo.readWorkspace().revision }, op, native, time).session.id;
 }
 
-test("latest database has exactly five STRICT tables, two verified migrations and no FK violations", () => {
+test("latest database preserves P2 tables alongside P3, verifies three migrations and has no FK violations", () => {
   const db = open();
   expect(db.query("SELECT name FROM pragma_table_list WHERE schema='main' AND name NOT LIKE 'sqlite_%' ORDER BY name").all())
-    .toEqual(["model_calls", "runs", "schema_migrations", "sessions", "workspace"].map(name => ({ name })));
-  expect(db.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }]);
+    .toEqual(["answers", "artifacts", "batches", "business_events", "catalog_state", "change_events", "devices", "imports", "model_calls", "queries", "query_evidence", "runs", "schema_migrations", "sessions", "snapshots", "tool_calls", "workspace"].map(name => ({ name })));
+  expect(db.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
   expect(db.query("SELECT COUNT(*) AS n FROM pragma_table_list WHERE schema='main' AND name NOT LIKE 'sqlite_%' AND strict<>1").get()).toEqual({ n: 0 });
   expect(db.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
   expect(db.query("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
@@ -56,7 +56,7 @@ function legacy(path: string) {
   const sql = readFileSync(new URL("../../packages/storage/src/migrations/001_p1.sql", import.meta.url));
   db.exec(sql.toString());
   db.query("INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(1,?,?)").run(createHash("sha256").update(sql).digest("hex"), time);
-  // Seed 001 directly: current repositories intentionally target schema 002.
+  // Seed 001 directly so upgrading proves original P1 facts survive.
   for (const [index, status] of ["completed", "failed", "cancelled"].entries()) {
     const base = provider(`legacy-${index}`), priorRunId = index || null, runId = index + 1;
     const originalRequest = { ...base.originalRequest, ...(priorRunId ? { priorRunId } : {}) };
@@ -83,7 +83,7 @@ test("001 upgrades without changing any existing field, JSON byte or unknown usa
   expect(db.query("SELECT * FROM model_calls ORDER BY id").all()).toEqual(calls);
   expect(db.query("SELECT * FROM sessions").all()).toEqual([]);
   db.close(); handles.pop();
-  expect(open(path).query("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({ n: 2 });
+  expect(open(path).query("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({ n: 3 });
 });
 
 test("a late migration fault rolls back to the original valid 001 file", () => {
@@ -100,6 +100,10 @@ test("create replay returns original result without reselecting over later B; CA
   const repo = new Repositories(open());
   const a = repo.createSession({ expectedWorkspaceRevision: 0 }, "create-a", "native-a", time);
   const b = repo.createSession({ expectedWorkspaceRevision: 1 }, "create-b", "native-b", time);
+  expect(a.session.title).toBe("New Session 1");
+  expect(b.session.title).toBe("New Session 2");
+  expect(repo.readSession(a.session.id)?.title).toBe("New Session 1");
+  expect(repo.findOperation("create-a")).toMatchObject({ method: "session.create", result: a });
   expect(repo.createSession({ selectOnCreate: true, expectedWorkspaceRevision: 0 }, "create-a", "unused", later)).toEqual(a);
   expect(repo.readWorkspace()).toEqual(b.workspace);
   expect(() => repo.createSession({ expectedWorkspaceRevision: 2 }, "create-a", "unused", later)).toThrow("state_conflict");
@@ -107,6 +111,33 @@ test("create replay returns original result without reselecting over later B; CA
   expect(repo.selectSession({ sessionId: b.session.id, expectedWorkspaceRevision: 2 }, later).revision).toBe(2);
   expect(repo.selectSession({ sessionId: a.session.id, expectedWorkspaceRevision: 2 }, later).revision).toBe(3);
   expect(repo.listSessions({}).sessions.map(s => s.id)).toEqual([2, 1]);
+});
+
+test("legacy creation replay preserves the Chinese snapshot, later selection and saved error facts", async () => {
+  const { errorMessage } = await import("../../packages/contracts/src/error");
+  const db = open(), repo = new Repositories(db);
+  const a = repo.createSession({ expectedWorkspaceRevision: 0 }, "legacy-create-a", "native-a", time);
+  const original = { ...a, session: { ...a.session, title: "新会话 1" } };
+  db.query("UPDATE sessions SET title=?,creation_result_json=? WHERE id=?").run(original.session.title, JSON.stringify(original), a.session.id);
+  const { runId } = repo.registerAgent(agent(repo, a.session.id));
+  repo.startCall(runId, "legacy-call", "main", time);
+  const oldError = { ...safeError("run_timeout"), message: "模型请求超过运行时限。" };
+  repo.checkpointFailure(runId, oldError, { ...cleanup, secondaryErrors: [oldError] }, time);
+  db.query("UPDATE model_calls SET error_json=? WHERE run_id=?").run(JSON.stringify(oldError), runId);
+  const b = repo.createSession({ expectedWorkspaceRevision: 1 }, "create-b", "native-b", later);
+  const sessions = db.query("SELECT * FROM sessions ORDER BY id").all(), runs = db.query("SELECT * FROM runs").all(), calls = db.query("SELECT * FROM model_calls").all();
+  expect(repo.createSession({ expectedWorkspaceRevision: 0 }, "legacy-create-a", "unused", later)).toEqual(original);
+  expect(repo.readWorkspace()).toEqual(b.workspace);
+  expect(repo.readSession(a.session.id)?.title).toBe("新会话 1");
+  const saved = repo.read({ runId });
+  if (saved.kind !== "one" || !saved.run?.error) throw new Error("missing original Run error");
+  expect(errorMessage(saved.run.error)).toBe("The model request exceeded the runtime limit.");
+  expect(saved.run.error).toEqual(oldError);
+  expect(saved.run.calls[0]?.error).toEqual(oldError);
+  expect(saved.run.cleanup?.secondaryErrors).toEqual([oldError]);
+  expect(db.query("SELECT * FROM sessions ORDER BY id").all()).toEqual(sessions);
+  expect(db.query("SELECT * FROM runs").all()).toEqual(runs);
+  expect(db.query("SELECT * FROM model_calls").all()).toEqual(calls);
 });
 
 test("creation commit failure leaves neither Session nor changed workspace", () => {
