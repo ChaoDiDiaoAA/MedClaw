@@ -8,6 +8,7 @@ import { WorkspaceViewSchema, WorkspaceChangeSchema, RevisionSchema, type Worksp
 import { businessToolSchemas } from "../../contracts/src/business-tools";
 import {
   DiagnoseRequestSchema, ModelSelectionSchema, ProviderRequestSchema, RequestPolicySchema, ReferenceDateSchema, TimezoneSchema,
+  AgentPolicySchema, MeasurementContextSchema, ToolProfileSnapshotSchema,
   type ProviderAccepted, type ProviderRequest,
 } from "../../contracts/src/model";
 import {
@@ -39,6 +40,9 @@ const providerConfigSchema = z.object({
   selection: ModelSelectionSchema, policy: RequestPolicySchema,
 }).strict();
 const agentConfigSchema = z.strictObject({ selection: ModelSelectionSchema, policy: RequestPolicySchema,
+  agentPolicy: AgentPolicySchema.optional(),
+  measurementContext: MeasurementContextSchema.optional(),
+  toolProfileSnapshot: ToolProfileSnapshotSchema.optional(),
   referenceDate: z.string(), timezone: z.string(), agent: P2AgentOptionsSchema.extend({ stage: z.enum(["P2", "P3"]), nativeSessionId: OpaqueIdSchema,
     tools: z.array(z.string()), autoCompaction: z.literal(false), autoRetry: z.literal(false), cacheWarming: z.literal("off") }) });
 const commonConfigSchema = z.object({ selection: ModelSelectionSchema, policy: RequestPolicySchema });
@@ -124,7 +128,12 @@ export class Repositories implements ProviderRunStore {
       output,
       calls: row.kind === "provider" ? calls : calls.slice(callOffset, callOffset + callLimit), persistence: "committed",
       ...(agent ? { clientSequence: row.submission_client_sequence, nativeSessionId: agent.agent.nativeSessionId,
-        nextCallOffset: callOffset + callLimit < calls.length ? callOffset + callLimit : null } : {}),
+        nextCallOffset: callOffset + callLimit < calls.length ? callOffset + callLimit : null,
+        control: agent.agentPolicy || agent.measurementContext || agent.toolProfileSnapshot ? {
+          agentPolicy: agent.agentPolicy ?? null,
+          measurementContext: agent.measurementContext ?? null,
+          toolProfileSnapshot: agent.toolProfileSnapshot ?? null,
+        } : null } : {}),
     }, "storage_read_failed");
   }
 
@@ -313,6 +322,9 @@ export class Repositories implements ProviderRunStore {
         || input.model.modelId !== request.model.modelId || input.model.configVersion !== request.model.expectedConfigVersion) fail("invalid_argument");
       checked(OpaqueIdSchema, input.instanceId);
       const config = checked(agentConfigSchema, { selection: input.model, policy: input.policy, referenceDate: request.referenceDate,
+        ...(input.agentPolicy ? { agentPolicy: input.agentPolicy } : {}),
+        ...(input.measurementContext ? { measurementContext: input.measurementContext } : {}),
+        ...(input.toolProfileSnapshot ? { toolProfileSnapshot: input.toolProfileSnapshot } : {}),
         timezone: request.timezone, agent: { ...input.agentOptions, stage: input.scope.allowedToolNames.length ? "P3" : "P2", nativeSessionId: session.nativeSessionId, tools: input.scope.allowedToolNames,
           autoCompaction: false, autoRetry: false, cacheWarming: "off" } });
       const result = this.db.query(`INSERT INTO runs(session_id,input_id,kind,instance_id,submission_operation_ref,submission_client_sequence,
@@ -398,6 +410,7 @@ export class Repositories implements ProviderRunStore {
   private validateCleanup(previous: unknown, input: RunCleanupRecord): RunCleanupRecord {
     const next = checked(RunCleanupRecordSchema, input), old = RunCleanupRecordSchema.safeParse(previous);
     if (old.success) {
+      if (next.budgetSummary == null && old.data.budgetSummary != null) next.budgetSummary = old.data.budgetSummary;
       for (const key of ["executionStarted", "stopConfirmed", "requiredPersistenceComplete", "inputsSettled", "resourcesReleased"] as const) {
         if (old.data[key] === true && next[key] !== true || key === "executionStarted" && old.data[key] === false && next[key] !== false) fail("state_conflict");
       }
@@ -411,7 +424,7 @@ export class Repositories implements ProviderRunStore {
     if (!["completed", "failed", "cancelled"].includes(fact.status)) fail("invalid_argument");
     checked(z.string().nullable(), fact.outputText);
     const error = fact.error === null ? null : checked(AppErrorSchema, fact.error);
-    const cleanup = fact.cleanup == null ? null : checked(z.union([cleanupSchema, RunCleanupRecordSchema]), fact.cleanup);
+    let cleanup = fact.cleanup == null ? null : checked(z.union([cleanupSchema, RunCleanupRecordSchema]), fact.cleanup);
     const usage = fact.usage == null ? null : checked(usageSchema, fact.usage);
     return this.db.transaction(() => {
       const row = this.row(runId);
@@ -425,7 +438,7 @@ export class Repositories implements ProviderRunStore {
       if (terminal && (row.status !== fact.status || row.output_text !== null && row.output_text !== fact.outputText
         || row.stopped_at !== null && row.stopped_at !== fact.stoppedAt || !isDeepStrictEqual(decoded(row.error_json), error)
         || row.usage_json !== null && !isDeepStrictEqual(decoded(row.usage_json), usage))) fail("state_conflict");
-      if (cleanup && "contract" in cleanup) this.validateCleanup(decoded(row.cleanup_json), cleanup);
+      if (cleanup && "contract" in cleanup) cleanup = this.validateCleanup(decoded(row.cleanup_json), cleanup);
       else if (terminal && !isDeepStrictEqual(decoded(row.cleanup_json), cleanup)) fail("state_conflict");
       for (const original of calls) {
         const incoming = finalCalls.find(call => call.callId === original.callId);
@@ -478,10 +491,14 @@ export class Repositories implements ProviderRunStore {
   isFinalSaved(runId: number, fact: FinalProviderFact | FinalAgentFact): boolean {
     id(runId);
     const row = this.row(runId);
+    const savedCleanup = RunCleanupRecordSchema.safeParse(row ? decoded(row.cleanup_json) : null);
+    const expectedCleanup = fact.cleanup && 'contract' in fact.cleanup && savedCleanup.success
+      ? { ...fact.cleanup, ...(fact.cleanup.budgetSummary == null && savedCleanup.data.budgetSummary != null ? { budgetSummary: savedCleanup.data.budgetSummary } : {}) }
+      : fact.cleanup ?? null;
     if (!row || row.kind !== ("calls" in fact ? "agent" : "provider") || row.status !== fact.status
       || row.output_text !== fact.outputText || row.stopped_at !== fact.stoppedAt || row.ended_at !== fact.endedAt
       || row.cancel_requested_at !== (fact.cancelRequestedAt ?? null) || !isDeepStrictEqual(decoded(row.error_json), fact.error)
-      || !isDeepStrictEqual(decoded(row.usage_json), fact.usage ?? null) || !isDeepStrictEqual(decoded(row.cleanup_json), fact.cleanup ?? null)) return false;
+      || !isDeepStrictEqual(decoded(row.usage_json), fact.usage ?? null) || !isDeepStrictEqual(decoded(row.cleanup_json), expectedCleanup)) return false;
     if (this.p3 && row.kind === "agent" && fact.status === "completed" && checked(agentConfigSchema, decoded(row.config_json), "storage_read_failed").agent.stage === "P3") {
       const answer = this.db.query<{ text: string }, [number]>("SELECT text FROM answers WHERE run_id=?").get(runId);
       if (!answer || answer.text !== (fact.outputText ?? "")) return false;
@@ -500,9 +517,9 @@ export class Repositories implements ProviderRunStore {
       if (!row) fail("run_not_found");
       const terminal = row.status !== "created" && row.status !== "running";
       if (terminal && (row.status !== "failed" || !isDeepStrictEqual(decoded(row.error_json), error))) fail("state_conflict");
-      this.validateCleanup(decoded(row.cleanup_json), cleanup);
+      const checkedCleanup = this.validateCleanup(decoded(row.cleanup_json), cleanup);
       this.db.query("UPDATE runs SET status='failed',error_json=?,ended_at=COALESCE(ended_at,?),cleanup_json=? WHERE id=?")
-        .run(json(error), time, json(cleanup), runId);
+        .run(json(error), time, json(checkedCleanup), runId);
       this.beforeCommit?.();
     }).immediate();
   }
@@ -598,6 +615,7 @@ export class Repositories implements ProviderRunStore {
           requiredPersistenceComplete: cleanup.requiredPersistenceComplete, inputsSettled: cleanup.inputsSettled,
           resourcesReleased: cleanup.resourcesReleased, unconfirmedCount: cleanup.unconfirmedItems.length,
           secondaryErrorCount: cleanup.secondaryErrors.length, verifiedAt: cleanup.verifiedAt } : null;
+        if (cleanupSummary && cleanup?.budgetSummary !== undefined) Object.assign(cleanupSummary, { budgetSummary: cleanup.budgetSummary });
         if ("nextCallOffset" in summary) { const { nextCallOffset, ...agentSummary } = summary; return checked(RecentRunViewSchema, { ...agentSummary, inputText: safePreview(row.input_text, 2048).text, cleanupSummary }); }
         return checked(RecentRunViewSchema, { ...summary, inputText: safePreview(row.input_text, 2048).text, cleanupSummary });
       }),
@@ -632,6 +650,7 @@ export class Repositories implements ProviderRunStore {
           stopConfirmed: facts.stopConfirmed, requiredPersistenceComplete: facts.requiredPersistenceComplete,
           inputsSettled: true, resourcesReleased: facts.stopConfirmed, unconfirmedItems: facts.unconfirmedItems,
           secondaryErrors: prior.success ? prior.data.secondaryErrors : [], verifiedAt: facts.stopConfirmed === true ? time : prior.success ? prior.data.verifiedAt : null,
+          ...(prior.success && prior.data.budgetSummary !== undefined ? { budgetSummary: prior.data.budgetSummary } : {}),
         }) : { previousInstanceId: row.instance_id, oldProcessExited: true, observationGap: true };
         if (row.kind === "provider") this.db.query("UPDATE model_calls SET state='failed',error_json=?,unavailable_reason='host_interrupted' WHERE run_id=? AND state='started'")
           .run(JSON.stringify(error), row.id);

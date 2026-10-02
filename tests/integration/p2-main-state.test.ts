@@ -19,13 +19,14 @@ afterEach(() => { handlers.clear(); for (const root of roots.splice(0)) rmSync(r
 const submission = { sessionId: 1, clientSequence: 1, text: "original", mode: "send" as const, expectedRevision: 1, expectedBatchIds: [] as [], expectedQueryId: null,
   model: { provider: "fixture", modelId: "fixture", expectedConfigVersion: "1" }, referenceDate: "2026-10-01", timezone: "Asia/Shanghai" };
 const accepted = { sessionId: 1, clientSequence: 1, inputId: null, runId: 7 };
-async function setup(prior: boolean) {
+async function setup(prior: boolean, policyPublication = false) {
   const root = mkdtempSync(join(tmpdir(), "medclaw-p2-ipc-")); roots.push(root);
   const calls: { method: string; payload: unknown; op?: string }[] = []; let syncs = 0;
   const host = { read: () => ({ state: "ready", instanceId: "host-1" }), request: async (method: string, payload: unknown, op?: string) => {
     calls.push({ method, payload, op }); return { ok: true, data: method === "run.read" ? { kind: "one", run: null } : method === "session.readSubmission" ? prior ? accepted : null : accepted };
   } } as unknown as HostController;
-  const settings = new MainSettings(join(root, "settings.json")); settings.read(); settings.synchronize = async () => { syncs++; throw new Error("config_write_failed"); };
+  const settings = new MainSettings(join(root, "settings.json"), policyPublication ? { async prepare() {}, async commit() {}, async abort() {} } : undefined);
+  settings.read(); settings.synchronize = async () => { syncs++; if (policyPublication) return settings.read(); throw new Error("config_write_failed"); };
   const credentials = new MainCredentials(join(root, "credentials.json"), { isEncryptionAvailable: () => false, encryptString: () => { throw new Error("unavailable"); }, decryptString: () => { throw new Error("unavailable"); } });
   const mainFrame = { url: "file:///desktop.html" }, window = { id: 1, webContents: { id: 10, mainFrame }, on: () => {} } as unknown as BrowserWindow;
   const { registerIpc } = await import("../../apps/desktop/src/main/ipc-handlers");
@@ -39,6 +40,18 @@ test("Main checks original Session identity before current configuration/auth sy
   expect(await c.request("session.submit", submission)).toEqual({ ok: true, data: accepted }); expect(c.syncs()).toBe(0);
   expect(c.calls.at(-1)).toEqual({ method: "session.submit", payload: submission, op: "original-operation" });
   expect(c.calls.some(c => c.method === "session.readSubmission")).toBe(true);
+});
+
+test("Main exposes and publishes Agent policy through the existing policy IPC without widening UI", async () => {
+  const { DEFAULT_AGENT_POLICY } = await import("../../packages/contracts/src/model");
+  const c = await setup(false, true);
+  expect(await c.request("model.config.read", {})).toMatchObject({ ok: true, data: { agentPolicy: DEFAULT_AGENT_POLICY, configVersion: "1" } });
+  const policy = { timeoutMs: 800000, maxRetries: 0, maxRetryDelayMs: 2000 };
+  const agentPolicy = { ...DEFAULT_AGENT_POLICY, maxToolCalls: 99 };
+  expect(await c.request("model.policy.update", { expectedConfigVersion: "1", policy, agentPolicy }, "policy-1")).toMatchObject({ ok: true, data: { policy, agentPolicy, configVersion: "2" } });
+  expect(await c.request("model.policy.update", { expectedConfigVersion: "2", policy: { ...policy, timeoutMs: 900000 } }, "policy-2")).toMatchObject({ ok: true, data: { agentPolicy, configVersion: "3" } });
+  expect(await c.request("model.policy.update", { expectedConfigVersion: "1", policy, agentPolicy }, "policy-conflict")).toMatchObject({ ok: false, error: { code: "config_conflict" } });
+  expect(await c.request("settings.ui.update", { expectedConfigVersion: "3", patch: { agentPolicy } }, "policy-ui")).toMatchObject({ ok: false, error: { code: "invalid_argument" } });
 });
 test("new Session Send synchronizes configuration after read-only identity probes", async () => {
   const c = await setup(false); expect(await c.request("session.submit", submission)).toMatchObject({ ok: false, error: { code: "config_write_failed" } });

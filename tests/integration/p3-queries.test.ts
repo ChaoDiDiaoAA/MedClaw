@@ -12,6 +12,7 @@ import { EvidenceReader } from '../../packages/core/src/evidence/evidence-reader
 import { createReadQueryTool } from '../../packages/core/src/tools/business-tools/read-query';
 import { ChangesQuerySchema, CurrentQuerySchema, QueryParamsSchema, type QueryExecutionContext } from '../../packages/contracts/src/query';
 import type { ToolExecutionContext } from '../../packages/contracts/src/tool';
+import { safeError } from '../../packages/contracts/src/error';
 
 const roots: string[] = [];
 const handles: Database[] = [];
@@ -199,4 +200,84 @@ test('excluded regions cannot make a fresh regional count stale or require a mis
     .toMatchObject({ ok: true, data: { warnings: [], interpretation: { dataDates: ['2026-01-02'], quantity: 3, isStale: false } } });
   expect(queries.changes(ChangesQuerySchema.parse({ batchIds: [1, 2, 3], region: '浙江', time: { start: '2026-01-02', endExclusive: '2026-01-03' } }), { ...context, nativeToolCallId: 'region-changes' }))
     .toMatchObject({ totalRows: 3, interpretation: { dataDates: ['2026-01-02'] } });
+});
+
+test('saved query interpretation and current page reject valid-schema date or identity corruption', () => {
+  const { db, context, queries } = fixture();
+  const result = queries.current(CurrentQuerySchema.parse({ batchIds: [1, 2] }), context);
+  // Model an already-corrupt on-disk record; normal application writes remain immutable.
+  db.exec('DROP TRIGGER queries_update_immutable');
+  db.query("UPDATE queries SET result_json=json_set(result_json,'$.interpretation.requestedDate','2026-01-01') WHERE id=?").run(result.queryId);
+  expect(() => queries.read(result.queryId, context)).toThrow('tool_output_inconsistent');
+  db.query("UPDATE queries SET result_json=json_set(result_json,'$.interpretation.requestedDate','2026-01-02','$.rows[0].date','2026-01-01') WHERE id=?").run(result.queryId);
+  expect(() => queries.page({ queryId: result.queryId, page: 1, pageSize: 1 }, context)).toThrow('tool_output_inconsistent');
+  expect(queries.page({ queryId: result.queryId, page: 99, pageSize: 1 }, context)).toMatchObject({ totalRows: 3, rows: [] });
+  db.query("UPDATE queries SET result_json=json_set(result_json,'$.rows[0].date','2026-01-02','$.rows[0].deviceId',999) WHERE id=?").run(result.queryId);
+  expect(() => queries.page({ queryId: result.queryId, page: 1, pageSize: 1 }, context)).toThrow('tool_output_inconsistent');
+});
+
+test('evidence reads reject mismatched saved query hash, source version and page row references', () => {
+  const { db, context, queries, evidence } = fixture();
+  const result = queries.current(CurrentQuerySchema.parse({ batchIds: [1, 2] }), context);
+  const evidenceId = result.evidenceIds[0]!;
+  db.exec('DROP TRIGGER query_evidence_update_immutable');
+  db.query("UPDATE query_evidence SET result_hash='other-result' WHERE id=?").run(evidenceId);
+  expect(() => evidence.list({ queryId: result.queryId, page: 1, pageSize: 50 }, context)).toThrow('tool_output_inconsistent');
+  db.query("UPDATE query_evidence SET result_hash=(SELECT result_hash FROM queries WHERE id=?),material_version='other-version' WHERE id=?").run(result.queryId, evidenceId);
+  expect(() => evidence.read(evidenceId, context)).toThrow('tool_output_inconsistent');
+  db.query("UPDATE query_evidence SET material_version='material/v1',source_row_refs_json='[\"unrelated-row\"]' WHERE id=?").run(evidenceId);
+  expect(() => evidence.rows({ evidenceId, page: 1, pageSize: 1 }, context)).toThrow('tool_output_inconsistent');
+});
+
+test('schema-valid imported snapshot region and event values cannot commit contradictory query facts', () => {
+  const { db, context, queries } = fixture();
+  db.query("UPDATE snapshots SET region='上海' WHERE id=4").run();
+  expect(() => queries.current(CurrentQuerySchema.parse({ batchIds: [1, 2] }), context)).toThrow('tool_output_inconsistent');
+  db.query("UPDATE snapshots SET region='浙江' WHERE id=4").run();
+  db.query("UPDATE change_events SET old_value_json='123' WHERE id=1").run();
+  expect(() => queries.changes(ChangesQuerySchema.parse({ batchIds: [2], time: { start: '2026-01-02', endExclusive: '2026-01-03' } }), { ...context, nativeToolCallId: 'bad-event' })).toThrow('tool_output_inconsistent');
+  expect(db.query('SELECT COUNT(*) AS n FROM queries').get()).toEqual({ n: 0 });
+  expect(db.query('SELECT COUNT(*) AS n FROM query_evidence').get()).toEqual({ n: 0 });
+});
+
+test('trusted deadline after synchronous SQLite calculation rolls back query and preserves the deadline error', async () => {
+  const { db, context } = fixture();
+  let expired = false;
+  class ExpiringCatalog extends SqliteCatalogStore {
+    override readSnapshots(...args: Parameters<SqliteCatalogStore['readSnapshots']>) {
+      const rows = super.readSnapshots(...args);
+      expired = true;
+      return rows;
+    }
+  }
+  const queries = new QueryService(new CatalogService(new ExpiringCatalog(db)), new SqliteToolStore(db));
+  const execution: QueryExecutionContext = { runId: 1, sessionId: 1, inputId: null, source: 'user_form', callRef: '1:expired', scope: context.scope,
+    referenceDate: context.referenceDate, timezone: context.timezone, signal: context.signal,
+    checkActive: () => { if (expired) throw safeError('run_timeout'); } };
+  expect(await queries.execute(QueryParamsSchema.parse({ kind: 'current', population: 'snapshot', snapshotMode: 'exact_date', batchIds: [1, 2] }), execution))
+    .toMatchObject({ ok: false, error: { code: 'run_timeout' } });
+  expect(db.query('SELECT COUNT(*) AS n FROM queries').get()).toEqual({ n: 0 });
+  expect(db.query('SELECT COUNT(*) AS n FROM query_evidence').get()).toEqual({ n: 0 });
+});
+
+test('schema-valid inconsistent batch coverage metadata is rejected while baseline zero changes stay valid', () => {
+  const { db, context, catalog, queries } = fixture();
+  expect(catalog.checkCoverage({ time: { start: '2026-01-01', endExclusive: '2026-01-02' }, snapshotMode: 'exact_date', requirePredecessor: true }, context))
+    .toEqual({ batchIds: [1], missingDates: [], missingPredecessorBatchIds: [], complete: false });
+  expect(queries.changes(ChangesQuerySchema.parse({ batchIds: [1], time: { start: '2026-01-01', endExclusive: '2026-01-02' } }), context))
+    .toMatchObject({ totalRows: 0, rows: [], warnings: ['baseline_no_predecessor:1'] });
+  db.query('UPDATE batches SET observed_entity_count=2 WHERE id=2').run();
+  const next = services(db);
+  expect(() => next.catalog.readBatch(2, context)).toThrow('tool_output_inconsistent');
+});
+
+test('filter dictionaries omit empty values and device resolution retains its full-match status on empty pages', () => {
+  const { db, context, catalog } = fixture();
+  db.query("UPDATE snapshots SET manufacturer='' WHERE device_id IN (1,2)").run();
+  expect(catalog.listFilterValues({ field: 'manufacturer', batchIds: [1, 2], page: 1, pageSize: 50 }, context))
+    .toEqual({ values: ['厂家B'], totalRows: 1, page: 1, pageSize: 50 });
+  expect(catalog.resolveDevice({ text: 'device-1', matchBy: 'source_id', page: 2, pageSize: 1 }, context))
+    .toMatchObject({ resolution: 'unique', totalRows: 1, items: [] });
+  expect(catalog.resolveDevice({ text: '器械', matchBy: 'name', page: 9, pageSize: 1 }, context))
+    .toMatchObject({ resolution: 'ambiguous', totalRows: 3, items: [] });
 });

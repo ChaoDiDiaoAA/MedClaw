@@ -4,7 +4,7 @@ import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import {
-  ConfigVersionSchema, DEFAULT_DISPLAY_PREFERENCES, DEFAULT_REQUEST_POLICY,
+  AgentPolicySchema, ConfigVersionSchema, DEFAULT_AGENT_POLICY, DEFAULT_DISPLAY_PREFERENCES, DEFAULT_REQUEST_POLICY,
   DesktopDisplayPreferencesSchema, PublishedSettingsSchema, RequestPolicySchema, SETTINGS_SCHEMA_VERSION,
   SettingsSnapshotSchema, type DesktopDisplayPreferences, type PublishedSettings, type SettingsSnapshot,
 } from "../../../../packages/contracts/src/model";
@@ -33,7 +33,7 @@ export interface SettingsCoordinator {
   abort(token: string): Promise<unknown>;
   readVersion?(): Promise<string>;
 }
-export type SettingsPatch = Partial<Pick<SettingsSnapshot, "model" | "customProviders" | "credentialRefs" | "requestPolicy">> & {
+export type SettingsPatch = Partial<Pick<SettingsSnapshot, "model" | "customProviders" | "credentialRefs" | "requestPolicy" | "agentPolicy">> & {
   ui?: Partial<DesktopDisplayPreferences>;
 };
 export interface PublishOptions {
@@ -47,6 +47,7 @@ const patchSchema = z.strictObject({
   customProviders: SettingsSnapshotSchema.shape.customProviders.optional(),
   credentialRefs: SettingsSnapshotSchema.shape.credentialRefs.optional(),
   requestPolicy: RequestPolicySchema.optional(), ui: DesktopDisplayPreferencesSchema.partial().optional(),
+  agentPolicy: AgentPolicySchema.optional(),
 });
 function snapshot(value: PublishedSettings): SettingsSnapshot {
   const { previous, rollbackFromVersion, ...current } = value;
@@ -71,7 +72,7 @@ export class MainSettings {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") fail("config_read_failed");
       const initial: PublishedSettings = {
         schemaVersion: SETTINGS_SCHEMA_VERSION, configVersion: "1", model: null, customProviders: [], credentialRefs: {},
-        requestPolicy: { ...DEFAULT_REQUEST_POLICY }, ui: { ...DEFAULT_DISPLAY_PREFERENCES }, previous: null, rollbackFromVersion: null,
+        requestPolicy: { ...DEFAULT_REQUEST_POLICY }, agentPolicy: { ...DEFAULT_AGENT_POLICY }, ui: { ...DEFAULT_DISPLAY_PREFERENCES }, previous: null, rollbackFromVersion: null,
       };
       try { this.writeJson(this.path, initial); } catch { return fail("config_write_failed"); }
       return initial;

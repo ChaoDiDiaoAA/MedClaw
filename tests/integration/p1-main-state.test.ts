@@ -13,6 +13,27 @@ function file(name: string) {
   return join(root, name);
 }
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+
+test("runtime policy publication preserves omitted policy and legacy files under CAS", async () => {
+  const { DEFAULT_AGENT_POLICY } = await import("../../packages/contracts/src/model");
+  const path = file("settings.json");
+  const candidates: unknown[] = [];
+  const settings = new MainSettings(path, { async prepare(_token, candidate) { candidates.push(candidate.agentPolicy); }, async commit() {}, async abort() {} });
+  const initial = settings.read();
+  const { agentPolicy: _agent, ...legacy } = initial;
+  writeFileSync(path, JSON.stringify(legacy));
+  expect(settings.read().agentPolicy).toEqual(DEFAULT_AGENT_POLICY);
+  expect(readFileSync(path, "utf8")).toBe(JSON.stringify(legacy));
+  const agentPolicy = { ...DEFAULT_AGENT_POLICY, maxToolCalls: 400, maxModelCalls: 80, singleToolTimeoutMs: 500000, maxRecoveryAttempts: 0 };
+  const saved = await settings.publish("1", { requestPolicy: { ...initial.requestPolicy, timeoutMs: 900000 }, agentPolicy }, { kind: "policy" });
+  expect(saved.agentPolicy).toEqual(agentPolicy);
+  await expect(settings.publish("1", { agentPolicy }, { kind: "policy" })).rejects.toThrow("config_conflict");
+  const omitted = await settings.publish("2", { requestPolicy: initial.requestPolicy }, { kind: "policy" });
+  expect(omitted.agentPolicy).toEqual(agentPolicy);
+  expect(candidates).toEqual([agentPolicy, agentPolicy]);
+  const restored = await settings.publish("3", {}, { kind: "rollback", targetConfigVersion: "2" });
+  expect(restored.agentPolicy).toEqual(agentPolicy);
+});
 function protection(): SafeStoragePort {
   const key = randomBytes(32);
   return {

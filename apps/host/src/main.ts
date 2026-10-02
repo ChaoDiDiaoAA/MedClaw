@@ -275,7 +275,7 @@ async function dispatch(request: HostRequest): Promise<unknown> {
         const record = toolStore.readCall({ ...context, nativeToolCallId: row.native_tool_call_id })!;
         const { input, data, sdkDelivery, ...metadata } = record;
         const args = JSON.stringify(input), result = JSON.stringify(sdkDelivery ?? data);
-        return { ...metadata, inputPreview: args.slice(0, 8192), resultPreview: result.slice(0, 16384), truncated: args.length > 8192 || result.length > 16384 };
+        return { ...metadata, sdkResultIsError: record.sdkReturned ? sdkDelivery?.isError ?? null : null, inputPreview: args.slice(0, 8192), resultPreview: result.slice(0, 16384), truncated: args.length > 8192 || result.length > 16384 };
       });
       return { runId, scope: context.scope, items, totalRows, page, pageSize };
     }

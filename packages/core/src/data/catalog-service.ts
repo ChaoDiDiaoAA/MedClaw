@@ -83,6 +83,7 @@ export class CatalogService {
   }
 
   assertContext(context: QueryContext) {
+    this.checkActive(context);
     if ('nativeToolCallId' in context) ToolContextIdentitySchema.parse(context);
     else {
       PositiveIdSchema.parse(context.runId); PositiveIdSchema.parse(context.sessionId); RunScopeSchema.parse(context.scope);
@@ -90,14 +91,31 @@ export class CatalogService {
       if (context.inputId !== null) throw new Error('invalid_argument');
       TimezoneSchema.parse(context.timezone);
     }
-    BusinessDateSchema.parse(context.referenceDate); context.signal.throwIfAborted();
+    BusinessDateSchema.parse(context.referenceDate);
     if (this.store) {
       const batches = context.scope.batchIds.filter(id => !this.batchById.has(id));
-      if (batches.length) for (const batch of this.store.readBatches(batches)) this.batchById.set(batch.id, batch);
+      if (batches.length) for (const batch of this.store.readBatches(batches)) {
+        if (!batches.includes(batch.id) || this.batchById.has(batch.id)) throw new Error('tool_output_inconsistent');
+        this.assertBatch(batch);
+        this.batchById.set(batch.id, batch);
+      }
       const devices = context.scope.deviceIds?.filter(id => !this.deviceById.has(id)) ?? [];
-      if (devices.length) for (const device of this.store.readDevices(devices)) this.deviceById.set(device.id, device);
+      if (devices.length) for (const device of this.store.readDevices(devices)) {
+        if (!devices.includes(device.id) || this.deviceById.has(device.id)) throw new Error('tool_output_inconsistent');
+        this.deviceById.set(device.id, device);
+      }
     }
     if (context.scope.batchIds.some(id => !this.batchById.has(id)) || context.scope.deviceIds?.some(id => !this.deviceById.has(id))) throw new Error("access_denied");
+    this.checkActive(context);
+  }
+  checkActive(context: QueryContext): void {
+    context.checkActive?.();
+    context.signal.throwIfAborted();
+  }
+  private assertBatch(batch: Batch): void {
+    if (batch.observedEntityCount + batch.declaredMissingDeviceIds.length !== batch.expectedEntityCount
+      || new Set(batch.declaredMissingDeviceIds).size !== batch.declaredMissingDeviceIds.length || batch.previousBatchId === batch.id)
+      throw new Error('tool_output_inconsistent');
   }
   revision() { return this.store?.readRevision() ?? Math.max(0, ...this.data.batches.map(batch => batch.catalogRevision)); }
   private batch(id: number) { return this.batchById.get(id) ?? this.store?.readBatches([id])[0]; }
@@ -105,7 +123,10 @@ export class CatalogService {
     const existing = this.deviceById.get(id);
     if (existing) return existing;
     const device = this.store?.readDevices([id])[0];
-    if (device) this.deviceById.set(id, device);
+    if (device) {
+      if (device.id !== id) throw new Error('tool_output_inconsistent');
+      this.deviceById.set(id, device);
+    }
     return device;
   }
   batches(ids: number[], context: QueryContext): Batch[] {
@@ -118,14 +139,40 @@ export class CatalogService {
   }
   snapshots(ids: number[], context: QueryContext, filters: CatalogFilters = {}) {
     this.batches(ids, context);
-    if (this.store) return this.store.readSnapshots(ids, context.scope.deviceIds, filters);
-    return this.data.snapshots.filter(row => ids.includes(row.batchId) && (context.scope.deviceIds === null || context.scope.deviceIds.includes(row.deviceId)));
+    const rows = this.store ? this.store.readSnapshots(ids, context.scope.deviceIds, filters)
+      : this.data.snapshots.filter(row => ids.includes(row.batchId) && (context.scope.deviceIds === null || context.scope.deviceIds.includes(row.deviceId)));
+    this.assertSnapshots(rows, ids, context);
+    return rows;
+  }
+  private assertSnapshots(rows: Snapshot[], batchIds: number[], context: QueryContext): void {
+    const pairs = new Set<string>(), ids = new Set<number>();
+    const allowedBatches = new Set(batchIds), allowedDevices = context.scope.deviceIds === null ? null : new Set(context.scope.deviceIds);
+    for (const [index, row] of rows.entries()) {
+      if (index % 256 === 0) this.checkActive(context);
+      const batch = this.batch(row.batchId), device = this.device(row.deviceId), key = `${row.batchId}:${row.deviceId}`;
+      if (!batch || !device || !allowedBatches.has(row.batchId) || row.region !== batch.region || device.sourceBundleId !== batch.sourceBundleId
+        || allowedDevices !== null && !allowedDevices.has(row.deviceId) || ids.has(row.id) || pairs.has(key))
+        throw new Error('tool_output_inconsistent');
+      ids.add(row.id); pairs.add(key);
+    }
+    this.checkActive(context);
   }
   changes(ids: number[], context: QueryContext, filters: CatalogFilters = {}) {
     this.batches(ids, context);
-    if (this.store) return this.store.readChanges(ids, context.scope.batchIds, context.scope.deviceIds, filters);
-    return this.data.changes.filter(row => ids.includes(row.newBatchId) && context.scope.batchIds.includes(row.oldBatchId)
+    const rows = this.store ? this.store.readChanges(ids, context.scope.batchIds, context.scope.deviceIds, filters)
+      : this.data.changes.filter(row => ids.includes(row.newBatchId) && context.scope.batchIds.includes(row.oldBatchId)
       && (context.scope.deviceIds === null || context.scope.deviceIds.includes(row.deviceId)));
+    const identities = new Set<number>(), keys = new Set<string>();
+    for (const row of rows) {
+      const old = this.batch(row.oldBatchId), next = this.batch(row.newBatchId), key = JSON.stringify([row.oldBatchId, row.newBatchId, row.deviceId, row.kind, row.field]);
+      if (!old || !next || !ids.includes(next.id) || !context.scope.batchIds.includes(old.id) || next.previousBatchId !== old.id
+        || old.scopeKey !== next.scopeKey || old.snapshotDate >= next.snapshotDate || identities.has(row.id) || keys.has(key)
+        || context.scope.deviceIds !== null && !context.scope.deviceIds.includes(row.deviceId)
+        || (row.kind === 'field_changed' ? row.field === null : row.field !== null)) throw new Error('tool_output_inconsistent');
+      identities.add(row.id); keys.add(key);
+    }
+    this.checkActive(context);
+    return rows;
   }
   snapshot(id: number, context: QueryContext) {
     return this.snapshotRows([PositiveIdSchema.parse(id)], context)[0]!;
@@ -133,27 +180,37 @@ export class CatalogService {
   snapshotRows(ids: number[], context: QueryContext): Snapshot[] {
     this.assertContext(context);
     const rows = this.store ? this.store.readSnapshotsById(ids) : ids.map(id => this.snapshotById.get(PositiveIdSchema.parse(id))).filter((row): row is Snapshot => !!row);
-    if (rows.length !== new Set(ids).size || rows.some(row => !context.scope.batchIds.includes(row.batchId)
+    if (rows.length !== new Set(ids).size || new Set(rows.map(row => row.id)).size !== rows.length || rows.some(row => !ids.includes(row.id))) throw new Error('tool_output_inconsistent');
+    if (rows.some(row => !context.scope.batchIds.includes(row.batchId)
       || context.scope.deviceIds !== null && !context.scope.deviceIds.includes(row.deviceId))) throw new Error('access_denied');
+    this.assertSnapshots(rows, context.scope.batchIds, context);
     const byId = new Map(rows.map(row => [row.id, row]));
     return ids.map(id => byId.get(id)!);
   }
   snapshotReferences(ids: number[], context: QueryContext): SnapshotReference[] {
     this.assertContext(context);
     const rows = this.store ? this.store.readSnapshotReferences(ids) : ids.map(id => this.snapshotById.get(id)).filter((row): row is Snapshot => !!row);
-    if (rows.length !== new Set(ids).size || rows.some(row => !context.scope.batchIds.includes(row.batchId)
+    if (rows.length !== new Set(ids).size || new Set(rows.map(row => row.id)).size !== rows.length || rows.some(row => !ids.includes(row.id))) throw new Error('tool_output_inconsistent');
+    if (rows.some(row => !context.scope.batchIds.includes(row.batchId)
       || context.scope.deviceIds !== null && !context.scope.deviceIds.includes(row.deviceId))) throw new Error('access_denied');
+    this.checkActive(context);
     return rows.map(({ id, batchId, deviceId, sourceRowRef }) => ({ id, batchId, deviceId, sourceRowRef }));
   }
   summarize(params: QueryParams, batchIds: number[], context: QueryContext) {
     this.assertContext(context);
     if (batchIds.length) this.batches(batchIds, context);
-    return this.store?.summarize(params, batchIds, context.scope.batchIds, context.scope.deviceIds) ?? null;
+    const result = this.store?.summarize(params, batchIds, context.scope.batchIds, context.scope.deviceIds) ?? null;
+    this.checkActive(context);
+    return result;
   }
   snapshotFor(batchId: number, deviceId: number, context: QueryContext) {
     this.batches([batchId], context);
     if (context.scope.deviceIds !== null && !context.scope.deviceIds.includes(deviceId)) throw new Error("access_denied");
-    return this.store ? this.store.readSnapshotFor(batchId, deviceId) : this.snapshotByPair.get(`${batchId}:${deviceId}`) ?? null;
+    const row = this.store ? this.store.readSnapshotFor(batchId, deviceId) : this.snapshotByPair.get(`${batchId}:${deviceId}`) ?? null;
+    if (row && (row.batchId !== batchId || row.deviceId !== deviceId)) throw new Error('tool_output_inconsistent');
+    if (row) this.assertSnapshots([row], [batchId], context);
+    this.checkActive(context);
+    return row;
   }
   readScope(context: ToolExecutionContext) {
     this.assertContext(context); return structuredClone({ scope: context.scope, referenceDate: context.referenceDate, timezone: context.timezone });
@@ -169,6 +226,7 @@ export class CatalogService {
     if (mode === "exact_date" && nextDate(target.start) !== target.endExclusive) throw new Error("invalid_argument");
     const selected: Batch[] = [];
     for (const scopeKey of new Set(all.map(batch => batch.scopeKey))) {
+      this.checkActive(context);
       const candidates = all.filter(batch => batch.scopeKey === scopeKey && (mode === "exact_date" ? batch.snapshotDate === target.start : batch.snapshotDate < target.endExclusive));
       const batch = candidates.at(-1);
       if (!batch) throw new Error("data_coverage_missing");
@@ -180,6 +238,7 @@ export class CatalogService {
     this.assertContext(context); const time = TimeRangeSchema.parse(input.time), all = context.scope.batchIds.length ? this.batches(context.scope.batchIds, context) : [];
     const selected = new Map<number, Batch>(), missingDates = new Set<string>();
     for (const scopeKey of new Set(all.map(batch => batch.scopeKey))) {
+      this.checkActive(context);
       const group = all.filter(batch => batch.scopeKey === scopeKey);
       if (input.snapshotMode === "as_of") {
         const batch = group.filter(batch => batch.snapshotDate < time.endExclusive).at(-1);
@@ -191,11 +250,12 @@ export class CatalogService {
     }
     if (!all.length) missingDates.add(time.start);
     const missingPredecessorBatchIds = [...new Set([...selected.values()].filter(batch => input.requirePredecessor && batch.previousBatchId !== null && !context.scope.batchIds.includes(batch.previousBatchId)).map(batch => batch.previousBatchId!))].sort((a, b) => a - b);
+    this.checkActive(context);
     return { batchIds: [...selected.keys()].sort((a, b) => a - b), missingDates: [...missingDates].sort(), missingPredecessorBatchIds,
       complete: all.length > 0 && missingDates.size === 0 && missingPredecessorBatchIds.length === 0 && (!input.requirePredecessor || [...selected.values()].every(batch => batch.previousBatchId !== null)) };
   }
   listFilterValues(input: PageInput & { field: "manufacturer" | "distributor" | "category" | "status" | "region"; batchIds: number[] }, context: ToolExecutionContext) {
-    const values = [...new Set(this.snapshots(input.batchIds, context).map(row => row[input.field]).filter((value): value is string => value !== null))].sort();
+    const values = [...new Set(this.snapshots(input.batchIds, context).map(row => row[input.field]).filter((value): value is string => value !== null && value.length > 0))].sort();
     const page = pageItems(values, input); return { values: page.items, totalRows: page.totalRows, page: page.page, pageSize: page.pageSize };
   }
   resolveDevice(input: PageInput & { text: string; matchBy: "name" | "source_id" | "submission_id" }, context: ToolExecutionContext) {

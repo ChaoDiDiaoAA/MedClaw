@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, resultSchema, type Result } from "./error";
 import {
-  ApiIdSchema, AuthAttemptViewSchema, AuthNotifyViewSchema, AuthPromptViewSchema, AuthStatusViewSchema,
+  AgentPolicySchema, ApiIdSchema, AuthAttemptViewSchema, AuthNotifyViewSchema, AuthPromptViewSchema, AuthStatusViewSchema,
   ConfigVersionSchema, CredentialRefSchema, CustomProviderDefinitionSchema, DesktopDisplayPreferencesSchema,
   DiagnoseRequestSchema, HostViewSchema, ModelChoiceSchema, ModelDirectoryViewSchema, ModelSelectionSchema,
   ProviderAcceptedSchema, ProviderIdSchema, ProviderRequestSchema, RequestPolicySchema,
@@ -73,10 +73,10 @@ export const publicMethodSchemas = {
     output: z.strictObject({ configVersion: ConfigVersionSchema, definition: CustomProviderDefinitionSchema, registered: z.boolean() }),
   },
   "model.configure": { input: ModelChoiceSchema, output: configurableSelection },
-  "model.policy.update": { input: z.strictObject({ ...expectedVersion, policy: RequestPolicySchema }), output: z.strictObject({ configVersion: ConfigVersionSchema, policy: RequestPolicySchema }) },
+  "model.policy.update": { input: z.strictObject({ ...expectedVersion, policy: RequestPolicySchema, agentPolicy: AgentPolicySchema.optional() }), output: z.strictObject({ configVersion: ConfigVersionSchema, policy: RequestPolicySchema, agentPolicy: AgentPolicySchema }) },
   "model.config.read": {
     input: EmptyPayloadSchema,
-    output: z.strictObject({ configVersion: ConfigVersionSchema, previousConfigVersion: ConfigVersionSchema.nullable(), rollbackFromVersion: ConfigVersionSchema.nullable(), policy: RequestPolicySchema }),
+    output: z.strictObject({ configVersion: ConfigVersionSchema, previousConfigVersion: ConfigVersionSchema.nullable(), rollbackFromVersion: ConfigVersionSchema.nullable(), policy: RequestPolicySchema, agentPolicy: AgentPolicySchema }),
   },
   "model.config.rollback": {
     input: z.strictObject({ ...expectedVersion, targetConfigVersion: ConfigVersionSchema }),

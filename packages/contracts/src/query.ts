@@ -74,6 +74,7 @@ export type QueryExecutionContext = {
   referenceDate: string;
   timezone: string;
   signal: AbortSignal;
+  checkActive?: () => void;
   basedOnQueryId?: number | null;
   workspaceRevision?: number;
 };

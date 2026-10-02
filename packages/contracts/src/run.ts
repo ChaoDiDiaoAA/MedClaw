@@ -1,8 +1,8 @@
 import { z } from "zod";
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } from "./error";
-import { ModelSelectionSchema, ReferenceDateSchema, RequestPolicySchema, TimezoneSchema } from "./model";
+import { AgentPolicySchema, BudgetSummarySchema, MeasurementContextSchema, ModelSelectionSchema, ReferenceDateSchema, RequestPolicySchema, TimezoneSchema, ToolProfileSnapshotSchema } from "./model";
 import type { AppError } from "./error";
-import type { DiagnoseRequest, ModelSelection, ProviderAccepted, ProviderRequest, RequestPolicy } from "./model";
+import type { AgentPolicy, BudgetSummary, DiagnoseRequest, MeasurementContext, ModelSelection, ProviderAccepted, ProviderRequest, RequestPolicy, ToolProfileSnapshot } from "./model";
 import type { NewSessionInput, NewSessionResult, SubmitInput, SubmitResult, SessionStore } from "./session";
 import type { WorkspaceView } from "./workspace";
 
@@ -36,6 +36,7 @@ export const RunCleanupRecordSchema = z.strictObject({
   requiredPersistenceComplete: z.boolean().nullable(), inputsSettled: z.boolean().nullable(), resourcesReleased: z.boolean().nullable(),
   unconfirmedItems: z.array(z.string().min(1).max(64).regex(/^[a-z][a-z0-9_.:-]*$/)).max(32),
   secondaryErrors: z.array(AppErrorSchema).max(32), verifiedAt: TimestampSchema.nullable(),
+  budgetSummary: BudgetSummarySchema.nullable().optional(),
 });
 export const RunCleanupSummarySchema = RunCleanupRecordSchema.omit({ contract: true, unconfirmedItems: true, secondaryErrors: true }).extend({
   unconfirmedCount: z.number().int().min(0).max(32), secondaryErrorCount: z.number().int().min(0).max(32),
@@ -52,6 +53,11 @@ export const ProviderRunViewSchema = z.strictObject({ ...runFields, kind: z.lite
 export const AgentRunViewSchema = z.strictObject({ ...runFields, kind: z.literal("agent"), sessionId: PositiveIdSchema,
   clientSequence: PositiveIdSchema, nativeSessionId: OpaqueIdSchema, goal: z.literal("answer"),
   calls: z.array(ModelCallViewSchema).max(50), nextCallOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  control: z.strictObject({
+    agentPolicy: AgentPolicySchema.nullable(),
+    measurementContext: MeasurementContextSchema.nullable(),
+    toolProfileSnapshot: ToolProfileSnapshotSchema.nullable(),
+  }).nullable().optional(),
 });
 export const RunViewSchema = z.discriminatedUnion("kind", [ProviderRunViewSchema, AgentRunViewSchema]);
 const outputPaging = { outputOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).default(0), outputLimit: z.number().int().min(1).max(32768).default(16384) };
@@ -78,8 +84,26 @@ export const CancelRunResultSchema = z.strictObject({
 });
 export const RunHandleSchema = z.strictObject({ runId: PositiveIdSchema, kind: z.enum(["provider", "agent"]), sessionId: PositiveIdSchema.nullable() });
 export const ActiveRunViewSchema = RunHandleSchema.extend({ persistencePending: z.boolean(), stopPending: z.boolean() });
+const budgetCount = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const callBudgetSchema = z.strictObject({
+  limit: PositiveIdSchema,
+  used: budgetCount,
+  remaining: budgetCount,
+});
+export const RuntimeBudgetViewSchema = z.strictObject({
+  runId: PositiveIdSchema,
+  toolCalls: callBudgetSchema,
+  modelCalls: callBudgetSchema,
+  remainingTimeMs: z.number().finite().nonnegative().nullable(),
+  recovery: z.strictObject({
+    episodeId: OpaqueIdSchema.nullable(),
+    used: budgetCount,
+    remaining: budgetCount,
+    unresolvedItems: z.array(z.string().min(1).max(256)).max(1000),
+  }),
+});
 export const RuntimeControlViewSchema = z.strictObject({ instanceId: OpaqueIdSchema, activeRootRun: RunHandleSchema.nullable(),
-  acceptingNewRuns: z.boolean(), blockReasons: z.array(AppErrorSchema).max(32) });
+  acceptingNewRuns: z.boolean(), blockReasons: z.array(AppErrorSchema).max(32), budget: RuntimeBudgetViewSchema.nullable().optional() });
 export const UsageViewSchema = z.strictObject({
   inputTokens: nullableToken, outputTokens: nullableToken, cost: nullableAmount, costCurrency: z.literal("USD").nullable(),
   source: z.literal("pi_normalized").nullable(), unavailableReason: safeLabel.nullable(),
@@ -87,6 +111,7 @@ export const UsageViewSchema = z.strictObject({
 export type RunStatus = z.infer<typeof RunStatusSchema>;
 export type RunHandle = z.infer<typeof RunHandleSchema>;
 export type RuntimeControlView = z.infer<typeof RuntimeControlViewSchema>;
+export type RuntimeBudgetView = z.infer<typeof RuntimeBudgetViewSchema>;
 export type RunCleanupRecord = z.infer<typeof RunCleanupRecordSchema>;
 export type RunScope = z.infer<typeof RunScopeSchema>;
 export type ModelCallView = z.infer<typeof ModelCallViewSchema>;
@@ -139,19 +164,24 @@ export interface FinalProviderFact {
 export interface AgentStartFields {
   sessionId: number; inputId: null; text: string; model: ModelSelection; policy: RequestPolicy; goal: "answer";
   workspace: WorkspaceView; scope: RunScope; referenceDate: string; timezone: string; timeoutMs: number; agentOptions: P2AgentOptions;
+  agentPolicy?: AgentPolicy;
+  measurementContext?: MeasurementContext;
+  toolProfileSnapshot?: ToolProfileSnapshot;
   submission: { operationRef: string; originalSubmitInput: SubmitInput };
 }
 export type StartRunInput<Resolved> = AgentStartFields & { resolved: Resolved };
 export type RegisterAgentInput = AgentStartFields & { instanceId: string; createdAt: string };
-export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[] };
+export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[]; budgetSummary?: BudgetSummary };
 export type AgentRuntimePort<Resolved> = {
   readonly toolNames?: readonly string[];
   toolPersistencePending?: (runId: number) => boolean;
   retryToolPersistence?: (runId: number) => void;
   releaseToolFacts?: (runId: number) => void;
+  captureToolProfiles?: (scope: RunScope) => { measurementContext: MeasurementContext; toolProfileSnapshot: ToolProfileSnapshot };
+  readBudget?: (runId: number) => RuntimeBudgetView | null;
   describe: (resolved: Resolved) => P2AgentOptions;
   execute: (input: { runId: number; sessionId: number; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number;
-    scope?: RunScope; referenceDate?: string; timezone?: string },
+    scope?: RunScope; referenceDate?: string; timezone?: string; agentPolicy?: AgentPolicy; measurementContext?: MeasurementContext; toolProfileSnapshot?: ToolProfileSnapshot },
     callbacks: { startCall: (time: string) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
       fatal?: (error: AppError) => void }) => Promise<AgentExecutionObservation>;
 };

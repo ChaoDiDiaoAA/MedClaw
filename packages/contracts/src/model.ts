@@ -30,9 +30,140 @@ export const ModelSelectionSchema = z.strictObject({
 });
 export const DEFAULT_REQUEST_POLICY = Object.freeze({ timeoutMs: 120000, maxRetries: 0, maxRetryDelayMs: 2000 } as const);
 export const RequestPolicySchema = z.strictObject({
-  timeoutMs: z.number().int().min(1000).max(300000), maxRetries: z.union([z.literal(0), z.literal(1)]),
+  timeoutMs: z.number().int().min(1000).max(Number.MAX_SAFE_INTEGER), maxRetries: z.union([z.literal(0), z.literal(1)]),
   maxRetryDelayMs: z.number().int().min(1).max(5000),
 });
+export const DEFAULT_AGENT_POLICY = Object.freeze({
+  version: 'medclaw.agent-policy/v1',
+  maxToolCalls: 24,
+  maxModelCalls: 12,
+  singleToolTimeoutMs: 30000,
+  maxRecoveryAttempts: 2,
+} as const);
+const safeCount = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const elapsedMs = z.number().finite().nonnegative();
+const controlCode = z.string().min(1).max(128).regex(/^[a-z][a-z0-9_.:-]*$/);
+export const AgentPolicySchema = z.strictObject({
+  version: z.literal('medclaw.agent-policy/v1'),
+  maxToolCalls: PositiveIdSchema,
+  maxModelCalls: PositiveIdSchema,
+  singleToolTimeoutMs: PositiveIdSchema,
+  maxRecoveryAttempts: safeCount,
+});
+export const MeasurementContextSchema = z.strictObject({
+  version: z.literal('medclaw.tool-measurement/v1'),
+  sdkVersion: nonblank(128),
+  environmentKey: nonblank(256),
+  cutoffAt: TimestampSchema,
+  maxToolCallId: PositiveIdSchema.nullable(),
+});
+export const ToolProfileSchema = z.strictObject({
+  name: nonblank(256),
+  version: nonblank(128),
+  sdkVersion: nonblank(128),
+  measurementVersion: nonblank(128),
+  environmentKey: nonblank(256),
+  workloadBucket: nonblank(256),
+  sampleCount: safeCount,
+  completeSamples: safeCount,
+  p95Ms: elapsedMs.nullable(),
+  timeoutRate: z.number().finite().min(0).max(1).nullable(),
+  reliability: z.record(nonblank(256), safeCount),
+});
+export const ToolProfileSnapshotSchema = z.strictObject({
+  version: z.literal('medclaw.tool-profile/v1'),
+  cutoffAt: TimestampSchema,
+  maxToolCallId: PositiveIdSchema.nullable(),
+  windowDays: PositiveIdSchema,
+  observationLimit: PositiveIdSchema,
+  perGroupLimit: PositiveIdSchema,
+  minimumCompleteSamples: PositiveIdSchema,
+  available: z.boolean(),
+  profiles: z.array(ToolProfileSchema).max(2000),
+});
+export const ToolValidationStatusSchema = z.enum(['passed', 'failed', 'not_applicable', 'not_reached', 'unknown']);
+export const ToolAdmissionStatusSchema = z.enum(['passed', 'blocked', 'failed', 'not_reached', 'unknown']);
+export const ToolControlObservationSchema = z.strictObject({
+  version: z.literal('medclaw.tool-control/v1'),
+  admission: z.strictObject({
+    status: ToolAdmissionStatusSchema,
+    reason: controlCode.nullable(),
+  }),
+  inputValidation: ToolValidationStatusSchema,
+  outputValidation: ToolValidationStatusSchema,
+  businessValidation: z.strictObject({
+    pre: ToolValidationStatusSchema,
+    post: ToolValidationStatusSchema,
+  }),
+  preflightStatus: ToolAdmissionStatusSchema,
+  postflightStatus: z.enum(['passed', 'failed', 'not_reached', 'unknown']),
+  hookFailure: z.strictObject({
+    stage: z.enum(['beforeToolCall', 'afterToolCall']),
+    code: controlCode,
+  }).nullable(),
+  effectiveTimeoutMs: elapsedMs.nullable(),
+  executionElapsedMs: elapsedMs.nullable(),
+  observedElapsedMs: elapsedMs.nullable(),
+  latencyObservation: z.enum(['complete', 'right_censored', 'missing']),
+  timeoutRequestedAt: TimestampSchema.nullable(),
+  stopLagMs: elapsedMs.nullable(),
+  failureOrigin: controlCode.nullable(),
+  failureClass: controlCode.nullable(),
+  failureStage: controlCode.nullable(),
+  failureVisibility: z.enum(['explicit', 'implicit', 'unknown']),
+  failurePersistence: z.enum(['transient', 'persistent', 'unknown']),
+  validationIssues: z.array(z.strictObject({
+    code: controlCode,
+    stage: controlCode,
+    fieldPath: z.array(z.string().min(1).max(128).regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/)).max(32),
+  })).max(100),
+  environmentKey: nonblank(256).nullable(),
+  workloadBucket: nonblank(256).nullable(),
+  repairEpisodeId: OpaqueIdSchema.nullable(),
+  repairOfToolCallId: PositiveIdSchema.nullable(),
+  recoveryAction: controlCode.nullable(),
+});
+export const BudgetSummarySchema = z.strictObject({
+  version: z.literal('medclaw.budget-summary/v1'),
+  toolCalls: safeCount,
+  modelCalls: safeCount,
+  toolAdmissionsRejected: safeCount,
+  modelAdmissionsRejected: safeCount,
+  convergenceRequested: z.boolean(),
+  recoveryAttempts: safeCount,
+  stopReason: controlCode.nullable(),
+  unresolvedItems: z.array(z.string().min(1).max(256)).max(1000),
+});
+export function createToolControlObservation(patch: Partial<ToolControlObservation> = {}): ToolControlObservation {
+  return ToolControlObservationSchema.parse({
+    version: 'medclaw.tool-control/v1',
+    admission: { status: 'not_reached', reason: null },
+    inputValidation: 'not_reached',
+    outputValidation: 'not_reached',
+    businessValidation: { pre: 'not_reached', post: 'not_reached' },
+    preflightStatus: 'not_reached',
+    postflightStatus: 'not_reached',
+    hookFailure: null,
+    effectiveTimeoutMs: null,
+    executionElapsedMs: null,
+    observedElapsedMs: null,
+    latencyObservation: 'missing',
+    timeoutRequestedAt: null,
+    stopLagMs: null,
+    failureOrigin: null,
+    failureClass: null,
+    failureStage: null,
+    failureVisibility: 'unknown',
+    failurePersistence: 'unknown',
+    validationIssues: [],
+    environmentKey: null,
+    workloadBucket: null,
+    repairEpisodeId: null,
+    repairOfToolCallId: null,
+    recoveryAction: null,
+    ...patch,
+  });
+}
 export const DEFAULT_DISPLAY_PREFERENCES = Object.freeze({ navCollapsed: false, detailOpen: false, detailTab: "conditions" } as const);
 export const DesktopDisplayPreferencesSchema = z.strictObject({ navCollapsed: z.boolean(), detailOpen: z.boolean(), detailTab: z.enum(["conditions", "evidence", "runtime"]) });
 export const ModelEntryViewSchema = z.strictObject({
@@ -79,6 +210,7 @@ export const SettingsSnapshotSchema = z.strictObject({
   model: z.strictObject({ provider: ProviderIdSchema, modelId: ModelIdSchema }).nullable(),
   customProviders: z.array(z.strictObject({ definition: CustomProviderDefinitionSchema, credentialRef: CredentialRefSchema.nullable() })).max(10000),
   credentialRefs: z.record(ProviderIdSchema, CredentialRefSchema.nullable()), requestPolicy: RequestPolicySchema,
+  agentPolicy: AgentPolicySchema.default(DEFAULT_AGENT_POLICY),
   ui: DesktopDisplayPreferencesSchema.default(DEFAULT_DISPLAY_PREFERENCES),
 }).refine(settings => new Set(settings.customProviders.map(provider => provider.definition.providerId)).size === settings.customProviders.length, "Duplicate custom provider ID");
 export const PublishedSettingsSchema = SettingsSnapshotSchema.safeExtend({ previous: SettingsSnapshotSchema.nullable(), rollbackFromVersion: ConfigVersionSchema.nullable() });
@@ -119,6 +251,12 @@ export const HostViewSchema = z.strictObject({
 export type ModelChoice = z.infer<typeof ModelChoiceSchema>;
 export type ModelSelection = z.infer<typeof ModelSelectionSchema>;
 export type RequestPolicy = z.infer<typeof RequestPolicySchema>;
+export type AgentPolicy = z.infer<typeof AgentPolicySchema>;
+export type MeasurementContext = z.infer<typeof MeasurementContextSchema>;
+export type ToolProfile = z.infer<typeof ToolProfileSchema>;
+export type ToolProfileSnapshot = z.infer<typeof ToolProfileSnapshotSchema>;
+export type ToolControlObservation = z.infer<typeof ToolControlObservationSchema>;
+export type BudgetSummary = z.infer<typeof BudgetSummarySchema>;
 export type DesktopDisplayPreferences = z.infer<typeof DesktopDisplayPreferencesSchema>;
 export type ModelEntryView = z.infer<typeof ModelEntryViewSchema>;
 export type AuthStatusView = z.infer<typeof AuthStatusViewSchema>;

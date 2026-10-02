@@ -101,12 +101,13 @@ describe("P1 model boundaries", () => {
     expect(DEFAULT_REQUEST_POLICY).toEqual({ timeoutMs: 120000, maxRetries: 0, maxRetryDelayMs: 2000 });
     expect(DEFAULT_DISPLAY_PREFERENCES).toEqual(ui);
     for (const candidate of [
-      { ...policy, timeoutMs: 999 }, { ...policy, timeoutMs: 300001 }, { ...policy, timeoutMs: 1000.5 },
+      { ...policy, timeoutMs: 999 }, { ...policy, timeoutMs: Number.MAX_SAFE_INTEGER + 1 }, { ...policy, timeoutMs: 1000.5 },
       { ...policy, maxRetries: 2 }, { ...policy, maxRetries: -1 }, { ...policy, maxRetryDelayMs: 0 },
       { ...policy, maxRetryDelayMs: 5001 }, { ...policy, maxRetryDelayMs: 1.5 }, { ...policy, extra: true },
     ]) expect(RequestPolicySchema.safeParse(candidate).success).toBe(false);
     expect(RequestPolicySchema.safeParse({ timeoutMs: 1000, maxRetries: 1, maxRetryDelayMs: 1 }).success).toBe(true);
     expect(RequestPolicySchema.safeParse({ timeoutMs: 300000, maxRetries: 0, maxRetryDelayMs: 5000 }).success).toBe(true);
+    expect(RequestPolicySchema.safeParse({ ...policy, timeoutMs: 300001 }).success).toBe(true);
     const { ui: _ui, ...withoutUi } = snapshot;
     expect(SettingsSnapshotSchema.parse(withoutUi).ui).toEqual(ui);
   });
@@ -156,6 +157,39 @@ describe("P1 model boundaries", () => {
     expect(AuthPromptViewSchema.safeParse({ ...prompt, signal: {} }).success).toBe(false);
     expect(AuthStatusViewSchema.safeParse({ providerId: "openai", state: "available", type: "api_key", source: "OPENAI_API_KEY",
       checkKind: "snapshot", checkedAt: "2026-09-30T00:00:00.000Z", key: "secret" }).success).toBe(false);
+  });
+});
+
+describe("P3 runtime policy contracts", () => {
+  test("accepts configurable safe budgets and defaults legacy Settings without widening UI writes", async () => {
+    const { AgentPolicySchema, DEFAULT_AGENT_POLICY, SettingsSnapshotSchema } = await import("../../packages/contracts/src/model");
+    const { parsePublicPayload, publicMethodSchemas } = await import("../../packages/contracts/src/protocol");
+    expect(DEFAULT_AGENT_POLICY).toEqual({ version: "medclaw.agent-policy/v1", maxToolCalls: 24, maxModelCalls: 12, singleToolTimeoutMs: 30000, maxRecoveryAttempts: 2 });
+    expect(SettingsSnapshotSchema.parse(snapshot).agentPolicy).toEqual(DEFAULT_AGENT_POLICY);
+    const configured = { ...DEFAULT_AGENT_POLICY, maxToolCalls: 501, maxModelCalls: 101, singleToolTimeoutMs: 600001, maxRecoveryAttempts: 0 };
+    expect(AgentPolicySchema.parse(configured)).toEqual(configured);
+    for (const patch of [{ maxToolCalls: 0 }, { maxModelCalls: 1.5 }, { singleToolTimeoutMs: Number.MAX_SAFE_INTEGER + 1 }, { maxRecoveryAttempts: -1 }, { maxRecoveryAttempts: 0.5 }, { extra: true }]) {
+      expect(AgentPolicySchema.safeParse({ ...configured, ...patch }).success).toBe(false);
+    }
+    expect(parsePublicPayload("model.policy.update", { expectedConfigVersion: "1", policy, agentPolicy: configured })).toHaveProperty("agentPolicy", configured);
+    expect(parsePublicPayload("model.policy.update", { expectedConfigVersion: "1", policy })).not.toHaveProperty("agentPolicy");
+    expect(() => parsePublicPayload("settings.ui.update", { expectedConfigVersion: "1", patch: { agentPolicy: configured } })).toThrow();
+    expect(publicMethodSchemas["model.config.read"].output.safeParse({ configVersion: "1", previousConfigVersion: null, rollbackFromVersion: null, policy, agentPolicy: configured }).success).toBe(true);
+  });
+
+  test("keeps unknown control facts explicit and stage errors safe", async () => {
+    const { createToolControlObservation, ToolControlObservationSchema } = await import("../../packages/contracts/src/model");
+    const { safeError } = await import("../../packages/contracts/src/error");
+    const control = createToolControlObservation();
+    expect(Object.keys(control)).toHaveLength(25);
+    expect(control).toMatchObject({ admission: { status: "not_reached", reason: null }, inputValidation: "not_reached", businessValidation: { pre: "not_reached", post: "not_reached" }, latencyObservation: "missing", executionElapsedMs: null, repairOfToolCallId: null });
+    expect(ToolControlObservationSchema.safeParse({ ...control, postflightStatus: "succeeded" }).success).toBe(false);
+    expect(ToolControlObservationSchema.safeParse({ ...control, executionElapsedMs: -1 }).success).toBe(false);
+    expect(ToolControlObservationSchema.safeParse({ ...control, validationIssues: [{ code: "mismatch", stage: "output", fieldPath: ["id"], rawError: "secret" }] }).success).toBe(false);
+    for (const code of ["tool_call_limit", "tool_timeout", "tool_output_inconsistent", "tool_recovery_limit", "tool_postprocess_failed"]) {
+      expect(safeError(code, new Error("secret-provider-body"))).toMatchObject({ code });
+      expect(safeError(code).message).not.toContain("secret");
+    }
   });
 });
 

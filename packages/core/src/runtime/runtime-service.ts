@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import { performance } from "node:perf_hooks";
 import { safeError, serviceResult, type AppError } from "../../../contracts/src/error";
 import type { Command, CommandContext, RuntimeNotice } from "../../../contracts/src/protocol";
-import type { CredentialScope, DiagnoseRequest, ModelRuntimePort, ProviderAccepted, ProviderRequest, PublishedSettings, ResolvedProviderSelection } from "../../../contracts/src/model";
+import { AgentPolicySchema, DEFAULT_AGENT_POLICY, type BudgetSummary, type CredentialScope, type DiagnoseRequest, type ModelRuntimePort, type ProviderAccepted, type ProviderRequest, type PublishedSettings, type ResolvedProviderSelection } from "../../../contracts/src/model";
 import { canonicalRequest, RuntimeControlViewSchema, safePreview, type AgentRuntimePort, type CancelRunResult, type FinalAgentFact,
   type FinalProviderFact, type ModelCallRecorderPort, type ModelCallStarter, type ProviderOutcome, type RuntimeRunStore, type RunCleanupRecord,
   type RunHandle, type RunView, type StartRunInput } from "../../../contracts/src/run";
@@ -13,7 +13,8 @@ import type { RunScope } from '../../../contracts/src/run';
 type Execution = { handle: RunHandle; operationRef: string; abort: AbortController; nativeTerminal: boolean; cause: "user" | "deadline" | "shutdown" | null;
   cancelAt: string | null; stopped: boolean; executionStarted: boolean | null; fact: FinalProviderFact | FinalAgentFact | null;
   primaryError: AppError | null; failureAt: string | null; secondaryErrors: AppError[]; pendingSave: boolean; sequence: number; task: Promise<void>;
-  scope?: RunScope; referenceDate?: string; timezone?: string; toolGap: boolean };
+  scope?: RunScope; referenceDate?: string; timezone?: string; toolGap: boolean; budgetSummary?: BudgetSummary;
+  deadlineAt: number | null; deadlineTimer: ReturnType<typeof setTimeout> | null };
 type Recovery = { run: RunView; cleanup: RunCleanupRecord; verified: boolean; at: string };
 const now = () => new Date().toISOString();
 
@@ -46,7 +47,8 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       || !isDeepStrictEqual(workspace.deviceIds.length ? workspace.deviceIds : null, execution.scope.deviceIds)) throw new Error('state_conflict');
     return { runId: execution.handle.runId, inputId: null, sessionId: execution.handle.sessionId!, source: 'user_form',
       callRef: `${execution.handle.runId}:${operationRef}`, scope: structuredClone(execution.scope), referenceDate: execution.referenceDate,
-      timezone: execution.timezone, signal: execution.abort.signal, basedOnQueryId: workspace.queryId, workspaceRevision: expectedRevision };
+      timezone: execution.timezone, signal: execution.abort.signal, basedOnQueryId: workspace.queryId, workspaceRevision: expectedRevision,
+      checkActive: () => this.checkActive(execution) };
   }
   get busy() { return this.closing || this.modelControlBusy() || this.reservation !== null || this.execution !== null
     || this.recoveryError !== null || this.recoveries.size > 0 || this.store.active() !== null || this.store.recoveryCandidates(this.instanceId).length > 0; }
@@ -66,7 +68,8 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       for (const gap of gaps) reasons.push(safeError(recoveryCode(this.recoveries.get(gap.id)), undefined, { runId: gap.id }));
       for (const recovery of this.recoveries.values()) if (!gaps.some(gap => gap.id === recovery.run.id)) reasons.push(safeError(recoveryCode(recovery), undefined, { runId: recovery.run.id }));
       if (reasons.length > 32) throw new Error("frame_too_large");
-      return RuntimeControlViewSchema.parse({ instanceId: this.instanceId, activeRootRun: this.activeHandle, acceptingNewRuns: reasons.length === 0, blockReasons: reasons });
+      const budget = this.execution?.handle.kind === 'agent' ? this.agent?.readBudget?.(this.execution.handle.runId) ?? null : null;
+      return RuntimeControlViewSchema.parse({ instanceId: this.instanceId, activeRootRun: this.activeHandle, acceptingNewRuns: reasons.length === 0, blockReasons: reasons, budget });
     }, "storage_read_failed");
   }
   private reserve(operationRef: string, original: unknown, kind: "provider" | "agent") {
@@ -100,8 +103,12 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
           config.credentialRefs[request.model.provider] ?? null, config.requestPolicy, true);
         this.recheck(context.operationRef, config.configVersion);
         const workspace = this.store.readWorkspace(), scope = this.store.freezeAgentScope(workspace, this.agent.toolNames ?? []);
+        const agentPolicy = structuredClone(AgentPolicySchema.parse(config.agentPolicy ?? DEFAULT_AGENT_POLICY));
+        let profiles: ReturnType<NonNullable<AgentRuntimePort<Resolved>['captureToolProfiles']>> | undefined;
+        try { profiles = this.agent.captureToolProfiles?.(scope); } catch { /* Missing statistics use the frozen configured timeout. */ }
         const started = await this.start({ sessionId: request.sessionId, inputId: null, text: request.text, model: resolved.selection, policy: resolved.policy, goal: "answer",
           workspace, scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: resolved.policy.timeoutMs,
+          agentPolicy, ...(profiles ? structuredClone(profiles) : {}),
           agentOptions: this.agent.describe(resolved), submission: { operationRef: context.operationRef, originalSubmitInput: request }, resolved });
         if (!started.ok) throw started.error;
         return { sessionId: request.sessionId, clientSequence: request.clientSequence, inputId: null, runId: started.data.runId } satisfies SubmitResult;
@@ -154,20 +161,43 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   }
   private begin(handle: RunHandle, operationRef: string): Execution {
     const execution: Execution = { handle, operationRef, abort: new AbortController(), nativeTerminal: false, cause: null, cancelAt: null, stopped: false,
-      executionStarted: null, fact: null, primaryError: null, failureAt: null, secondaryErrors: [], pendingSave: false, sequence: 0, task: Promise.resolve(), toolGap: false };
+      executionStarted: null, fact: null, primaryError: null, failureAt: null, secondaryErrors: [], pendingSave: false, sequence: 0, task: Promise.resolve(), toolGap: false,
+      deadlineAt: null, deadlineTimer: null };
     this.execution = execution; return execution;
   }
   private cleanup(execution: Execution, complete: boolean): RunCleanupRecord {
     return { contract: "medclaw.run-cleanup/v1", executionStarted: execution.executionStarted, stopConfirmed: execution.stopped,
       requiredPersistenceComplete: complete, inputsSettled: true, resourcesReleased: execution.stopped,
-      unconfirmedItems: [...(execution.stopped ? [] : ['stop', 'resources']), ...(complete ? [] : ['persistence']), ...(execution.toolGap && !complete ? ['tool_persistence'] : [])], secondaryErrors: execution.secondaryErrors, verifiedAt: complete && execution.stopped ? now() : null };
+      unconfirmedItems: [...(execution.stopped ? [] : ['stop', 'resources']), ...(complete ? [] : ['persistence']), ...(execution.toolGap && !complete ? ['tool_persistence'] : [])], secondaryErrors: execution.secondaryErrors, verifiedAt: complete && execution.stopped ? now() : null,
+      ...(execution.budgetSummary ? { budgetSummary: structuredClone(execution.budgetSummary) } : {}) };
   }
   private deadline(execution: Execution, timeout: number) {
-    return setTimeout(() => {
-      if (execution.nativeTerminal || execution.cause) return;
-      execution.cause = "deadline"; execution.abort.abort();
-      this.checkpoint(execution, safeError("run_timeout"));
-    }, timeout);
+    execution.deadlineAt = performance.now() + timeout;
+    const tick = () => {
+      execution.deadlineTimer = null;
+      if (execution.stopped || execution.nativeTerminal || execution.cause) return;
+      const remaining = execution.deadlineAt! - performance.now();
+      if (remaining <= 0) { this.expire(execution); return; }
+      execution.deadlineTimer = setTimeout(tick, Math.min(2147483647, Math.max(1, Math.ceil(remaining))));
+      execution.deadlineTimer.unref?.();
+    };
+    tick();
+  }
+  private clearDeadline(execution: Execution) {
+    if (execution.deadlineTimer !== null) clearTimeout(execution.deadlineTimer);
+    execution.deadlineTimer = null;
+  }
+  private expire(execution: Execution) {
+    if (!execution.cause) execution.cause = 'deadline';
+    execution.abort.abort();
+    this.checkpoint(execution, safeError('run_timeout'));
+  }
+  private checkActive(execution: Execution) {
+    if (this.execution !== execution || execution.stopped || execution.nativeTerminal) throw safeError('state_conflict');
+    if (execution.deadlineAt !== null && performance.now() >= execution.deadlineAt && !execution.cause) this.expire(execution);
+    if (execution.primaryError) throw execution.primaryError;
+    if (execution.abort.signal.aborted) throw safeError(execution.cause === 'deadline' ? 'run_timeout' : 'tool_cancelled');
+    if (execution.pendingSave || this.agent?.toolPersistencePending?.(execution.handle.runId)) throw safeError('storage_write_failed');
   }
   private checkpoint(execution: Execution, error: AppError) {
     execution.primaryError ??= error; execution.failureAt ??= now();
@@ -193,15 +223,19 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       noticeSequence: ++execution.sequence, ...snapshot } : { type: "provider.preview", runId: execution.handle.runId, ...snapshot });
   }
   private async runAgent(execution: Execution, input: StartRunInput<Resolved>) {
-    const timer = this.deadline(execution, input.timeoutMs), deadlineAt = performance.now() + input.timeoutMs; let entered = false;
+    this.deadline(execution, input.timeoutMs);
+    const deadlineAt = execution.deadlineAt!;
+    let entered = false;
     try {
       const observed = await this.credentials({ purpose: "runtime", operationRef: execution.operationRef, credentialRef: input.model.credentialRef }, () => { entered = true; return this.agent!.execute({
         runId: execution.handle.runId, sessionId: input.sessionId, text: input.text, resolved: input.resolved, agentOptions: input.agentOptions,
-        scope: input.scope, referenceDate: input.referenceDate, timezone: input.timezone, signal: execution.abort.signal, deadlineAt }, {
+        scope: input.scope, referenceDate: input.referenceDate, timezone: input.timezone, signal: execution.abort.signal, deadlineAt,
+        agentPolicy: input.agentPolicy, measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot }, {
         startCall: time => this.startCall(execution.handle.runId, "main", time), preview: text => this.preview(execution, text),
         fatal: error => { this.checkpoint(execution, error); execution.abort.abort(); },
         nativeTerminal: outcome => { execution.nativeTerminal = true; if (outcome.error && !execution.cause) this.checkpoint(execution, outcome.error); },
       }); });
+      if (observed.budgetSummary) execution.budgetSummary = structuredClone(observed.budgetSummary);
       execution.stopped = observed.nativeIdle;
       execution.executionStarted = observed.calls.length === 0 ? false : observed.calls.some(call => call.sdkStopReason !== null) ? true : null;
       const outcome = observed.lastOutcome, endedAt = now();
@@ -216,11 +250,12 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
           endedAt: execution.failureAt ?? now(), cancelRequestedAt: execution.cancelAt, calls: [], cleanup: this.cleanup(execution, true),
           error: execution.cause === "user" ? null : this.terminalError(execution, null) ?? safeError("credential_read_failed") };
       }
-    } finally { clearTimeout(timer); }
+    } finally { if (execution.stopped) this.clearDeadline(execution); }
     if (execution.fact) this.saveFinal(execution);
   }
   private async runProvider(execution: Execution, resolved: Resolved, text: string, kind: "main" | "diagnostic") {
-    const timer = this.deadline(execution, resolved.policy.timeoutMs); let recorder: ModelCallRecorderPort | null = null;
+    this.deadline(execution, resolved.policy.timeoutMs);
+    let recorder: ModelCallRecorderPort | null = null;
     try {
       recorder = this.startCall(execution.handle.runId, kind, now());
       const outcome = await this.credentials({ purpose: "runtime", operationRef: execution.operationRef, credentialRef: resolved.selection.credentialRef },
@@ -238,7 +273,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         callState: execution.abort.signal.aborted ? "cancelled" : "failed", usage: { inputTokens: null, outputTokens: null, cost: null, costCurrency: null, source: null, unavailableReason: "request_failed_before_usage" }, error };
       execution.fact = { status: execution.primaryError ? "failed" : execution.cause === "user" ? "cancelled" : "failed", outputText: null, stoppedAt: recorder ? endedAt : null, endedAt: execution.failureAt ?? endedAt,
         cancelRequestedAt: execution.cancelAt, error, ...(recorder ? { call: recorder.finish(failure, endedAt) } : {}), cleanup: this.cleanup(execution, true) };
-    } finally { clearTimeout(timer); }
+    } finally { if (execution.stopped) this.clearDeadline(execution); }
     this.saveFinal(execution);
   }
   private emit(notice: RuntimeNotice) { try { this.notice(notice); } catch { this.report(safeError("preview_delivery_failed")); } }
@@ -261,6 +296,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     }
     if (saved) {
       this.agent?.releaseToolFacts?.(execution.handle.runId);
+      this.clearDeadline(execution);
       execution.pendingSave = false; if (this.execution === execution) this.execution = null;
       this.emit(execution.handle.kind === "agent" ? { type: "agent.settled", sessionId: execution.handle.sessionId!, runId: execution.handle.runId,
         noticeSequence: ++execution.sequence, status: fact.status } : { type: "provider.settled", runId: execution.handle.runId });
@@ -318,7 +354,8 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         this.recoveries.set(run.id, { run, at, verified: facts.stopConfirmed === true,
           cleanup: { contract: "medclaw.run-cleanup/v1", executionStarted: run.cleanup?.executionStarted ?? null, stopConfirmed: facts.stopConfirmed,
             requiredPersistenceComplete: facts.requiredPersistenceComplete, inputsSettled: true, resourcesReleased: facts.stopConfirmed,
-            unconfirmedItems: facts.unconfirmedItems, secondaryErrors: run.cleanup?.secondaryErrors ?? [], verifiedAt: facts.stopConfirmed === true ? at : run.cleanup?.verifiedAt ?? null } });
+            unconfirmedItems: facts.unconfirmedItems, secondaryErrors: run.cleanup?.secondaryErrors ?? [], verifiedAt: facts.stopConfirmed === true ? at : run.cleanup?.verifiedAt ?? null,
+            ...(run.cleanup?.budgetSummary !== undefined ? { budgetSummary: run.cleanup.budgetSummary } : {}) } });
       }
       if (previousProcessExited) for (const recovery of [...this.recoveries.values()]) this.saveRecovery(recovery);
       this.recoveryError = null;

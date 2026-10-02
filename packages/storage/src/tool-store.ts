@@ -5,14 +5,20 @@ import { isDeepStrictEqual } from "node:util";
 import { AppErrorSchema, PositiveIdSchema, safeError, type AppError } from "../../contracts/src/error";
 import { ChangesQuerySchema, CurrentQuerySchema, QueryParamsSchema, EvidenceSchema, QueryRecordSchema, type Evidence, type QueryRecord, type QueryStore, type QueryContext } from "../../contracts/src/query";
 import { canonicalRequest, RunScopeSchema } from "../../contracts/src/run";
+import { createToolControlObservation, MeasurementContextSchema, ToolControlObservationSchema, type ToolControlObservation } from '../../contracts/src/model';
 import { ToolCallRecordSchema, ToolContextIdentitySchema, ToolExecutionModeSchema, ToolSdkDeliverySchema, type ToolCallIdentity, type ToolCallRecord,
-  type ToolCallStore, type ToolExecutionContext, type ToolResult, type ToolSdkDelivery } from "../../contracts/src/tool";
+  ToolObservationSchema, type ToolObservation, type ToolCallStore, type ToolExecutionContext, type ToolResult, type ToolSdkDelivery } from "../../contracts/src/tool";
 
 const knownErrors = new Set(["invalid_argument", "access_denied", "state_conflict", "operation_not_found", "runtime_interrupted", "storage_read_failed", "storage_write_failed"]);
 function fail(code: string): never { throw new Error(code); }
 function protect<T>(action: () => T, fallback: string): T {
   try { return action(); }
-  catch (error) { if (error instanceof Error && knownErrors.has(error.message)) throw error; return fail(fallback); }
+  catch (error) {
+    const safe = AppErrorSchema.safeParse(error);
+    if (safe.success && safeError(safe.data.code).code === safe.data.code) throw safeError(safe.data.code, undefined, safe.data);
+    if (error instanceof Error && (knownErrors.has(error.message) || ['tool_timeout', 'run_timeout', 'tool_cancelled'].includes(error.message))) throw error;
+    return fail(fallback);
+  }
 }
 function json(value: unknown): string {
   return protect(() => {
@@ -23,8 +29,28 @@ function json(value: unknown): string {
 }
 function decode(text: string): unknown { return protect(() => JSON.parse(text), "storage_read_failed"); }
 function id(value: number) { if (!PositiveIdSchema.safeParse(value).success) fail("invalid_argument"); }
-function cancelled(context: QueryContext) { if (context.signal.aborted) fail("runtime_interrupted"); }
+function cancelled(context: QueryContext) {
+  if ('checkActive' in context && typeof context.checkActive === 'function') context.checkActive();
+  if (context.signal.aborted) fail("runtime_interrupted");
+}
 const terminal = (status: ToolCallRecord["status"]) => status === "succeeded" || status === "failed" || status === "cancelled";
+
+function mergeFacts(previous: unknown, incoming: unknown, field = ''): unknown {
+  if (isDeepStrictEqual(previous, incoming) || incoming === undefined || incoming === null
+    || ['unknown', 'not_reached', 'missing'].includes(String(incoming))) return previous;
+  if (previous === undefined || previous === null || ['unknown', 'not_reached', 'missing'].includes(String(previous))) return incoming;
+  if (field === 'validationIssues' && Array.isArray(previous) && Array.isArray(incoming)) {
+    return [...previous, ...incoming.filter(issue => !previous.some(prior => isDeepStrictEqual(prior, issue)))];
+  }
+  if (field === 'recoveryAction' && incoming === 'recovered') return incoming;
+  if (field === 'observedElapsedMs' && typeof previous === 'number' && typeof incoming === 'number' && incoming >= previous) return incoming;
+  if (previous && incoming && typeof previous === 'object' && typeof incoming === 'object' && !Array.isArray(previous) && !Array.isArray(incoming)) {
+    const result = { ...previous } as Record<string, unknown>;
+    for (const [key, value] of Object.entries(incoming)) result[key] = mergeFacts(result[key], value, key);
+    return result;
+  }
+  return fail('state_conflict');
+}
 
 /** Explicit isolated-DB entry point. Do not append these tables to a daily P2 database:
  * openDatabase validates its exact table set until a P3 migration is registered. */
@@ -36,10 +62,11 @@ export function initializeToolStorage(db: Database): void {
 }
 
 type CallRow = { id: number; run_id: number; session_id: number; native_tool_call_id: string; tool_name: string; tool_version: string; model_call_id?: number | null; stopped_at?: string | null;
+  requested_at: string; started_at: string | null;
   effect: string; execution_mode: string; args_json: string; status: ToolCallRecord["status"]; result_json: string | null;
   error_json: string | null; delivery_json: string | null };
 type QueryRow = { id: number; session_id: number; run_id: number; call_ref: string; kind: QueryRecord["kind"];
-  params_json: string; batch_ids_json: string; result_json: string; result_hash: string; created_at: string;
+  params_json: string; params_hash: string; batch_ids_json: string; result_json: string; result_hash: string; created_at: string;
   source?: QueryRecord['source']; catalog_revision?: number; material_version?: string; based_on_query_id?: number | null };
 type EvidenceRow = { id: number; query_id: number; batch_ids_json: string; snapshot_ids_json: string; event_ids_json: string;
   source_row_refs_json: string; calculation_version: string; material_version: string; source_bundle_id: string; source_lock_hash: string; result_hash: string;
@@ -73,7 +100,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   private call(row: CallRow): ToolCallRecord {
     const delivery = row.delivery_json === null ? null : decode(row.delivery_json);
     if (delivery !== null && (typeof delivery !== "object" || !Object.hasOwn(delivery, "sdkReturned") || !Object.hasOwn(delivery, "nativeEntryId"))) fail("storage_read_failed");
-    const receipt = delivery as { sdkReturned: boolean; nativeEntryId: string; message?: ToolSdkDelivery; nextModelCallId?: string | null; consumedAt?: string | null } | null;
+    const receipt = delivery as { sdkReturned: boolean; nativeEntryId: string | null; message?: ToolSdkDelivery; nextModelCallId?: string | null; consumedAt?: string | null; control?: ToolControlObservation } | null;
     const model = row.model_call_id ? this.db.query<{ call_id: string }, [number]>("SELECT call_id FROM model_calls WHERE id=?").get(row.model_call_id) : null;
     const parsed = ToolCallRecordSchema.safeParse({ id: row.id, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id,
       name: row.tool_name, version: row.tool_version, executionMode: row.execution_mode, input: decode(row.args_json), status: row.status,
@@ -81,7 +108,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       sdkReturned: receipt?.sdkReturned ?? false, nativeEntryId: receipt?.nativeEntryId ?? null,
       ...(receipt?.message ? { sdkDelivery: receipt.message } : {}), ...(model ? { modelCallId: model.call_id } : {}),
       ...(row.stopped_at ? { stoppedAt: row.stopped_at } : {}), ...(receipt?.nextModelCallId ? { nextModelCallId: receipt.nextModelCallId } : {}),
-      ...(receipt?.consumedAt ? { consumedAt: receipt.consumedAt } : {}) });
+      ...(receipt?.consumedAt ? { consumedAt: receipt.consumedAt } : {}), ...(receipt?.control ? { control: receipt.control } : {}) });
     return parsed.success ? parsed.data : fail("storage_read_failed");
   }
   private callRow(context: ToolExecutionContext): CallRow | null {
@@ -121,7 +148,41 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
           tool.version, tool.effect, tool.executionMode, json(input), json(problem), requestedAt, new Date().toISOString(), ...(this.p3 ? [context.runId] : []));
     }).immediate(), 'storage_write_failed');
   }
-  transition(callId: number, from: ToolCallRecord["status"], to: ToolCallRecord["status"], result?: ToolResult<unknown>): ToolCallRecord {
+  private delivery(row: CallRow): Record<string, unknown> {
+    if (row.delivery_json !== null) {
+      const value = decode(row.delivery_json);
+      if (!value || typeof value !== 'object' || Array.isArray(value)) fail('storage_read_failed');
+      return value as Record<string, unknown>;
+    }
+    return {
+      contract: 'medclaw.tool-delivery/v1',
+      resultRecorded: terminal(row.status),
+      sdkReturned: false,
+      nativeEntryId: null,
+      deliveredAt: null,
+      nextModelCallId: null,
+      consumedAt: null,
+      error: null,
+    };
+  }
+  private withControl(row: CallRow, patch: Partial<ToolControlObservation>): Record<string, unknown> {
+    if (!ToolControlObservationSchema.partial().safeParse(patch).success) fail('invalid_argument');
+    const delivery = this.delivery(row);
+    const old = delivery.control === undefined ? createToolControlObservation() : ToolControlObservationSchema.parse(delivery.control);
+    const control = ToolControlObservationSchema.parse(mergeFacts(old, patch));
+    return { ...delivery, control };
+  }
+  mergeControl(context: ToolExecutionContext, patch: Partial<ToolControlObservation>): ToolCallRecord {
+    return protect(() => this.db.transaction(() => {
+      this.identity(context, false);
+      const row = this.callRow(context);
+      if (!row) fail('operation_not_found');
+      const delivery = this.withControl(row, patch);
+      this.db.query('UPDATE tool_calls SET delivery_json=? WHERE id=?').run(json(delivery), row.id);
+      return this.call(this.callRow(context)!);
+    }).immediate(), 'storage_write_failed');
+  }
+  transition(callId: number, from: ToolCallRecord["status"], to: ToolCallRecord["status"], result?: ToolResult<unknown>, control?: ToolControlObservation): ToolCallRecord {
     return protect(() => this.db.transaction(() => {
       id(callId);
       const row = this.db.query<CallRow, [number]>("SELECT * FROM tool_calls WHERE id=?").get(callId);
@@ -143,6 +204,11 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       const updated = this.db.query(`UPDATE tool_calls SET status=?,result_json=?,error_json=?,started_at=CASE WHEN ?='running' THEN ? ELSE started_at END,
         ended_at=CASE WHEN ?='running' THEN NULL ELSE ? END WHERE id=? AND status=?`).run(to, data, error, to, now, to, now, callId, from);
       if (updated.changes !== 1) fail("state_conflict");
+      if (control !== undefined) {
+        const delivery = this.withControl(row, control);
+        delivery.resultRecorded = terminal(to);
+        this.db.query('UPDATE tool_calls SET delivery_json=? WHERE id=?').run(json(delivery), callId);
+      }
       if (this.p3 && from === "running" && terminal(to)) this.db.query("UPDATE tool_calls SET stopped_at=? WHERE id=?").run(now, callId);
       return this.call(this.db.query<CallRow, [number]>("SELECT * FROM tool_calls WHERE id=?").get(callId)!);
     }).immediate(), "storage_write_failed");
@@ -161,7 +227,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
         if (record.nativeEntryId !== nativeEntryId || message !== undefined && !isDeepStrictEqual(record.sdkDelivery, message)) fail("state_conflict");
         return;
       }
-      this.db.query("UPDATE tool_calls SET delivery_json=? WHERE id=?").run(json({ contract: "medclaw.tool-delivery/v1", resultRecorded: true, sdkReturned: true, nativeEntryId,
+      this.db.query("UPDATE tool_calls SET delivery_json=? WHERE id=?").run(json({ ...this.delivery(row), contract: "medclaw.tool-delivery/v1", resultRecorded: true, sdkReturned: true, nativeEntryId,
         deliveredAt: new Date().toISOString(), nextModelCallId: null, consumedAt: null, error: null,
         ...(message !== undefined ? { message } : {}) }), row.id);
     }).immediate(), "storage_write_failed");
@@ -174,6 +240,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       if (!row || row.delivery_json === null) fail("state_conflict");
       const receipt = decode(row.delivery_json);
       if (receipt === null || typeof receipt !== "object") fail("storage_read_failed");
+      if (!('sdkReturned' in receipt) || receipt.sdkReturned !== true) fail('state_conflict');
       const next = this.db.query<{ id: number }, [string, number, number]>("SELECT id FROM model_calls WHERE call_id=? AND run_id=? AND session_id=?").get(nextCallId, context.runId, context.sessionId);
       if (!next || row.model_call_id != null && next.id <= row.model_call_id) fail("state_conflict");
       const previous = this.call(row);
@@ -182,11 +249,72 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
     }).immediate(), "storage_write_failed");
   }
 
+  readToolObservations(input: { cutoffAt: string; maxToolCallId?: number | null; limit?: number }): { maxToolCallId: number | null; observations: ToolObservation[] } {
+    return protect(() => this.db.transaction(() => {
+      const cutoff = Date.parse(input.cutoffAt);
+      const limit = input.limit ?? 2000;
+      if (!Number.isFinite(cutoff) || new Date(cutoff).toISOString() !== input.cutoffAt || !Number.isSafeInteger(limit) || limit < 1 || limit > 2000) fail('invalid_argument');
+      if (input.maxToolCallId !== undefined && input.maxToolCallId !== null) id(input.maxToolCallId);
+      const maximum = this.db.query<{ maximum: number | null }, [string]>('SELECT MAX(id) AS maximum FROM tool_calls WHERE requested_at<=?').get(input.cutoffAt)!.maximum;
+      const maxToolCallId = input.maxToolCallId === undefined ? maximum : input.maxToolCallId;
+      if (maxToolCallId === null) return { maxToolCallId, observations: [] };
+      const since = new Date(cutoff - 30 * 86400000).toISOString();
+      const rows = this.db.query<CallRow & { config_json: string }, [number, string, string, number]>(
+        'SELECT t.*,r.config_json FROM tool_calls t JOIN runs r ON r.id=t.run_id WHERE t.id<=? AND t.requested_at>=? AND t.requested_at<=? ORDER BY t.id DESC LIMIT ?')
+        .all(maxToolCallId, since, input.cutoffAt, limit);
+      const observations = rows.map(row => {
+        const delivery = this.delivery(row);
+        const config = decode(row.config_json);
+        const fields = config && typeof config === 'object' ? config as Record<string, unknown> : {};
+        const measurement = MeasurementContextSchema.safeParse(fields.measurementContext);
+        const selection = fields.selection && typeof fields.selection === 'object' ? fields.selection as Record<string, unknown> : {};
+        const modelKey = ['provider', 'modelId', 'sdkVersion'].every(key => typeof selection[key] === 'string')
+          ? canonicalRequest([selection.provider, selection.modelId, selection.sdkVersion]) : null;
+        const parsed = ToolObservationSchema.safeParse({
+          id: row.id,
+          name: row.tool_name,
+          version: row.tool_version,
+          status: row.status,
+          requestedAt: row.requested_at,
+          startedAt: row.started_at,
+          stoppedAt: row.stopped_at ?? null,
+          control: delivery.control ?? null,
+          measurementContext: measurement.success ? measurement.data : null,
+          modelKey,
+          sdkReturned: delivery.sdkReturned === true,
+          consumedAt: delivery.consumedAt ?? null,
+        });
+        return parsed.success ? parsed.data : fail('storage_read_failed');
+      });
+      return { maxToolCallId, observations };
+    }).deferred(), 'storage_read_failed');
+  }
+
   private query(row: QueryRow): QueryRecord {
     const result = decode(row.result_json);
     if (typeof result !== "object" || result === null) fail("storage_read_failed");
+    const params = decode(row.params_json);
+    const batches = decode(row.batch_ids_json);
+    const schema = params && typeof params === 'object' && 'kind' in params ? QueryParamsSchema : row.kind === 'current' ? CurrentQuerySchema : ChangesQuerySchema;
+    const prepared = schema.safeParse(params);
+    if (!prepared.success || 'kind' in prepared.data && prepared.data.kind !== row.kind
+      || row.params_hash !== createHash('sha256').update(canonicalRequest(prepared.data)).digest('hex')) throw safeError('tool_output_inconsistent');
+    const headers: Record<string, unknown> = {
+      id: row.id,
+      sessionId: row.session_id,
+      runId: row.run_id,
+      callRef: row.call_ref,
+      kind: row.kind,
+      params: prepared.data,
+      batchIds: batches,
+      resultHash: row.result_hash,
+      createdAt: row.created_at,
+    };
+    for (const [key, value] of Object.entries(headers)) {
+      if (Object.hasOwn(result, key) && !isDeepStrictEqual((result as Record<string, unknown>)[key], value)) throw safeError('tool_output_inconsistent');
+    }
     const parsed = QueryRecordSchema.safeParse({ ...result, id: row.id, sessionId: row.session_id, runId: row.run_id, callRef: row.call_ref,
-      kind: row.kind, params: decode(row.params_json), batchIds: decode(row.batch_ids_json), resultHash: row.result_hash, createdAt: row.created_at });
+      kind: row.kind, params: prepared.data, batchIds: batches, resultHash: row.result_hash, createdAt: row.created_at });
     return parsed.success ? parsed.data : fail("storage_read_failed");
   }
   findQuery(callRef: string): QueryRecord | null {

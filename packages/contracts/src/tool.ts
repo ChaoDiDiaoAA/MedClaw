@@ -1,7 +1,7 @@
 import { z } from "zod";
-import { AppErrorSchema, PositiveIdSchema, type AppError } from "./error";
+import { AppErrorSchema, PositiveIdSchema, TimestampSchema, type AppError } from "./error";
 import { RunScopeSchema, type RunScope } from "./run";
-import { ReferenceDateSchema, TimezoneSchema } from "./model";
+import { MeasurementContextSchema, ReferenceDateSchema, TimezoneSchema, ToolControlObservationSchema, type ToolControlObservation } from "./model";
 
 export const ToolExecutionModeSchema = z.enum(["sequential", "parallel"]);
 export type ToolExecutionMode = z.infer<typeof ToolExecutionModeSchema>;
@@ -23,6 +23,7 @@ export type ToolCallIdentity = Pick<AnyToolDefinition, "name" | "version" | "eff
 export type ToolExecutionContext = {
   runId: number; sessionId: number; nativeToolCallId: string; scope: RunScope;
   referenceDate: string; timezone: string; signal: AbortSignal;
+  checkActive?: () => void;
 };
 export const ToolContextIdentitySchema = z.object({
   runId: PositiveIdSchema, sessionId: PositiveIdSchema, nativeToolCallId: z.string().min(1).max(256),
@@ -54,9 +55,11 @@ export const ToolCallRecordSchema = z.strictObject({
   stoppedAt: z.string().min(1).optional(),
   nextModelCallId: z.string().min(1).optional(),
   consumedAt: z.string().min(1).optional(),
+  control: ToolControlObservationSchema.nullable().optional(),
 });
 export type ToolCallRecord = z.infer<typeof ToolCallRecordSchema>;
 export const ToolCallViewSchema = ToolCallRecordSchema.omit({ input: true, data: true, sdkDelivery: true }).extend({
+  sdkResultIsError: z.boolean().nullable().optional(),
   inputPreview: z.string().max(8192),
   resultPreview: z.string().max(16384),
   truncated: z.boolean(),
@@ -69,11 +72,28 @@ export const RunToolsViewSchema = z.strictObject({
   page: z.number().int().positive(),
   pageSize: z.number().int().min(1).max(50),
 });
+export const ToolObservationSchema = z.strictObject({
+  id: PositiveIdSchema,
+  name: z.string().min(1).max(256),
+  version: z.string().min(1).max(128),
+  status: ToolCallRecordSchema.shape.status,
+  requestedAt: TimestampSchema,
+  startedAt: TimestampSchema.nullable(),
+  stoppedAt: TimestampSchema.nullable(),
+  control: ToolControlObservationSchema.nullable(),
+  measurementContext: MeasurementContextSchema.nullable(),
+  modelKey: z.string().min(1).max(512).nullable(),
+  sdkReturned: z.boolean(),
+  consumedAt: TimestampSchema.nullable(),
+});
+export type ToolObservation = z.infer<typeof ToolObservationSchema>;
 export interface ToolCallStore {
   assertContext(context: ToolExecutionContext): void;
   request(tool: ToolCallIdentity, input: unknown, context: ToolExecutionContext): ToolCallRecord;
   readCall(context: ToolExecutionContext): ToolCallRecord | null;
-  transition(id: number, from: ToolCallRecord["status"], to: ToolCallRecord["status"], result?: ToolResult<unknown>): ToolCallRecord;
+  transition(id: number, from: ToolCallRecord["status"], to: ToolCallRecord["status"], result?: ToolResult<unknown>, control?: ToolControlObservation): ToolCallRecord;
+  mergeControl?(context: ToolExecutionContext, patch: Partial<ToolControlObservation>): ToolCallRecord;
+  readToolObservations?(input: { cutoffAt: string; maxToolCallId?: number | null; limit?: number }): { maxToolCallId: number | null; observations: ToolObservation[] };
   recordDelivery(context: ToolExecutionContext, nativeEntryId: string, message?: ToolSdkDelivery): void;
   recordConsumption?(context: ToolExecutionContext, nextCallId: string): void;
   recordFailedRequest?(tool: ToolCallIdentity, input: unknown, context: ToolExecutionContext, error: AppError, requestedAt: string): void;

@@ -58,14 +58,14 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       case "host.restart": return host.restart((raw as { expectedInstanceId: string }).expectedInstanceId);
       case "settings.ui.read": { const s = settings.read(); return { configVersion: s.configVersion, ui: s.ui }; }
       case "settings.ui.update": { const p = raw as { expectedConfigVersion: string; patch: PublishedSettings["ui"] }; const s = await publish(p.expectedConfigVersion, { ui: p.patch }, "ui"); if (host.read().state === "ready") await synchronize(); options.notify({ type: "config.changed", configVersion: s.configVersion }); return { configVersion: s.configVersion, ui: s.ui }; }
-      case "model.config.read": { const s = settings.read(); return { configVersion: s.configVersion, previousConfigVersion: s.previous?.configVersion ?? null, rollbackFromVersion: s.rollbackFromVersion, policy: s.requestPolicy }; }
+      case "model.config.read": { const s = settings.read(); return { configVersion: s.configVersion, previousConfigVersion: s.previous?.configVersion ?? null, rollbackFromVersion: s.rollbackFromVersion, policy: s.requestPolicy, agentPolicy: s.agentPolicy }; }
       case "diagnostics.read": return options.diagnostics((raw as { categories: string[] }).categories);
       case "model.configure": {
         await synchronize(); const p = raw as { provider: string; modelId: string; expectedConfigVersion: string };
         const s = await publish(p.expectedConfigVersion, { model: { provider: p.provider, modelId: p.modelId }, credentialRefs: credentials.captureRefs() }, "model");
         const dir = await request("model.read", {}) as { selection: unknown }; return { configVersion: s.configVersion, selection: dir.selection };
       }
-      case "model.policy.update": { await synchronize(); const p = raw as { expectedConfigVersion: string; policy: PublishedSettings["requestPolicy"] }; const s = await publish(p.expectedConfigVersion, { requestPolicy: p.policy }, "policy"); return { configVersion: s.configVersion, policy: s.requestPolicy }; }
+      case "model.policy.update": { await synchronize(); const p = raw as { expectedConfigVersion: string; policy: PublishedSettings["requestPolicy"]; agentPolicy?: PublishedSettings['agentPolicy'] }; const s = await publish(p.expectedConfigVersion, { requestPolicy: p.policy, ...(p.agentPolicy ? { agentPolicy: p.agentPolicy } : {}) }, "policy"); return { configVersion: s.configVersion, policy: s.requestPolicy, agentPolicy: s.agentPolicy }; }
       case "model.config.rollback": {
         await synchronize(); const p = raw as { expectedConfigVersion: string; targetConfigVersion: string };
         if (!(await request("run.control.read", {}) as { acceptingNewRuns: boolean }).acceptingNewRuns) throw new Error("runtime_busy");

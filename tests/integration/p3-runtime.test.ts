@@ -59,17 +59,20 @@ test('production PiAgentRuntime executes business and native tools in one frozen
       expectedRevision: workspace.revision, expectedBatchIds: [], expectedQueryId: null,
       model: { provider: 'p3-runtime', modelId: 'fixture', expectedConfigVersion: '1' }, referenceDate: '2026-01-01', timezone: 'Asia/Shanghai' });
     const policy = { timeoutMs: 10000, maxRetries: 0 as const, maxRetryDelayMs: 2000 };
+    const agentPolicy = { version: 'medclaw.agent-policy/v1' as const, maxToolCalls: 24, maxModelCalls: 2, singleToolTimeoutMs: 30000, maxRecoveryAttempts: 2 };
     const resolved = await runtime.resolve(request.model, '1', null, policy), agentOptions = agent.describe(resolved);
     const accepted = repo.registerAgent({ sessionId: session.id, inputId: null, text: request.text, model: resolved.selection, policy, goal: 'answer',
-      workspace, scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: policy.timeoutMs, agentOptions,
+      workspace, scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: policy.timeoutMs, agentOptions, agentPolicy,
       submission: { operationRef: 'send', originalSubmitInput: request }, instanceId: 'instance', createdAt: new Date().toISOString() });
     const observed = await agent.execute({ runId: accepted.runId, sessionId: session.id, text: request.text, resolved, agentOptions,
-      scope, referenceDate: request.referenceDate, timezone: request.timezone, signal: new AbortController().signal, deadlineAt: performance.now() + 10000 }, {
+      scope, referenceDate: request.referenceDate, timezone: request.timezone, agentPolicy, signal: new AbortController().signal, deadlineAt: performance.now() + 10000 }, {
       startCall: time => new ModelCallRecorder(repo, accepted.runId, 'main', time), preview: () => {}, nativeTerminal: () => {},
     });
     expect(observed.lastOutcome).toMatchObject({ text: 'Scope and file verified.', error: null });
     expect(observed.calls).toHaveLength(2);
     expect(requests).toHaveLength(2);
+    expect(requests[1]!.tools).toEqual([]);
+    expect(observed.budgetSummary).toMatchObject({ toolCalls: 2, modelCalls: 2 });
     const providerMessages: unknown[] = Array.isArray(requests[0]!.messages) ? requests[0]!.messages : [];
     const systemPrompt = providerMessages.flatMap(message => message !== null && typeof message === 'object'
       && 'role' in message && message.role === 'system' && 'content' in message && typeof message.content === 'string' ? [message.content] : []).join('\n');

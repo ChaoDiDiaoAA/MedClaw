@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from 'zod';
 import { ChangesQuerySchema, CurrentQuerySchema, PageSchema, QueryInterpretationSchema, QueryPageSchema, QueryParamsSchema, type Batch, type CatalogSummary, type ChangesQueryInput, type CurrentQueryInput, type Evidence, type QueryContext, type QueryExecutionContext, type QueryParams, type QueryRecord, type QueryStore, type Snapshot } from "../../../contracts/src/query";
-import { PositiveIdSchema, safeError, type Result } from "../../../contracts/src/error";
+import { AppErrorSchema, PositiveIdSchema, safeError, type Result } from "../../../contracts/src/error";
 import { canonicalRequest } from "../../../contracts/src/run";
 import type { ToolExecutionContext } from "../../../contracts/src/tool";
 import { CatalogService, nextDate } from "./catalog-service";
@@ -15,7 +15,15 @@ const matches = (row: Snapshot, input: Filters) => (!input.deviceIds || input.de
 
 export class QueryService {
   constructor(private readonly catalog: CatalogService, private readonly store: QueryStore) {}
-  private transaction<T>(action: () => T): T { return this.store.withQueryTransaction ? this.store.withQueryTransaction(action) : action(); }
+  private transaction<T>(action: () => T, context: QueryContext): T {
+    const checked = () => {
+      this.catalog.checkActive(context);
+      const result = action();
+      this.catalog.checkActive(context);
+      return result;
+    };
+    return this.store.withQueryTransaction ? this.store.withQueryTransaction(checked) : checked();
+  }
   private assertFilters(input: Filters & { batchIds: number[] }, context: QueryContext) {
     this.catalog.assertContext(context); this.store.assertContext(context);
     const batches = this.catalog.batches(input.batchIds, context);
@@ -33,10 +41,10 @@ export class QueryService {
   current(input: CurrentQueryInput, context: ToolExecutionContext) {
     return this.transaction(() => {
     const params = CurrentQuerySchema.parse(input); this.assertFilters(params, context);
-    const previous = this.replay("current", params, context); if (previous) return this.project(previous, params);
+    const previous = this.replay("current", params, context); if (previous) return this.project(previous, params, context);
     const result = this.calculateCurrent(params, context);
-    return this.project(this.commit('current', params, result.batchIds, result.rows, result.snapshotIds, result.eventIds, result.warnings, context), params);
-    });
+    return this.project(this.commit('current', params, result.batchIds, result.rows, result.snapshotIds, result.eventIds, result.warnings, context), params, context);
+    }, context);
   }
   private calculateCurrent(params: CurrentQueryInput, context: QueryContext): Calculation {
     const batches = this.catalog.selectBatches(params.batchIds, params.time, params.snapshotMode, context, params.region);
@@ -55,10 +63,10 @@ export class QueryService {
   changes(input: ChangesQueryInput, context: ToolExecutionContext) {
     return this.transaction(() => {
     const params = ChangesQuerySchema.parse(input); this.assertFilters(params, context);
-    const previous = this.replay("changes", params, context); if (previous) return this.project(previous, params);
+    const previous = this.replay("changes", params, context); if (previous) return this.project(previous, params, context);
     const result = this.calculateChanges(params, context);
-    return this.project(this.commit('changes', params, result.batchIds, result.rows, result.snapshotIds, result.eventIds, result.warnings, context), params);
-    });
+    return this.project(this.commit('changes', params, result.batchIds, result.rows, result.snapshotIds, result.eventIds, result.warnings, context), params, context);
+    }, context);
   }
   private calculateChanges(params: ChangesQueryInput, context: QueryContext, requireCoverage = true): Calculation {
     const all = this.catalog.batches(params.batchIds, context).filter(batch => params.region === undefined || batch.region === params.region), batches = all.filter(batch => batch.snapshotDate >= params.time.start && batch.snapshotDate < params.time.endExclusive);
@@ -71,7 +79,15 @@ export class QueryService {
     const warnings = batches.filter(batch => batch.previousBatchId === null).map(batch => `baseline_no_predecessor:${batch.id}`);
     const events = this.catalog.changes(batches.map(batch => batch.id), context, params).filter(event => (!params.changeKind || event.kind === params.changeKind) && (!params.changeField || event.field === params.changeField));
     const matched = events.map(event => {
+      this.catalog.checkActive(context);
       const old = this.catalog.snapshotFor(event.oldBatchId, event.deviceId, context), next = this.catalog.snapshotFor(event.newBatchId, event.deviceId, context);
+      if (event.kind === 'added' ? old !== null || next === null : event.kind === 'missing' ? old === null || next !== null : old === null || next === null)
+        throw new Error('tool_output_inconsistent');
+      if (event.kind === 'field_changed') {
+        const field = event.field === 'price' ? 'priceCents' : event.field!;
+        if (old![field] !== event.oldValue || next![field] !== event.newValue || event.oldValue === event.newValue
+          || event.field === 'price' && (old!.currency !== next!.currency || old!.unit !== next!.unit)) throw new Error('tool_output_inconsistent');
+      }
       const snapshot = next ?? old!;
       const deltaCents = event.field === "price" && old?.priceCents !== null && old?.priceCents !== undefined && next?.priceCents !== null && next?.priceCents !== undefined ? next.priceCents - old.priceCents : null;
       const ratio = deltaCents === null || !old?.priceCents ? null : deltaCents / old.priceCents;
@@ -112,9 +128,10 @@ export class QueryService {
       else result = this.calculateSummary(params, context);
       const record = this.commit(params.kind, params, result.batchIds, result.rows, result.snapshotIds, result.eventIds, result.warnings, context);
       return { ok: true, data: record };
-      });
+      }, context);
     } catch (error) {
-      return { ok: false, error: safeError(error instanceof z.ZodError ? 'invalid_argument' : context.signal.aborted ? 'tool_cancelled' : error instanceof Error ? error.message : 'internal_error', undefined,
+      const trusted = AppErrorSchema.safeParse(error);
+      return { ok: false, error: safeError(trusted.success ? trusted.data.code : error instanceof z.ZodError ? 'invalid_argument' : context.signal.aborted ? 'tool_cancelled' : error instanceof Error ? error.message : 'internal_error', undefined,
         { runId: context.runId, sessionId: context.sessionId }) };
     }
   }
@@ -148,6 +165,7 @@ export class QueryService {
       if (!groups.size) groups.set('{}', {});
       const grid: QueryRecord['rows'] = [];
       for (let date = params.time!.start; date < params.time!.endExclusive; date = nextDate(date)) {
+        this.catalog.checkActive(context);
         const missing = [...new Set(all.map(batch => batch.scopeKey))].filter(scopeKey => !batches.some(batch => batch.scopeKey === scopeKey && batch.snapshotDate === date));
         for (const scopeKey of missing) warnings.push(`date_gap:${scopeKey}:${date}`);
         for (const [key, dimensionValues] of groups) {
@@ -183,6 +201,7 @@ export class QueryService {
     const price = params.metric === 'sum_price' || params.metric === 'mean_price';
     const groups = new Map<string, { dimensions: QueryRecord['rows'][number]; items: QueryRecord['rows'] }>();
     for (const row of source.rows) {
+      this.catalog.checkActive(context);
       const dimensions: QueryRecord['rows'][number] = {};
       if (params.kind === 'trend' || params.groupBy === 'date') dimensions.date = row.date!;
       if (params.groupBy && params.groupBy !== 'date') dimensions[params.groupBy] = row[params.groupBy] ?? null;
@@ -234,11 +253,13 @@ export class QueryService {
     });
   }
   private commit(kind: QueryRecord["kind"], params: CurrentQueryInput | ChangesQueryInput | QueryParams, batchIds: number[], rows: QueryRecord["rows"], snapshotIds: number[], eventIds: number[], warnings: string[], context: QueryContext) {
+    this.catalog.checkActive(context);
     // ponytail: freeze at most 100,000 rows in JSON; move result paging to indexed SQL if the dataset grows beyond this ceiling.
     if (rows.length > 100000) throw new Error("query_result_too_large");
     const scopeDeviceIds = params.deviceIds ?? context.scope.deviceIds;
     const batches = this.catalog.batches(batchIds, context), groups = new Map<string, typeof batches>();
     const interpretation = this.interpretation(kind, params, batches, rows, context);
+    this.assertRows({ kind, params, batchIds, scopeDeviceIds, snapshotIds, eventIds }, rows, batches);
     const resultHash = createHash("sha256").update(canonicalRequest({ kind, params, batchIds, scopeDeviceIds, rows, interpretation, calculationVersion })).digest("hex");
     const evidence: Omit<Evidence, "id" | "queryId">[] = [];
     for (const batch of batches) {
@@ -247,6 +268,8 @@ export class QueryService {
     }
     const sourceEvents = new Map(eventIds.length ? this.catalog.changes(batchIds, context).map(event => [event.id, event]) : []);
     const referencedSnapshots = this.catalog.snapshotReferences(snapshotIds, context);
+    if (new Set(snapshotIds).size !== snapshotIds.length || new Set(eventIds).size !== eventIds.length
+      || eventIds.some(id => !sourceEvents.has(id)) || referencedSnapshots.some(row => !batchIds.includes(row.batchId))) throw new Error('tool_output_inconsistent');
     for (const group of groups.values()) {
       const ids = group.map(batch => batch.id), groupSnapshots = referencedSnapshots.filter(row => ids.includes(row.batchId));
       const groupEvents = eventIds.filter(id => ids.includes(sourceEvents.get(id)?.newBatchId ?? -1));
@@ -255,7 +278,7 @@ export class QueryService {
         materialVersion: group[0]!.materialVersion, sourceBundleId: group[0]!.sourceBundleId, sourceLockHash: group[0]!.sourceLockHash, resultHash,
         filters: params, provenance: 'synthetic-derived' });
     }
-    context.signal.throwIfAborted();
+    this.catalog.checkActive(context);
     const materialVersions = [...new Set(batches.map(batch => batch.materialVersion))].sort();
     return this.store.commitQuery({ sessionId: context.sessionId, runId: context.runId, callRef: callRef(context),
       source: 'source' in context ? context.source : 'agent_tool', catalogRevision: this.catalog.revision(), materialVersion: materialVersions.join(','),
@@ -267,21 +290,82 @@ export class QueryService {
     const record = this.store.readQuery(PositiveIdSchema.parse(queryId));
     if (!record || record.sessionId !== context.sessionId) throw new Error("access_denied");
     const batches = this.catalog.batches(record.batchIds, context);
+    if (record.id !== queryId || 'kind' in record.params && record.params.kind !== record.kind
+      || record.kind === 'current' && record.batchIds.some(id => !record.params.batchIds.includes(id))
+      || record.scopeDeviceIds !== null && record.params.deviceIds != null && canonicalRequest(record.scopeDeviceIds) !== canonicalRequest(record.params.deviceIds)
+      || new Set(record.snapshotIds).size !== record.snapshotIds.length || new Set(record.eventIds).size !== record.eventIds.length
+      || record.kind === 'current' && (record.eventIds.length !== 0 || record.snapshotIds.length !== record.rows.length)
+      || record.kind === 'changes' && record.eventIds.length !== record.rows.length) throw new Error('tool_output_inconsistent');
     if (context.scope.deviceIds !== null && (record.scopeDeviceIds === null || record.scopeDeviceIds.some(id => !context.scope.deviceIds!.includes(id)))
       || record.params.deviceIds?.some(id => context.scope.deviceIds !== null && !context.scope.deviceIds.includes(id))
       || (record.kind === 'current' || record.kind === 'changes') && record.rows.some(row => typeof row.deviceId !== "number" || context.scope.deviceIds !== null && !context.scope.deviceIds.includes(row.deviceId))) throw new Error("access_denied");
+    if (record.interpretation) {
+      const saved = record.interpretation;
+      const expected = this.interpretation(record.kind, record.params, batches, record.rows,
+        saved.referenceDate === null ? undefined : { ...context, referenceDate: saved.referenceDate, timezone: saved.timezone ?? context.timezone });
+      if (canonicalRequest({ ...expected, timezone: saved.timezone }) !== canonicalRequest(saved)
+        || record.kind === 'current' && saved.requestedDate !== null && saved.dataDates.some(date => saved.snapshotMode === 'exact_date' ? date !== saved.requestedDate : date > saved.requestedDate!))
+        throw new Error('tool_output_inconsistent');
+    }
+    this.catalog.checkActive(context);
     // Legacy queries retain their saved hash and leave an omitted original cutoff unknown.
     return structuredClone({ ...record, interpretation: record.interpretation ?? this.interpretation(record.kind, record.params, batches, record.rows) });
   }
   page(input: { queryId: number; page: number; pageSize: number }, context: QueryContext) {
-    const record = this.read(input.queryId, context); return this.project(record, PageSchema.parse({ page: input.page, pageSize: input.pageSize }));
+    const record = this.read(input.queryId, context); return this.project(record, PageSchema.parse({ page: input.page, pageSize: input.pageSize }), context);
   }
   async readQueryResult(queryId: number, context: QueryContext): Promise<Result<QueryRecord>> {
     try { return { ok: true, data: this.read(queryId, context) }; }
-    catch (error) { return { ok: false, error: safeError(error instanceof Error ? error.message : 'storage_read_failed', undefined, { runId: context.runId, sessionId: context.sessionId }) }; }
+    catch (error) { const trusted = AppErrorSchema.safeParse(error); return { ok: false, error: safeError(trusted.success ? trusted.data.code : error instanceof Error ? error.message : 'storage_read_failed', undefined, { runId: context.runId, sessionId: context.sessionId }) }; }
   }
-  private project(record: QueryRecord, input: { page: number; pageSize: number }) {
-    return QueryPageSchema.parse({ queryId: record.id, rows: record.rows.slice((input.page - 1) * input.pageSize, input.page * input.pageSize), totalRows: record.rows.length,
-      page: input.page, pageSize: input.pageSize, warnings: record.warnings, calculationVersion: record.calculationVersion, evidenceIds: this.store.listEvidence(record.id).map(item => item.id), interpretation: record.interpretation });
+  private project(record: QueryRecord, input: { page: number; pageSize: number }, context: QueryContext) {
+    const rows = record.rows.slice((input.page - 1) * input.pageSize, input.page * input.pageSize);
+    const evidence = this.store.listEvidence(record.id);
+    if (evidence.some(item => item.queryId !== record.id || item.resultHash !== record.resultHash || item.calculationVersion !== record.calculationVersion)) throw new Error('tool_output_inconsistent');
+    const batches = this.catalog.batches(record.batchIds, context);
+    this.assertRows(record, rows, batches);
+    if (record.kind === 'current') {
+      const references = new Map(this.catalog.snapshotReferences(rows.map(row => row.snapshotId as number), context).map(row => [row.id, row]));
+      if (rows.some(row => references.get(row.snapshotId as number)?.batchId !== row.batchId || references.get(row.snapshotId as number)?.deviceId !== row.deviceId))
+        throw new Error('tool_output_inconsistent');
+    } else if (record.kind === 'changes') {
+      for (const row of rows) {
+        const old = this.catalog.snapshotFor(row.oldBatchId as number, row.deviceId as number, context);
+        const next = this.catalog.snapshotFor(row.newBatchId as number, row.deviceId as number, context);
+        if (batches.find(batch => batch.id === row.newBatchId)?.previousBatchId !== row.oldBatchId
+          || (row.kind === 'added' ? old !== null || next === null : row.kind === 'missing' ? old === null || next !== null : old === null || next === null)
+          || [old?.id, next?.id].some(id => id !== undefined && !record.snapshotIds.includes(id))) throw new Error('tool_output_inconsistent');
+      }
+    }
+    return QueryPageSchema.parse({ queryId: record.id, rows, totalRows: record.rows.length,
+      page: input.page, pageSize: input.pageSize, warnings: record.warnings, calculationVersion: record.calculationVersion, evidenceIds: evidence.map(item => item.id), interpretation: record.interpretation });
+  }
+  private assertRows(record: Pick<QueryRecord, 'kind' | 'params' | 'batchIds' | 'scopeDeviceIds' | 'snapshotIds' | 'eventIds'>, rows: QueryRecord['rows'], batches?: Batch[]): void {
+    if (record.kind !== 'current' && record.kind !== 'changes') return;
+    const identities = new Set<number>();
+    const allowedIds = new Set(record.kind === 'current' ? record.snapshotIds : record.eventIds);
+    const allowedBatches = new Set(record.batchIds), allowedDevices = record.scopeDeviceIds === null ? null : new Set(record.scopeDeviceIds);
+    const batchById = new Map(batches?.map(batch => [batch.id, batch]));
+    for (const row of rows) {
+      const id = record.kind === 'current' ? row.snapshotId : row.eventId;
+      const batchId = record.kind === 'current' ? row.batchId : row.newBatchId;
+      const batch = batchById.get(batchId as number);
+      if (typeof id !== 'number' || !allowedIds.has(id) || identities.has(id)
+        || typeof batchId !== 'number' || !allowedBatches.has(batchId) || typeof row.deviceId !== 'number'
+        || allowedDevices !== null && !allowedDevices.has(row.deviceId)
+        || batch && (row.date !== batch.snapshotDate || row.scopeKey !== batch.scopeKey || row.region !== batch.region)
+        || record.params.region != null && row.region !== record.params.region
+        || record.params.status != null && row.status !== record.params.status
+        || record.params.time && ((row.date as string) < record.params.time.start || (row.date as string) >= record.params.time.endExclusive)
+          && (record.kind !== 'current' || !('snapshotMode' in record.params) || record.params.snapshotMode !== 'as_of'))
+        throw new Error('tool_output_inconsistent');
+      if (record.kind === 'current') {
+        const date = record.params.time?.start;
+        if (date && 'snapshotMode' in record.params && record.params.snapshotMode === 'exact_date' && row.date !== date || row.currency !== 'CNY' || typeof row.unit !== 'string')
+          throw new Error('tool_output_inconsistent');
+      } else if (typeof row.oldBatchId !== 'number' || !allowedBatches.has(row.oldBatchId) || row.currency !== 'CNY' || typeof row.unit !== 'string')
+        throw new Error('tool_output_inconsistent');
+      identities.add(id);
+    }
   }
 }

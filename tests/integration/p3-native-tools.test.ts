@@ -8,6 +8,9 @@ import { safeError } from '../../packages/contracts/src/error';
 import { canonicalRequest } from '../../packages/contracts/src/run';
 import { ToolSdkDeliverySchema, type ToolCallIdentity, type ToolCallRecord, type ToolCallStore, type ToolExecutionContext, type ToolResult, type ToolSdkDelivery } from '../../packages/contracts/src/tool';
 import { ToolRecorder } from '../../packages/core/src/tools/recorder';
+import { DEFAULT_AGENT_POLICY } from '../../packages/contracts/src/model';
+import { RunControl } from '../../packages/core/src/runtime/run-control';
+import { performance } from 'node:perf_hooks';
 import { PiModelRuntime } from '../../packages/runtime-pi/src/model-runtime';
 
 const closers: (() => Promise<void>)[] = [];
@@ -52,7 +55,7 @@ class Calls implements ToolCallStore {
   }
 }
 
-async function setup(calls: Call[], options: ToolsOptions = {}, repeat = false) {
+async function setup(calls: Call[], options: ToolsOptions = {}, repeat = false, singleToolTimeoutMs?: number) {
   const adapter = await import('../../packages/runtime-pi/src/pi-tool-adapter');
   expect(adapter.createPiNativeTools).toBeFunction();
   const root = await mkdtemp(join(tmpdir(), 'medclaw-native-'));
@@ -86,16 +89,30 @@ async function setup(calls: Call[], options: ToolsOptions = {}, repeat = false) 
     scope: { batchIds: [], deviceIds: null, allowedToolNames: names, allowedResourceRefs: [], artifactIds: [], readOnly: false },
     referenceDate: '2026-10-02', timezone: 'Asia/Shanghai', signal: signal ? AbortSignal.any([signal, abort.signal]) : abort.signal });
   let workdir: string | undefined;
-  const native = adapter.createPiNativeTools(() => { if (!workdir) throw new Error('Run workdir is not bound yet'); return workdir; }, recorder, getContext, options);
+  const control = singleToolTimeoutMs === undefined ? undefined : new RunControl({ runId: 81, policy: { ...DEFAULT_AGENT_POLICY, singleToolTimeoutMs },
+    scope: getContext('native-1').scope, signal: abort.signal, deadlineAt: performance.now() + 10000, totalTimeoutMs: 10000 });
+  const native = adapter.createPiNativeTools(() => { if (!workdir) throw new Error('Run workdir is not bound yet'); return workdir; }, recorder, getContext, options, () => control);
   const { session } = await createAgentSession({ cwd: root, agentDir: join(root, 'pi'), modelRuntime: runtime.native, model: model.model,
     thinkingLevel: 'off', tools: names, customTools: native.definitions, settingsManager, resourceLoader, sessionManager: SessionManager.inMemory(root) });
   session.agent.toolExecution = 'sequential';
   workdir = root;
   abortSession = () => { void session.abort(); };
   const unsubscribe = native.bind(session);
-  closers.unshift(async () => { await session.abort(); await session.waitForIdle(); unsubscribe(); session.dispose(); });
-  return { root, session, store, requests, native, recorder, getContext, setWorkdir(value: string) { workdir = value; } };
+  const unsubscribeControl = control ? adapter.createPiRunControlBinding(session, { get: () => undefined }, recorder, getContext, () => control)() : () => {};
+  closers.unshift(async () => { await session.abort(); await session.waitForIdle(); unsubscribe(); unsubscribeControl(); control?.dispose(); session.dispose(); });
+  return { root, session, store, requests, native, recorder, getContext, control, abort, setWorkdir(value: string) { workdir = value; } };
 }
+
+test('controlled PowerShell timeout stops the actual SDK child before later effects and retains measured stop facts', async () => {
+  const c = await setup([{ name: 'powershell', args: { command: "Write-Output 'started'; Start-Sleep -Seconds 5; Set-Content -LiteralPath late.txt -Value 'must not run'", timeout: 10 } }], {}, false, 500);
+  await c.session.prompt('Execute the controlled shell tool.');
+  expect(c.abort.signal.aborted).toBe(false);
+  expect([...c.store.rows.values()][0]).toMatchObject({ status: 'failed', error: { code: 'tool_timeout' }, sdkReturned: true, sdkDelivery: { isError: true } });
+  expect(await Bun.file(join(c.root, 'late.txt')).exists()).toBe(false);
+  expect(c.control?.observation('native-1')).toMatchObject({ effectiveTimeoutMs: 500, latencyObservation: 'right_censored', executionElapsedMs: null });
+  expect(c.control?.observation('native-1').observedElapsedMs).toBeGreaterThanOrEqual(500);
+  expect(c.control?.observation('native-1').stopLagMs).not.toBeNull();
+}, 10000);
 
 test('Pi executes all eight native definitions with real files, shell commands, and SDK receipts', async () => {
   const previousOffline = process.env.PI_OFFLINE; process.env.PI_OFFLINE = '1';

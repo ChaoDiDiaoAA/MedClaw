@@ -10,7 +10,8 @@ import { canonicalRequest } from '../../packages/contracts/src/run';
 import { safeError } from '../../packages/contracts/src/error';
 
 const root = resolve(import.meta.dirname, '../..'), bun = process.env.MEDCLAW_BUN_EXECUTABLE ?? 'bun';
-let app: ElectronApplication, page: Page, temporary: string, server: Server;
+let app: ElectronApplication, page: Page, temporary: string, server: Server, nativeRunId: number;
+const providerUserTexts: string[] = [];
 let dateQueryGate: { entered: Promise<void>; reply: Promise<void>; markEntered: () => void; release: () => void } | null = null;
 test.describe.configure({ mode: 'serial' });
 function snapshotPackage(directory: string) {
@@ -43,6 +44,7 @@ test.beforeAll(async () => {
   server = createServer(async (request, response) => {
     let body = ''; for await (const chunk of request) body += chunk;
     const payload = JSON.parse(body), text = JSON.stringify(payload.messages.filter((message: { role: string }) => message.role === 'user').at(-1)?.content ?? ''), count = counts.get(text) ?? 0;
+    providerUserTexts.push(text);
     if (dateQueryGate && text.includes('Hold date query scope')) { dateQueryGate.markEntered(); await dateQueryGate.reply; }
     counts.set(text, count + 1); response.writeHead(200, { 'content-type': 'text/event-stream' });
     const tool = count === 0 && text.includes('Query fixture data') ? { id: 'ui-query-call', name: 'query_current_devices', arguments: { batchIds: [1, 2], snapshotMode: 'exact_date' } }
@@ -63,9 +65,20 @@ test.beforeAll(async () => {
   writeFileSync(delayedImport, `
     const { ipcMain } = require('electron');
     const handle = ipcMain.handle.bind(ipcMain);
-    const state = globalThis.__p3DelayedImport = { enabled: false, pending: null, operationRef: null, commits: 0, reads: 0, catalogDelayMs: 0, catalogDefaultsUnknown: false };
+    const state = globalThis.__p3DelayedImport = { enabled: false, pending: null, operationRef: null, commits: 0, reads: 0, catalogDelayMs: 0, catalogDefaultsUnknown: false, toolProjection: null, toolRunId: null };
     ipcMain.handle = (channel, listener) => handle(channel, async (event, envelope) => {
       if (channel !== 'medclaw:request') return listener(event, envelope);
+      // UI fixtures change public projections only; original execution and saved facts remain intact.
+      if (state.toolProjection && envelope.payload.runId === state.toolRunId && ['tool.read', 'run.read'].includes(envelope.method)) {
+        const result = await listener(event, envelope);
+        if (!result.ok) return result;
+        if (envelope.method === 'run.read') return state.toolProjection === 'legacy' && result.data.kind === 'one'
+          ? { ...result, data: { ...result.data, run: { ...result.data.run, control: null, cleanup: { ...result.data.run.cleanup, budgetSummary: null } } } }
+          : result;
+        return { ...result, data: { ...result.data, items: result.data.items.map(call => state.toolProjection === 'postflight-failure'
+          ? { ...call, sdkResultIsError: true, control: { ...call.control, postflightStatus: 'failed', hookFailure: { stage: 'afterToolCall', code: 'tool_postprocess_failed' } } }
+          : { ...call, sdkReturned: false, sdkResultIsError: null, nativeEntryId: null, ...(state.toolProjection === 'legacy' ? { control: null } : {}) }) } };
+      }
       if (envelope.method === 'data.read') {
         const result = await listener(event, envelope);
         if (state.catalogDelayMs) await new Promise(resolve => setTimeout(resolve, state.catalogDelayMs));
@@ -105,6 +118,34 @@ test.afterAll(async () => {
   dateQueryGate?.release();
   await app?.close(); if (server) await new Promise<void>(resolve => server.close(() => resolve()));
   if (temporary) { const path = resolve(temporary), inside = relative(resolve(tmpdir()), path); if (inside && !inside.startsWith('..') && !inside.includes(':')) rmSync(path, { recursive: true, force: true }); }
+});
+
+test('P3 Settings publishes configurable Agent budgets with the existing policy version', async () => {
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.getByLabel('Tool call budget', { exact: true })).toHaveValue('24');
+  await expect(page.getByLabel('Model call budget', { exact: true })).toHaveValue('12');
+  await page.getByLabel('Run timeout (milliseconds)', { exact: true }).fill('600000');
+  await page.getByLabel('Tool call budget', { exact: true }).fill('80');
+  await page.getByLabel('Model call budget', { exact: true }).fill('40');
+  await page.getByLabel('Tool timeout (milliseconds)', { exact: true }).fill('100000');
+  await page.getByLabel('Recovery round budget', { exact: true }).fill('0');
+  await page.getByRole('button', { name: 'Publish request policy', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Request policy published; applies to the next run' })).toBeVisible();
+  const changed = await page.evaluate(() => window.medclaw.request('model.config.read', {}));
+  if (!changed.ok) throw new Error(changed.error.code);
+  expect(changed.data.policy.timeoutMs).toBe(600000);
+  expect(changed.data.agentPolicy).toMatchObject({ maxToolCalls: 80, maxModelCalls: 40, singleToolTimeoutMs: 100000, maxRecoveryAttempts: 0 });
+  await page.reload();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.getByLabel('Tool call budget', { exact: true })).toHaveValue('80');
+  await page.getByLabel('Run timeout (milliseconds)', { exact: true }).fill('120000');
+  await page.getByLabel('Tool call budget', { exact: true }).fill('24');
+  await page.getByLabel('Model call budget', { exact: true }).fill('12');
+  await page.getByLabel('Tool timeout (milliseconds)', { exact: true }).fill('30000');
+  await page.getByLabel('Recovery round budget', { exact: true }).fill('2');
+  await page.getByRole('button', { name: 'Publish request policy', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Request policy published; applies to the next run' })).toBeVisible();
+  await page.getByRole('button', { name: 'Chat', exact: true }).click();
 });
 test('P3 imports the authorized directory, applies batches and preserves the chat draft', async () => {
   await page.getByRole('button', { name: 'New Session', exact: true }).click(); await expect(page.getByTestId('current-session')).toContainText('New Session 1');
@@ -150,6 +191,8 @@ test('P3 actual business tool creates a saved query with inspectable source evid
   if (!savedRun.ok || savedRun.data.kind !== 'recent' || !savedRun.data.runs[0]) throw new Error('Missing saved date-override run');
   expect(savedRun.data.runs[0].referenceDate).toBe('2026-01-01');
   expect(savedRun.data.runs[0].timezone).toBe('Asia/Shanghai');
+  const queryTools = await page.evaluate(runId => window.medclaw.request('tool.read', { runId }), savedRun.data.runs[0].id);
+  if (!queryTools.ok || !queryTools.data.items.some(call => call.name === 'query_current_devices' && call.status === 'succeeded')) throw new Error(`Missing executed fixture query: ${JSON.stringify({ calls: queryTools.ok ? queryTools.data.items.map(call => ({ name: call.name, status: call.status, error: call.error?.code })) : queryTools.error.code, fixtureUser: providerUserTexts.at(-1)?.slice(0, 180) })}`);
   await page.getByLabel('Reference date', { exact: true }).fill('2026-01-02');
   const frozenRun = await page.evaluate(runId => window.medclaw.request('run.read', { runId }), savedRun.data.runs[0].id);
   if (!frozenRun.ok || frozenRun.data.kind !== 'one' || !frozenRun.data.run) throw new Error('Missing original frozen run');
@@ -199,6 +242,7 @@ test('P3 actual native write has separate execution, SDK delivery and model-cons
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
   const run = await page.evaluate(() => window.medclaw.request('run.read', { recent: true, sessionId: 1, limit: 1 }));
   if (!run.ok || run.data.kind !== 'recent' || !run.data.runs[0]) throw new Error('Missing saved run');
+  nativeRunId = run.data.runs[0].id;
   expect(readFileSync(join(temporary, 'data/runtime', String(run.data.runs[0].id), 'work/scratch/ui-result.txt'), 'utf8')).toBe('Actual Pi write from the UI fixture');
   await page.getByRole('button', { name: 'View run details', exact: true }).click(); await page.getByRole('tab', { name: 'Run details', exact: true }).click();
   await expect(page.getByRole('tab', { name: 'Run details', exact: true })).toHaveAttribute('aria-selected', 'true');
@@ -206,6 +250,14 @@ test('P3 actual native write has separate execution, SDK delivery and model-cons
   await expect(page.getByTestId('tool-call-details')).toContainText('write');
   await expect(page.getByTestId('tool-call-details')).toContainText('SDK result saved');
   await expect(page.getByTestId('tool-call-details')).toContainText('Included in model call');
+  await expect(page.getByTestId('run-agent-policy')).toContainText('24');
+  await expect(page.getByTestId('run-agent-policy')).toContainText('12');
+  await expect(page.getByTestId('run-tool-profile')).toContainText('Insufficient samples');
+  await expect(page.getByTestId('run-budget-summary')).toContainText('1 tool attempts');
+  await expect(page.getByTestId('tool-call-details')).toContainText('Original execution');
+  await expect(page.getByTestId('tool-call-details')).toContainText('After-tool hook');
+  await expect(page.getByTestId('tool-call-details')).toContainText('passed');
+  await expect(page.getByTestId('tool-call-details')).toContainText('Latency observation');
   await page.getByTestId('tool-call-details').scrollIntoViewIfNeeded(); await page.screenshot({ path: test.info().outputPath('p3-tool-details.png') });
 });
 
@@ -271,4 +323,83 @@ test('P3 query dates and quantities remain explicit across stale snapshots, resu
     await expect(page.getByLabel('Start date', { exact: true })).toBeVisible();
     await expect(page.getByLabel('End date (exclusive)', { exact: true })).toBeVisible();
   } finally { dateQueryGate.release(); dateQueryGate = null; }
+});
+
+test('P3 active and saved Runs retain frozen budgets while Settings changes apply to the next Run', async () => {
+  test.setTimeout(60000);
+  let markEntered!: () => void, release!: () => void;
+  dateQueryGate = { entered: new Promise<void>(resolve => { markEntered = resolve; }), reply: new Promise<void>(resolve => { release = resolve; }), markEntered: () => markEntered(), release: () => release() };
+  try {
+    await page.getByRole('button', { name: 'Chat', exact: true }).click();
+    await page.getByLabel('Message text', { exact: true }).fill('Hold date query scope for budget publication');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await dateQueryGate.entered;
+    const active = await page.evaluate(() => window.medclaw.request('run.active', {}));
+    if (!active.ok || !active.data) throw new Error('Missing active fixture Run');
+    const runId = active.data.runId;
+    await page.getByRole('button', { name: 'View run details', exact: true }).click();
+    await page.getByRole('tab', { name: 'Run details', exact: true }).click();
+    await expect(page.getByTestId('run-agent-policy')).toContainText('24');
+    await expect(page.getByTestId('run-budget-summary')).toContainText('1 used');
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByLabel('Tool call budget', { exact: true }).fill('80');
+    await page.getByRole('button', { name: 'Publish request policy', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Request policy published; applies to the next run' })).toBeVisible();
+    await expect(page.getByTestId('run-agent-policy')).toContainText('24');
+    const frozen = await page.evaluate(id => window.medclaw.request('run.read', { runId: id }), runId);
+    if (!frozen.ok || frozen.data.kind !== 'one' || frozen.data.run?.kind !== 'agent') throw new Error('Missing active frozen Run');
+    expect(frozen.data.run.control?.agentPolicy?.maxToolCalls).toBe(24);
+    dateQueryGate.release();
+    await expect.poll(async () => {
+      const result = await page.evaluate(() => window.medclaw.request('run.control.read', {}));
+      return result.ok && result.data.acceptingNewRuns;
+    }).toBe(true);
+    await page.getByRole('button', { name: 'Chat', exact: true }).click();
+    await page.getByLabel('Message text', { exact: true }).fill('New Run after budget publication');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect(page.getByTestId('run-output')).toHaveText('P3 saved reply');
+    await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+    await expect(page.getByTestId('run-agent-policy')).toContainText('80');
+    const original = await page.evaluate(id => window.medclaw.request('run.read', { runId: id }), runId);
+    if (!original.ok || original.data.kind !== 'one' || original.data.run?.kind !== 'agent') throw new Error('Missing saved frozen Run');
+    expect(original.data.run.control?.agentPolicy?.maxToolCalls).toBe(24);
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByLabel('Tool call budget', { exact: true }).fill('24');
+    await page.getByRole('button', { name: 'Publish request policy', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Request policy published; applies to the next run' })).toBeVisible();
+  } finally { dateQueryGate.release(); dateQueryGate = null; }
+});
+
+test('P3 Run Details distinguishes after-tool failures, unconfirmed consumption and legacy projections', async () => {
+  const modelRequests = providerUserTexts.length;
+  const project = (mode: string | null) => app.evaluate((_, { mode, runId }) => {
+    const state = (globalThis as typeof globalThis & { __p3DelayedImport: { toolProjection: string | null; toolRunId: number } }).__p3DelayedImport;
+    state.toolProjection = mode;
+    state.toolRunId = runId;
+  }, { mode, runId: nativeRunId });
+  const details = page.getByTestId('tool-call-details');
+  try {
+    await project('postflight-failure');
+    if (!await page.getByRole('button', { name: 'Close run details', exact: true }).isVisible()) await page.getByRole('button', { name: 'View run details', exact: true }).click();
+    await page.getByRole('tab', { name: 'Run details', exact: true }).click();
+    await page.getByRole('button', { name: 'Refresh recent runs', exact: true }).click();
+    await page.getByRole('button', { name: `View Run ${nativeRunId}`, exact: true }).click();
+    await expect(details.locator('dt:has-text("Original execution") + dd')).toHaveText('succeeded');
+    await expect(details.locator('dt:has-text("After-tool hook") + dd')).toHaveText('failed');
+    await expect(details.locator('dt:has-text("SDK result status") + dd')).toHaveText('Error result delivered');
+    await expect(details.locator('dt:has-text("Model consumption") + dd')).toContainText('Included in model call');
+    await project('undelivered');
+    await page.getByRole('button', { name: 'Refresh tools', exact: true }).click();
+    await expect(details.locator('dt:has-text("SDK result status") + dd')).toHaveText('Not delivered');
+    await expect(details.locator('dt:has-text("Model consumption") + dd')).toHaveText('No later model call confirmed');
+    await expect(details.locator('dt:has-text("Consumption observed") + dd')).toHaveText('Not recorded');
+    await project('legacy');
+    await page.getByRole('button', { name: 'Read this run again', exact: true }).click();
+    await page.getByRole('button', { name: 'Refresh tools', exact: true }).click();
+    await expect(page.getByTestId('run-agent-policy')).toContainText('Unknown');
+    await expect(page.getByTestId('run-budget-summary')).toContainText('Unknown');
+    await expect(page.getByTestId('run-tool-profile')).toContainText('Unknown');
+    await expect(details).toContainText('No control observation was saved');
+    expect(providerUserTexts.length).toBe(modelRequests);
+  } finally { await project(null).catch(() => {}); }
 });

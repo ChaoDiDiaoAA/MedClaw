@@ -1,6 +1,7 @@
 import { AppErrorSchema, safeError, type AppError, type AppErrorCode } from "@medclaw/contracts/error";
 import type { ToolCallIdentity, ToolCallStore, ToolExecutionContext, ToolResult, ToolSdkDelivery } from "@medclaw/contracts/tool";
 import { isDeepStrictEqual } from 'node:util';
+import type { ToolControlObservation } from '@medclaw/contracts/model';
 
 export class ToolRecorder {
   private readonly blockedRuns = new Map<number, AppError>();
@@ -24,15 +25,16 @@ export class ToolRecorder {
     if (!writes) this.pending.set(context.runId, writes = new Map());
     writes.set(key, save); return this.failPersistence(context);
   }
-  private saveResult(id: number, result: ToolResult<unknown>, context: ToolExecutionContext): void {
+  private saveResult(id: number, result: ToolResult<unknown>, context: ToolExecutionContext, control?: ToolControlObservation): void {
     const saved = this.store.readCall(context);
     if (!saved || saved.id !== id) throw new Error('storage_read_failed');
     if (['succeeded', 'failed', 'cancelled'].includes(saved.status)) {
       if (saved.status !== result.status || !isDeepStrictEqual(saved.data, result.data ?? null)
         || result.status !== 'succeeded' && saved.error?.code !== result.error.code) throw new Error('state_conflict');
+      if (control) this.store.mergeControl?.(context, control);
       return;
     }
-    this.store.transition(id, saved.status, result.status, result);
+    this.store.transition(id, saved.status, result.status, result, control);
   }
   failPersistence(context: ToolExecutionContext): AppError {
     const error = safeError("storage_write_failed", undefined, { runId: context.runId, sessionId: context.sessionId });
@@ -78,15 +80,25 @@ export class ToolRecorder {
       throw error;
     }
   }
-  finish(id: number, result: ToolResult<unknown>, from: "requested" | "running" = "running") {
+  finish(id: number, result: ToolResult<unknown>, from: "requested" | "running" = "running", control?: ToolControlObservation) {
     const context = this.contexts.get(id);
-    try { return this.checked(() => this.store.transition(id, from, result.status, result), 'storage_write_failed', context); }
+    try { return this.checked(() => this.store.transition(id, from, result.status, result, control), 'storage_write_failed', context); }
     catch (error) {
-      if (context && this.blocked(context)) this.defer(context, `result:${id}`, () => this.saveResult(id, result, context));
+      if (context && this.blocked(context)) this.defer(context, `result:${id}`, () => this.saveResult(id, result, context, control));
       throw error;
     }
   }
   read(context: ToolExecutionContext) { return this.checked(() => this.store.readCall(context), "storage_read_failed"); }
+  readToolObservations(input: { cutoffAt: string; maxToolCallId?: number; limit?: number }) {
+    return this.store.readToolObservations?.(input) ?? { maxToolCallId: null, observations: [] };
+  }
+  mergeControl(context: ToolExecutionContext, control: Partial<ToolControlObservation>) {
+    try { return this.checked(() => this.store.mergeControl?.(context, control), 'storage_write_failed', context); }
+    catch (error) {
+      if (this.blocked(context)) this.defer(context, `control:${context.nativeToolCallId}`, () => this.store.mergeControl?.(context, control));
+      throw error;
+    }
+  }
   recordDelivery(context: ToolExecutionContext, nativeEntryId: string, message?: ToolSdkDelivery) {
     try { return this.checked(() => this.store.recordDelivery(context, nativeEntryId, message), 'storage_write_failed', context); }
     catch (error) {

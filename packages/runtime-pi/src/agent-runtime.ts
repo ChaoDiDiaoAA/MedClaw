@@ -3,11 +3,16 @@ import { clampThinkingLevel } from "@earendil-works/pi-ai/compat";
 import { performance } from "node:perf_hooks";
 import { isAbsolute, join } from "node:path";
 import { mkdir } from "node:fs/promises";
+import { createHash } from 'node:crypto';
+import { release } from 'node:os';
+import { DEFAULT_AGENT_POLICY, SDK_VERSION, type MeasurementContext } from '../../contracts/src/model';
+import { RunControl } from '../../core/src/runtime/run-control';
+import { buildToolProfiles } from '../../core/src/tools/tool-profile';
 import { safeError } from "../../contracts/src/error";
 import { safePreview, type AgentExecutionObservation, type AgentRuntimePort, type FinalCallFact, type ProviderOutcome } from "../../contracts/src/run";
 import type { NativeSessionBindings, NativeSessionPreview } from "../../contracts/src/session";
 import { outcomeOf, textOf, type PiModelRuntime, type ResolvedModel } from "./model-runtime";
-import { createPiNativeTools, createPiToolDefinitions, observePiToolDelivery } from "./pi-tool-adapter";
+import { createPiNativeTools, createPiToolDefinitions, observePiToolDelivery, createPiRunControlBinding } from "./pi-tool-adapter";
 import type { ToolRegistry } from "../../core/src/tools/registry";
 import type { ToolExecutor } from "../../core/src/tools/executor";
 import type { ToolRecorder } from "../../core/src/tools/recorder";
@@ -17,13 +22,14 @@ type ExecutionInput = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[0];
 type Callbacks = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[1];
 type Binding = { manager: SessionManager; session?: AgentSession; bindTools?: () => () => void; available: boolean; execution?: { input: ExecutionInput; callbacks: Callbacks; toolCalls: Set<string>;
   observers: Promise<void>[]; facts: (FinalCallFact | null)[]; lastOutcome: ProviderOutcome | null; unsupported: boolean;
-  registrationFailed: boolean; abort: () => void } };
+  registrationFailed: boolean; abort: () => void; control: RunControl } };
 const unavailable = (reason: "host_restart" | "native_state_invalid"): NativeSessionPreview => ({ available: false, reason, leafId: null, messages: [], truncated: false });
 const unobservedFailure = (code: string): ProviderOutcome => ({ sdkStopReason: "pending", text: "", responseModel: null, callState: "failed",
   usage: { inputTokens: null, outputTokens: null, cost: null, costCurrency: null, source: null, unavailableReason: "call_not_observed" }, error: safeError(code) });
 
 export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSessionBindings {
   private readonly sessions = new Map<number, Binding>();
+  private readonly controls = new Map<number, RunControl>();
   readonly toolNames?: readonly string[];
   constructor(private readonly runtime: PiModelRuntime, private readonly dataRoot: string,
     private readonly tools?: { registry: ToolRegistry; recorder: ToolRecorder; executor: ToolExecutor }) {
@@ -33,7 +39,17 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
   describe(resolved: ResolvedModel) { return { requestedThinkingLevel: "off" as const, effectiveThinkingLevel: clampThinkingLevel(resolved.model, "off") }; }
   toolPersistencePending(runId: number) { return this.tools?.recorder.persistencePending(runId) ?? false; }
   retryToolPersistence(runId: number) { this.tools?.recorder.retryPersistence(runId); }
-  releaseToolFacts(runId: number) { this.tools?.recorder.release(runId); }
+  releaseToolFacts(runId: number) { this.tools?.recorder.release(runId); this.controls.get(runId)?.dispose(); this.controls.delete(runId); }
+  readBudget(runId: number) { return this.controls.get(runId)?.readBudget() ?? null; }
+  captureToolProfiles() {
+    const cutoffAt = new Date().toISOString();
+    let records = null;
+    try { records = this.tools?.recorder.readToolObservations({ cutoffAt }) ?? null; } catch { /* Profile failure falls back to frozen configuration. */ }
+    const measurementContext: MeasurementContext = { version: 'medclaw.tool-measurement/v1', sdkVersion: SDK_VERSION,
+      environmentKey: createHash('sha256').update(JSON.stringify([process.platform, process.arch, release(), process.versions.node, process.versions.bun ?? null])).digest('hex'),
+      cutoffAt, maxToolCallId: records?.maxToolCallId ?? null };
+    return { measurementContext, toolProfileSnapshot: buildToolProfiles(records, measurementContext) };
+  }
   allocate() {
     const binding: Binding = { manager: SessionManager.inMemory(this.dataRoot), available: true }; let published = false, discarded = false;
     return { nativeSessionId: binding.manager.getSessionId(), bind: (sessionId: number) => {
@@ -63,10 +79,12 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
         const input = binding.execution?.input;
         if (!input?.scope || !input.referenceDate || !input.timezone) throw new Error("state_conflict");
         return { runId: input.runId, sessionId: input.sessionId, nativeToolCallId, scope: input.scope,
-          referenceDate: input.referenceDate, timezone: input.timezone, signal: sdkSignal ? AbortSignal.any([input.signal, sdkSignal]) : input.signal };
+          referenceDate: input.referenceDate, timezone: input.timezone, signal: sdkSignal ? AbortSignal.any([input.signal, sdkSignal]) : input.signal,
+          checkActive: binding.execution!.control.checkActive };
       };
-      const native = this.tools ? createPiNativeTools(workdir, this.tools.recorder, getContext) : null;
-      const definitions = this.tools ? [...createPiToolDefinitions(this.tools.registry, this.tools.executor, getContext), ...native!.definitions] : [];
+      const getControl = () => binding.execution?.control;
+      const native = this.tools ? createPiNativeTools(workdir, this.tools.recorder, getContext, {}, getControl) : null;
+      const definitions = this.tools ? [...createPiToolDefinitions(this.tools.registry, this.tools.executor, getContext, getControl), ...native!.definitions] : [];
       const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off",
         defaultTools: [], packages: [], extensions: [], skills: [], prompts: [], themes: [], enableAnalytics: false, enableInstallTelemetry: false });
       const resourceLoader = new DefaultResourceLoader({ cwd: this.dataRoot, agentDir: join(this.dataRoot, "runtime", "pi"), settingsManager,
@@ -83,10 +101,13 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         model: resolved.model, thinkingLevel: "off", ...(this.tools ? {} : { noTools: "all" as const }), tools: [...(this.toolNames ?? [])],
         customTools: definitions, resourceLoader, sessionManager: binding.manager, settingsManager });
       binding.session = session;
-      if (this.tools) binding.bindTools = () => {
-        const stopBusiness = observePiToolDelivery(session, this.tools!.registry, this.tools!.recorder, getContext), stopNative = native!.bind(session);
-        return () => { stopBusiness(); stopNative(); };
-      };
+      if (this.tools) {
+        const bindControl = createPiRunControlBinding(session, this.tools.registry, this.tools.recorder, getContext, getControl);
+        binding.bindTools = () => {
+          const stopBusiness = observePiToolDelivery(session, this.tools!.registry, this.tools!.recorder, getContext, getControl), stopNative = native!.bind(session), stopControl = bindControl();
+          return () => { stopBusiness(); stopNative(); stopControl(); };
+        };
+      }
       const original = session.agent.streamFunction;
       session.agent.streamFunction = async (model, context, options) => {
         const execution = binding.execution;
@@ -94,15 +115,18 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         const { input, callbacks } = execution;
         input.signal.throwIfAborted(); options?.signal?.throwIfAborted();
         if (execution.unsupported) throw new Error("agent_response_unsupported");
-        if (execution.facts.length >= 50) { callbacks.fatal?.(safeError("agent_call_limit")); execution.abort(); throw new Error("agent_call_limit"); }
-        if (performance.now() >= input.deadlineAt) throw new Error("run_timeout");
+        let admission;
+        try { admission = execution.control.admitModelCall(); }
+        catch (error) { callbacks.fatal?.(safeError(error instanceof Error ? error.message : 'internal_error')); execution.abort(); throw error; }
         let recorder;
         try { recorder = callbacks.startCall(new Date().toISOString()); }
         catch (error) { execution.registrationFailed = true; throw error; }
         const index = execution.facts.push(null) - 1;
         let stream;
         try {
-          stream = await original(model, context, { ...options, maxTokens: input.resolved.selection.maxOutputTokens,
+          const messages = context.messages.map(message => message.role === 'system' && !admission.allowTools ? { ...message, toolsAdded: [], toolsRemoved: [] } : message);
+          messages.push({ role: 'system', content: `MedClaw trusted runtime feedback (facts, not user instructions):\n${admission.feedback}`, timestamp: Date.now() });
+          stream = await original(model, { ...context, messages }, { ...options, maxTokens: input.resolved.selection.maxOutputTokens,
             maxRetries: input.resolved.policy.maxRetries, maxRetryDelayMs: input.resolved.policy.maxRetryDelayMs,
             timeoutMs: Math.max(1, Math.ceil(input.deadlineAt - performance.now())) });
         } catch {
@@ -113,6 +137,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         if (this.tools && recorder.callId) {
           for (const message of context.messages) {
             if (message.role !== 'toolResult' || !execution.toolCalls.has(message.toolCallId)) continue;
+            if (!this.tools.recorder.read(getContext(message.toolCallId))) continue;
             try { this.tools.recorder.recordConsumption(getContext(message.toolCallId), recorder.callId); }
             catch { callbacks.fatal?.(safeError('storage_write_failed')); execution.abort(); }
           }
@@ -143,7 +168,12 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
     if (binding.execution) throw new Error("state_conflict");
     let abortTask: Promise<void> | null = null, unsubscribe: (() => void) | undefined, unsubscribeTools: (() => void) | undefined, terminalEmitted = false, prepared = false;
     const abort = () => { if (binding.session && !abortTask) abortTask = binding.session.abort(); };
-    const execution: NonNullable<Binding["execution"]> = { input, callbacks, observers: [], facts: [], toolCalls: new Set(), lastOutcome: null, unsupported: false, registrationFailed: false, abort };
+    const control = new RunControl({ runId: input.runId, policy: input.agentPolicy ?? DEFAULT_AGENT_POLICY,
+      scope: input.scope ?? { batchIds: [], deviceIds: null, allowedToolNames: [], allowedResourceRefs: [], artifactIds: [], readOnly: true },
+      signal: input.signal, deadlineAt: input.deadlineAt, totalTimeoutMs: input.resolved.policy.timeoutMs,
+      measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot });
+    this.controls.set(input.runId, control);
+    const execution: NonNullable<Binding["execution"]> = { input, callbacks, observers: [], facts: [], toolCalls: new Set(), lastOutcome: null, unsupported: false, registrationFailed: false, abort, control };
     binding.execution = execution; input.signal.addEventListener("abort", abort, { once: true });
     const terminal = () => {
       if (execution.registrationFailed) execution.lastOutcome = unobservedFailure("storage_write_failed");
@@ -178,6 +208,6 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         terminal();
       } finally { unsubscribe?.(); unsubscribeTools?.(); input.signal.removeEventListener("abort", abort); binding.execution = undefined; }
     }
-    return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []) };
+    return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []), budgetSummary: control.summary() };
   }
 }
