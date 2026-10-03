@@ -3,7 +3,7 @@ import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } fro
 import { AgentPolicySchema, BudgetSummarySchema, MeasurementContextSchema, ModelSelectionSchema, ReferenceDateSchema, RequestPolicySchema, TimezoneSchema, ToolProfileSnapshotSchema } from "./model";
 import type { AppError } from "./error";
 import type { AgentPolicy, BudgetSummary, DiagnoseRequest, MeasurementContext, ModelSelection, ProviderAccepted, ProviderRequest, RequestPolicy, ToolProfileSnapshot } from "./model";
-import type { NewSessionInput, NewSessionResult, SubmitInput, SubmitResult, SessionStore } from "./session";
+import type { NewSessionInput, NewSessionResult, SubmitInput, SubmitResult, SessionStore, InputStore, InputAdapterPort, InputSettlementProof, InputControl } from "./session";
 import type { WorkspaceView } from "./workspace";
 import { StoredToolConfigurationSchema, type ToolConfiguration } from './tool-config';
 import { RuntimeConfigurationSchema, type RuntimeConfiguration } from './runtime-config';
@@ -52,7 +52,7 @@ const runFields = {
 };
 export const ProviderRunViewSchema = z.strictObject({ ...runFields, kind: z.literal("provider"), sessionId: z.null(),
   goal: z.enum(["answer", "verify"]), calls: z.array(ModelCallViewSchema).max(1) });
-export const AgentRunViewSchema = z.strictObject({ ...runFields, kind: z.literal("agent"), sessionId: PositiveIdSchema,
+export const AgentRunViewSchema = z.strictObject({ ...runFields, inputId: PositiveIdSchema.nullable(), kind: z.literal("agent"), sessionId: PositiveIdSchema,
   clientSequence: PositiveIdSchema, nativeSessionId: OpaqueIdSchema, goal: z.literal("answer"),
   calls: z.array(ModelCallViewSchema).max(50), nextCallOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
   control: z.strictObject({
@@ -165,20 +165,25 @@ export interface FinalProviderFact {
   usage?: ProviderUsageDetails | null;
   cleanup?: RunCleanupRecord | { oldProcessExited?: boolean; observationGap?: boolean; previousInstanceId?: string; errors?: AppError[] } | null;
 }
-export interface AgentStartFields {
-  sessionId: number; inputId: null; text: string; model: ModelSelection; policy: RequestPolicy; goal: "answer";
+interface AgentStartCommon {
+  sessionId: number; text: string; model: ModelSelection; policy: RequestPolicy; goal: "answer";
   workspace: WorkspaceView; scope: RunScope; referenceDate: string; timezone: string; timeoutMs: number; agentOptions: P2AgentOptions;
   agentPolicy?: AgentPolicy;
   runtimeConfiguration?: RuntimeConfiguration;
   toolConfiguration?: ToolConfiguration;
   measurementContext?: MeasurementContext;
   toolProfileSnapshot?: ToolProfileSnapshot;
-  submission: { operationRef: string; originalSubmitInput: SubmitInput };
 }
+export type AgentStartFields = AgentStartCommon & ({ inputId: null; submission: { operationRef: string; originalSubmitInput: SubmitInput } } | { inputId: number; submission: null });
 export type StartRunInput<Resolved> = AgentStartFields & { resolved: Resolved };
 export type RegisterAgentInput = AgentStartFields & { instanceId: string; createdAt: string };
-export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[]; budgetSummary?: BudgetSummary };
+export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[]; budgetSummary?: BudgetSummary; inputSettlement?: InputSettlementProof };
 export type AgentRuntimePort<Resolved> = {
+  readonly inputAdapter?: InputAdapterPort;
+  readInputControl?: (runId: number) => InputControl | null;
+  inputPersistencePending?: (runId: number) => boolean;
+  retryInputPersistence?: (runId: number) => void;
+  releaseInputFacts?: (runId: number) => void;
   readonly toolNames?: readonly string[];
   toolPersistencePending?: (runId: number) => boolean;
   retryToolPersistence?: (runId: number) => void;
@@ -186,12 +191,12 @@ export type AgentRuntimePort<Resolved> = {
   captureToolProfiles?: (scope: RunScope) => { measurementContext: MeasurementContext; toolProfileSnapshot: ToolProfileSnapshot };
   readBudget?: (runId: number) => RuntimeBudgetView | null;
   describe: (resolved: Resolved) => P2AgentOptions;
-  execute: (input: { runId: number; sessionId: number; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number;
+  execute: (input: { runId: number; sessionId: number; inputId?: number | null; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number;
     scope?: RunScope; referenceDate?: string; timezone?: string; agentPolicy?: AgentPolicy; runtimeConfiguration?: RuntimeConfiguration; toolConfiguration?: ToolConfiguration; measurementContext?: MeasurementContext; toolProfileSnapshot?: ToolProfileSnapshot },
     callbacks: { startCall: (time: string) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
-      fatal?: (error: AppError) => void }) => Promise<AgentExecutionObservation>;
+      fatal?: (error: AppError) => void; inputStore?: InputStore; admissionClosed?: () => void }) => Promise<AgentExecutionObservation>;
 };
-export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord };
+export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord; inputSettlement?: InputSettlementProof };
 export type StoredOperation = ProviderOperation
   | { method: "session.create"; operationRef: string; originalRequest: NewSessionInput; result: NewSessionResult }
   | { method: "session.submit"; operationRef: string; originalRequest: SubmitInput; result: SubmitResult };
@@ -209,7 +214,7 @@ export interface ProviderRunStore {
   read(request: z.input<typeof ReadRunRequestSchema>): ReadRunResult;
   active(): RunHandle | null;
 }
-export interface RuntimeRunStore extends ProviderRunStore, SessionStore {
+export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputStore {
   freezeAgentScope(workspace: WorkspaceView, toolNames: readonly string[]): RunScope;
   registerAgent(input: RegisterAgentInput): SubmitResult;
   finalizeAgent(runId: number, fact: FinalAgentFact): RunView;
@@ -217,6 +222,7 @@ export interface RuntimeRunStore extends ProviderRunStore, SessionStore {
   checkpointFailure(runId: number, error: AppError, cleanup: RunCleanupRecord, time: string): void;
   saveRunCleanup(runId: number, cleanup: RunCleanupRecord): void;
   recoveryCandidates(instanceId: string): RunView[];
+  verifyPriorInputFacts?(runId: number, previousProcessExited: boolean, time: string): { inputsSettled: boolean; requiredPersistenceComplete: boolean; unconfirmedItems: string[] };
   verifyPriorToolFacts?(runId: number, previousProcessExited: boolean, time: string): {
     stopConfirmed: boolean | null; requiredPersistenceComplete: boolean; unconfirmedItems: string[];
   };

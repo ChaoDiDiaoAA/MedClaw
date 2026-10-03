@@ -116,7 +116,7 @@ export const QueryRequestParamsSchema = z.custom<QueryParamsInput>(value => Quer
 export type QuerySource = 'agent_tool' | 'intent' | 'user_form';
 export type QueryExecutionContext = {
   runId: number;
-  inputId: null;
+  inputId: number | null;
   sessionId: number;
   source: QuerySource;
   callRef: string;
@@ -182,7 +182,7 @@ export const QueryInterpretationSchema = z.strictObject({
   isStale: z.boolean().nullable(),
 });
 export type QueryInterpretation = z.infer<typeof QueryInterpretationSchema>;
-export const QueryRecordSchema = z.strictObject({ id: PositiveIdSchema, sessionId: PositiveIdSchema, runId: PositiveIdSchema, callRef: z.string(),
+export const QueryRecordSchema = z.strictObject({ id: PositiveIdSchema, sessionId: PositiveIdSchema, runId: PositiveIdSchema, inputId: PositiveIdSchema.nullable().optional(), callRef: z.string(),
   kind: z.enum(["current", "changes", "aggregate", "trend"]), params: z.union([QueryParamsSchema, ChangesQuerySchema, CurrentQuerySchema]), batchIds: BatchIdsSchema,
   source: z.enum(['agent_tool', 'intent', 'user_form']).optional(),
   catalogRevision: z.number().int().nonnegative().optional(),
