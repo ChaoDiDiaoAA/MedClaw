@@ -3,6 +3,7 @@ import { AppErrorSchema, PositiveIdSchema, TimestampSchema, type AppError } from
 import { RunScopeSchema, type RunScope } from "./run";
 import { MeasurementContextSchema, ReferenceDateSchema, TimezoneSchema, ToolControlObservationSchema, type ToolControlObservation } from "./model";
 import type { ToolConfiguration } from './tool-config';
+import { WorkspaceContextSchema, RevisionSchema, type WorkspaceContext } from './workspace';
 
 export const TOOL_READ_RULES = Object.freeze({
   defaultPage: 1,
@@ -34,10 +35,25 @@ export type ToolExecutionContext = {
   referenceDate: string; timezone: string; signal: AbortSignal;
   checkActive?: () => void;
   toolConfiguration?: ToolConfiguration;
+  workspaceContext?: WorkspaceContext | null;
+  workspaceInputId?: number | null;
+  basedOnQueryId?: number | null;
+  workspaceRevision?: number;
 };
-export const ToolContextIdentitySchema = z.object({
+export const ToolContextFieldsSchema = z.object({
   runId: PositiveIdSchema, sessionId: PositiveIdSchema, nativeToolCallId: z.string().min(1).max(256),
   scope: RunScopeSchema, referenceDate: ReferenceDateSchema, timezone: TimezoneSchema,
+  workspaceContext: WorkspaceContextSchema.nullable().optional(), workspaceInputId: PositiveIdSchema.nullable().optional(),
+  basedOnQueryId: PositiveIdSchema.nullable().optional(), workspaceRevision: RevisionSchema.optional(),
+});
+export const ToolContextIdentitySchema = ToolContextFieldsSchema.superRefine((identity, ctx) => {
+  const keys = ['workspaceContext', 'workspaceInputId', 'basedOnQueryId', 'workspaceRevision'] as const;
+  if (!keys.some(key => identity[key] !== undefined)) return;
+  if (keys.some(key => identity[key] === undefined) || !identity.workspaceContext) {
+    ctx.addIssue({ code: 'custom', message: 'Workspace identity requires the complete frozen group' }); return;
+  }
+  if (identity.workspaceContext.sessionId !== identity.sessionId || identity.workspaceContext.revision !== identity.workspaceRevision
+    || identity.workspaceContext.queryId !== identity.basedOnQueryId) ctx.addIssue({ code: 'custom', message: 'Frozen workspace identity mismatch' });
 });
 export type ToolResult<O> = { status: "succeeded"; data: O }
   | { status: "failed" | "cancelled"; error: AppError; data?: O };

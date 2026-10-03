@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, type Result } from './error';
 import { BatchSchema, BusinessDateSchema, ChangeSchema, FieldOriginsSchema, SourceRefSchema, SnapshotSchema, type Snapshot, type Change } from './query';
+import { WorkspaceSelectionSchema } from './workspace';
 
 export const ImportPreviewRequestSchema = z.strictObject({
   operationRef: OpaqueIdSchema,
@@ -101,9 +102,10 @@ export const DataCatalogSchema = z.strictObject({
   timezone: z.string().nullable(),
 });
 export const DataRowsSchema = z.discriminatedUnion('kind', [
-  z.strictObject({ kind: z.literal('devices'), items: z.array(SnapshotSchema), totalRows: z.number().int().nonnegative(), page: z.number().int().positive(), pageSize: z.number().int().min(1) }),
-  z.strictObject({ kind: z.literal('changes'), items: z.array(ChangeSchema), totalRows: z.number().int().nonnegative(), page: z.number().int().positive(), pageSize: z.number().int().min(1) }),
-]);
+  z.strictObject({ kind: z.literal('devices'), items: z.array(SnapshotSchema), selections: z.array(WorkspaceSelectionSchema), totalRows: z.number().int().nonnegative(), page: z.number().int().positive(), pageSize: z.number().int().min(1) }),
+  z.strictObject({ kind: z.literal('changes'), items: z.array(ChangeSchema), selections: z.array(WorkspaceSelectionSchema), totalRows: z.number().int().nonnegative(), page: z.number().int().positive(), pageSize: z.number().int().min(1) }),
+]).refine(page => page.items.length === page.selections.length && page.selections.every(item => item.field === null
+  && item.kind === (page.kind === 'devices' ? 'device' : 'change')), 'Selections must align with data rows');
 
 export const SnapshotMetadataSchema = z.object({
   contract: z.literal('medclaw.snapshot/v1'),
