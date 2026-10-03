@@ -498,9 +498,15 @@ test('A14 minimum window, keyboard row selection and 200 percent zoom keep table
   await page.getByRole('button', { name: 'Chat', exact: true }).click(); const query = await savedQuery();
   const view = await page.evaluate(queryId => window.medclaw.request('query.read', { queryId }), query.queryId); if (!view.ok) throw Error(view.error.code);
   await app.evaluate(({ BrowserWindow }) => { const win = BrowserWindow.getAllWindows()[0]; win.setSize(1100, 720); win.webContents.setZoomFactor(2); });
-  await page.setViewportSize({ width: 550, height: 360 });
+  await page.setViewportSize({ width: 1100, height: 720 });
+  expect(await page.evaluate(() => window.innerWidth)).toBe(550);
+  expect(await page.evaluate(() => window.innerHeight)).toBe(360);
+  await page.getByRole('button', { name: 'Collapse navigation', exact: true }).click();
   const choice = page.getByRole('button', { name: `Select Query ${query.queryId} ${view.data.page.rowKeys[0]} field deltaCents`, exact: true });
   await choice.focus(); await expect(choice).toBeFocused(); await page.keyboard.press('Enter');
+  const selectedBounds = await choice.boundingBox(); expect(selectedBounds).not.toBeNull();
+  expect(selectedBounds!.x).toBeGreaterThanOrEqual(0); expect(selectedBounds!.x + selectedBounds!.width).toBeLessThanOrEqual(550);
+  expect(selectedBounds!.y).toBeGreaterThanOrEqual(0); expect(selectedBounds!.y + selectedBounds!.height).toBeLessThanOrEqual(360);
   await expect.poll(() => JSON.parse(sql('SELECT selection_json FROM workspace')[0].selection_json).field).toBe('deltaCents');
   const table = page.getByTestId('query-results').locator('..');
   const geometry = await table.evaluate(element => ({ overflowX: getComputedStyle(element).overflowX, width: element.clientWidth, scrollWidth: element.scrollWidth }));
@@ -509,7 +515,9 @@ test('A14 minimum window, keyboard row selection and 200 percent zoom keep table
   await page.getByRole('button', { name: 'View run details', exact: true }).focus(); await page.keyboard.press('Enter');
   const close = page.getByRole('button', { name: 'Close run details', exact: true }); await expect(close).toBeVisible(); await close.focus(); await page.keyboard.press('Escape');
   await expect(close).toHaveCount(0); await expect(page.getByRole('button', { name: 'View run details', exact: true })).toBeFocused();
-  await page.screenshot({ path: join(evidence, 'A14-minimum-zoom-keyboard.png'), fullPage: true });
-  save('A14-accessible-layout', { geometry, viewport: page.viewportSize(), query, workspace: sql('SELECT * FROM workspace') });
+  const png = await app.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].webContents.capturePage()).toPNG().toString('base64'));
+  writeFileSync(join(evidence, 'A14-minimum-zoom-keyboard.png'), Buffer.from(png, 'base64'));
+  save('A14-accessible-layout', { geometry, selectedBounds, configuredViewport: page.viewportSize(), actualViewport: await page.evaluate(() => ({ width: innerWidth, height: innerHeight, devicePixelRatio })), zoomFactor: await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.getZoomFactor()), query, workspace: sql('SELECT * FROM workspace') });
   await app.evaluate(({ BrowserWindow }) => { const win = BrowserWindow.getAllWindows()[0]; win.webContents.setZoomFactor(1); win.setSize(1440, 1000); }); await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.getByRole('button', { name: 'Expand navigation', exact: true }).click();
 });
