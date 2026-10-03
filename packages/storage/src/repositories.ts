@@ -389,7 +389,9 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     return this.transactions.immediate(()=>{
       const original=this.workspaceInspection([]);
       if(original.state.revision!==expectedRevision||original.fingerprint!==expectedFingerprint)throw safeError('state_conflict',undefined,{reason:'workspace_revision_mismatch'});
-      const invalidArtifacts=original.state.batchRefs.filter(ref=>!candidate.batchRefs.some(item=>item.id===ref.id)).flatMap(ref=>{
+      // DB-invalid references already disappeared from the original candidate.
+      // Only additional removals can represent a failed managed-file inspection.
+      const invalidArtifacts=original.candidate.batchRefs.filter(ref=>!candidate.batchRefs.some(item=>item.id===ref.id)).flatMap(ref=>{
         const row=this.db.query<{artifact_id:number|null},[number]>('SELECT i.artifact_id FROM batches b JOIN imports i ON i.id=b.import_id WHERE b.id=?').get(ref.id);
         return row?.artifact_id==null?[]:[row.artifact_id];
       });

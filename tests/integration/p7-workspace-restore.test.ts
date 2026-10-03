@@ -132,6 +132,17 @@ test('an already drifted BatchRef is removed, never rebuilt with the current dat
   const f=fixture();f.db.query('UPDATE batches SET content_hash=? WHERE id=1').run(hash('changed'));
   const result=await f.service.restore();expect(result.ok).toBe(true);if(result.ok){expect(result.data.batchRefs.map(b=>b.id)).toEqual([2]);expect(result.data.deviceIds).toEqual([2]);}
 });
+test('one stale BatchRef sharing a valid managed Artifact preserves the other valid batch reference',async()=>{
+  const f=fixture();f.db.query('UPDATE batches SET import_id=1 WHERE id=2').run();
+  f.db.query('UPDATE batches SET content_hash=? WHERE id=1').run(hash('stale-batch'));
+  expect(await f.inspector.inspectManagedImport(1)).toEqual({status:'valid'});
+  const before=f.repos.readWorkspace(),facts=f.db.query('SELECT * FROM batches ORDER BY id').all();
+  const result=await f.service.restore();expect(result.ok).toBe(true);if(!result.ok)return;
+  expect(result.data.batchRefs).toEqual([before.batchRefs[1]!]);expect(result.data.deviceIds).toEqual([2]);expect(result.data.revision).toBe(before.revision+1);
+  expect(result.data).toHaveProperty('notices',[{code:'reference_cleared',kind:'batch',targetId:'1'},{code:'reference_cleared',kind:'device',targetId:'1'}]);
+  expect(f.db.query('SELECT * FROM batches ORDER BY id').all()).toEqual(facts);expect(await f.inspector.inspectManagedImport(1)).toEqual({status:'valid'});
+  const saved=f.sql();expect((await f.service.restore()).ok).toBe(true);expect(f.sql()).toEqual(saved);
+});
 test('missing Session clears only its session reference while legal batch scope survives',async()=>{
   const f=fixture();f.db.exec('PRAGMA foreign_keys=OFF');f.db.query('DELETE FROM sessions WHERE id=1').run();
   const result=await f.service.restore();expect(result.ok).toBe(true);if(result.ok){expect(result.data.sessionId).toBeNull();expect(result.data.batchRefs.map(b=>b.id)).toEqual([1,2]);expect(result.data.deviceIds).toEqual([1,2]);}
