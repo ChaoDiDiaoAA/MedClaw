@@ -12,7 +12,8 @@ import { RunControl } from '../../core/src/runtime/run-control';
 import { buildToolProfiles, TOOL_PROFILE_RULES } from '../../core/src/tools/tool-profile';
 import { safeError } from "../../contracts/src/error";
 import { type AgentExecutionObservation, type AgentRuntimePort, type FinalCallFact, type ProviderOutcome } from "../../contracts/src/run";
-import type { NativeSessionBindings, NativeSessionPreview } from "../../contracts/src/session";
+import type { NativeSessionBindings, NativeSessionPreview, InputAdapterPort, InputSettlementProof } from "../../contracts/src/session";
+import { PiInputAdapter } from './input-adapter';
 import { outcomeOf, textOf, type PiModelRuntime, type ResolvedModel } from "./model-runtime";
 import { createPiNativeTools, createPiToolDefinitions, observePiToolDelivery, createPiRunControlBinding } from "./pi-tool-adapter";
 import type { ToolRegistry } from "../../core/src/tools/registry";
@@ -35,6 +36,18 @@ const unobservedFailure = (code: string): ProviderOutcome => ({ sdkStopReason: "
 export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSessionBindings {
   private readonly sessions = new Map<number, Binding>();
   private readonly controls = new Map<number, RunControl>();
+  private readonly inputs = new Map<number, PiInputAdapter>();
+  private readonly inputStartFailures = new Map<number, { save: () => void; pending: boolean; proof: InputSettlementProof }>();
+  readonly inputAdapter: InputAdapterPort = {
+    deliver: input => { const adapter = this.inputs.get(input.targetRunId); if (!adapter) return Promise.reject(safeError('input_invalid')); return adapter.deliver(input); },
+    cancel: inputId => { const adapter = [...this.inputs.values()].find(adapter => adapter.hasInput(inputId)); return adapter ? adapter.cancel(inputId) : Promise.resolve({ kind: 'unknown', inputId, error: safeError('input_delivery_unknown') }); },
+    close: (runId, outcome) => { const adapter = this.inputs.get(runId); if (!adapter) { const failed = this.inputStartFailures.get(runId); return failed ? Promise.resolve({ ...failed.proof, pendingPersistence: failed.pending }) : Promise.reject(safeError('input_invalid')); } return adapter.close(runId, outcome); },
+    persistencePending: runId => this.inputPersistencePending(runId), retryPersistence: runId => this.retryInputPersistence(runId),
+  };
+  readInputControl(runId: number) { return this.inputs.get(runId)?.readControl() ?? null; }
+  inputPersistencePending(runId: number) { return (this.inputs.get(runId)?.persistencePending(runId) ?? false) || (this.inputStartFailures.get(runId)?.pending ?? false); }
+  retryInputPersistence(runId: number) { this.inputs.get(runId)?.retryPersistence(runId); const failed = this.inputStartFailures.get(runId); if (failed?.pending) { try { failed.save(); failed.pending = false; } catch { /* Retain exact failure fact for the next save attempt. */ } } }
+  releaseInputFacts(runId: number) { const adapter = this.inputs.get(runId); if (this.inputPersistencePending(runId)) throw safeError('storage_write_failed'); adapter?.dispose(); this.inputs.delete(runId); this.inputStartFailures.delete(runId); }
   readonly toolNames?: readonly string[];
   constructor(private readonly runtime: PiModelRuntime, private readonly dataRoot: string,
     private readonly tools?: RunTools & { recorder: ToolRecorder; configure?: (configuration: ToolConfiguration) => RunTools }) {
@@ -231,7 +244,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
     if (!binding || !binding.available) throw new Error("session_history_invalid");
     if (binding.execution) throw new Error("state_conflict");
     let abortTask: Promise<void> | null = null, unsubscribe: (() => void) | undefined, unsubscribeTools: (() => void) | undefined, unsubscribeMessages: (() => void) | undefined, terminalEmitted = false;
-    const abort = () => { if (binding.session && !abortTask) abortTask = binding.session.abort(); };
+    const abort = () => { this.inputs.get(input.runId)?.stop(); if (binding.session && !abortTask) abortTask = binding.session.abort(); };
     const control = new RunControl({ runId: input.runId, toolConfiguration: input.toolConfiguration, runtimeConfiguration: input.runtimeConfiguration, policy: input.agentPolicy,
       scope: input.scope ?? { batchIds: [], deviceIds: null, allowedToolNames: [], allowedResourceRefs: [], artifactIds: [], readOnly: true },
       signal: input.signal, deadlineAt: input.deadlineAt, totalTimeoutMs: input.resolved.policy.timeoutMs,
@@ -244,6 +257,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
       if (execution.unsupported && execution.lastOutcome) execution.lastOutcome = { ...execution.lastOutcome, error: safeError("agent_response_unsupported") };
       if (!terminalEmitted && execution.lastOutcome) { terminalEmitted = true; callbacks.nativeTerminal(execution.lastOutcome); }
     };
+    let inputSettlement: InputSettlementProof | undefined;
     try {
       input.signal.throwIfAborted();
       if (this.tools) await Promise.all([mkdir(join(this.dataRoot, "runtime", String(input.runId), "work", "materials"), { recursive: true }),
@@ -258,14 +272,28 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         const entry = manager.getEntries().findLast(entry => entry.type === "message" && entry.message === event.message);
         if (entry) binding.entryRuns.set(entry.id, originalRunId);
       });
+      if (input.inputId != null) {
+        const store = callbacks.inputStore;
+        if (!store) throw safeError('state_conflict');
+        const adapter = new PiInputAdapter(session, manager, { runId: input.runId, sessionId: input.sessionId,
+          delivered: (binding, at) => store.recordInputDelivery(binding.inputId, at),
+          consumed: (binding, fact) => { store.recordInputConsumption(binding.inputId, fact); },
+          failed: (binding, fact) => store.recordInputFailure(binding.inputId, fact),
+          cancelled: (proof, at) => { store.recordInputCancellation(proof, at); },
+          nativeStateInvalid: () => { binding.available = false; },
+          fatal: error => { callbacks.fatal?.(error); abort(); }, admissionClosed: () => callbacks.admissionClosed?.() });
+        this.inputs.set(input.runId, adapter);
+      }
       unsubscribeTools = binding.bindTools?.();
       unsubscribe = session.subscribe(event => {
         if (event.type === "message_update" && event.message.role === "assistant") {
           try { callbacks.preview(textOf(event.message)); } catch { /* Optional preview does not change the execution. */ }
         }
-        if (event.type === "agent_settled") terminal();
       });
-      await session.prompt(input.text, { expandPromptTemplates: false });
+      if (input.inputId != null) {
+        await this.inputs.get(input.runId)!.deliver({ inputId: input.inputId, sessionId: input.sessionId, targetRunId: input.runId, mode: 'send', text: input.text, stopEpoch: 0 });
+        inputSettlement = await this.inputs.get(input.runId)!.waitForCompletion(input.signal.aborted ? 'cancelled' : 'completed');
+      } else await session.prompt(input.text, { expandPromptTemplates: false });
     } catch {
       if (!input.signal.aborted && !execution.lastOutcome) {
         execution.lastOutcome = unobservedFailure(execution.registrationFailed ? "storage_write_failed" : performance.now() >= input.deadlineAt ? "run_timeout" : "provider_request_failed");
@@ -275,9 +303,20 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
       try {
         await binding.session?.waitForIdle(); await abortTask; await Promise.all(execution.observers);
         if (binding.session && !binding.session.isIdle) throw new Error("stop_unconfirmed");
+        if (this.inputs.has(input.runId)) inputSettlement = await this.inputs.get(input.runId)!.close(input.runId, input.signal.aborted ? 'cancelled' : execution.lastOutcome?.error ? 'failed' : 'completed');
+        else if (input.inputId != null) {
+          // Preparation never invoked the SDK prompt; this root has no native input source.
+          callbacks.admissionClosed?.();
+          const at = new Date().toISOString(), inputId = input.inputId;
+          const fact = { sessionId: input.sessionId, targetRunId: input.runId, at, error: safeError('provider_request_failed'), proof: { kind: 'not_consumed' as const, reason: 'start_failed' as const } };
+          const proof: InputSettlementProof = { runId: input.runId, admissionClosed: true, preflightSettled: true, nativeIdle: true, nativeQueuesEmpty: !binding.session?.agent.hasQueuedMessages(), pendingPersistence: false, removals: [], unconfirmedInputIds: [] };
+          const failed = { save: () => { if (!callbacks.inputStore) throw safeError('state_conflict'); callbacks.inputStore.recordInputFailure(inputId, fact); }, pending: false, proof };
+          try { failed.save(); } catch { failed.pending = true; callbacks.fatal?.(safeError('storage_write_failed')); }
+          this.inputStartFailures.set(input.runId, failed); inputSettlement = { ...proof, pendingPersistence: failed.pending };
+        }
         terminal();
       } finally { unsubscribe?.(); unsubscribeTools?.(); unsubscribeMessages?.(); input.signal.removeEventListener("abort", abort); binding.lastRunId = input.runId; binding.execution = undefined; }
     }
-    return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []), budgetSummary: control.summary() };
+    return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []), budgetSummary: control.summary(), ...(inputSettlement ? { inputSettlement } : {}) };
   }
 }

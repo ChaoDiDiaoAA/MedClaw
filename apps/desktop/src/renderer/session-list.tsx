@@ -1,14 +1,14 @@
 import type { ModelChoice } from "../../../../packages/contracts/src/model";
-import type { SessionView, SubmitInput } from "../../../../packages/contracts/src/session";
+import type { InputMode, SessionView, SubmitInput } from "../../../../packages/contracts/src/session";
 
 export function sessionDisplayTitle(session: Pick<SessionView, "id" | "title">): string {
   return session.title === `新会话 ${session.id}` ? `New Session ${session.id}` : session.title;
 }
 
-export type SessionDraft = { text: string; referenceDate: string; timezone: string; model: ModelChoice | null;
-  pending: { operationRef: string; input: SubmitInput } | null };
+export type SessionDraft = { text: string; referenceDate: string; timezone: string; model: ModelChoice | null; mode?: InputMode;
+  resendConfirmed?: boolean; pending: { operationRef: string; input: SubmitInput } | null };
 export function newSessionDraft(model: ModelChoice | null, dataDefaults?: { batchCount: number; referenceDate: string | null; timezone: string | null } | null): SessionDraft {
-  return { text: "", referenceDate: dataDefaults && dataDefaults.batchCount > 0 ? dataDefaults.referenceDate ?? "" : new Date().toLocaleDateString("sv-SE"), timezone: dataDefaults && dataDefaults.batchCount > 0 ? dataDefaults.timezone ?? "" : (Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"), model, pending: null };
+  return { text: "", referenceDate: dataDefaults && dataDefaults.batchCount > 0 ? dataDefaults.referenceDate ?? "" : new Date().toLocaleDateString("sv-SE"), timezone: dataDefaults && dataDefaults.batchCount > 0 ? dataDefaults.timezone ?? "" : (Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"), model, mode: "send", pending: null, resendConfirmed: false };
 }
 export function selectSessionModelDraft(draft: SessionDraft | undefined, context: { instanceId: string | null; configVersion: string | undefined; session: SessionView | undefined },
   target: { instanceId: string; sessionId: number }, choice: ModelChoice): SessionDraft | null {
@@ -19,7 +19,7 @@ export function selectSessionModelDraft(draft: SessionDraft | undefined, context
 export function acceptSubmissionDraft(draft: SessionDraft, original: NonNullable<SessionDraft["pending"]>): SessionDraft {
   if (draft.pending?.operationRef !== original.operationRef || draft.pending.input.sessionId !== original.input.sessionId
     || draft.pending.input.clientSequence !== original.input.clientSequence) return draft;
-  return { ...draft, pending: null, text: draft.text === original.input.text ? "" : draft.text };
+  return { ...draft, pending: null, resendConfirmed: false, text: draft.text === original.input.text ? "" : draft.text };
 }
 export function SessionList(props: { sessions: SessionView[]; current: number | null; running: number | null; creating: boolean; canCreate: boolean;
   creationUnknown: boolean; nextBefore: number | null; onCreate: () => void; onRecoverCreate: () => void; onSelect: (id: number) => void; onMore: () => void }) {

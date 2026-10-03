@@ -66,7 +66,7 @@ type CallRow = { id: number; run_id: number; session_id: number; native_tool_cal
   requested_at: string; started_at: string | null;
   effect: string; execution_mode: string; args_json: string; status: ToolCallRecord["status"]; result_json: string | null;
   error_json: string | null; delivery_json: string | null };
-type QueryRow = { id: number; session_id: number; run_id: number; call_ref: string; kind: QueryRecord["kind"];
+type QueryRow = { input_id?:number|null; id: number; session_id: number; run_id: number; call_ref: string; kind: QueryRecord["kind"];
   params_json: string; params_hash: string; batch_ids_json: string; result_json: string; result_hash: string; created_at: string;
   source?: QueryRecord['source']; catalog_revision?: number; material_version?: string; based_on_query_id?: number | null };
 type EvidenceRow = { id: number; query_id: number; batch_ids_json: string; snapshot_ids_json: string; event_ids_json: string;
@@ -86,10 +86,11 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   private identity(context: QueryContext, active: boolean): void {
     const { signal: _signal, ...identity } = context;
     if (!("nativeToolCallId" in identity ? ToolContextIdentitySchema : ToolContextIdentitySchema.omit({ nativeToolCallId: true })).safeParse(identity).success) fail("invalid_argument");
-    if ("source" in context && (!["agent_tool", "intent", "user_form"].includes(context.source) || context.inputId !== null || !context.callRef)) fail("invalid_argument");
-    const run = this.db.query<{ session_id: number; status: string; scope_json: string; reference_date: string; timezone: string }, [number]>(
-      "SELECT session_id,status,scope_json,reference_date,timezone FROM runs WHERE id=?").get(context.runId);
+    if ("source" in context && (!["agent_tool", "intent", "user_form"].includes(context.source) || !context.callRef)) fail("invalid_argument");
+    const run = this.db.query<{ input_id?:number|null; session_id: number; status: string; scope_json: string; reference_date: string; timezone: string }, [number]>(
+      "SELECT * FROM runs WHERE id=?").get(context.runId);
     if (!run || run.session_id !== context.sessionId || run.reference_date !== context.referenceDate || run.timezone !== context.timezone) fail("access_denied");
+    if('inputId' in context && context.inputId !== (run.input_id ?? null)) fail('access_denied');
     const scope = RunScopeSchema.safeParse(decode(run.scope_json));
     if (!scope.success || !isDeepStrictEqual(scope.data, context.scope)) fail("access_denied");
     if (active && run.status !== "running") fail("state_conflict");
@@ -319,7 +320,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
     for (const [key, value] of Object.entries(headers)) {
       if (Object.hasOwn(result, key) && !isDeepStrictEqual((result as Record<string, unknown>)[key], value)) throw safeError('tool_output_inconsistent');
     }
-    const parsed = QueryRecordSchema.safeParse({ ...result, id: row.id, sessionId: row.session_id, runId: row.run_id, callRef: row.call_ref,
+    const parsed = QueryRecordSchema.safeParse({ ...result, id: row.id, sessionId: row.session_id, runId: row.run_id, inputId: row.input_id ?? null, callRef: row.call_ref,
       kind: row.kind, params: prepared.data, batchIds: batches, resultHash: row.result_hash, createdAt: row.created_at });
     return parsed.success ? parsed.data : fail("storage_read_failed");
   }
@@ -352,6 +353,9 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       if (!parsed.success || !params.success) fail("invalid_argument");
       if ('kind' in params.data && params.data.kind !== input.kind) fail('invalid_argument');
       const source = "source" in context ? context.source : "agent_tool";
+      const rootInput = this.db.query<{input_id?:number|null},[number]>('SELECT * FROM runs WHERE id=?').get(context.runId)?.input_id ?? null;
+      if(input.inputId !== undefined && input.inputId !== rootInput)fail('access_denied');
+      if(!this.p3 && rootInput !== null)fail('access_denied');
       if (input.source !== undefined && input.source !== source) fail("access_denied");
       if (!params.data.batchIds.every(batch => context.scope.batchIds.includes(batch))) fail("access_denied");
       if (!isDeepStrictEqual(input.scopeDeviceIds, params.data.deviceIds ?? context.scope.deviceIds)
@@ -409,13 +413,13 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
         ...(input.interpretation === undefined ? {} : { interpretation: input.interpretation }),
         ...(input.source === undefined ? {} : { source: input.source }), ...(input.catalogRevision === undefined ? {} : { catalogRevision: input.catalogRevision }),
         ...(input.materialVersion === undefined ? {} : { materialVersion: input.materialVersion }), ...(input.basedOnQueryId === undefined ? {} : { basedOnQueryId: input.basedOnQueryId }) };
-      const extraColumns = this.p3 ? ",source,catalog_revision,material_version,based_on_query_id" : "";
-      const extraValues = this.p3 ? ",?,?,?,?" : "";
+      const extraColumns = this.p3 ? ",source,catalog_revision,material_version,based_on_query_id,input_id" : "";
+      const extraValues = this.p3 ? ",?,?,?,?,?" : "";
       const inserted = this.db.query(`INSERT INTO queries(session_id,run_id,call_ref,kind,params_hash,params_json,batch_ids_json,result_json,result_hash,created_at${extraColumns})
         VALUES(?,?,?,?,?,?,?,?,?,?${extraValues})`).run(input.sessionId, input.runId, input.callRef, input.kind,
         createHash("sha256").update(json(params.data)).digest("hex"), json(params.data), json(input.batchIds), json(result), input.resultHash, input.createdAt,
         ...(this.p3 ? [source, input.catalogRevision ?? this.db.query<{ revision: number }, []>("SELECT revision FROM catalog_state WHERE id=1").get()!.revision,
-          input.materialVersion ?? inputEvidence.map(item => item.materialVersion).join(","), input.basedOnQueryId ?? null] : []));
+          input.materialVersion ?? inputEvidence.map(item => item.materialVersion).join(","), input.basedOnQueryId ?? null, rootInput] : []));
       const queryId = Number(inserted.lastInsertRowid);
       for (const item of evidence) this.db.query(`INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,
         calculation_version,material_version,source_bundle_id,source_lock_hash,result_hash${this.p3 ? ",filters_json,provenance" : ""}) VALUES(?,?,?,?,?,?,?,?,?,?${this.p3 ? ",?,?" : ""})`).run(queryId, json(item.batchIds),

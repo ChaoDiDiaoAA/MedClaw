@@ -7,6 +7,8 @@ export type PrivateCredentialCall = (method: string, payload: unknown, signal?: 
 /** Main holds the lease while Pi's callback runs in Host, including OAuth refresh. */
 export class BridgeCredentialStore implements CredentialStore {
   private readonly contexts = new AsyncLocalStorage<CredentialContext>();
+  private activeReads = 0;
+  private readonly waitingReads: (() => void)[] = [];
   constructor(private readonly call: PrivateCredentialCall) {}
   private async invoke<M extends PrivateCredentialMethod>(method: M, payload: unknown, signal?: AbortSignal): Promise<PrivateCredentialReturn<M>> {
     signal?.throwIfAborted();
@@ -16,8 +18,40 @@ export class BridgeCredentialStore implements CredentialStore {
   }
   withContext<T>(context: CredentialContext, fn: () => Promise<T>): Promise<T> { return this.contexts.run(context, fn); }
   private context() { return this.contexts.getStore() ?? { purpose: "runtime" as const, operationRef: "catalog_snapshot" }; }
+  private releaseRead() {
+    const next = this.waitingReads.shift();
+    if (next) next(); else this.activeReads--;
+  }
+  private acquireRead(signal?: AbortSignal): Promise<() => void> {
+    signal?.throwIfAborted();
+    // Pi catalog refresh fans out too; leave headroom in the 256-frame transport.
+    // Lease begin/commit/abort and other private methods never wait for read slots.
+    if (this.activeReads < 64) {
+      this.activeReads++;
+      return Promise.resolve(() => this.releaseRead());
+    }
+    return new Promise((resolve, reject) => {
+      const admit = () => {
+        signal?.removeEventListener("abort", cancel);
+        resolve(() => this.releaseRead());
+      };
+      const cancel = () => {
+        const index = this.waitingReads.indexOf(admit);
+        if (index === -1) return;
+        this.waitingReads.splice(index, 1);
+        signal?.removeEventListener("abort", cancel);
+        reject(signal?.reason);
+      };
+      this.waitingReads.push(admit);
+      signal?.addEventListener("abort", cancel, { once: true });
+      if (signal?.aborted) cancel();
+    });
+  }
   async read(providerId: string, options?: AuthOperationOptions) {
-    return await this.invoke("credential.read", { providerId, context: this.context() }, options?.signal) ?? undefined;
+    const payload = { providerId, context: { ...this.context() } };
+    const release = await this.acquireRead(options?.signal);
+    try { return await this.invoke("credential.read", payload, options?.signal) ?? undefined; }
+    finally { release(); }
   }
   async list(options?: AuthOperationOptions): Promise<readonly CredentialInfo[]> { return this.invoke("credential.list", {}, options?.signal); }
   async modify(providerId: string, fn: (current: Credential | undefined) => Promise<Credential | undefined>, options?: AuthOperationOptions) {

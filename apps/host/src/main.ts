@@ -173,7 +173,9 @@ async function initialize(raw: unknown) {
     (runId, kind, time) => new ModelCallRecorder(repositories, runId, kind, time),
     notice, error => errorLog.add(error), agent);
   application.runs.recoverInterrupted(true); // The writer lock proves that the previous owning process exited.
-  sessions = new SessionService(config.instanceId, repositories, agent, (input, context) => application!.runs.submitAgent(input, context), () => application!.runs.activeHandle);
+  sessions = new SessionService(config.instanceId, repositories, agent, (input, context) => application!.runs.submitAgent(input, context),
+    () => application!.runs.activeHandle, sessionId => application!.runs.readInputControl(sessionId),
+    (inputId, context) => application!.runs.cancelInput(inputId, context));
   workspace = new WorkspaceService(repositories);
   await sendRaw(`${JSON.stringify({ protocolVersion: HOST_PROTOCOL_VERSION, instanceId: config.instanceId, sdkVersion: actualVersion, schemaVersion: SCHEMA_VERSION, configVersion: settings.configVersion, dataRoot: config.paths.dataRoot })}\n`);
   runtimeLog.add("host_ready");
@@ -189,10 +191,10 @@ function evidenceSummary(record: Evidence) {
   return EvidenceSummarySchema.parse({ ...metadata, snapshotCount: snapshotIds.length, eventCount: eventIds.length });
 }
 function readContext(runId: number, requireSelectedSession = true): QueryExecutionContext {
-  const row = database!.query<{ kind: string; session_id: number | null; scope_json: string; reference_date: string; timezone: string; config_json: string }, [number]>(
-    'SELECT kind,session_id,scope_json,reference_date,timezone,config_json FROM runs WHERE id=?').get(runId);
+  const row = database!.query<{ kind: string; session_id: number | null; input_id: number | null; scope_json: string; reference_date: string; timezone: string; config_json: string }, [number]>(
+    'SELECT kind,session_id,input_id,scope_json,reference_date,timezone,config_json FROM runs WHERE id=?').get(runId);
   if (!row || row.kind !== 'agent' || row.session_id === null || requireSelectedSession && repositories.readWorkspace().sessionId !== row.session_id) throw new Error('access_denied');
-  return { runId, inputId: null, sessionId: row.session_id, source: 'user_form', callRef: `read:${runId}`,
+  return { runId, inputId: row.input_id, sessionId: row.session_id, source: 'user_form', callRef: `read:${runId}`,
     scope: RunScopeSchema.parse(JSON.parse(row.scope_json)), referenceDate: row.reference_date, timezone: row.timezone,
     signal: new AbortController().signal };
 }
@@ -240,6 +242,9 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case "session.submit": return unwrap(await sessions!.submit(request.payload, request));
     case "session.messages.read": return unwrap(await sessions!.readMessages(request.payload));
     case "session.readSubmission": return unwrap(await sessions!.readSubmission(request.payload));
+    case "session.readInput": return unwrap(await sessions!.readInput(request.payload));
+    case "session.listInputs": return unwrap(await sessions!.listInputs(request.payload));
+    case "session.cancelInput": return unwrap(await sessions!.cancelInput(request.payload.inputId, request));
     case "workspace.read": return unwrap(await workspace!.read());
     case "workspace.restore": return unwrap(await workspace!.restore());
     case 'workspace.update': return unwrap(await workspace!.update(request.payload.change, request.payload.expectedRevision));

@@ -87,7 +87,7 @@ test.each(["P2", "P4"])("%s runner discovers only its stage and rejects empty, s
 test("late model callback keeps its captured Session and rejects an old Host or directory", async () => {
   const helpers = await import("../../apps/desktop/src/renderer/session-list");
   expect(helpers).toHaveProperty("selectSessionModelDraft");
-  const context = { instanceId: "host-1", configVersion: "1", session: { id: 1, title: "A", nativeSessionId: "native-a", kind: "user" as const, status: "active" as const, storageVersion: 0 as const, leafId: null, nextSubmissionSequence: 1 } };
+  const context = { instanceId: "host-1", configVersion: "1", session: { id: 1, title: "A", nativeSessionId: "native-a", kind: "user" as const, status: "active" as const, inputControl: null, storageVersion: 0 as const, leafId: null, nextSubmissionSequence: 1 } };
   const dataDefaults = { batchCount: 2, referenceDate: "2026-01-02", timezone: "Asia/Shanghai" };
   const original = helpers.newSessionDraft({ provider: "fixture", modelId: "first", expectedConfigVersion: "1" }, dataDefaults), choice = { provider: "fixture", modelId: "second", expectedConfigVersion: "1" };
   expect(original).toMatchObject({ referenceDate: "2026-01-02", timezone: "Asia/Shanghai" });

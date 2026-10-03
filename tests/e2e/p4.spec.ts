@@ -47,7 +47,7 @@ function receipt<T>(wire: Wire, id: string): T {
 }
 type ScopeReceipt = { scope: { batchIds: number[]; deviceIds: number[] | null }; referenceDate: string; timezone: string };
 type QueryReceipt = { queryId: number; totalRows: number; rows: { deviceId: number; deltaCents: number; ratio: number; deviceName: string }[]; evidenceIds: number[] };
-async function accepted() { return app.evaluate(() => (globalThis as MainGlobal).__p4Gate.accepted); }
+async function accepted() { const results = await app.evaluate(() => (globalThis as MainGlobal).__p4Gate.accepted); return results.map(value => { if (value.runId === null) throw new Error('A Send acceptance must identify its Run'); return { ...value, runId: value.runId }; }); }
 async function readRun(runId: number) { const result = await page.evaluate(runId => window.medclaw.request('run.read', { runId, callLimit: 50 }), runId); if (!result.ok || result.data.kind !== 'one' || !result.data.run) throw new Error('Missing original Run'); return result.data.run; }
 async function messages(sessionId: number, leafId: string | null = null, limit = 100, afterEntryId: string | null = null) {
   const result = await page.evaluate(input => window.medclaw.request('session.messages.read', input), { sessionId, leafId, afterEntryId, limit });
@@ -291,7 +291,11 @@ test('chat message pages reject late session, host and leaf replies', async () =
   await select(b.id); await rules([{ method: 'session.read', sessionId: a.id, hold: 'old-metadata', project: { ok: true, data: { ...detail.data, session: { ...detail.data.session, nextSubmissionSequence: 99 }, history: { ...detail.data.history, available: false, reason: 'native_state_invalid' } } } }]); await select(a.id); await entered('old-metadata');
   await rules([{ method: 'session.read', sessionId: a.id, hold: 'new-metadata' }]);
   await app.evaluate(({ BrowserWindow }, ids) => BrowserWindow.getAllWindows()[0]!.webContents.send('medclaw:notice', { type: 'agent.settled', instanceId: ids.instanceId, sessionId: ids.sessionId, runId: 999999, noticeSequence: 1, status: 'completed' }), { instanceId: hostBefore.data.instanceId, sessionId: a.id });
-  await entered('new-metadata'); await release('new-metadata'); await expect(region()).toContainText('No native messages'); await release('old-metadata'); await expect(page.getByText('This session cannot continue after a restart. Create a new session.', { exact: true })).toHaveCount(0); await expect(input()).toHaveValue('Draft survives failed message read');
+  // P5 serializes each original Session read. The requested refresh invalidates the held old generation,
+  // then starts after that response returns; its stale history flag must never become the current view.
+  await release('old-metadata'); await entered('new-metadata');
+  await expect(page.getByText('This session cannot continue after a restart. Create a new session.', { exact: true })).toHaveCount(0);
+  await release('new-metadata'); await expect(region()).toContainText('No native messages'); await expect(input()).toHaveValue('Draft survives failed message read');
   await rules([{ method: 'session.messages.read', sessionId: a.id, hold: 'old-host', project: projection(a.id, a.nativeSessionId, 'HOST OLD', [entry('host-old', 'OLD HOST TEXT')]) }]); await refresh(); await entered('old-host');
   const host = await page.evaluate(() => window.medclaw.request('host.read', {})); if (!host.ok || !host.data.instanceId) throw new Error('No host');
   expect(await page.evaluate(instanceId => window.medclaw.request('host.restart', { expectedInstanceId: instanceId }), host.data.instanceId)).toMatchObject({ ok: true });

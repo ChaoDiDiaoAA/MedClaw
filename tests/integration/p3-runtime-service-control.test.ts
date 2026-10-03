@@ -9,11 +9,15 @@ import { ModelCallRecorder } from '../../packages/runtime-pi/src/model-call-reco
 import { RuntimeService } from '../../packages/core/src/runtime/runtime-service';
 import { PublishedSettingsSchema, type BudgetSummary, type MeasurementContext, type ModelRuntimePort, type ResolvedProviderSelection, type ToolProfileSnapshot } from '../../packages/contracts/src/model';
 import type { AgentRuntimePort, ProviderOutcome, RuntimeBudgetView } from '../../packages/contracts/src/run';
-import { SubmitInputSchema, type NativeSessionBindings } from '../../packages/contracts/src/session';
+import { SubmitInputSchema, type NativeSessionBindings, type SubmitResult } from '../../packages/contracts/src/session';
 
 const closes: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of closes.splice(0)) await close(); });
 const unsupported = async (): Promise<never> => { throw new Error('Unexpected fixture operation'); };
+function requireSend(result: SubmitResult) {
+  if (result.inputId === null || result.runId === null) throw new Error('Expected current Send Input and Run');
+  return { ...result, inputId: result.inputId, runId: result.runId };
+}
 async function fixture(timeoutMs = 120000) {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-runtime-service-control-'));
   const db = openDatabase(join(root, 'app.sqlite'));
@@ -99,7 +103,11 @@ async function fixture(timeoutMs = 120000) {
     }),
     execute: async (input, callbacks) => {
       captured = input;
-      const recorder = callbacks.startCall(new Date().toISOString());
+      if (input.inputId == null || !callbacks.inputStore) throw new Error('Expected root Input persistence');
+      const at = new Date().toISOString();
+      callbacks.inputStore.recordInputDelivery(input.inputId, at);
+      callbacks.inputStore.recordInputConsumption(input.inputId, { sessionId: input.sessionId, runId: input.runId, nativeEntryId: `fixture-input-${input.inputId}`, at });
+      const recorder = callbacks.startCall(at);
       started();
       await waitForStop;
       const outcome: ProviderOutcome = {
@@ -110,8 +118,11 @@ async function fixture(timeoutMs = 120000) {
         usage: { inputTokens: null, outputTokens: null, cost: null, costCurrency: null, source: null, unavailableReason: 'fixture' },
         error: null,
       };
+      callbacks.admissionClosed?.();
       callbacks.nativeTerminal(outcome);
-      return { nativeIdle: true, lastOutcome: outcome, calls: [recorder.finish(outcome, new Date().toISOString())], budgetSummary };
+      return { nativeIdle: true, lastOutcome: outcome, calls: [recorder.finish(outcome, new Date().toISOString())], budgetSummary,
+        inputSettlement: { runId: input.runId, admissionClosed: true, preflightSettled: true, nativeIdle: true,
+          nativeQueuesEmpty: true, pendingPersistence: false, removals: [], unconfirmedInputIds: [] } };
     },
   };
   const service = new RuntimeService('instance', () => settings, modelRuntime, repo, (_context, action) => action(),
@@ -143,9 +154,13 @@ test('P3 RuntimeService freezes configured policy and profiles once and projects
   const c = await fixture();
   const accepted = await c.service.submitAgent(c.request, { instanceId: 'instance', operationRef: 'submit' });
   if (!accepted.ok) throw accepted.error;
+  const send = requireSend(accepted.data);
+  expect(send.inputId).toBeGreaterThan(0);
   await c.waitForStart;
-  const runId = accepted.data.runId;
+  const runId = send.runId;
   expect(c.profilesRead()).toBe(1);
+  expect(c.captured()?.inputId).toBe(send.inputId);
+  expect(c.repo.readInput({ inputId: send.inputId })).toMatchObject({ status: 'consumed', processingStatus: 'pending', targetRunId: runId, runId });
   expect(c.captured()).toMatchObject({ toolConfiguration: c.settings.toolConfiguration, agentPolicy: c.settings.agentPolicy, measurementContext: c.measurementContext, toolProfileSnapshot: c.toolProfileSnapshot });
   expect(c.repo.read({ runId })).toMatchObject({ kind: 'one', run: { control: { agentPolicy: c.settings.agentPolicy, measurementContext: c.measurementContext, toolProfileSnapshot: c.toolProfileSnapshot } } });
   expect(await c.service.readControl()).toMatchObject({ ok: true, data: { budget: { runId, toolCalls: { limit: 200, used: 3 } } } });
@@ -160,8 +175,14 @@ test('P3 RuntimeService freezes configured policy and profiles once and projects
   expect(await c.service.submitAgent(c.request, { instanceId: 'instance', operationRef: 'submit' })).toEqual(accepted);
   expect(c.profilesRead()).toBe(1);
   c.complete();
+  const completionDeadline = Date.now() + 1000;
+  while (c.repo.readInput({ inputId: send.inputId })?.processingStatus === 'pending') {
+    if (Date.now() > completionDeadline) throw new Error('Fixture native completion did not persist');
+    await Bun.sleep(1);
+  }
   await c.service.shutdown();
-  expect(c.repo.read({ runId })).toMatchObject({ kind: 'one', run: { cleanup: { budgetSummary: c.budgetSummary } } });
+  expect(c.repo.read({ runId })).toMatchObject({ kind: 'one', run: { cleanup: { budgetSummary: c.budgetSummary, inputsSettled: true } } });
+  expect(c.repo.readInput({ inputId: send.inputId })).toMatchObject({ status: 'consumed', processingStatus: 'completed', runId });
   expect(await c.service.readControl()).toMatchObject({ ok: true, data: { budget: null } });
 });
 
@@ -171,11 +192,13 @@ test('P3 statistics read failure does not block Run admission or fabricate a pro
   c.agent.captureToolProfiles = () => { throw new Error('Fixture statistics read failed'); };
   const accepted = await c.service.submitAgent(c.request, { instanceId: 'instance', operationRef: 'submit' });
   if (!accepted.ok) throw accepted.error;
+  const send = requireSend(accepted.data);
+  expect(send.inputId).toBeGreaterThan(0);
   await c.waitForStart;
   expect(c.captured()?.agentPolicy).toEqual(c.settings.agentPolicy);
   expect(c.captured()?.measurementContext).toBeUndefined();
   expect(c.captured()?.toolProfileSnapshot).toBeUndefined();
-  expect(c.repo.read({ runId: accepted.data.runId })).toMatchObject({ kind: 'one', run: { control: {
+  expect(c.repo.read({ runId: send.runId })).toMatchObject({ kind: 'one', run: { control: {
     agentPolicy: c.settings.agentPolicy, measurementContext: null, toolProfileSnapshot: null,
   } } });
   c.complete();
@@ -185,9 +208,12 @@ test('P3 manual Query context has a trusted synchronous deadline check', async (
   const c = await fixture();
   const accepted = await c.service.submitAgent(c.request, { instanceId: 'instance', operationRef: 'submit' });
   if (!accepted.ok) throw accepted.error;
+  const send = requireSend(accepted.data);
+  expect(send.inputId).toBeGreaterThan(0);
   await c.waitForStart;
   const context = c.service.bindQueryContext('query-form', c.repo.readWorkspace().revision);
   expect(context.checkActive).toBeFunction();
+  expect(context.inputId).toBe(send.inputId);
   const monotonic = spyOn(performance, 'now').mockReturnValue(c.captured()!.deadlineAt + 1);
   try {
     let failure: unknown;
@@ -203,6 +229,8 @@ test('P3 large total deadlines use bounded timer chunks without an immediate dea
   try {
     const accepted = await c.service.submitAgent(c.request, { instanceId: 'instance', operationRef: 'submit' });
     if (!accepted.ok) throw accepted.error;
+  const send = requireSend(accepted.data);
+  expect(send.inputId).toBeGreaterThan(0);
     await c.waitForStart;
     expect(timeout.mock.calls[0]?.[1]).toBeLessThanOrEqual(2147483647);
     expect(c.captured()?.signal.aborted).toBe(false);

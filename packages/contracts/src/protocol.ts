@@ -9,7 +9,7 @@ import {
 } from "./model";
 import { ActiveRunViewSchema, CancelRunResultSchema, ReadRunRequestSchema, ReadRunResultSchema, RunViewSchema, RuntimeControlViewSchema } from "./run";
 import { ListSessionsRequestSchema, NewSessionInputSchema, NewSessionResultSchema, ReadSubmissionRequestSchema, SelectSessionInputSchema,
-  SessionDetailSchema, SessionPageSchema, SubmitInputSchema, SubmitResultSchema } from "./session";
+  ReadInputRequestSchema, ListInputsRequestSchema, CancelInputRequestSchema, SessionInputSchema, SessionInputPageSchema, SessionDetailSchema, SessionPageSchema, SubmitInputSchema, SubmitResultSchema } from "./session";
 import { WorkspaceViewSchema, UpdateWorkspaceRequestSchema } from "./workspace";
 import { ImportPreviewRequestSchema, ImportCommitRequestSchema, ImportPreviewSchema, ImportOperationSchema, ImportReferenceSchema, ArtifactSchema, DataCatalogSchema, DataRowsSchema } from "./data";
 import { BUSINESS_RULES, createQuerySchemas, EvidenceViewSchema, PageSchema, QueryRequestParamsSchema, QuerySummarySchema, QueryViewSchema } from './query';
@@ -18,12 +18,12 @@ import { StoredToolConfigurationSchema, normalizeToolConfiguration } from './too
 import { RuntimeConfigurationSchema, normalizeRuntimeConfiguration, projectRuntimePolicies } from './runtime-config';
 import { ReadSessionMessagesInputSchema, SessionMessagePageSchema } from "./messages";
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p4-v1" as const;
-export const DATABASE_SCHEMA_VERSION = 3 as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p5-v1" as const;
+export const DATABASE_SCHEMA_VERSION = 4 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
-  return method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method.startsWith('evidence.read') || method === 'data.rows' || method === 'tool.read' || method === "run.active" || method === "workspace.restore" || method === "session.readSubmission";
+  return method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method.startsWith('evidence.read') || method === 'data.rows' || method === 'tool.read' || method === "run.active" || method === "workspace.restore" || method === "session.readSubmission" || method === "session.readInput" || method === "session.listInputs";
 }
 export const EmptyPayloadSchema = z.strictObject({});
 const accepted = z.strictObject({ accepted: z.literal(true) });
@@ -122,6 +122,9 @@ export const publicMethodSchemas = {
   "session.read": { input: z.strictObject({ sessionId: PositiveIdSchema }), output: SessionDetailSchema.nullable() },
   "session.messages.read": { input: ReadSessionMessagesInputSchema, output: SessionMessagePageSchema },
   "session.submit": { input: SubmitInputSchema, output: SubmitResultSchema },
+  "session.readInput": { input: ReadInputRequestSchema, output: SessionInputSchema.nullable() },
+  "session.listInputs": { input: ListInputsRequestSchema, output: SessionInputPageSchema },
+  "session.cancelInput": { input: CancelInputRequestSchema, output: SessionInputSchema },
   "session.readSubmission": { input: ReadSubmissionRequestSchema, output: SubmitResultSchema.nullable() },
   "workspace.read": { input: EmptyPayloadSchema, output: WorkspaceViewSchema },
   "workspace.restore": { input: EmptyPayloadSchema, output: WorkspaceViewSchema },
@@ -233,6 +236,9 @@ export const PublicHostRequestSchema = z.discriminatedUnion("method", [
   hostRequest("session.read", publicMethodSchemas["session.read"].input),
   hostRequest("session.messages.read", publicMethodSchemas["session.messages.read"].input),
   hostRequest("session.submit", publicMethodSchemas["session.submit"].input),
+  hostRequest("session.readInput", publicMethodSchemas["session.readInput"].input),
+  hostRequest("session.listInputs", publicMethodSchemas["session.listInputs"].input),
+  hostRequest("session.cancelInput", publicMethodSchemas["session.cancelInput"].input),
   hostRequest("session.readSubmission", publicMethodSchemas["session.readSubmission"].input),
   hostRequest("workspace.read", publicMethodSchemas["workspace.read"].input),
   hostRequest("workspace.restore", publicMethodSchemas["workspace.restore"].input),

@@ -165,7 +165,9 @@ export class PiModelRuntime implements ModelRuntimePort<ResolvedModel> {
     } catch { return { providerId, state: "sync_unknown", type: null, source: null, checkKind: "snapshot", checkedAt }; }
   }
   async directory(configVersion: string, selection: ModelSelection | null = null): Promise<ModelDirectoryView> {
-    const providers = await Promise.all(this.native.getProviders().map(async p => ({ id: p.id, name: p.name, loginTypes: [ ...(p.auth.apiKey?.login ? ["api_key" as const] : []), ...(p.auth.oauth ? ["oauth" as const] : []) ], auth: await this.authStatus(p.id), source: this.custom.has(p.id) ? "custom" as const : "pi_builtin" as const })));
+    const providers: ModelDirectoryView["providers"] = [];
+    // Overlapping snapshots must not multiply catalog-wide private credential requests.
+    for (const p of this.native.getProviders()) providers.push({ id: p.id, name: p.name, loginTypes: [ ...(p.auth.apiKey?.login ? ["api_key" as const] : []), ...(p.auth.oauth ? ["oauth" as const] : []) ], auth: await this.authStatus(p.id), source: this.custom.has(p.id) ? "custom" as const : "pi_builtin" as const });
     return { providers, models: this.native.getModels().map(m => modelView(m, this.custom.has(m.provider))), configVersion, selection, customApis: getApiProviders().map(p => p.api) };
   }
   async refresh(providerId: string | undefined, signal: AbortSignal) {

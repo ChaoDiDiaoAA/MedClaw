@@ -1,7 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import { createRequire } from "node:module";
 const requireContracts = createRequire(new URL("../../packages/contracts/package.json", import.meta.url));
-import { HostHelloSchema, HostReadySchema, HostRequestSchema, HostReplySchema, isReadOnlyMethod, parsePublicPayload, publicMethodSchemas, type PublicPayload } from "../../packages/contracts/src/protocol";
+import { DATABASE_SCHEMA_VERSION, HOST_PROTOCOL_VERSION, HostHelloSchema, HostReadySchema, HostRequestSchema, HostReplySchema, isReadOnlyMethod, parsePublicPayload, publicMethodSchemas, type PublicPayload } from "../../packages/contracts/src/protocol";
 import { safeError, serviceResult, type AppError } from "../../packages/contracts/src/error";
 import { ToolCallRecordSchema, ToolCallViewSchema, type ToolCallStore, type ToolExecutionContext, type ToolCallView } from "../../packages/contracts/src/tool";
 import type { ReadSessionMessagesInput, SessionMessageView, SessionMessagePage } from "../../packages/contracts/src/messages";
@@ -25,7 +25,7 @@ const message: SessionMessageView = { nativeEntryId: "entry-1", parentEntryId: n
   textInfo: { totalChars: 7, truncated: false, redacted: false } };
 const page: SessionMessagePage = { sessionId: 1, nativeSessionId: "native-1", leafId: "entry-1", source: "native_memory",
   items: [message], nextEntryId: null, hasMore: false };
-const frame = { protocolVersion: "medclaw.host/p4-v1", kind: "request", requestId: "request-1", instanceId: "host-1", operationRef: "operation-1",
+const frame = { protocolVersion: HOST_PROTOCOL_VERSION, kind: "request", requestId: "request-1", instanceId: "host-1", operationRef: "operation-1",
   method: "session.messages.read", payload: { sessionId: 1 } };
 
 test("P4 message contracts reject invalid cursors, limits, references and oversized pages", async () => {
@@ -72,7 +72,7 @@ test("P4 output validation budgets escaped and Unicode JSON in UTF-8 below the H
     if (text.startsWith("\u0000")) {
       expect(new TextEncoder().encode(JSON.stringify(candidate)).byteLength).toBeGreaterThan(3 * 1024 * 1024);
       expect(output.safeParse(candidate).success).toBe(false);
-      expect(HostReplySchema.safeParse({ protocolVersion: "medclaw.host/p4-v1", kind: "reply", instanceId: "host-1", requestId: "request-1", result: { ok: true, data: candidate } }).success).toBe(false);
+      expect(HostReplySchema.safeParse({ protocolVersion: HOST_PROTOCOL_VERSION, kind: "reply", instanceId: "host-1", requestId: "request-1", result: { ok: true, data: candidate } }).success).toBe(false);
     } else expect(output.safeParse(candidate).success).toBe(true);
   }
   // A structurally valid page crosses the budget through escaped text, not item or character limits.
@@ -83,22 +83,25 @@ test("P4 output validation budgets escaped and Unicode JSON in UTF-8 below the H
   expect(output.safeParse(above).success).toBe(false);
 });
 
-test("P4 protocol keeps schema 3 and classifies message and submission reads as read only", () => {
+test("P4 message methods use the P5 protocol and schema 4 and classifies message and submission reads as read only", () => {
   const input: PublicPayload<"session.messages.read"> = { sessionId: 1 };
   expect(parsePublicPayload("session.messages.read", input)).toEqual({ sessionId: 1, leafId: null, afterEntryId: null, limit: 50 });
   expect(HostRequestSchema.safeParse(frame).success).toBe(true);
   expect(HostRequestSchema.safeParse({ ...frame, protocolVersion: "medclaw.host/p3-v1" }).success).toBe(false);
+  expect(HostRequestSchema.safeParse({ ...frame, protocolVersion: "medclaw.host/p4-v1" }).success).toBe(false);
   expect(HostRequestSchema.safeParse({ ...frame, payload: { sessionId: 1, limit: 101 } }).success).toBe(false);
-  const reply = { protocolVersion: "medclaw.host/p4-v1", kind: "reply", instanceId: "host-1", requestId: "request-1", result: { ok: true, data: page } };
+  const reply = { protocolVersion: HOST_PROTOCOL_VERSION, kind: "reply", instanceId: "host-1", requestId: "request-1", result: { ok: true, data: page } };
   expect(HostReplySchema.safeParse(reply).success).toBe(true);
   expect(HostReplySchema.safeParse({ ...reply, protocolVersion: "medclaw.host/p3-v1" }).success).toBe(false);
-  const ready = { protocolVersion: "medclaw.host/p4-v1", instanceId: "host-1", sdkVersion: "0.87.1", schemaVersion: 3, configVersion: "1", dataRoot: "D:/fixture" };
+  expect(HostReplySchema.safeParse({ ...reply, protocolVersion: "medclaw.host/p4-v1" }).success).toBe(false);
+  const ready = { protocolVersion: HOST_PROTOCOL_VERSION, instanceId: "host-1", sdkVersion: "0.87.1", schemaVersion: DATABASE_SCHEMA_VERSION, configVersion: "1", dataRoot: "D:/fixture" };
   expect(HostReadySchema.safeParse(ready).success).toBe(true);
-  expect(HostReadySchema.safeParse({ ...ready, schemaVersion: 4 }).success).toBe(false);
-  const hello = { protocolVersion: "medclaw.host/p4-v1", instanceId: "host-1", sdkVersion: "0.87.1", expectedSchemaVersion: 3, startupToken: "token-1",
+  expect(HostReadySchema.safeParse({ ...ready, schemaVersion: 3 }).success).toBe(false);
+  const hello = { protocolVersion: HOST_PROTOCOL_VERSION, instanceId: "host-1", sdkVersion: "0.87.1", expectedSchemaVersion: DATABASE_SCHEMA_VERSION, startupToken: "token-1",
     paths: { dataRoot: "D:/fixture", databasePath: "D:/fixture/db", settingsPath: "D:/fixture/settings", cachePath: "D:/fixture/cache", lockPath: "D:/fixture/lock" } };
   expect(HostHelloSchema.safeParse(hello).success).toBe(true);
   expect(HostHelloSchema.safeParse({ ...hello, protocolVersion: "medclaw.host/p3-v1" }).success).toBe(false);
+  expect(HostHelloSchema.safeParse({ ...hello, protocolVersion: "medclaw.host/p4-v1" }).success).toBe(false);
   expect(isReadOnlyMethod("session.messages.read")).toBe(true);
   expect(isReadOnlyMethod("session.readSubmission")).toBe(true);
   expect(isReadOnlyMethod("session.submit")).toBe(false);

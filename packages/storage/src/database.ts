@@ -4,8 +4,8 @@ import { readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
-export const SCHEMA_VERSION = 3;
-const migrations = ["001_p1.sql", "002_p2.sql", "003_p3.sql"].map(name => {
+export const SCHEMA_VERSION = 4;
+const migrations = ["001_p1.sql", "002_p2.sql", "003_p3.sql", "004_p5.sql"].map(name => {
   const sql = readFileSync(new URL(`./migrations/${name}`, import.meta.url));
   return { sql: sql.toString("utf8"), checksum: createHash("sha256").update(sql).digest("hex") };
 });
@@ -15,8 +15,12 @@ const expectedSchemas = (() => {
   const reference = new Database(":memory:", { strict: true });
   try {
     return migrations.map((migration, index) => {
-      if (index === 1) reference.exec("PRAGMA foreign_keys=OFF");
-      reference.exec(migration.sql);
+      if(index===1||index===3){
+        reference.exec("PRAGMA foreign_keys=OFF");
+        if(reference.query<{foreign_keys:number},[]>("PRAGMA foreign_keys").get()?.foreign_keys!==0)throw new Error("storage_migration_failed");
+        try{reference.transaction(()=>reference.exec(migration.sql)).immediate();}
+        finally{reference.exec("PRAGMA foreign_keys=ON");if(reference.query<{foreign_keys:number},[]>("PRAGMA foreign_keys").get()?.foreign_keys!==1)throw new Error("storage_migration_failed");}
+      }else reference.exec(migration.sql);
       return reference.query(schemaQuery).all();
     });
   } finally {
@@ -32,7 +36,7 @@ function validate(db: Database, version: number) {
 }
 
 // The Host verifies its root and exclusive process identity before calling this.
-export function openDatabase(path: string, beforeMigrationCommit?: () => void): Database {
+export function openDatabase(path: string, beforeMigrationCommit?: (phase?: string) => void): Database {
   if (!isAbsolute(path)) throw new Error("storage_migration_failed");
   const db = new Database(path, { create: true, strict: true });
   try {
@@ -88,6 +92,28 @@ export function openDatabase(path: string, beforeMigrationCommit?: () => void): 
         beforeMigrationCommit?.();
         db.query("INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(3,?,?)").run(migrations[2]!.checksum, new Date().toISOString());
       }).immediate();
+    }
+    if (version <= 3) {
+      const names = db.query<{name:string},[]>("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations' ORDER BY name").all().map(row=>row.name);
+      const oldRows = names.map(name=>db.query<Record<string,unknown>,[]>(`SELECT * FROM ${name} ORDER BY id`).all());
+      try {
+        db.exec("PRAGMA foreign_keys=OFF");
+        if(db.query<{foreign_keys:number},[]>("PRAGMA foreign_keys").get()?.foreign_keys!==0) throw new Error("storage_migration_failed");
+        db.transaction(()=> {
+          const sql = migrations[3]!.sql;
+          const copyEnd = sql.indexOf('DROP TRIGGER model_calls_owner_insert');
+          const renameEnd = sql.indexOf('CREATE UNIQUE INDEX runs_one_root');
+          db.exec(sql.slice(0,copyEnd)); beforeMigrationCommit?.('p5_copy');
+          db.exec(sql.slice(copyEnd,renameEnd)); beforeMigrationCommit?.('p5_rename');
+          db.exec(sql.slice(renameEnd));
+          for(const [i,name] of names.entries()) if(!isDeepStrictEqual(oldRows[i],db.query(`SELECT * FROM ${name} ORDER BY id`).all())) throw new Error("storage_migration_failed");
+          validate(db,4); beforeMigrationCommit?.("p5_marker");
+          db.query("INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(4,?,?)").run(migrations[3]!.checksum,new Date().toISOString());
+        }).immediate();
+      } finally {
+        db.exec("PRAGMA foreign_keys=ON");
+        if(db.query<{foreign_keys:number},[]>("PRAGMA foreign_keys").get()?.foreign_keys!==1) throw new Error("storage_migration_failed");
+      }
     }
     validate(db, SCHEMA_VERSION);
     return db;
