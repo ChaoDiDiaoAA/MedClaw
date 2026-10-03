@@ -89,7 +89,7 @@ export class CatalogService {
     else {
       PositiveIdSchema.parse(context.runId); PositiveIdSchema.parse(context.sessionId); RunScopeSchema.parse(context.scope);
       z.enum(['agent_tool', 'user_form', 'intent']).parse(context.source); z.string().min(1).max(512).parse(context.callRef);
-      if (context.inputId !== null) throw new Error('invalid_argument');
+      PositiveIdSchema.nullable().parse(context.inputId);
       TimezoneSchema.parse(context.timezone);
     }
     BusinessDateSchema.parse(context.referenceDate);

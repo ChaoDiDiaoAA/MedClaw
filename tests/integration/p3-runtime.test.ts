@@ -17,7 +17,7 @@ import { createQueryCurrentDevicesTool } from '../../packages/core/src/tools/bus
 import { PiAgentRuntime } from '../../packages/runtime-pi/src/agent-runtime';
 import { PiModelRuntime } from '../../packages/runtime-pi/src/model-runtime';
 import { ModelCallRecorder } from '../../packages/runtime-pi/src/model-call-recorder';
-import { SubmitInputSchema } from '../../packages/contracts/src/session';
+import { SubmitInputSchema, type SubmitResult } from '../../packages/contracts/src/session';
 import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
 import { Application } from '../../packages/core/src/application';
 import type { ResolvedModel } from '../../packages/runtime-pi/src/model-runtime';
@@ -25,6 +25,11 @@ import type { RuntimeNotice } from '../../packages/contracts/src/protocol';
 import { SqliteCatalogStore } from '../../packages/storage/src/catalog-store';
 import { EvidenceReader } from '../../packages/core/src/evidence/evidence-reader';
 import { createBusinessTools } from '../../packages/core/src/tools/tools';
+
+function requireSend(result: SubmitResult) {
+  if (result.inputId === null || result.runId === null) throw new Error('Expected current Send Input and Run');
+  return { ...result, inputId: result.inputId, runId: result.runId };
+}
 
 test('production PiAgentRuntime executes business and native tools in one frozen Run, then records a final model request', async () => {
   const root = await mkdtemp(join(tmpdir(), 'medclaw-p3-runtime-'));
@@ -292,12 +297,14 @@ test.each(['request-before-commit', 'request-after-commit', 'result', 'delivery'
       model: { provider: 'p3-save', modelId: 'fixture', expectedConfigVersion: '1' }, referenceDate: '2026-01-01', timezone: 'Asia/Shanghai' });
     const accepted = await app.runs.submitAgent(input, { instanceId: 'instance', operationRef: 'send' });
     if (!accepted.ok) throw accepted.error;
+    const send = requireSend(accepted.data);
+    expect(send.inputId).toBeGreaterThan(0);
     const until = Date.now() + 5000;
     while (!notices.some(notice => notice.type === 'agent.persistence_failed') && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 5));
     expect(notices.some(notice => notice.type === 'agent.persistence_failed')).toBe(true);
-    expect(await app.runs.readControl()).toMatchObject({ ok: true, data: { acceptingNewRuns: false, activeRootRun: { runId: accepted.data.runId } } });
-    expect(db.query('SELECT status FROM runs WHERE id=?').get(accepted.data.runId)).toEqual({ status: 'failed' });
-    if (!fault.startsWith('request')) expect(await readFile(join(root, 'runtime', String(accepted.data.runId), 'work', 'scratch', 'proof.txt'), 'utf8')).toBe('one real effect');
+    expect(await app.runs.readControl()).toMatchObject({ ok: true, data: { acceptingNewRuns: false, activeRootRun: { runId: send.runId } } });
+    expect(db.query('SELECT status FROM runs WHERE id=?').get(send.runId)).toEqual({ status: 'failed' });
+    if (!fault.startsWith('request')) expect(await readFile(join(root, 'runtime', String(send.runId), 'work', 'scratch', 'proof.txt'), 'utf8')).toBe('one real effect');
     expect(requests).toBe(fault.startsWith('consumption') ? 2 : 1);
     if (originalEvidence) {
       expect(originalEvidence[2]).toBe('provider_input_verified');
@@ -305,7 +312,7 @@ test.each(['request-before-commit', 'request-after-commit', 'result', 'delivery'
       expect(store.readCall(originalEvidence[0])?.consumptionEvidence).toBe(fault.includes('after-commit') ? 'provider_input_verified' : undefined);
     }
     const originalReceipts = batchConsumption ? ['write-1', 'write-2'].map(nativeToolCallId => store.readCall({ ...originalEvidence![0], nativeToolCallId })!) : [];
-    const work = join(root, 'runtime', String(accepted.data.runId), 'work', 'scratch');
+    const work = join(root, 'runtime', String(send.runId), 'work', 'scratch');
     const originalFileTimes = batchConsumption ? await Promise.all(['proof.txt', 'proof-second.txt'].map(async name => (await stat(join(work, name), { bigint: true })).mtimeNs)) : [];
     if (batchConsumption) {
       expect(await readFile(join(work, 'proof-second.txt'), 'utf8')).toBe('second real effect');
@@ -316,29 +323,30 @@ test.each(['request-before-commit', 'request-after-commit', 'result', 'delivery'
         const text = record.sdkDelivery!.content.map(part => (part as { text: string }).text).join('\n');
         expect(payloads[1]!.messages).toEqual(expect.arrayContaining([{ role: 'tool', tool_call_id: record.nativeToolCallId, content: text }]));
       }
-      expect(recorder.persistencePending(accepted.data.runId)).toBe(true);
+      expect(recorder.persistencePending(send.runId)).toBe(true);
     }
     failing = false;
     if (secondRetryFailure) {
-      expect(await app.runs.retrySave(accepted.data.runId)).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
-      expect(await app.runs.readControl()).toMatchObject({ ok: true, data: { acceptingNewRuns: false, activeRootRun: { runId: accepted.data.runId } } });
-      expect(recorder.persistencePending(accepted.data.runId)).toBe(true);
+      expect(await app.runs.retrySave(send.runId)).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+      expect(await app.runs.readControl()).toMatchObject({ ok: true, data: { acceptingNewRuns: false, activeRootRun: { runId: send.runId } } });
+      expect(recorder.persistencePending(send.runId)).toBe(true);
       expect(store.readCall({ ...originalEvidence![0], nativeToolCallId: 'write-1' })).toMatchObject({ nextModelCallId: originalEvidence![1], consumptionEvidence: 'provider_input_verified' });
       expect(store.readCall({ ...originalEvidence![0], nativeToolCallId: 'write-2' })?.consumptionEvidence).toBeUndefined();
       expect(requests).toBe(2);
       secondRetryFailure = false;
     }
-    expect(await app.runs.retrySave(accepted.data.runId)).toMatchObject({ ok: true, data: { status: 'failed', cleanup: { stopConfirmed: true, requiredPersistenceComplete: true } } });
+    expect(await app.runs.retrySave(send.runId)).toMatchObject({ ok: true, data: { status: 'failed', cleanup: { stopConfirmed: true, requiredPersistenceComplete: true } } });
     expect(db.query('SELECT tool_name,status FROM tool_calls').all()).toEqual([
       { tool_name: 'write', status: fault.startsWith('request') ? 'failed' : 'succeeded' },
       ...(batchConsumption ? [{ tool_name: 'write', status: 'succeeded' }] : []),
     ]);
     expect(await app.runs.readControl()).toMatchObject({ ok: true, data: { acceptingNewRuns: true } });
+    expect(repo.readInput({ inputId: send.inputId })).toMatchObject({ status: 'consumed', processingStatus: 'failed', targetRunId: send.runId, runId: send.runId });
     expect(requests).toBe(fault.startsWith('consumption') ? 2 : 1);
     if (originalEvidence) {
       expect(store.readCall(originalEvidence[0])).toMatchObject({ nextModelCallId: originalEvidence[1], consumptionEvidence: 'provider_input_verified',
         status: 'succeeded', sdkReturned: true });
-      expect(await readFile(join(root, 'runtime', String(accepted.data.runId), 'work', 'scratch', 'proof.txt'), 'utf8')).toBe('one real effect');
+      expect(await readFile(join(root, 'runtime', String(send.runId), 'work', 'scratch', 'proof.txt'), 'utf8')).toBe('one real effect');
       expect(db.query('SELECT COUNT(*) n FROM model_calls').get()).toEqual({ n: 2 });
       expect(db.query('SELECT COUNT(*) n FROM tool_calls').get()).toEqual({ n: 2 });
       for (const original of originalReceipts) {
@@ -348,7 +356,7 @@ test.each(['request-before-commit', 'request-after-commit', 'result', 'delivery'
         expect(saved.sdkDelivery).toEqual(original.sdkDelivery);
       }
       expect(await Promise.all(['proof.txt', 'proof-second.txt'].map(async name => (await stat(join(work, name), { bigint: true })).mtimeNs))).toEqual(originalFileTimes);
-      expect(recorder.persistencePending(accepted.data.runId)).toBe(false);
+      expect(recorder.persistencePending(send.runId)).toBe(false);
     }
   } finally { try { await app?.shutdown(); } finally { server.stop(true); db.close(); await rm(root, { recursive: true, force: true }); } }
 }, 15000);

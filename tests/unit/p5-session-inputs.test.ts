@@ -3,7 +3,7 @@ import * as contracts from '../../packages/contracts/src/session';
 import { HOST_PROTOCOL_VERSION, DATABASE_SCHEMA_VERSION, isReadOnlyMethod, publicMethodSchemas, HostHelloSchema, HostReadySchema, HostRequestSchema, HostReplySchema } from '../../packages/contracts/src/protocol';
 import { safeError } from '../../packages/contracts/src/error';
 import { SessionMessageViewSchema } from '../../packages/contracts/src/messages';
-import { safePreview } from '../../packages/contracts/src/run';
+import { ModelCallViewSchema, safePreview } from '../../packages/contracts/src/run';
 import { discoverTests, runStage } from '../run';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -28,7 +28,8 @@ test('P5 input selectors and list defaults', () => {
 test('P5 delivery and processing combinations require consumption evidence', () => {
  expect(contracts.SessionInputSchema).toBeDefined();
  for (const status of ['queued', 'consumed', 'failed', 'cancelled', 'delivery_unknown']) for (const processingStatus of ['pending', 'completed', 'failed', 'cancelled']) {
-  const valid = status === 'consumed' || status === 'queued' && processingStatus === 'pending' || status === 'failed' && processingStatus === 'failed' || status === 'cancelled' && processingStatus === 'cancelled' || status === 'delivery_unknown' && processingStatus !== 'completed';
+  const allowed = new Set(['queued/pending', 'consumed/pending', 'consumed/completed', 'consumed/failed', 'consumed/cancelled', 'failed/failed', 'cancelled/cancelled', 'delivery_unknown/pending', 'delivery_unknown/failed', 'delivery_unknown/cancelled']);
+  const valid = allowed.has(`${status}/${processingStatus}`);
   const value = { ...input, status, processingStatus, processedAt: processingStatus === 'pending' ? null : input.updatedAt, runId: status === 'consumed' ? 1 : null, nativeEntryId: status === 'consumed' ? 'entry-1' : null };
   expect(contracts.SessionInputSchema.safeParse(value).success).toBe(valid);
  }
@@ -86,4 +87,12 @@ test('P5 public errors keep fixed safe text and direct message input identities'
  const message = { nativeEntryId: 'entry-1', parentEntryId: null, entryType: 'message', displayRole: 'user', text: 'hello', references: [], inputId: 1, runId: 1, toolCallRef: null, textInfo: { totalChars: 5, truncated: false, redacted: false } };
  expect(SessionMessageViewSchema.safeParse(message).success).toBe(true);
  expect(SessionMessageViewSchema.safeParse({ ...message, displayRole: 'assistant' }).success).toBe(false);
+});
+
+// Public call projections must carry the root Input, including legacy null.
+test('P5 model call exposes positive root input identity with legacy null', () => {
+ expect(ModelCallViewSchema.shape.inputId).toBeDefined();
+ expect(ModelCallViewSchema.shape.inputId.safeParse(1).success).toBe(true);
+ expect(ModelCallViewSchema.shape.inputId.safeParse(null).success).toBe(true);
+ expect(ModelCallViewSchema.shape.inputId.safeParse(0).success).toBe(false);
 });

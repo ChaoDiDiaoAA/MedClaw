@@ -19,7 +19,7 @@ const nullableAmount = z.number().finite().nonnegative().nullable();
 const nullableToken = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable();
 const safeLabel = z.string().min(1).max(256);
 export const ModelCallViewSchema = z.strictObject({
-  id: PositiveIdSchema, callId: OpaqueIdSchema, kind: z.enum(["main", "diagnostic"]), state: z.enum(["started", "completed", "failed", "cancelled"]),
+  id: PositiveIdSchema, inputId: PositiveIdSchema.nullable().default(null), callId: OpaqueIdSchema, kind: z.enum(["main", "diagnostic"]), state: z.enum(["started", "completed", "failed", "cancelled"]),
   granularity: z.literal("logical_request"), attempt: z.literal(1), attemptCountUnknown: z.literal(true), model: ModelSelectionSchema,
   responseModel: z.string().min(1).max(256).nullable(), sdkStopReason: SdkStopReasonSchema.nullable(),
   startedAt: TimestampSchema, endedAt: TimestampSchema.nullable(), durationMs: nullableAmount,

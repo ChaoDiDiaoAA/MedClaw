@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../../packages/storage/src/database";
 import { Repositories } from "../../packages/storage/src/repositories";
-import type { SessionDetail, SubmitInput, SubmitResult } from "../../packages/contracts/src/session";
+import type { SessionDetail, SubmitInput, SubmitResult, InputSettlementProof } from "../../packages/contracts/src/session";
 import type { Result } from "../../packages/contracts/src/error";
 import { safeError } from "../../packages/contracts/src/error";
 import type { RunHandle } from "../../packages/contracts/src/run";
@@ -126,6 +126,15 @@ test("accepted original submit is returned before runtime admission even after W
   expect(c.stats().delegated).toBe(0);
 });
 
+function requireSend(result: SubmitResult) {
+  if (result.inputId === null || result.runId === null) throw new Error("Expected current Send to create a real Input and root Run");
+  return { ...result, inputId: result.inputId, runId: result.runId };
+}
+function closedInputSource(runId: number): InputSettlementProof {
+  return { runId, admissionClosed: true, preflightSettled: true, nativeIdle: true, nativeQueuesEmpty: true,
+    pendingPersistence: false, removals: [], unconfirmedInputIds: [] };
+}
+
 async function runtimeSetup(mode: Parameters<typeof providerFixture>[0] = "success", beforeCommit?: () => void, credentialScope: CredentialScope = (_context, action) => action()) {
   const root = mkdtempSync(join(tmpdir(), "medclaw-p2-app-"));
   const fixture = providerFixture(mode), db = openDatabase(join(root, "db.sqlite")), repo = new Repositories(db, beforeCommit);
@@ -157,7 +166,7 @@ async function until(test: () => boolean, timeout = 4000) { const end = Date.now
 test("Provider and Agent share one root; browsing B and Stop keep A execution identity", async () => {
   const c = await runtimeSetup("slow"), a = await c.create("a"), b = await c.create("b");
   unwrap(await c.sessions.select({ sessionId: a.session.id, expectedWorkspaceRevision: 2 }));
-  const original = c.input(a.session.id, "A-only"), accepted = unwrap(await c.sessions.submit(original, context("send-a"))); await c.fixture.requested;
+  const original = c.input(a.session.id, "A-only"), accepted = requireSend(unwrap(await c.sessions.submit(original, context("send-a")))); await c.fixture.requested;
   unwrap(await c.sessions.select({ sessionId: b.session.id, expectedWorkspaceRevision: 3 }));
   expect(await c.sessions.submit(c.input(b.session.id, "B-draft"), context("send-b"))).toMatchObject({ ok: false, error: { code: "state_conflict", reason: "runtime_busy" } });
   await expect(c.app.submitProvider(c.command)).rejects.toThrow("runtime_busy");
@@ -186,7 +195,7 @@ test("async model admission reserves the root with no fake RunHandle and only on
 
 test("Agent save failure blocks new Run and retrySave persists the original fact without another request", async () => {
   let fail = false; const c = await runtimeSetup("slow", () => { if (fail) throw new Error("save fixture"); }), a = await c.create();
-  const accepted = unwrap(await c.sessions.submit(c.input(a.session.id), context("send"))); await c.fixture.requested; fail = true;
+  const accepted = requireSend(unwrap(await c.sessions.submit(c.input(a.session.id), context("send")))); await c.fixture.requested; fail = true;
   const cancelled = unwrap(await c.app.runs.cancel(accepted.runId)); expect(cancelled).toMatchObject({ stopped: true, persistencePending: true });
   expect(unwrap(await c.app.runs.readControl())).toMatchObject({ acceptingNewRuns: false, activeRootRun: { runId: accepted.runId } });
   expect(await c.sessions.submit(c.input(a.session.id), context("next"))).toMatchObject({ ok: false, error: { reason: "runtime_busy" } });
@@ -198,36 +207,49 @@ test("known deadline failure remains occupied until actual stop; late cleanup pr
   const c = await runtimeSetup(), a = await c.create(); let release!: (value: AgentExecutionObservation) => void, observedAbort = false;
   const pending = new Promise<AgentExecutionObservation>(resolve => { release = resolve; });
   let recorder: ReturnType<Parameters<typeof c.adapter.execute>[1]["startCall"]> | undefined;
-  c.adapter.execute = async (input, callbacks) => { recorder = callbacks.startCall(new Date().toISOString()); input.signal.addEventListener("abort", () => { observedAbort = true; }); return pending; };
-  const accepted = unwrap(await c.sessions.submit(c.input(a.session.id), context("delayed-stop")));
+  c.adapter.execute = async (input, callbacks) => {
+    if (input.inputId == null || !callbacks.inputStore) throw new Error("Expected Input persistence port");
+    const at = new Date().toISOString();
+    callbacks.inputStore.recordInputDelivery(input.inputId, at);
+    callbacks.inputStore.recordInputConsumption(input.inputId, { sessionId: input.sessionId, runId: input.runId, nativeEntryId: "controlled-input", at });
+    recorder = callbacks.startCall(at);
+    input.signal.addEventListener("abort", () => { observedAbort = true; });
+    return pending;
+  };
+  const accepted = requireSend(unwrap(await c.sessions.submit(c.input(a.session.id), context("delayed-stop"))));
   try {
     await until(() => observedAbort); const failed = c.repo.read({ runId: accepted.runId });
     expect(failed).toMatchObject({ kind: "one", run: { status: "failed", stoppedAt: null, error: { code: "run_timeout" }, calls: [{ state: "started", endedAt: null }], cleanup: { stopConfirmed: false } } });
+    expect(c.repo.readInput({ inputId: accepted.inputId })).toMatchObject({ status: "consumed", processingStatus: "pending", runId: accepted.runId });
     const endedAt = failed.kind === "one" ? failed.run!.endedAt : null;
     expect(c.repo.active()).toBeNull(); expect(unwrap(await c.app.runs.readControl()).acceptingNewRuns).toBe(false);
     expect(await c.sessions.submit(c.input(a.session.id), context("blocked"))).toMatchObject({ ok: false, error: { reason: "runtime_busy" } });
     expect(unwrap(await c.app.runs.cancel(accepted.runId))).toMatchObject({ stopped: false, committedStatus: "failed" });
     const outcome = { sdkStopReason: "aborted" as const, text: "", responseModel: null, callState: "cancelled" as const, error: null,
       usage: { inputTokens: null, outputTokens: null, cost: null, costCurrency: null, source: null, unavailableReason: "controlled_unknown" } };
-    release({ nativeIdle: true, lastOutcome: outcome, calls: [recorder!.finish(outcome, new Date().toISOString())] });
+    release({ nativeIdle: true, lastOutcome: outcome, calls: [recorder!.finish(outcome, new Date().toISOString())], inputSettlement: closedInputSource(accepted.runId) });
     await until(() => !c.app.busy);
     expect(c.repo.read({ runId: accepted.runId })).toMatchObject({ kind: "one", run: { status: "failed", error: { code: "run_timeout" }, endedAt,
       cleanup: { stopConfirmed: true, resourcesReleased: true, unconfirmedItems: [] } } });
-  } finally { release({ nativeIdle: true, lastOutcome: null, calls: [] }); }
+    expect(c.repo.readInput({ inputId: accepted.inputId })).toMatchObject({ status: "consumed", processingStatus: "failed", runId: accepted.runId });
+  } finally { release({ nativeIdle: true, lastOutcome: null, calls: [], inputSettlement: closedInputSource(accepted.runId) }); }
 }, 12000);
 
 test("normal native completion latch survives Stop while final save is pending", async () => {
-  let writes = 0, fail = true; const c = await runtimeSetup("success", () => { if (++writes >= 4 && fail) throw new Error("final save fault"); }), a = await c.create();
-  const accepted = unwrap(await c.sessions.submit(c.input(a.session.id), context("success")));
+  let fail = false;
+  const c = await runtimeSetup("success", () => { if (fail) throw new Error("final save fault"); }), a = await c.create();
+  const finalize = c.repo.finalizeAgent.bind(c.repo);
+  c.repo.finalizeAgent = (...args) => { fail = true; return finalize(...args); };
+  const accepted = requireSend(unwrap(await c.sessions.submit(c.input(a.session.id), context("success"))));
   await until(() => c.notices.some(n => n.type === "agent.persistence_failed"));
   expect(unwrap(await c.app.runs.cancel(accepted.runId))).toMatchObject({ cancelRequested: false, stopped: true, persistencePending: true });
-  fail = false; expect(unwrap(await c.app.runs.retrySave(accepted.runId))).toMatchObject({ status: "completed", cancelRequestedAt: null });
+  c.repo.finalizeAgent = finalize; fail = false; expect(unwrap(await c.app.runs.retrySave(accepted.runId))).toMatchObject({ status: "completed", cancelRequestedAt: null });
   expect(c.fixture.requests).toHaveLength(1);
 });
 
 test("old cancelled cleanup gap blocks with empty active view and ordinary control reads never repair", async () => {
   let writes = 0; const c = await runtimeSetup("success", () => { writes++; }), a = await c.create();
-  const accepted = unwrap(await c.sessions.submit(c.input(a.session.id), context("old"))); await until(() => !c.app.busy);
+  const accepted = requireSend(unwrap(await c.sessions.submit(c.input(a.session.id), context("old")))); await until(() => !c.app.busy);
   c.db.query("UPDATE runs SET instance_id='old-host',status='cancelled',cancel_requested_at=created_at,cleanup_json=json_set(cleanup_json,'$.stopConfirmed',0,'$.resourcesReleased',0,'$.unconfirmedItems',json('[\"stop\",\"resources\"]')) WHERE id=?").run(accepted.runId);
   const before = c.db.query("SELECT status,error_json,ended_at,input_text,output_text FROM runs WHERE id=?").get(accepted.runId), count = writes;
   const control = unwrap(await c.app.runs.readControl()); expect(control).toMatchObject({ activeRootRun: null, acceptingNewRuns: false });
@@ -248,7 +270,7 @@ test("model/auth validation fails before Agent acceptance, not as a fallback run
 test("final COMMIT with a lost return is confirmed from the original durable facts without another execution", async () => {
   const c = await runtimeSetup(), a = await c.create(), finalize = c.repo.finalizeAgent.bind(c.repo);
   c.repo.finalizeAgent = (...args) => { finalize(...args); throw new Error("reply lost after COMMIT"); };
-  const accepted = unwrap(await c.sessions.submit(c.input(a.session.id), context("commit-unknown")));
+  const accepted = requireSend(unwrap(await c.sessions.submit(c.input(a.session.id), context("commit-unknown"))));
   try {
     await until(() => c.notices.some(n => n.type === "agent.settled" || n.type === "agent.persistence_failed"));
     expect(c.app.persistencePending).toBe(false);
@@ -263,7 +285,7 @@ test("cancel before native entry has no call or invented stoppedAt", async () =>
   let release!: () => void, entered!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; }), ready = new Promise<void>(resolve => { entered = resolve; });
   const c = await runtimeSetup("success", undefined, async (_context, action) => { entered(); await gate; return action(); }), a = await c.create();
-  const accepted = unwrap(await c.sessions.submit(c.input(a.session.id), context("early-stop"))); await ready;
+  const accepted = requireSend(unwrap(await c.sessions.submit(c.input(a.session.id), context("early-stop")))); await ready;
   c.app.runs.cancelNow(accepted.runId); release(); await until(() => !c.app.busy);
   expect(c.repo.read({ runId: accepted.runId })).toMatchObject({ kind: "one", run: { status: "cancelled", stoppedAt: null, calls: [],
     cleanup: { executionStarted: false, stopConfirmed: true, resourcesReleased: true } } });
@@ -273,7 +295,7 @@ test("cancel before native entry has no call or invented stoppedAt", async () =>
 
 test("credential scope failure before native entry closes an accepted zero-call Run safely", async () => {
   const c = await runtimeSetup("success", undefined, async () => { throw new Error("credential_read_failed"); }), a = await c.create();
-  const accepted = unwrap(await c.sessions.submit(c.input(a.session.id), context("scope-failed")));
+  const accepted = requireSend(unwrap(await c.sessions.submit(c.input(a.session.id), context("scope-failed"))));
   await until(() => c.notices.some(n => n.type === "agent.settled") || c.repo.read({ runId: accepted.runId }).kind === "one" && !c.app.runs.stopPending);
   expect(c.repo.read({ runId: accepted.runId })).toMatchObject({ kind: "one", run: { status: "failed", stoppedAt: null, calls: [],
     error: { code: "credential_read_failed" }, cleanup: { executionStarted: false, stopConfirmed: true } } });
@@ -290,16 +312,24 @@ test("control read failure is an error and never an empty idle success or repair
 });
 
 for (const status of ["failed", "cancelled", "completed"] as const) test(`Host recovery only supplements ${status} cleanup; failed save keeps admission blocked`, async () => {
-  let fail = false; const c = await runtimeSetup("success", () => { if (fail) throw new Error("recovery save fixture"); }), a = await c.create();
-  const accepted = unwrap(await c.sessions.submit(c.input(a.session.id), context(`old-${status}`))); await until(() => !c.app.busy);
+  let fail = false, savingCleanup = false;
+  const c = await runtimeSetup("success", () => { if (fail && savingCleanup) throw new Error("recovery save fixture"); }), a = await c.create();
+  const saveCleanup = c.repo.saveRunCleanup.bind(c.repo);
+  c.repo.saveRunCleanup = (...args) => {
+    savingCleanup = true;
+    try { return saveCleanup(...args); } finally { savingCleanup = false; }
+  };
+  const accepted = requireSend(unwrap(await c.sessions.submit(c.input(a.session.id), context(`old-${status}`)))); await until(() => !c.app.busy);
   c.db.query("UPDATE runs SET instance_id='old-host',status=?,error_json=?,cancel_requested_at=?,cleanup_json=json_set(cleanup_json,'$.stopConfirmed',0,'$.resourcesReleased',0,'$.unconfirmedItems',json('[\"stop\",\"resources\"]')) WHERE id=?")
     .run(status, status === "failed" ? JSON.stringify(safeError("run_timeout")) : null, status === "cancelled" ? "2026-10-01T00:00:00.000Z" : null, accepted.runId);
   const facts = () => c.db.query("SELECT status,error_json,ended_at,stopped_at,input_text,output_text,usage_json FROM runs WHERE id=?").get(accepted.runId);
   const before = facts(), calls = c.db.query("SELECT * FROM model_calls WHERE run_id=?").all(accepted.runId);
+  const originalInput = c.repo.readInput({ inputId: accepted.inputId });
   fail = true; c.app.runs.recoverInterrupted(true);
   expect(unwrap(await c.app.runs.readControl())).toMatchObject({ activeRootRun: null, acceptingNewRuns: false });
   expect(await c.sessions.submit(c.input(a.session.id), context("blocked-next"))).toMatchObject({ ok: false, error: { reason: "runtime_busy" } });
   fail = false; unwrap(await c.app.runs.retrySave(accepted.runId));
   expect(facts()).toEqual(before); expect(c.db.query("SELECT * FROM model_calls WHERE run_id=?").all(accepted.runId)).toEqual(calls);
+  expect(c.repo.readInput({ inputId: accepted.inputId })).toEqual(originalInput);
   expect(unwrap(await c.app.runs.readControl()).acceptingNewRuns).toBe(true); expect(c.fixture.requests).toHaveLength(1);
 });

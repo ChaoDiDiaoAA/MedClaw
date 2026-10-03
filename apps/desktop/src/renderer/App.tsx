@@ -4,11 +4,12 @@ import { errorMessage, type Result } from "../../../../packages/contracts/src/er
 import type { AuthAttemptView, AuthNotifyView, AuthPromptView, DesktopDisplayPreferences, HostView, ModelChoice, ModelDirectoryView, ProviderAccepted } from "../../../../packages/contracts/src/model";
 import type { DesktopNotice, DesktopSecretInput, DesktopSecretInputResult, PublicMethod, PublicPayload, PublicReturn } from "../../../../packages/contracts/src/protocol";
 import type { ActiveRunView, RunView, RuntimeControlView } from "../../../../packages/contracts/src/run";
-import type { NewSessionInput, SessionDetail, SessionView, SubmitInput, SubmitResult } from "../../../../packages/contracts/src/session";
+import type { NewSessionInput, SessionDetail, SessionInput, SessionView, SubmitInput, SubmitResult } from "../../../../packages/contracts/src/session";
 import type { WorkspaceChange, WorkspaceView } from "../../../../packages/contracts/src/workspace";
 import { Sidebar } from "./sidebar";
 import { SessionList, sessionDisplayTitle, newSessionDraft, selectSessionModelDraft, acceptSubmissionDraft, type SessionDraft } from "./session-list";
 import { Chat } from "./chat";
+import { useInputQueue } from "./input-queue";
 import { ModelsPage } from "./models-page";
 import { SettingsPage } from "./settings-page";
 import { RunDetails } from "./run-details";
@@ -43,8 +44,11 @@ export function App() {
   const [sessions, setSessions] = useState<SessionView[]>([]), [nextSession, setNextSession] = useState<number | null>(null);
   const [details, setDetails] = useState<Record<number, SessionDetail>>({}), [drafts, setDrafts] = useState<Record<number, SessionDraft>>({});
   const [creating, setCreating] = useState(false), [creationUnknown, setCreationUnknown] = useState(false), [sending, setSending] = useState<number | null>(null);
+  const [cancellingInputs, setCancellingInputs] = useState<number[]>([]), cancelBusy = useRef(new Set<number>());
+  const inputQueue = useInputQueue(host), { readInput, refresh: refreshInputs, readPage: readInputPage, accept: acceptInput } = inputQueue;
   const [prompt, setPrompt] = useState<AuthPromptView | null>(null), [authNotify, setAuthNotify] = useState<AuthNotifyView | null>(null), [authAttempt, setAuthAttempt] = useState<AuthAttemptView | null>(null);
   const hostRef = useRef(host), runRef = useRef(run), workspaceRef = useRef(workspace), sessionsRef = useRef(sessions), draftsRef = useRef(drafts), directoryRef = useRef(directory), catalogRef = useRef(catalog);
+  const activeRef = useRef(active), controlRef = useRef(control), detailsRef = useRef(details), pageRef = useRef(page);
   const selectedRuns = useRef(new Map<number, RunView>()), settled = useRef(new Set<number>());
   const inspectedRun = useRef<number | null>(null);
   const previews = useRef(new Map<number, { sessionId: number | null; sequence: number; text: string; truncated: boolean }>());
@@ -53,8 +57,11 @@ export function App() {
   const directoryRead = useRef(0), activeRead = useRef(0), detailsButton = useRef<HTMLButtonElement>(null);
   const workspaceChangeBusy = useRef(false);
   const sessionReadOrder = useRef(new Map<number, number>()), mounted = useRef(true);
+  const sessionReads = useRef(new Map<number, Promise<void>>());
+  const sessionReadAgain = useRef(new Set<number>());
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   hostRef.current = host; runRef.current = run; workspaceRef.current = workspace; sessionsRef.current = sessions; draftsRef.current = drafts; directoryRef.current = directory; catalogRef.current = catalog;
+  activeRef.current = active; controlRef.current = control; detailsRef.current = details; pageRef.current = page;
 
   const editDraft = useCallback((sessionId: number, patch: Partial<SessionDraft>) => {
     setDrafts(old => { const next = { ...old, [sessionId]: { ...(old[sessionId] ?? newSessionDraft(null, catalogRef.current)), ...patch } }; draftsRef.current = next; return next; });
@@ -83,8 +90,8 @@ export function App() {
     const instance = hostRef.current.instanceId, order = ++activeRead.current;
     const [gate, current] = await Promise.all([window.medclaw.request("run.control.read", {}), window.medclaw.request("run.active", {})]);
     if (instance !== hostRef.current.instanceId || order !== activeRead.current) return;
-    if (gate.ok && gate.data.instanceId === instance) setControl(gate.data); else { setControl(null); if (!gate.ok) setError(errorMessage(gate.error)); }
-    if (current.ok) setActive(current.data); else setError(errorMessage(current.error));
+    if (gate.ok && gate.data.instanceId === instance) { controlRef.current = gate.data; setControl(gate.data); } else { controlRef.current = null; setControl(null); if (!gate.ok) setError(errorMessage(gate.error)); }
+    if (current.ok) { activeRef.current = current.data; setActive(current.data); } else setError(errorMessage(current.error));
   }, []);
   const readCatalog = useCallback(async (page = 1) => {
     const instance = hostRef.current.instanceId, order = ++catalogRead.current;
@@ -92,11 +99,11 @@ export function App() {
     if (instance !== hostRef.current.instanceId || order !== catalogRead.current) return;
     if (result.ok) { catalogRef.current = result.data; setCatalog(result.data); } else setError(errorMessage(result.error));
   }, []);
-  const readRun = useCallback(async (runId: number) => {
+  const readRun = useCallback(async (runId: number): Promise<RunView | null> => {
     const instance = hostRef.current.instanceId, result = await window.medclaw.request("run.read", { runId });
-    if (instance !== hostRef.current.instanceId) return;
-    if (!result.ok) { setError(errorMessage(result.error)); return; }
-    if (result.data.kind !== "one" || !result.data.run) return;
+    if (instance !== hostRef.current.instanceId) return null;
+    if (!result.ok) { setError(errorMessage(result.error)); return null; }
+    if (result.data.kind !== "one" || !result.data.run) return null;
     const value = result.data.run;
     if (value.kind === "agent") {
       const prior = selectedRuns.current.get(value.sessionId);
@@ -108,14 +115,26 @@ export function App() {
       runRef.current = value; setRun(value);
       const cached = previews.current.get(runId); setPreview(cached && !settled.current.has(runId) ? cached : null);
     }
+    return value;
   }, []);
-  const readSession = useCallback(async (sessionId: number) => {
+  const readSession: (sessionId: number) => Promise<void> = useCallback((sessionId: number): Promise<void> => {
+    const existing = sessionReads.current.get(sessionId);
+    if (existing) {
+      if (!sessionReadAgain.current.has(sessionId)) { sessionReadAgain.current.add(sessionId); sessionReadOrder.current.set(sessionId, (sessionReadOrder.current.get(sessionId) ?? 0) + 1); }
+      return existing.then(() => sessionReads.current.get(sessionId) ?? Promise.resolve());
+    }
     const instance = hostRef.current.instanceId, order = (sessionReadOrder.current.get(sessionId) ?? 0) + 1;
     sessionReadOrder.current.set(sessionId, order);
-    const result = await window.medclaw.request("session.read", { sessionId });
-    if (!mounted.current || instance !== hostRef.current.instanceId || sessionReadOrder.current.get(sessionId) !== order) return;
-    if (!result.ok) { setError(errorMessage(result.error)); return; }
-    if (result.data?.session.id === sessionId) { ensureDraft(sessionId); setDetails(old => ({ ...old, [sessionId]: result.data! })); }
+    let task!: Promise<void>; task = (async () => { try {
+      const result = await window.medclaw.request("session.read", { sessionId });
+      if (!mounted.current || instance !== hostRef.current.instanceId || sessionReadOrder.current.get(sessionId) !== order) return;
+      if (!result.ok) { setError(errorMessage(result.error)); return; }
+      if (result.data?.session.id === sessionId) { ensureDraft(sessionId); const next = { ...detailsRef.current, [sessionId]: result.data }; detailsRef.current = next; setDetails(next); }
+    } finally { if (sessionReads.current.get(sessionId) === task) {
+      sessionReads.current.delete(sessionId);
+      if (sessionReadAgain.current.delete(sessionId) && mounted.current && instance === hostRef.current.instanceId && hostRef.current.state === 'ready') void readSession(sessionId);
+    } } })();
+    sessionReads.current.set(sessionId, task); return task;
   }, [ensureDraft]);
   const readSessions = useCallback(async (beforeSessionId?: number) => {
     const instance = hostRef.current.instanceId, result = await window.medclaw.request("session.list", { ...(beforeSessionId ? { beforeSessionId } : {}), limit: 20 });
@@ -165,7 +184,7 @@ export function App() {
         setCatalog(null); catalogRef.current = null; catalogRead.current++;
         previews.current.clear(); settled.current.clear(); selectedRuns.current.clear(); setPreview(null);
         inspectedRun.current = null;
-        sessionReadOrder.current.clear();
+        sessionReadOrder.current.clear(); sessionReads.current.clear(); sessionReadAgain.current.clear(); cancelBusy.current.clear(); setCancellingInputs([]);
       } return;
     }
     if (notice.instanceId && notice.instanceId !== hostRef.current.instanceId) return;
@@ -183,20 +202,26 @@ export function App() {
       if (settled.current.size > 50) settled.current.delete(settled.current.values().next().value!);
       if (runRef.current?.id === notice.runId) setPreview(null);
       void readActive(); void readRun(notice.runId);
-      if (notice.type === "agent.settled") void readSession(notice.sessionId);
+      if (notice.type === "agent.settled") { void readSession(notice.sessionId); void refreshInputs(notice.sessionId); }
     } else if (notice.type === "provider.persistence_failed" || notice.type === "agent.persistence_failed") { setError(errorMessage(notice.error)); void readActive(); }
     else if (notice.type === "auth.prompt") { setPrompt(notice.prompt); setPage("models"); }
     else if (notice.type === "auth.notify") setAuthNotify(notice.notification);
     else if (notice.type === "auth.finished") { setAuthAttempt(notice.attempt); setPrompt(null); setAuthNotify(null); void readDirectory(); }
     else if (notice.type === "config.changed") void changed();
-  }), [changed, readActive, readDirectory, readRun, readSession]);
+  }), [changed, readActive, readDirectory, readRun, readSession, refreshInputs]);
   useEffect(() => { void readUi(); void window.medclaw.request("host.read", {}).then(result => { if (result.ok) { hostRef.current = result.data; setHost(result.data); } else setError(errorMessage(result.error)); }); }, [readUi]);
   useEffect(() => { if (host.state === "ready") void changed(); }, [host.instanceId, host.state, changed]);
   useEffect(() => {
     if (host.state !== "ready") return;
-    const timer = setInterval(() => { void readActive(); if (runRef.current && !released(runRef.current)) void readRun(runRef.current.id); }, 1000);
+    const timer = setInterval(() => {
+      void readActive(); if (runRef.current && !released(runRef.current)) void readRun(runRef.current.id);
+      const targets = new Set<number>(); if (pageRef.current === 'chat' && workspaceRef.current?.sessionId) targets.add(workspaceRef.current.sessionId);
+      if (activeRef.current?.sessionId) targets.add(activeRef.current.sessionId);
+      for (const sessionId of targets) { void readSession(sessionId); void refreshInputs(sessionId); }
+    }, 1000);
     return () => clearInterval(timer);
-  }, [host.state, readActive, readRun]);
+  }, [host.state, readActive, readRun, readSession, refreshInputs]);
+  useEffect(() => { if (host.state === 'ready' && page === 'chat' && workspace?.sessionId) void refreshInputs(workspace.sessionId, true); }, [host.instanceId, host.state, page, workspace?.sessionId, refreshInputs]);
 
   async function selectSession(sessionId: number) {
     setRequestedQuery(null); desiredSession.current = sessionId; if (selectBusy.current || workspaceChangeBusy.current) return;
@@ -239,25 +264,50 @@ export function App() {
   }
   async function acceptedAgent(value: SubmitResult, pending: NonNullable<SessionDraft["pending"]>) {
     if (value.sessionId !== pending.input.sessionId || value.clientSequence !== pending.input.clientSequence) { setError("The acceptance reply does not match the original submission. Keep it and read its result."); return; }
+    const instance = hostRef.current.instanceId;
+    let healthy = false;
+    if (value.inputId !== null) {
+      const original = await readInput(value.inputId, value.sessionId);
+      if (instance !== hostRef.current.instanceId) return;
+      if (!original || original.clientSequence !== value.clientSequence || original.mode !== pending.input.mode) {
+        setError('The original Input is unavailable. Keep the original draft and read its submission again.');
+      } else if (original.status === 'failed' || original.status === 'cancelled' || original.processingStatus === 'failed' || original.status === 'delivery_unknown') {
+        const draft = draftsRef.current[value.sessionId];
+        if (original.status !== 'delivery_unknown' && draft?.pending?.operationRef === pending.operationRef) editDraft(value.sessionId, { pending: null, resendConfirmed: false });
+        setError(original.error ? errorMessage(original.error) : `Input ${original.id} ${original.status === 'delivery_unknown' ? 'consumption is unconfirmed' : 'failed or was cancelled'}. The original draft is retained.`);
+      } else healthy = original.status === 'queued' || original.status === 'consumed';
+    } else if (value.runId !== null) {
+      const original = await readRun(value.runId);
+      if (instance !== hostRef.current.instanceId) return;
+      healthy = original?.kind === 'agent' && original.sessionId === value.sessionId && original.clientSequence === value.clientSequence;
+      if (!healthy) setError('The original Run is unavailable. Keep the original draft and read its submission again.');
+    }
     if (workspaceRef.current?.sessionId === value.sessionId) inspectedRun.current = null;
     const draft = draftsRef.current[value.sessionId];
-    if (draft) { const next = acceptSubmissionDraft(draft, pending); if (next !== draft) editDraft(value.sessionId, next); }
-    await Promise.all([readRun(value.runId), readSession(value.sessionId), readActive()]);
+    if (healthy && draft) { const next = acceptSubmissionDraft(draft, pending); if (next !== draft) editDraft(value.sessionId, next); }
+    await Promise.all([...(value.inputId !== null && value.runId !== null ? [readRun(value.runId)] : []), readSession(value.sessionId), readActive()]);
   }
   async function sendSession(retry = false) {
     const sessionId = workspaceRef.current?.sessionId, draft = sessionId ? draftsRef.current[sessionId] : null, instance = hostRef.current.instanceId;
     if (!sessionId || !draft || !instance || sendBusy.current || selecting || !workspaceConfirmed) return;
-    if (!retry && (!draft.model || draft.pending || !control?.acceptingNewRuns || !draft.text.trim() || !draft.referenceDate || !draft.timezone.trim())) return;
-    const pending = retry ? draft.pending : { operationRef: crypto.randomUUID(), input: { sessionId, clientSequence: details[sessionId]?.session.nextSubmissionSequence ?? 0,
-      text: draft.text, mode: "send", expectedRevision: workspaceRef.current!.revision, expectedBatchIds: workspaceRef.current!.batchRefs.map(batch => batch.id), expectedQueryId: workspaceRef.current!.queryId, model: draft.model!,
-      referenceDate: draft.referenceDate, timezone: draft.timezone } satisfies SubmitInput };
+    const originalControl = detailsRef.current[sessionId]?.session.inputControl, root = selectedRuns.current.get(sessionId);
+    const mode = originalControl ? draft.mode ?? 'send' : 'send';
+    if (retry && !draft.resendConfirmed) return;
+    if (!retry && (!draft.model || draft.pending || mode === 'send' && !controlRef.current?.acceptingNewRuns
+      || mode !== 'send' && (!originalControl?.acceptingInputs || root?.id !== originalControl.runId || root.kind !== 'agent')
+      || !draft.text.trim() || !draft.referenceDate || !draft.timezone.trim())) return;
+    const fields = { sessionId, clientSequence: detailsRef.current[sessionId]?.session.nextSubmissionSequence ?? 0, text: draft.text,
+      expectedRevision: workspaceRef.current!.revision, expectedBatchIds: workspaceRef.current!.batchRefs.map(batch => batch.id), expectedQueryId: workspaceRef.current!.queryId,
+      model: mode === 'send' ? draft.model! : { provider: root!.model.provider, modelId: root!.model.modelId, expectedConfigVersion: root!.model.configVersion },
+      referenceDate: mode === 'send' ? draft.referenceDate : root!.referenceDate, timezone: mode === 'send' ? draft.timezone : root!.timezone };
+    const pending = retry ? draft.pending : { operationRef: crypto.randomUUID(), input: mode === 'send' ? { ...fields, mode } : { ...fields, mode, targetRunId: originalControl!.runId } satisfies SubmitInput };
     if (!pending) return;
-    editDraft(sessionId, { pending }); sendBusy.current = sessionId; setSending(sessionId); setError(null);
+    editDraft(sessionId, { pending, mode: pending.input.mode, resendConfirmed: false }); sendBusy.current = sessionId; setSending(sessionId); setError(null);
     try {
       const result = await window.medclaw.request("session.submit", pending.input, pending.operationRef);
       if (instance !== hostRef.current.instanceId) return;
       if (result.ok) await acceptedAgent(result.data, pending);
-      else { setError(errorMessage(result.error)); if (result.error.code !== "operation_result_unknown") editDraft(sessionId, { pending: null }); }
+      else { setError(errorMessage(result.error)); if (result.error.code !== "operation_result_unknown") editDraft(sessionId, { pending: null }); await Promise.all([readSession(sessionId), readActive(), refreshInputs(sessionId)]); }
     } finally { sendBusy.current = null; setSending(null); }
   }
   async function lookupSubmission() {
@@ -266,7 +316,16 @@ export function App() {
     const result = await window.medclaw.request("session.readSubmission", { sessionId: pending.input.sessionId, clientSequence: pending.input.clientSequence });
     if (instance !== hostRef.current.instanceId) return;
     if (result.ok && result.data) await acceptedAgent(result.data, pending);
-    else setError(result.ok ? "The original submission was not found. Keep its identity; you can resend the original request." : errorMessage(result.error));
+    else {
+      editDraft(sessionId, { resendConfirmed: false });
+      if (!result.ok) { setError(errorMessage(result.error)); return; }
+      const [gate, original] = await Promise.all([window.medclaw.request('run.control.read', {}), window.medclaw.request('session.read', { sessionId: pending.input.sessionId })]);
+      if (instance !== hostRef.current.instanceId) return;
+      const canRetry = gate.ok && original.ok && original.data?.history.available && (pending.input.mode === 'send' ? gate.data.acceptingNewRuns && gate.data.activeRootRun === null
+        : original.data.session.inputControl?.runId === pending.input.targetRunId && original.data.session.inputControl.acceptingInputs);
+      editDraft(sessionId, { resendConfirmed: !!canRetry });
+      setError(canRetry ? 'The original submission was not found and execution is confirmed available. You can resend its original identity.' : 'The original submission was not found. Execution is unconfirmed or busy; keep its identity and read it again.');
+    }
   }
   function useForSession(target: { instanceId: string; sessionId: number }, choice: ModelChoice) {
     const session = sessionsRef.current.find(s => s.id === target.sessionId) ?? details[target.sessionId]?.session;
@@ -287,12 +346,27 @@ export function App() {
   }
   async function stop() {
     if (!active) return;
-    const id = active.runId, result = await window.medclaw.request("run.cancel", { runId: id });
-    if (!result.ok) setError(errorMessage(result.error)); await Promise.all([readActive(), readRun(id)]);
+    const id = active.runId, sessionId = active.sessionId, instance = hostRef.current.instanceId, result = await window.medclaw.request("run.cancel", { runId: id });
+    if (instance !== hostRef.current.instanceId) return;
+    if (!result.ok) setError(errorMessage(result.error)); await Promise.all([readActive(), readRun(id), ...(sessionId ? [readSession(sessionId), refreshInputs(sessionId)] : [])]);
+  }
+  async function cancelInput(original: SessionInput) {
+    if (cancelBusy.current.has(original.id) || hostRef.current.state !== 'ready') return;
+    const instance = hostRef.current.instanceId; cancelBusy.current.add(original.id); setCancellingInputs([...cancelBusy.current]); setError(null);
+    try {
+      const result = await window.medclaw.request('session.cancelInput', { inputId: original.id }, crypto.randomUUID());
+      if (instance !== hostRef.current.instanceId) return;
+      if (!result.ok) setError(errorMessage(result.error));
+      else if (result.data.id === original.id && result.data.sessionId === original.sessionId) { acceptInput(result.data); if (result.data.status === 'consumed') setError(`Input ${original.id} is already consumed. Stop original Run ${result.data.runId} to stop further processing.`); }
+      else setError('Cancellation reply did not match the original Input. Read it again.');
+      await Promise.all([readInput(original.id, original.sessionId), readSession(original.sessionId), readActive(), ...(original.targetRunId ? [readRun(original.targetRunId)] : [])]);
+    } finally { if (instance === hostRef.current.instanceId) { cancelBusy.current.delete(original.id); setCancellingInputs([...cancelBusy.current]); } }
   }
   async function closeDetails() { await updateUi({ detailOpen: false }); detailsButton.current?.focus(); }
   const current = workspace?.sessionId ?? null, currentDetail = current ? details[current] ?? null : null, draft = current ? drafts[current] ?? null : null;
   const runningSession = sessions.find(s => s.id === active?.sessionId);
+  const queueRun = current && currentDetail?.session.inputControl ? selectedRuns.current.get(current) ?? null : null;
+  const queueRootInput = queueRun?.inputId && current ? inputQueue.snapshots[current]?.items.find(value => value.id === queueRun.inputId) ?? null : null;
   return <div className={"desktop " + (ui.navCollapsed ? "nav-collapsed " : "") + (ui.detailOpen ? "has-details" : "")}>
     <Sidebar page={page} onPage={page => { setRequestedQuery(null); setPage(page); }} collapsed={ui.navCollapsed} onCollapse={() => void updateUi({ navCollapsed: true })} host={host}>
       <SessionList sessions={sessions} current={current} running={active?.sessionId ?? null} creating={creating} canCreate={host.state === "ready" && workspaceConfirmed && !selecting}
@@ -304,6 +378,8 @@ export function App() {
       <section className="page-content chat-page" hidden={page !== "chat"}><Chat visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} directory={directory} directoryCurrent={directoryCurrent} host={host} active={active} control={control} run={run} preview={preview}
         workspace={workspace} workspaceConfirmed={workspaceConfirmed} onWorkspace={updateWorkspace} dataDefaults={catalog}
         session={currentDetail} draft={draft} selecting={selecting || !workspaceConfirmed} sending={sending === current} runningTitle={runningSession ? sessionDisplayTitle(runningSession) : null}
+        queueRun={queueRun} queueRootInput={queueRootInput} inputs={current ? inputQueue.snapshots[current] ?? null : null} cancellingInputs={cancellingInputs}
+        onRefreshInputs={() => { if (current) void refreshInputs(current, true); }} onMoreInputs={() => { if (current) void readInputPage(current, 'more'); }} onCancelInput={original => void cancelInput(original)}
         onDraft={patch => { if (current) editDraft(current, patch); }} onUseForSession={useForSession} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} /></section>
       <section className="page-content" hidden={page !== "data"}><DataWorkspace host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} catalog={catalog} batches={catalog?.batches ?? []} onRefresh={page => void readCatalog(page)} onUpdate={updateWorkspace} onError={setError} /></section>
       <section className="page-content" hidden={page !== "queries"}><QueryHistory visible={page === "queries"} requestedQueryId={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} active={active} onUpdate={updateWorkspace} onError={setError} /></section>
@@ -314,7 +390,7 @@ export function App() {
     </main>
     {ui.detailOpen && <RunDetails run={run} host={host} viewSessionId={current} tab={ui.detailTab} active={active} control={control} onTab={tab => void updateUi({ detailTab: tab })} onClose={() => void closeDetails()} onError={setError}
       onQuery={(queryId, sessionId) => { if (workspaceRef.current?.sessionId !== sessionId) void selectSession(sessionId); setRequestedQuery(queryId); setPage("queries"); }}
-      onRun={value => { inspectedRun.current = value.id; runRef.current = value; setRun(value); setPreview(null); }} onRetrySaved={() => void readActive()} />}
+      onRun={value => { inspectedRun.current = value.id; runRef.current = value; setRun(value); setPreview(null); }} onRetrySaved={() => { void readActive(); if (activeRef.current?.sessionId) { void readSession(activeRef.current.sessionId); void refreshInputs(activeRef.current.sessionId); } }} />}
   </div>;
 }
 createRoot(document.getElementById("root")!).render(<App />);

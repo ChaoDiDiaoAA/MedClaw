@@ -36,7 +36,8 @@ export const SessionMessageViewSchema = z.strictObject({
 }).refine(({ text, textInfo }) => text === null
   ? textInfo.totalChars === null && !textInfo.truncated
   : textInfo.totalChars !== null && (textInfo.truncated ? textInfo.totalChars > text.length : textInfo.totalChars === text.length),
-"Inconsistent visible text length or truncation");
+"Inconsistent visible text length or truncation")
+  .refine(message => message.inputId === null || message.displayRole === "user", "Only user entries may carry direct input identity");
 export type SessionMessageView = z.infer<typeof SessionMessageViewSchema>;
 
 export const SessionMessagePageSchema = z.strictObject({

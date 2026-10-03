@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { PiModelRuntime } from "../../packages/runtime-pi/src/model-runtime";
+import { BridgeCredentialStore } from "../../packages/runtime-pi/src/credential-store";
+import { privateCredentialMethodSchemas } from "../../packages/contracts/src/protocol";
 import { ModelCallRecorder } from "../../packages/runtime-pi/src/model-call-recorder";
 import { openDatabase } from "../../packages/storage/src/database";
 import { Repositories } from "../../packages/storage/src/repositories";
@@ -14,6 +16,112 @@ import type { SubmitInput } from "../../packages/contracts/src/session";
 
 const closers: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of closers.splice(0)) await close(); });
+
+test("overlapping native model snapshots stay within private credential capacity and read fresh original contexts", async () => {
+  let inFlight = 0, highWater = 0, overflows = 0, available = true;
+  const reads: { providerId: string; operationRef: string }[] = [];
+  const credentials = new BridgeCredentialStore(async (method, payload) => {
+    if (method === "credential.list") return [];
+    if (method !== "credential.read") throw new Error("Unexpected credential mutation in model snapshot");
+    const input = privateCredentialMethodSchemas["credential.read"].input.parse(payload);
+    reads.push({ providerId: input.providerId, operationRef: input.context.operationRef });
+    inFlight++; highWater = Math.max(highWater, inFlight);
+    try {
+      if (inFlight > 256) { overflows++; throw new Error("runtime_busy"); }
+      await Bun.sleep(2);
+      return input.providerId === "p2-snapshot" && available ? { type: "api_key", key: "fixture-only" } : null;
+    } finally { inFlight--; }
+  });
+  const runtime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
+  await runtime.installCustom([{ providerId: "p2-snapshot", name: "Snapshot fixture", api: "openai-completions", baseUrl: "http://127.0.0.1:9/v1",
+    models: [{ id: "snapshot", name: "Snapshot", input: ["text"], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }] }]);
+  reads.length = 0; highWater = 0; overflows = 0;
+  const operations = Array.from({ length: 8 }, (_, index) => `snapshot-${index}`);
+  const directories = await Promise.all(operations.map(operationRef => credentials.withContext({ purpose: "runtime", operationRef }, () => runtime.directory("1"))));
+  expect(reads.length).toBeGreaterThan(256);
+  expect(overflows).toBe(0);
+  expect(highWater).toBeLessThanOrEqual(256);
+  expect(inFlight).toBe(0);
+  expect([...new Set(reads.map(read => read.operationRef))].sort()).toEqual(operations);
+  for (const directory of directories) {
+    expect(directory.providers.some(provider => provider.auth.state === "sync_unknown")).toBe(false);
+    expect(directory.providers.find(provider => provider.id === "p2-snapshot")?.auth.state).toBe("available");
+  }
+  for (const operationRef of operations) expect(reads.some(read => read.operationRef === operationRef && read.providerId === "p2-snapshot")).toBe(true);
+  available = false;
+  const later = await credentials.withContext({ purpose: "runtime", operationRef: "snapshot-after-credential-change" }, () => runtime.directory("2"));
+  expect(later.configVersion).toBe("2");
+  expect(later.providers.find(provider => provider.id === "p2-snapshot")?.auth.state).toBe("unavailable");
+  expect(reads.some(read => read.operationRef === "snapshot-after-credential-change" && read.providerId === "p2-snapshot")).toBe(true);
+  expect(inFlight).toBe(0);
+});
+
+test("native catalog registration overlapping model snapshots cannot overflow private credential reads", async () => {
+  let inFlight = 0, highWater = 0, overflows = 0;
+  const contexts = new Set<string>();
+  const credentials = new BridgeCredentialStore(async (method, payload) => {
+    if (method === "credential.list") return [];
+    if (method !== "credential.read") throw new Error("Unexpected credential mutation in catalog refresh");
+    const input = privateCredentialMethodSchemas["credential.read"].input.parse(payload);
+    contexts.add(input.context.operationRef);
+    inFlight++; highWater = Math.max(highWater, inFlight);
+    try {
+      if (inFlight > 256) { overflows++; throw new Error("runtime_busy"); }
+      await Bun.sleep(2);
+      return input.providerId.startsWith("p2-catalog-") ? { type: "api_key", key: "fixture-only" } : null;
+    } finally { inFlight--; }
+  });
+  const runtime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
+  highWater = 0; overflows = 0; contexts.clear();
+  const definitions = Array.from({ length: 20 }, (_, index) => ({ providerId: `p2-catalog-${index}`, name: "Catalog fixture", api: "openai-completions", baseUrl: "http://127.0.0.1:9/v1",
+    models: [{ id: "catalog", name: "Catalog", input: ["text" as const], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true as const, pricingKnown: false, cost: null }] }));
+  const operations = Array.from({ length: 8 }, (_, index) => `catalog-snapshot-${index}`);
+  const outcomes = await Promise.allSettled([runtime.installCustom(definitions), ...operations.map(operationRef => credentials.withContext({ purpose: "runtime", operationRef }, () => runtime.directory("1")))]);
+  expect(overflows).toBe(0);
+  expect(highWater).toBeLessThanOrEqual(256);
+  expect(inFlight).toBe(0);
+  expect(outcomes.every(outcome => outcome.status === "fulfilled")).toBe(true);
+  for (const operationRef of operations) expect(contexts.has(operationRef)).toBe(true);
+  const after = await runtime.directory("2");
+  expect(after.providers.some(provider => provider.auth.state === "sync_unknown")).toBe(false);
+  for (const definition of definitions) expect(after.providers.find(provider => provider.id === definition.providerId)?.auth.state).toBe("available");
+});
+
+test("queued credential reads abort without frames while leases bypass read pressure and failed reads release admission", async () => {
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const calls: { method: string; providerId?: string; operationRef?: string }[] = [];
+  const credentials = new BridgeCredentialStore(async (method, payload) => {
+    if (method === "credential.read") {
+      const input = privateCredentialMethodSchemas["credential.read"].input.parse(payload);
+      calls.push({ method, providerId: input.providerId, operationRef: input.context.operationRef });
+      if (input.providerId === "p2-failed") throw new Error("fixture read failed");
+      await held; return null;
+    }
+    calls.push({ method });
+    if (method === "credential.modify.begin") return { leaseId: "fixture-lease", version: "1", current: null };
+    if (method === "credential.modify.commit" || method === "credential.modify.abort") return null;
+    throw new Error("Unexpected private credential method");
+  });
+  const blockers = Array.from({ length: 256 }, (_, index) => credentials.withContext({ purpose: "runtime", operationRef: `held-read-${index}` }, () => credentials.read("p2-held")));
+  try {
+    await Bun.sleep(0);
+    const abort = new AbortController();
+    const cancelled = credentials.withContext({ purpose: "runtime", operationRef: "queued-aborted-read" }, () => credentials.read("p2-aborted", { signal: abort.signal })).then(() => "completed", () => "aborted");
+    await Bun.sleep(0); abort.abort();
+    expect(await Promise.race([cancelled, Bun.sleep(100).then(() => "still waiting")])).toBe("aborted");
+    expect(calls.some(call => call.providerId === "p2-aborted")).toBe(false);
+    await credentials.modify("p2-lease", async () => undefined);
+    await expect(credentials.modify("p2-lease", async () => { throw new Error("fixture callback cancelled"); })).rejects.toThrow("fixture callback cancelled");
+    expect(calls.filter(call => call.method !== "credential.read").map(call => call.method)).toEqual(["credential.modify.begin", "credential.modify.commit", "credential.modify.begin", "credential.modify.abort"]);
+  } finally { release(); await Promise.allSettled(blockers); }
+  const failedReads = Promise.allSettled(Array.from({ length: 256 }, () => credentials.read("p2-failed"))).then(results => results.filter(result => result.status === "rejected").length);
+  expect(await Promise.race([failedReads, Bun.sleep(100).then(() => "leaked read slots")])).toBe(256);
+  expect(await credentials.withContext({ purpose: "runtime", operationRef: "after-read-failure" }, () => credentials.read("p2-released"))).toBeUndefined();
+  expect(calls.filter(call => call.providerId === "p2-held").map(call => call.operationRef)).toEqual(Array.from({ length: 256 }, (_, index) => `held-read-${index}`));
+  expect(calls.find(call => call.providerId === "p2-released")?.operationRef).toBe("after-read-failure");
+});
+
 async function setup(mode: Parameters<typeof providerFixture>[0] = "success") {
   const module = await import("../../packages/runtime-pi/src/agent-runtime").catch(() => null);
   expect(module).not.toBeNull(); if (!module) throw new Error("P2 native adapter is missing");

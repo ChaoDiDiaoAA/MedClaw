@@ -12,7 +12,7 @@ import { mergeRuntimeConfigurationPolicies } from '../../packages/contracts/src/
 import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
 import { DATABASE_SCHEMA_VERSION, type PrivateCredentialFrame } from '../../packages/contracts/src/protocol';
 import { ImportPreviewSchema, ImportOperationSchema } from '../../packages/contracts/src/data';
-import { NewSessionResultSchema, SessionDetailSchema, SubmitResultSchema } from '../../packages/contracts/src/session';
+import { NewSessionResultSchema, SessionDetailSchema, SessionInputPageSchema, SubmitResultSchema, type SubmitInput } from '../../packages/contracts/src/session';
 import { WorkspaceViewSchema } from '../../packages/contracts/src/workspace';
 import { RuntimeControlViewSchema, ReadRunResultSchema } from '../../packages/contracts/src/run';
 import { safeError, type Result } from '../../packages/contracts/src/error';
@@ -20,6 +20,13 @@ import { QueryParamsSchema, QueryViewSchema } from '../../packages/contracts/src
 import { SessionMessagePageSchema } from '../../packages/contracts/src/messages';
 
 function unwrap<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
+function sendResult(value: unknown) {
+  const result = SubmitResultSchema.parse(value);
+  expect(result.runId !== null).toBe(true);
+  expect(result.inputId !== null).toBe(true);
+  if (result.runId === null || result.inputId === null) throw new Error('Current Send acceptance requires root Run and input identities');
+  return { ...result, runId: result.runId, inputId: result.inputId };
+}
 async function until(check: () => Promise<boolean>, timeout = 15000) {
   const end = Date.now() + timeout;
   while (!await check()) { if (Date.now() > end) throw new Error('Host condition timed out'); await Bun.sleep(20); }
@@ -86,9 +93,9 @@ test('P3 production Host imports through Main tokens, freezes trusted scope and 
     await expect(f.host.request('session.submit', { ...input, referenceDate: '2026-02-30' }, 'invalid-date')).rejects.toThrow('Expected a real YYYY-MM-DD date');
     expect(await f.host.request('session.submit', { ...input, timezone: 'UTC' }, 'mismatched-timezone')).toMatchObject({ ok: false, error: { code: 'invalid_argument' } });
     expect(f.requests).toHaveLength(0);
-    const accepted = SubmitResultSchema.parse(unwrap(await f.host.request('session.submit', input, 'ask-devices')));
+    const accepted = sendResult(unwrap(await f.host.request('session.submit', input, 'ask-devices')));
     await until(async () => RuntimeControlViewSchema.parse(unwrap(await f.host.request('run.control.read', {}))).acceptingNewRuns);
-    const run = ReadRunResultSchema.parse(unwrap(await f.host.request('run.read', { runId: accepted.runId }))); expect(run).toMatchObject({ kind: 'one', run: { status: 'completed', referenceDate: '2026-01-02', timezone: 'Asia/Shanghai' } });
+    const run = ReadRunResultSchema.parse(unwrap(await f.host.request('run.read', { runId: accepted.runId }))); expect(run).toMatchObject({ kind: 'one', run: { status: 'completed', inputId: accepted.inputId, referenceDate: '2026-01-02', timezone: 'Asia/Shanghai' } });
     expect(await f.host.request('session.submit', { ...input, referenceDate: '2026-01-01' }, 'ask-devices')).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
     expect(await f.host.request('session.submit', input, 'ask-devices')).toMatchObject({ ok: true, data: accepted });
     expect(f.requests).toHaveLength(2);
@@ -96,6 +103,10 @@ test('P3 production Host imports through Main tokens, freezes trusted scope and 
     const messages = f.requests[1]!.messages as { role: string; content: string }[];
     expect(JSON.parse(messages.find(message => message.role === 'tool')!.content)).toMatchObject({ queryId: 1, totalRows: 813, interpretation: { referenceDate: '2026-01-02', requestedDate: '2026-01-01', dataDates: ['2026-01-01'], isStale: false } });
     const db = new Database(f.host.paths.databasePath, { readonly: true }); try {
+      expect(db.query('SELECT input_id FROM runs').all()).toEqual([{ input_id: accepted.inputId }]);
+      expect(db.query('SELECT input_id FROM model_calls ORDER BY id').all()).toEqual([{ input_id: accepted.inputId }, { input_id: accepted.inputId }]);
+      expect(db.query('SELECT input_id FROM queries').all()).toEqual([{ input_id: accepted.inputId }]);
+      expect(db.query('SELECT input_id FROM answers').all()).toEqual([{ input_id: accepted.inputId }]);
       expect(db.query('SELECT tool_name,status FROM tool_calls').all()).toEqual([{ tool_name: 'query_current_devices', status: 'succeeded' }]);
       expect(db.query('SELECT source FROM queries').all()).toEqual([{ source: 'agent_tool' }]);
       expect(db.query('SELECT count(*) n FROM query_evidence').get()).toEqual({ n: 1 });
@@ -119,7 +130,7 @@ test('P3 production Host imports through Main tokens, freezes trusted scope and 
   } finally { await f.close(); }
 }, 30000);
 
-test('manual queries bind the original active Agent Run and replay after completion without a new model request', async () => {
+test('manual Query and native Steer Follow Up retain the original P3 Run and frozen input identity after policy publication', async () => {
   const configuration = structuredClone(TOOL_CONFIG);
   const f = await setup(true, configuration); try {
     const { preview, fileToken } = await f.preview('import');
@@ -128,11 +139,16 @@ test('manual queries bind the original active Agent Run and replay after complet
     const selected = WorkspaceViewSchema.parse(unwrap(await f.host.request('workspace.update', { expectedRevision: (await f.workspace()).revision, change: { batchIds: imported.result!.batchIds } })));
     const params = { kind: 'aggregate', population: 'snapshot', snapshotMode: 'exact_date', batchIds: [1], metric: 'count' };
     expect(await f.host.request('query.execute', { params, expectedRevision: selected.revision }, 'before-run')).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
-    const accepted = SubmitResultSchema.parse(unwrap(await f.host.request('session.submit', { sessionId: session.session.id, clientSequence: 1, text: 'List imported devices.', mode: 'send',
+    const accepted = sendResult(unwrap(await f.host.request('session.submit', { sessionId: session.session.id, clientSequence: 1, text: 'List imported devices.', mode: 'send',
       expectedRevision: selected.revision, expectedBatchIds: [1], expectedQueryId: null, model: { provider: 'p3-fixture', modelId: 'fixture', expectedConfigVersion: '1' }, referenceDate: '2026-01-01', timezone: 'Asia/Shanghai' }, 'ask')));
     await until(async () => f.requests.length === 2);
+    const root = ReadRunResultSchema.parse(unwrap(await f.host.request('run.read', { runId: accepted.runId })));
+    if (root.kind !== 'one' || root.run === null || root.run.kind !== 'agent') throw new Error('Active root Agent Run must exist');
+    const frozen = root.run;
+    expect(frozen.model.configVersion).toBe('1');
     const nextConfiguration = structuredClone(configuration);
     await f.publisher.publish('1', { toolConfiguration: nextConfiguration }, { kind: 'policy' });
+    expect(f.publisher.read().configVersion).toBe('2');
     const request = { params, expectedRevision: selected.revision };
     const manual = QueryViewSchema.parse(unwrap(await f.host.request('query.execute', request, 'manual-query')));
     expect(manual).toMatchObject({ query: { runId: accepted.runId, sessionId: session.session.id, source: 'user_form', callRef: `${accepted.runId}:manual-query`, totalRows: 1 }, page: { rows: [{ value: 813 }] } });
@@ -151,8 +167,39 @@ test('manual queries bind the original active Agent Run and replay after complet
     expect('rows' in manual.query).toBe(false);
     expect('snapshotIds' in manual.query).toBe(false);
     expect(f.requests).toHaveLength(2);
+    const queuedIds: number[] = [];
+    for (const [mode, text, operation] of [['steer', 'Keep the original aggregate scope.', 'queued-steer'], ['follow_up', 'Then confirm the original device scope.', 'queued-follow']] as const) {
+      const detail = SessionDetailSchema.parse(unwrap(await f.host.request('session.read', { sessionId: session.session.id })));
+      const current = await f.workspace();
+      const input: SubmitInput = { sessionId: session.session.id, clientSequence: detail.session.nextSubmissionSequence, mode, text, targetRunId: accepted.runId,
+        expectedRevision: current.revision, expectedBatchIds: current.batchRefs.map(batch => batch.id), expectedQueryId: current.queryId,
+        model: { provider: frozen.model.provider, modelId: frozen.model.modelId, expectedConfigVersion: frozen.model.configVersion }, referenceDate: frozen.referenceDate, timezone: frozen.timezone };
+      const queued = SubmitResultSchema.parse(unwrap(await f.host.request('session.submit', input, operation)));
+      expect(queued.runId).toBeNull(); expect(queued.inputId !== null).toBe(true);
+      if (queued.inputId === null) throw new Error('Queued input requires accepted identity'); queuedIds.push(queued.inputId);
+    }
+    expect(f.requests).toHaveLength(2);
     f.releaseFinal();
     await until(async () => RuntimeControlViewSchema.parse(unwrap(await f.host.request('run.control.read', {}))).acceptingNewRuns);
+    const inputs = SessionInputPageSchema.parse(unwrap(await f.host.request('session.listInputs', { sessionId: session.session.id }))).items;
+    expect(inputs.map(input => [input.id, input.status, input.processingStatus, input.runId])).toEqual([[accepted.inputId, 'consumed', 'completed', accepted.runId], [queuedIds[0], 'consumed', 'completed', accepted.runId], [queuedIds[1], 'consumed', 'completed', accepted.runId]]);
+    expect(new Set(inputs.map(input => input.nativeEntryId)).size).toBe(3); expect(inputs.every(input => input.nativeEntryId !== null)).toBe(true);
+    const history = SessionMessagePageSchema.parse(unwrap(await f.host.request('session.messages.read', { sessionId: session.session.id })));
+    const users = history.items.filter(item => item.displayRole === 'user');
+    expect(users.map(item => [item.inputId, item.nativeEntryId, item.text])).toEqual([[accepted.inputId, inputs[0]!.nativeEntryId, 'List imported devices.'], [queuedIds[0], inputs[1]!.nativeEntryId, 'Keep the original aggregate scope.'], [queuedIds[1], inputs[2]!.nativeEntryId, 'Then confirm the original device scope.']]);
+    expect(history.items.filter(item => item.displayRole === 'assistant' || item.displayRole === 'tool_result').every(item => item.inputId === null)).toBe(true);
+    const linked = new Database(f.host.paths.databasePath, { readonly: true });
+    try {
+      expect(linked.query('SELECT id,input_id FROM runs').all()).toEqual([{ id: accepted.runId, input_id: accepted.inputId }]);
+      expect(linked.query('SELECT input_id FROM model_calls ORDER BY id').all()).toEqual(Array.from({ length: 4 }, () => ({ input_id: accepted.inputId })));
+      expect(linked.query('SELECT source,input_id FROM queries ORDER BY id').all()).toEqual([{ source: 'agent_tool', input_id: accepted.inputId }, { source: 'user_form', input_id: accepted.inputId }]);
+      expect(linked.query('SELECT run_id,input_id FROM answers').all()).toEqual([{ run_id: accepted.runId, input_id: accepted.inputId }]);
+    } finally { linked.close(); }
+    const completed = ReadRunResultSchema.parse(unwrap(await f.host.request('run.read', { runId: accepted.runId })));
+    expect(completed).toMatchObject({ kind: 'one', run: { status: 'completed', model: frozen.model, inputId: accepted.inputId, referenceDate: frozen.referenceDate, timezone: frozen.timezone } });
+    expect(f.requests).toHaveLength(4);
+    const settledRequestCount = f.requests.length;
+    console.info(JSON.stringify({ evidence: 'A14 actual Host', runId: accepted.runId, rootInputId: accepted.inputId, inputEntries: users.map(item => ({ inputId: item.inputId, nativeEntryId: item.nativeEntryId })), httpRequests: settledRequestCount, modelCalls: 4, queries: 2, answers: 1, frozenConfigVersion: frozen.model.configVersion, publishedConfigVersion: f.publisher.read().configVersion }));
     expect(QueryViewSchema.parse(unwrap(await f.host.request('query.execute', request, 'manual-query'))).query).toEqual(manual.query);
     expect(await f.host.request('query.execute', { ...request, expectedRevision: selected.revision + 1 }, 'manual-query')).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
     expect(QueryViewSchema.parse(unwrap(await f.host.request('query.read', { queryId: manual.query.id }))).query.resultHash).toBe(manual.query.resultHash);
@@ -160,7 +207,7 @@ test('manual queries bind the original active Agent Run and replay after complet
     expect(next.workspace.queryId).toBeNull();
     expect(await f.host.request('query.read', { queryId: manual.query.id })).toMatchObject({ ok: false, error: { code: 'access_denied' } });
     expect(await f.host.request('tool.read', { runId: accepted.runId })).toMatchObject({ ok: true, data: { runId: accepted.runId, scope: { batchIds: [1] }, items: [{ name: 'query_current_devices', status: 'succeeded' }] } });
-    expect(f.requests).toHaveLength(2);
+    expect(f.requests).toHaveLength(settledRequestCount);
   } finally { await f.close(); }
 }, 30000);
 
