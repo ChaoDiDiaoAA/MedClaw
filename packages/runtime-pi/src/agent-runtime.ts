@@ -15,7 +15,8 @@ import { type AgentExecutionObservation, type AgentRuntimePort, type FinalCallFa
 import type { NativeSessionBindings, NativeSessionPreview, InputAdapterPort, InputSettlementProof } from "../../contracts/src/session";
 import { PiInputAdapter } from './input-adapter';
 import { outcomeOf, type PiModelRuntime, type ResolvedModel } from "./model-runtime";
-import { createPiNativeTools, createPiToolDefinitions, observePiToolDelivery, createPiRunControlBinding } from "./pi-tool-adapter";
+import { createPiNativeTools, createPiToolDefinitions, observePiToolDelivery, createPiRunControlBinding, createFrozenToolContextFactory } from "./pi-tool-adapter";
+import { WorkspaceContextSchema } from '../../contracts/src/workspace';
 import type { ToolRegistry } from "../../core/src/tools/registry";
 import type { ToolExecutor } from "../../core/src/tools/executor";
 import type { ToolRecorder } from "../../core/src/tools/recorder";
@@ -29,7 +30,7 @@ type Callbacks = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[1];
 type RunTools = { registry: ToolRegistry; executor: ToolExecutor };
 type Binding = { manager: SessionManager; nativeSessionId: string; entryRuns: Map<string, number>; session?: AgentSession; toolSignature?: string; lastRunId?: number; bindTools?: () => () => void; available: boolean; execution?: { input: ExecutionInput; callbacks: Callbacks; toolCalls: Set<string>;
   observers: Promise<void>[]; facts: (FinalCallFact | null)[]; lastOutcome: ProviderOutcome | null; unsupported: boolean;
-  registrationFailed: boolean; currentModelCallId: string | null; abort: () => void; control: RunControl; tools?: RunTools } };
+  registrationFailed: boolean; currentModelCallId: string | null; abort: () => void; control: RunControl; tools?: RunTools; toolContexts: Map<string, ToolExecutionContext> } };
 const unavailable = (reason: "host_restart" | "native_state_invalid"): NativeSessionPreview => ({ available: false, reason, leafId: null, messages: [], truncated: false });
 const unobservedFailure = (code: string): ProviderOutcome => ({ sdkStopReason: "pending", text: "", responseModel: null, callState: "failed",
   usage: { inputTokens: null, outputTokens: null, cost: null, costCurrency: null, source: null, unavailableReason: "call_not_observed" }, error: safeError(code) });
@@ -39,6 +40,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
   readSnapshots(runId: number) { return this.eventAdapter.readSnapshots(runId); }
   private readonly sessions = new Map<number, Binding>();
   private readonly controls = new Map<number, RunControl>();
+  private readonly toolContexts = new Map<number, Map<string, ToolExecutionContext>>();
   private readonly inputs = new Map<number, PiInputAdapter>();
   private readonly inputStartFailures = new Map<number, { save: () => void; pending: boolean; proof: InputSettlementProof }>();
   readonly inputAdapter: InputAdapterPort = {
@@ -60,7 +62,11 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
   describe(resolved: ResolvedModel) { return { requestedThinkingLevel: "off" as const, effectiveThinkingLevel: clampThinkingLevel(resolved.model, "off") }; }
   toolPersistencePending(runId: number) { return this.tools?.recorder.persistencePending(runId) ?? false; }
   retryToolPersistence(runId: number) { this.tools?.recorder.retryPersistence(runId); }
-  releaseToolFacts(runId: number) { this.tools?.recorder.release(runId); this.controls.get(runId)?.dispose(); this.controls.delete(runId); }
+  releaseToolFacts(runId: number) {
+    if (this.toolPersistencePending(runId)) throw safeError('storage_write_failed');
+    if ([...this.sessions.values()].some(binding => binding.execution?.input.runId === runId)) throw safeError('state_conflict');
+    this.tools?.recorder.release(runId); this.controls.get(runId)?.dispose(); this.controls.delete(runId); this.toolContexts.delete(runId);
+  }
   readBudget(runId: number) { return this.controls.get(runId)?.readBudget() ?? null; }
   captureToolProfiles(_scope?: RunScope) {
     const cutoffAt = new Date().toISOString();
@@ -97,17 +103,31 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     return projectSessionMessages(binding.manager, input, binding.entryRuns);
   }
 
+  private contextFor(execution: NonNullable<Binding['execution']>, nativeToolCallId: string, sdkSignal?: AbortSignal): ToolExecutionContext {
+    try { return createFrozenToolContextFactory((id, signal) => {
+      const { input, control } = execution;
+      if (!input.scope || !input.referenceDate || !input.timezone) throw safeError('state_conflict');
+      const consumed = input.inputId != null ? this.inputs.get(input.runId)?.readConsumedWorkspace() : null;
+      if (input.inputId != null && !consumed) throw safeError('state_conflict');
+      const parsed = WorkspaceContextSchema.safeParse(consumed?.workspaceContext ?? input.workspaceContext);
+      if (!parsed.success || parsed.data.sessionId !== input.sessionId) throw safeError('state_conflict');
+      const workspaceContext = parsed.data;
+      return { runId: input.runId, sessionId: input.sessionId, nativeToolCallId: id, scope: input.scope,
+        referenceDate: input.referenceDate, timezone: input.timezone, signal: signal ? AbortSignal.any([input.signal, signal]) : input.signal,
+        checkActive: control.checkActive, toolConfiguration: control.configuration,
+        workspaceContext, workspaceInputId: consumed?.inputId ?? null, basedOnQueryId: workspaceContext.queryId, workspaceRevision: workspaceContext.revision };
+    }, execution.toolContexts)(nativeToolCallId, sdkSignal); }
+    catch (error) { execution.callbacks.fatal?.(safeError('state_conflict')); execution.abort(); throw error; }
+  }
+
   private async prepare(binding: Binding, resolved: ResolvedModel) {
     const workdir = () => {
       if (!binding.execution) throw new Error("state_conflict");
       return join(this.dataRoot, "runtime", String(binding.execution.input.runId), "work", "scratch");
     };
     const getContext = (nativeToolCallId: string, sdkSignal?: AbortSignal): ToolExecutionContext => {
-      const input = binding.execution?.input;
-      if (!input?.scope || !input.referenceDate || !input.timezone) throw new Error("state_conflict");
-      return { runId: input.runId, sessionId: input.sessionId, nativeToolCallId, scope: input.scope,
-        referenceDate: input.referenceDate, timezone: input.timezone, signal: sdkSignal ? AbortSignal.any([input.signal, sdkSignal]) : input.signal,
-        checkActive: binding.execution!.control.checkActive, toolConfiguration: binding.execution!.control.configuration };
+      if (!binding.execution) throw safeError('state_conflict');
+      return this.contextFor(binding.execution, nativeToolCallId, sdkSignal);
     };
     const getControl = () => binding.execution?.control;
     const native = this.tools ? createPiNativeTools(workdir, this.tools.recorder, getContext, {}, getControl) : null;
@@ -124,7 +144,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
         const resourceLoader = new DefaultResourceLoader({ cwd: this.dataRoot, agentDir: join(this.dataRoot, "runtime", "pi"), settingsManager,
           noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
           additionalExtensionPaths: [], additionalSkillPaths: [], additionalPromptTemplatePaths: [], additionalThemePaths: [], extensionFactories: [],
-          systemPrompt: this.tools ? `You are MedClaw, a medical device data assistant. Read the frozen data scope before querying in each run. Use business tools for data calculations and retain query and evidence identities in your answer. Native tools use the current run's work directory. Never invent missing data or import results.
+          systemPrompt: this.tools ? `You are MedClaw, a medical device data assistant. Read the frozen data scope for each actually consumed user input before querying. For references to a selected Query, row, or field, use the returned frozen workspace reference and verify it with read_query, read_query_page, and the evidence tools. Use business tools for data calculations and retain query and evidence identities in your answer. Native tools use the current run's work directory. Never invent missing data or import results.
 Explicit user dates take precedence over the default frozen referenceDate. Resolve "today", "now", and "current" against the frozen referenceDate and timezone, and explicitly state that anchor. Never silently substitute the system clock. If the user expressly means actual calendar today, distinguish that request from the frozen default; disclose uncertainty if trusted context does not establish its date.
 Use the returned interpretation to report requestedDate and requestedTime, actual dataDates, referenceDate and timezone, snapshotMode, basis, status, quantity and unit, and isStale. State unknown values as unknown. If data is stale for the requested date, report the latest known data dates and quantities and say the target-date quantity is unknown. Never describe stale observations as the actual quantity on that target date.
 State whether the basis counts snapshot records, device identifiers deduplicated by data scope, or change events. These counts are not physical units or inventory. Without a reliable stock quantity field, stock quantity is unknown; a pricing unit does not provide stock quantity. When status is omitted, include all statuses and say so; do not silently restrict results to active devices.
@@ -171,8 +191,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
               for (const message of messages) {
                 if (message.role !== 'toolResult' || !execution.toolCalls.has(message.toolCallId)) continue;
                 // Save already occurred delivery with the originating identity, independently of later execution admission.
-                const savedContext: ToolExecutionContext = { runId: input.runId, sessionId: input.sessionId, nativeToolCallId: message.toolCallId,
-                  scope: structuredClone(input.scope), referenceDate: input.referenceDate, timezone: input.timezone, signal: input.signal };
+                const savedContext = this.contextFor(execution, message.toolCallId);
                 const record = this.tools.recorder.read(savedContext);
                 if (!record?.sdkReturned || !record.nativeEntryId || !record.sdkDelivery || record.runId !== input.runId
                   || record.sessionId !== input.sessionId || record.nativeToolCallId !== message.toolCallId || record.name !== message.toolName
@@ -254,7 +273,8 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
       signal: input.signal, deadlineAt: input.deadlineAt, totalTimeoutMs: input.resolved.policy.timeoutMs,
       measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot });
     this.controls.set(input.runId, control);
-    const execution: NonNullable<Binding["execution"]> = { input, callbacks, observers: [], facts: [], toolCalls: new Set(), lastOutcome: null, unsupported: false, registrationFailed: false, currentModelCallId: null, abort, control, tools: this.tools?.configure?.(control.configuration) ?? this.tools };
+    const toolContexts = new Map<string, ToolExecutionContext>(); this.toolContexts.set(input.runId, toolContexts);
+    const execution: NonNullable<Binding["execution"]> = { input, callbacks, observers: [], facts: [], toolCalls: new Set(), lastOutcome: null, unsupported: false, registrationFailed: false, currentModelCallId: null, abort, control, toolContexts, tools: this.tools?.configure?.(control.configuration) ?? this.tools };
     binding.execution = execution; input.signal.addEventListener("abort", abort, { once: true });
     const terminal = () => {
       if (execution.registrationFailed) execution.lastOutcome = unobservedFailure("storage_write_failed");
@@ -293,13 +313,13 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         readCurrentModelCallId: () => execution.currentModelCallId,
         readToolIdentity: nativeToolCallId => {
           if (!this.tools || !input.scope || !input.referenceDate || !input.timezone) return null;
-          const record = this.tools.recorder.read({ runId: originalRunId, sessionId: input.sessionId, nativeToolCallId,
-            scope: input.scope, referenceDate: input.referenceDate, timezone: input.timezone, signal: input.signal });
+          const record = this.tools.recorder.read(this.contextFor(execution, nativeToolCallId));
           return record?.runId === originalRunId && record.sessionId === input.sessionId && record.nativeToolCallId === nativeToolCallId ? { toolCallId: record.id } : null;
         }, emit: snapshot => callbacks.stream?.(snapshot),
       });
       if (input.inputId != null) {
-        await this.inputs.get(input.runId)!.deliver({ inputId: input.inputId, sessionId: input.sessionId, targetRunId: input.runId, mode: 'send', text: input.text, stopEpoch: 0 });
+        await this.inputs.get(input.runId)!.deliver({ inputId: input.inputId, sessionId: input.sessionId, targetRunId: input.runId, mode: 'send', text: input.text, stopEpoch: 0,
+          workspaceContext: input.workspaceContext });
         inputSettlement = await this.inputs.get(input.runId)!.waitForCompletion(input.signal.aborted ? 'cancelled' : 'completed');
       } else await session.prompt(input.text, { expandPromptTemplates: false });
     } catch {

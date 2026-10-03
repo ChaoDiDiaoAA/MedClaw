@@ -25,6 +25,7 @@ import type { RuntimeNotice } from '../../packages/contracts/src/protocol';
 import { SqliteCatalogStore } from '../../packages/storage/src/catalog-store';
 import { EvidenceReader } from '../../packages/core/src/evidence/evidence-reader';
 import { createBusinessTools } from '../../packages/core/src/tools/tools';
+import { toWorkspaceContext } from '../../packages/contracts/src/workspace';
 
 function requireSend(result: SubmitResult) {
   if (result.inputId === null || result.runId === null) throw new Error('Expected current Send Input and Run');
@@ -73,7 +74,7 @@ test('production PiAgentRuntime executes business and native tools in one frozen
       workspace, scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: policy.timeoutMs, agentOptions, agentPolicy,
       submission: { operationRef: 'send', originalSubmitInput: request }, instanceId: 'instance', createdAt: new Date().toISOString() });
     const observed = await agent.execute({ runId: accepted.runId, sessionId: session.id, text: request.text, resolved, agentOptions,
-      scope, referenceDate: request.referenceDate, timezone: request.timezone, agentPolicy, signal: new AbortController().signal, deadlineAt: performance.now() + 10000 }, {
+      scope, workspaceContext: toWorkspaceContext(workspace), referenceDate: request.referenceDate, timezone: request.timezone, agentPolicy, signal: new AbortController().signal, deadlineAt: performance.now() + 10000 }, {
       startCall: time => new ModelCallRecorder(repo, accepted.runId, 'main', time), preview: () => {}, nativeTerminal: () => {},
     });
     expect(observed.lastOutcome).toMatchObject({ text: 'Scope and file verified.', error: null });
@@ -216,7 +217,7 @@ test('production PiAgentRuntime closes recovery only after actual delivery of th
       scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: policy.timeoutMs, agentOptions, agentPolicy, toolConfiguration,
       submission: { operationRef: 'send', originalSubmitInput: request }, instanceId: 'fixture', createdAt });
     const observed = await agent.execute({ runId: accepted.runId, sessionId: session.id, text: request.text, resolved, agentOptions, scope,
-      referenceDate: request.referenceDate, timezone: request.timezone, agentPolicy, toolConfiguration,
+      workspaceContext: toWorkspaceContext(workspace), referenceDate: request.referenceDate, timezone: request.timezone, agentPolicy, toolConfiguration,
       signal: new AbortController().signal, deadlineAt: performance.now() + 30000 }, {
       startCall: time => new ModelCallRecorder(repo, accepted.runId, 'main', time), preview: () => {}, nativeTerminal: () => {},
     });

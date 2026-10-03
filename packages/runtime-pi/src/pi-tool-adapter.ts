@@ -14,6 +14,22 @@ import type { ToolControlObservation } from '../../contracts/src/model';
 
 export type ToolContextFactory = (nativeToolCallId: string, signal?: AbortSignal) => ToolExecutionContext;
 
+/** One factory belongs to one execution; retain it until required saves and listeners settle. */
+export function createFrozenToolContextFactory(readContext: ToolContextFactory,
+  cache = new Map<string, ToolExecutionContext>()): ToolContextFactory {
+  return (nativeToolCallId, signal) => {
+    const prior = cache.get(nativeToolCallId);
+    // Identity stays frozen; SDK cancellation may arrive after an observer's first lookup.
+    if (prior) return signal && signal !== prior.signal ? { ...prior, signal: AbortSignal.any([prior.signal, signal]) } : prior;
+    const context = readContext(nativeToolCallId, signal);
+    const frozen = { ...context, scope: structuredClone(context.scope),
+      ...(context.workspaceContext === undefined ? {} : { workspaceContext: structuredClone(context.workspaceContext) }),
+      ...(context.toolConfiguration === undefined ? {} : { toolConfiguration: structuredClone(context.toolConfiguration) }) };
+    cache.set(nativeToolCallId, frozen);
+    return frozen;
+  };
+}
+
 const FailedReturnSchema = z.strictObject({ status: z.enum(["failed", "cancelled"]), error: AppErrorSchema, data: z.unknown().optional() });
 function inputIssues(schema: z.ZodType, input: unknown): ToolControlObservation['validationIssues'] {
   const parsed = schema.safeParse(input);

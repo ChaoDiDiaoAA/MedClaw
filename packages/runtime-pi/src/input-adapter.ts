@@ -1,6 +1,7 @@
 import type { AgentSession, SessionManager } from '@earendil-works/pi-coding-agent';
 import { safeError, type AppError } from '../../contracts/src/error';
 import type { InputAdapterPort, InputBinding, InputCancelProof, InputControl, InputSettlementProof, InputStore } from '../../contracts/src/session';
+import type { WorkspaceContext } from '../../contracts/src/workspace';
 
 type Message = Parameters<AgentSession['agent']['steer']>[0];
 type Failure = Parameters<InputStore['recordInputFailure']>[1];
@@ -17,7 +18,7 @@ export interface PiInputAdapterCallbacks {
   nativeStateInvalid?(): void;
   admissionClosed(): void;
 }
-type Record = { input: InputBinding; message?: Message; started: boolean; entryId?: string; removed?: Removal; unknown: boolean; failed: boolean };
+type Record = { input: InputBinding; message?: Message; started: boolean; entryId?: string; appendOrder?: number; removed?: Removal; unknown: boolean; failed: boolean };
 function latch<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; }
 
 /** Composes public Pi methods. Pi retains exclusive ownership of its scheduling loop. */
@@ -34,6 +35,9 @@ export class PiInputAdapter implements InputAdapterPort {
   private accepting = true;
   private epoch = 0;
   private invalid = false;
+  private appendOrder = 0;
+  private confirmedOrder = 0;
+  private consumedWorkspace: { inputId: number; nativeEntryId: string; workspaceContext: WorkspaceContext } | null = null;
   private readonly originals: { prompt: AgentSession['agent']['prompt']; steer: AgentSession['agent']['steer']; followUp: AgentSession['agent']['followUp']; append: SessionManager['appendMessage'] };
   private readonly installed: typeof this.originals;
   private readonly sessionOriginals: Pick<AgentSession, 'prompt' | 'steer' | 'followUp'>;
@@ -75,8 +79,16 @@ export class PiInputAdapter implements InputAdapterPort {
         if (record) {
           if (record.removed || record.entryId && record.entryId !== entryId) { this.block(); return entryId; }
           record.entryId = entryId;
+          const order = record.appendOrder ??= ++this.appendOrder;
           const fact: Consumption = { sessionId: record.input.sessionId, runId: record.input.targetRunId, nativeEntryId: entryId, at: new Date().toISOString() };
-          this.save(`consumed:${record.input.inputId}`, () => this.callbacks.consumed(record.input, fact));
+          this.save(`consumed:${record.input.inputId}`, () => {
+            this.callbacks.consumed(record.input, fact);
+            if (order >= this.confirmedOrder) {
+              this.confirmedOrder = order;
+              this.consumedWorkspace = record.input.workspaceContext ? { inputId: record.input.inputId, nativeEntryId: entryId,
+                workspaceContext: structuredClone(record.input.workspaceContext) } : null;
+            }
+          });
         } else if (message.role === 'user') this.block();
         return entryId;
       },
@@ -95,6 +107,10 @@ export class PiInputAdapter implements InputAdapterPort {
   }
 
   readControl(): InputControl { return { runId: this.callbacks.runId, acceptingInputs: this.accepting && !this.invalid, blockReasons: this.invalid ? [safeError('input_delivery_unknown')] : this.pendingSaves.size ? [safeError('storage_write_failed')] : [] }; }
+  readConsumedWorkspace(): { inputId: number; nativeEntryId: string; workspaceContext: WorkspaceContext } | null {
+    if (this.invalid || this.appendOrder > this.confirmedOrder) throw safeError('state_conflict');
+    return this.consumedWorkspace ? structuredClone(this.consumedWorkspace) : null;
+  }
   hasInput(inputId: number): boolean { return this.records.has(inputId); }
   async waitForCompletion(outcome: 'completed' | 'failed' | 'cancelled'): Promise<InputSettlementProof> {
     await Promise.all([...this.longTasks]);
@@ -138,7 +154,7 @@ export class PiInputAdapter implements InputAdapterPort {
     if (input.targetRunId !== this.callbacks.runId || input.sessionId !== this.callbacks.sessionId) throw safeError('state_conflict');
     const prior = this.records.get(input.inputId);
     if (prior) { if (JSON.stringify(prior.input) !== JSON.stringify(input)) throw safeError('state_conflict'); return; }
-    const record: Record = { input: { ...input }, started: false, unknown: false, failed: false }; this.records.set(input.inputId, record);
+    const record: Record = { input: structuredClone(input), started: false, unknown: false, failed: false }; this.records.set(input.inputId, record);
     await this.serial(async () => {
       if (!this.accepting) { record.failed = true; this.failure(record, { kind: 'not_consumed', reason: 'dispatch_rejected' }); return; }
       const dispatch = latch<void>(); this.scope = { record, epoch: this.epoch, count: 0, dispatch };

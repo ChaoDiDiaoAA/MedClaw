@@ -214,7 +214,8 @@ export class CatalogService {
     return row;
   }
   readScope(context: ToolExecutionContext) {
-    this.assertContext(context); return structuredClone({ scope: context.scope, referenceDate: context.referenceDate, timezone: context.timezone });
+    this.assertContext(context); return structuredClone({ scope: context.scope, referenceDate: context.referenceDate, timezone: context.timezone,
+      workspaceContext: context.workspaceContext ?? null, workspaceInputId: context.workspaceInputId ?? null });
   }
   listBatches(input: PageInput & { time?: z.infer<typeof TimeRangeSchema> }, context: ToolExecutionContext) {
     this.assertContext(context); const time = input.time && createQuerySchemas().TimeRangeSchema.parse(input.time);
