@@ -5,6 +5,9 @@ import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, safe
 import { ToolSdkDeliverySchema } from "../../contracts/src/tool";
 import { ToolControlObservationSchema } from "../../contracts/src/model";
 import { SqliteInputStore } from "./input-store";
+import { SqliteEventStore } from './event-store';
+import { SqliteWriteTransactions } from './write-transactions';
+import type { EventWriter, RegisteredEventDraft, RegisteredEventPayload } from '../../contracts/src/event';
 import { InputContentSchema, type PreparedInput, type InputStore, type InputCancelProof, type InputSettlementProof, type ReadInputRequest, type ListInputsRequest } from "../../contracts/src/session";
 import { SqliteToolStore } from "./tool-store";
 import { NewSessionInputSchema, NewSessionResultSchema, SelectSessionInputSchema, SessionViewSchema, ListSessionsRequestSchema, SubmitInputSchema, ReadSubmissionRequestSchema,
@@ -97,10 +100,37 @@ export class Repositories implements ProviderRunStore, SessionStore {
   private readonly p3: boolean;
   private readonly inputs: SqliteInputStore;
   private readonly p5: boolean;
-  constructor(private readonly db: Database, private readonly beforeCommit?: () => void) {
-    this.inputs = new SqliteInputStore(db);
+  private readonly events: EventWriter | undefined;
+  constructor(private readonly db: Database, private readonly beforeCommit?: () => void, events?: EventWriter,
+    private readonly transactions = SqliteWriteTransactions.forDatabase(db)) {
+    this.events = events ?? (db.query("SELECT name FROM sqlite_schema WHERE name='runtime_events'").get() ? new SqliteEventStore(db, transactions) : undefined);
+    this.inputs = new SqliteInputStore(db, this.events);
     this.p5 = db.query("SELECT name FROM sqlite_schema WHERE name='session_inputs'").get() !== null;
     this.p3 = this.db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name='answers'").get() !== null;
+  }
+
+  private event(row: RunRow, fact: RegisteredEventPayload, at: string, source: RegisteredEventDraft['source'] = 'application', toolCallId: number | null = null): void {
+    if (!this.events || row.kind !== 'agent' || row.session_id === null) return;
+    this.events.appendInTransaction({...fact,runId:row.id,sessionId:row.session_id,source,sourceConnection:null,sourceSequence:null,toolCallId,occurredAt:at,receivedAt:at});
+  }
+  private runLifecycle(row: RunRow, type: 'run_created'|'run_started', at: string): void {
+    if(row.kind==='agent'&&row.session_id!==null)this.event(row,{type,payload:{contract:'medclaw.event/v1',sessionId:row.session_id,kind:'agent',configVersion:this.config(row).selection.configVersion}},at);
+  }
+  private runTerminal(row: RunRow, status: 'completed'|'failed'|'cancelled', error: AppError|null, cleanup: unknown, at: string): void {
+    const saved = RunCleanupRecordSchema.safeParse(cleanup);
+    const answer = this.p3 ? this.db.query<{id:number},[number]>('SELECT id FROM answers WHERE run_id=?').get(row.id) : null;
+    const payload={contract:'medclaw.event/v1' as const,answerId:answer?.id??null,stopConfirmed:saved.success?saved.data.stopConfirmed:null};
+    if(status==='completed')this.event(row,{type:'run_completed',payload:{...payload,errorCode:null}},at);
+    else if(status==='failed'){
+      if(row.kind==='agent'&&error===null)fail('storage_write_failed');
+      if(error)this.event(row,{type:'run_failed',payload:{...payload,errorCode:error.code}},at);
+    }else this.event(row,{type:'run_cancelled',payload:{...payload,errorCode:error?.code??null}},at);
+  }
+  private recoveredToolEvent(run:RunRow,callId:number,error:AppError,at:string):void {
+    const row=this.db.query<{native_tool_call_id:string},[number]>('SELECT native_tool_call_id FROM tool_calls WHERE id=?').get(callId);
+    if(!row)fail('storage_write_failed');
+    const queryIds=this.db.query<{id:number},[number,string]>('SELECT id FROM queries WHERE run_id=? AND call_ref=? ORDER BY id').all(run.id,`${run.id}:${row.native_tool_call_id}`).map(query=>query.id);
+    this.event(run,{type:'tool_finished',payload:{contract:'medclaw.event/v1',callId,nativeToolCallId:row.native_tool_call_id,status:'failed',queryIds,errorCode:error.code}},at,'host',callId);
   }
 
   private creationReceipt(text: string): NewSessionResult {
@@ -108,7 +138,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
     return checked(NewSessionResultSchema, {...value, session: {...value.session, inputControl: value.session.inputControl ?? null}}, "storage_read_failed");
   }
   private inputRead<T>(action:()=>T):T {try{return action();}catch(error){if(error instanceof Error&&error.name==='SQLiteError')fail('storage_read_failed');throw error;}}
-  private inputWrite<T>(action:()=>T):T {try{return this.db.transaction(()=>{const result=action();this.beforeCommit?.();return result;}).immediate();}catch(error){if(error instanceof Error&&error.name==='SQLiteError')fail('storage_write_failed');throw error;}}
+  private inputWrite<T>(action:()=>T):T {try{return this.transactions.immediate(()=>{const result=action();this.beforeCommit?.();return result;});}catch(error){if(error instanceof Error&&error.name==='SQLiteError')fail('storage_write_failed');throw error;}}
   beginInputDelivery(inputId:number,instanceId:string,at:string):void {this.inputWrite(()=>this.inputs.beginInputDelivery(inputId,instanceId,at));}
   recordInputDelivery(inputId:number,at:string):void {this.inputWrite(()=>this.inputs.recordInputDelivery(inputId,at));}
   recordInputConsumption(inputId:number,fact:Parameters<InputStore['recordInputConsumption']>[1]):void {this.inputWrite(()=>this.inputs.recordInputConsumption(inputId,fact));}
@@ -157,7 +187,9 @@ export class Repositories implements ProviderRunStore, SessionStore {
         const config=checked(agentConfigSchema,{selection:run.model,policy:run.policy,referenceDate:run.referenceDate,timezone:run.timezone,...(run.agentPolicy?{agentPolicy:run.agentPolicy}:{}),...(run.runtimeConfiguration?{runtimeConfiguration:run.runtimeConfiguration}:{}),...(run.toolConfiguration?{toolConfiguration:run.toolConfiguration}:{}),...(run.measurementContext?{measurementContext:run.measurementContext}:{}),...(run.toolProfileSnapshot?{toolProfileSnapshot:run.toolProfileSnapshot}:{}),agent:{...run.agentOptions,stage:run.scope.allowedToolNames.length?'P3':'P2',nativeSessionId:session.nativeSessionId,tools:run.scope.allowedToolNames,autoCompaction:false,autoRetry:false,cacheWarming:'off'}});
         const r=this.db.query("INSERT INTO runs(session_id,input_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at) VALUES(?,?,'agent',?,NULL,NULL,NULL,'created','answer',?,?,?,?,?,?,?)").run(session.id,inputId,run.instanceId,content.text,JSON.stringify(config),JSON.stringify(run.scope),JSON.stringify(workspace),run.referenceDate,run.timezone,run.createdAt);target=Number(r.lastInsertRowid);
         this.db.query('UPDATE session_inputs SET target_run_id=? WHERE id=? AND target_run_id IS NULL').run(target,inputId);
+        this.runLifecycle(this.row(target)!, 'run_created', run.createdAt);
       }
+      this.inputs.accepted(inputId, plan.createdAt);
       return this.inputs.result(this.inputs.required(inputId));
     });
   }
@@ -267,7 +299,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
 
   updateWorkspace(change: WorkspaceChange, expectedRevision: number, time: string): WorkspaceView {
     const request = checked(WorkspaceChangeSchema, change); checked(RevisionSchema, expectedRevision); timestamp(time);
-    return this.db.transaction(() => {
+    return this.transactions.immediate(() => {
       const old = this.readWorkspace();
       if (old.revision !== expectedRevision) fail("workspace_revision_mismatch");
       const batchIds = request.batchIds ?? old.batchRefs.map(batch => batch.id), batches = this.batchReferences(batchIds);
@@ -293,7 +325,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
       if (saved.changes !== 1) fail("workspace_revision_mismatch");
       this.beforeCommit?.();
       return next;
-    }).immediate();
+    });
   }
 
   freezeAgentScope(workspace: WorkspaceView, toolNames: readonly string[]): RunScope {
@@ -331,7 +363,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
 
   createSession(input: NewSessionInput, operationRef: string, nativeSessionId: string, time: string): NewSessionResult {
     const request = checked(NewSessionInputSchema, input); checked(OpaqueIdSchema, operationRef); checked(OpaqueIdSchema, nativeSessionId); timestamp(time);
-    return this.db.transaction(() => {
+    return this.transactions.immediate(() => {
       const existing = this.findOperation(operationRef);
       if (existing) {
         if (existing.method !== "session.create" || canonicalRequest(existing.originalRequest) !== canonicalRequest(request)) fail("state_conflict");
@@ -350,12 +382,12 @@ export class Repositories implements ProviderRunStore, SessionStore {
         .run(sessionId, result.workspace.revision, time, workspace.revision);
       this.beforeCommit?.();
       return result;
-    }).immediate();
+    });
   }
 
   selectSession(input: SelectSessionInput, time: string): WorkspaceView {
     const request = checked(SelectSessionInputSchema, input); timestamp(time);
-    return this.db.transaction(() => {
+    return this.transactions.immediate(() => {
       const workspace = this.readWorkspace();
       if (workspace.revision !== request.expectedWorkspaceRevision) fail("workspace_revision_mismatch");
       if (!this.readSession(request.sessionId)) fail("session_not_found");
@@ -365,7 +397,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
         .run(request.sessionId, selected.revision, time, workspace.revision);
       this.beforeCommit?.();
       return selected;
-    }).immediate();
+    });
   }
 
   private submissionResult(row: RunRow): SubmitResult {
@@ -432,7 +464,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
   registerAgent(input: RegisterAgentInput): Extract<SubmitResult,{inputId:null}> {
     if(input.submission === null || input.inputId !== null) fail("invalid_argument");
     const request = checked(SubmitInputSchema, input.submission.originalSubmitInput), operationRef = checked(OpaqueIdSchema, input.submission.operationRef); timestamp(input.createdAt);
-    return this.db.transaction(() => {
+    return this.transactions.immediate(() => {
       const operation = this.findOperation(operationRef), sequence = this.findSubmission({ sessionId: request.sessionId, clientSequence: request.clientSequence });
       if (operation || sequence) {
         if (!operation || operation.method !== "session.submit" || !sequence || operation.result.runId !== sequence.runId
@@ -469,15 +501,17 @@ export class Repositories implements ProviderRunStore, SessionStore {
         VALUES(?,NULL,'agent',?,?,?,?,'created','answer',?,?,?,?,?,?,?)`)
         .run(session.id, input.instanceId, operationRef, request.clientSequence, canonicalRequest(request), request.text, JSON.stringify(config),
           JSON.stringify(input.scope), JSON.stringify(workspace), request.referenceDate, request.timezone, input.createdAt);
+      const runId=Number(result.lastInsertRowid);
+      this.runLifecycle(this.row(runId)!, 'run_created', input.createdAt);
       this.beforeCommit?.();
-      return { sessionId: session.id, clientSequence: request.clientSequence, inputId: null, runId: Number(result.lastInsertRowid) };
-    }).immediate();
+      return { sessionId: session.id, clientSequence: request.clientSequence, inputId: null, runId };
+    });
   }
 
   registerProvider(input: RegisterProviderInput): ProviderAccepted {
     const originalRequest = input.method === "model.request" ? checked(ProviderRequestSchema, input.originalRequest) : checked(DiagnoseRequestSchema, input.originalRequest);
     if (!input.operationRef || input.operationRef.length > 512) fail("invalid_argument");
-    return this.db.transaction(() => {
+    return this.transactions.immediate(() => {
       const operation = this.findOperation(input.operationRef);
       if (operation && operation.method !== input.method) fail("state_conflict");
       const existing = this.findProviderOperation(input.operationRef);
@@ -504,13 +538,13 @@ export class Repositories implements ProviderRunStore, SessionStore {
         .run(input.priorRunId ?? null, input.instanceId, input.goal, input.inputText, JSON.stringify(config), JSON.stringify(scope), input.referenceDate, input.timezone, input.createdAt);
       this.beforeCommit?.();
       return { runId: Number(result.lastInsertRowid), operationRef: input.operationRef, reused: false };
-    }).immediate();
+    });
   }
 
   startCall(runId: number, callId: string, kind: "main" | "diagnostic", time: string): void {
     id(runId); timestamp(time);
     if (!callId || callId.length > 512) fail("invalid_argument");
-    this.db.transaction(() => {
+    this.transactions.immediate(() => {
       const row = this.row(runId);
       if (!row || row.status !== "created" && !(row.kind === "agent" && row.status === "running")) fail("state_conflict");
       if (row.kind === "provider" && this.calls(runId).length) fail("state_conflict");
@@ -518,6 +552,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
       if (row.status === "created") {
         const changed = this.db.query("UPDATE runs SET status='running',started_at=? WHERE id=? AND status='created'").run(time, runId);
         if (changed.changes !== 1) fail("state_conflict");
+        this.runLifecycle(row,'run_started',time);
       }
       this.db.query(`INSERT INTO model_calls(call_id,run_id,session_id,input_id,kind,attempt,granularity,
         attempt_count_unknown,model_json,state,started_at,ended_at,duration_ms,input_tokens,output_tokens,
@@ -525,18 +560,21 @@ export class Repositories implements ProviderRunStore, SessionStore {
         VALUES(?,?,?,?,?,1,'logical_request',1,?,'started',?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)`)
         .run(callId, runId, row.session_id, row.input_id, kind, JSON.stringify({ selection: this.config(row).selection, responseModel: null, sdkStopReason: null }), time);
       this.beforeCommit?.();
-    }).immediate();
+    });
   }
 
   requestCancel(runId: number, time: string): boolean {
     id(runId); timestamp(time);
-    return this.db.transaction(() => {
-      if (!this.row(runId)) fail("state_conflict");
+    return this.transactions.immediate(() => {
+      const row=this.row(runId);if (!row) fail("state_conflict");
       const result = this.db.query(`UPDATE runs SET cancel_requested_at=COALESCE(cancel_requested_at,?)
         WHERE id=? AND status IN ('created','running')`).run(time, runId);
-      if (result.changes) this.beforeCommit?.();
+      if (result.changes) {
+        if(row.cancel_requested_at===null)this.event(row,{type:'run_cancel_requested',payload:{contract:'medclaw.event/v1',reason:'run_cancelled'}},time);
+        this.beforeCommit?.();
+      }
       return result.changes > 0;
-    }).immediate();
+    });
   }
 
   finalizeProvider(runId: number, fact: FinalProviderFact): RunView {
@@ -564,7 +602,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
     const error = fact.error === null ? null : checked(AppErrorSchema, fact.error);
     let cleanup = fact.cleanup == null ? null : checked(z.union([cleanupSchema, RunCleanupRecordSchema]), fact.cleanup);
     const usage = fact.usage == null ? null : checked(usageSchema, fact.usage);
-    return this.db.transaction(() => {
+    return this.transactions.immediate(() => {
       const row = this.row(runId);
       if (!row || row.kind !== kind) fail("state_conflict");
       const calls = this.calls(runId);
@@ -625,10 +663,11 @@ export class Repositories implements ProviderRunStore, SessionStore {
             .run(`answer:${runId}`, row.session_id, runId, JSON.stringify({ answerId: Number(saved.lastInsertRowid), queryIds }), fact.endedAt);
         }
       }
+      if(!terminal)this.runTerminal(row,fact.status,error,cleanup,fact.endedAt);
       const run = this.view(this.row(runId)!);
       this.beforeCommit?.();
       return run;
-    }).immediate();
+    });
   }
 
   /** Read-only proof after a COMMIT whose return was lost; compare full facts, not paged previews. */
@@ -657,7 +696,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
 
   checkpointFailure(runId: number, error: AppError, cleanup: RunCleanupRecord, time: string): void {
     id(runId); timestamp(time); checked(AppErrorSchema, error);
-    this.db.transaction(() => {
+    this.transactions.immediate(() => {
       const row = this.row(runId);
       if (!row) fail("run_not_found");
       const terminal = row.status !== "created" && row.status !== "running";
@@ -666,20 +705,21 @@ export class Repositories implements ProviderRunStore, SessionStore {
       const checkedCleanup = this.validateCleanup(decoded(row.cleanup_json), cleanup);
       this.db.query("UPDATE runs SET status='failed',error_json=?,ended_at=COALESCE(ended_at,?),cleanup_json=? WHERE id=?")
         .run(json(error), time, json(checkedCleanup), runId);
+      if(!terminal)this.runTerminal(row,'failed',error,checkedCleanup,time);
       this.beforeCommit?.();
-    }).immediate();
+    });
   }
 
   saveRunCleanup(runId: number, cleanup: RunCleanupRecord): void {
     id(runId);
-    this.db.transaction(() => {
+    this.transactions.immediate(() => {
       const row = this.row(runId);
       if (!row) fail("run_not_found");
       if(this.p5&&cleanup.inputsSettled&&this.inputs.hasPendingInputsForRun(runId))fail('state_conflict');
       const checkedCleanup = this.validateCleanup(decoded(row.cleanup_json), cleanup);
       this.db.query("UPDATE runs SET cleanup_json=? WHERE id=?").run(json(checkedCleanup), runId);
       this.beforeCommit?.();
-    }).immediate();
+    });
   }
 
   recoveryCandidates(instanceId: string): RunView[] {
@@ -702,7 +742,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
     stopConfirmed: boolean | null; requiredPersistenceComplete: boolean; unconfirmedItems: string[];
   } {
     id(runId); timestamp(time);
-    return this.db.transaction(() => {
+    return this.transactions.immediate(() => {
       const run = this.row(runId);
       if (!run) fail('run_not_found');
       const prior = RunCleanupRecordSchema.safeParse(decoded(run.cleanup_json));
@@ -735,6 +775,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
             const error = safeError('runtime_interrupted', undefined, { runId, toolCallId: tool.id });
             this.db.query(`UPDATE tool_calls SET status='failed',result_json=?,error_json=?,ended_at=? WHERE id=? AND status=?`)
               .run(JSON.stringify(result), JSON.stringify(error), time, tool.id, tool.status);
+            this.recoveredToolEvent(run,tool.id,error,time);
             changed = true;
             if (tool.status === 'running' && tool.effect === 'LOCAL_WRITE') unconfirmed.add('tool_effect_unknown');
           } else if (tool.effect === 'LOCAL_WRITE') {
@@ -747,7 +788,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
       if (stopConfirmed !== true) { unconfirmed.add('stop'); unconfirmed.add('resources'); }
       if (changed) this.beforeCommit?.();
       return { stopConfirmed, requiredPersistenceComplete: ![...unconfirmed].some(item => item.startsWith('tool_')), unconfirmedItems: [...unconfirmed] };
-    }).immediate();
+    });
   }
 
   read(request: z.input<typeof ReadRunRequestSchema>): ReadRunResult {
@@ -784,7 +825,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
   recoverInterrupted(instanceId: string, time: string): number {
     timestamp(time);
     if (!instanceId) fail("invalid_argument");
-    return this.db.transaction(() => {
+    return this.transactions.immediate(() => {
       const rows = this.db.query<RunRow, [string]>(
         "SELECT * FROM runs WHERE instance_id<>? AND status IN ('created','running')",
       ).all(instanceId);
@@ -806,9 +847,10 @@ export class Repositories implements ProviderRunStore, SessionStore {
         this.db.query(`UPDATE runs SET status='failed',ended_at=?,error_json=?,cleanup_json=?
           WHERE id=? AND status IN ('created','running')`)
           .run(time, JSON.stringify(error), JSON.stringify(cleanup), row.id);
+        this.runTerminal(row,'failed',error,cleanup,time);
       }
       if (rows.length) this.beforeCommit?.();
       return rows.length;
-    }).immediate();
+    });
   }
 }

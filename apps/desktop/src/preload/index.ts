@@ -9,7 +9,11 @@ ipcRenderer.on("medclaw:notice", (_event, raw: unknown) => {
   const { instanceId, ...notice } = raw as Record<string, unknown>;
   const parsed = DesktopNoticeSchema.safeParse(notice);
   if (!parsed.success || (instanceId !== null && !OpaqueIdSchema.safeParse(instanceId).success)) return;
-  listeners.forEach(listener => listener({ ...parsed.data, instanceId: instanceId as string | null }));
+  listeners.forEach(listener => { try { listener(structuredClone({ ...parsed.data, instanceId: instanceId as string | null })); } catch {
+    // Send only a fixed signal. User content, stack traces and provider errors
+    // never enter this diagnostic channel.
+    try { ipcRenderer.send('medclaw:observer-error'); } catch {}
+  } });
 });
 const bridge = {
   async request<M extends PublicMethod>(method: M, payload: PublicPayload<M>, operationRef?: string): Promise<Result<PublicReturn<M>>> {

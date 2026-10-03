@@ -4,8 +4,8 @@ import { readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
-export const SCHEMA_VERSION = 4;
-const migrations = ["001_p1.sql", "002_p2.sql", "003_p3.sql", "004_p5.sql"].map(name => {
+export const SCHEMA_VERSION = 5;
+const migrations = ["001_p1.sql", "002_p2.sql", "003_p3.sql", "004_p5.sql", "005_p6.sql"].map(name => {
   const sql = readFileSync(new URL(`./migrations/${name}`, import.meta.url));
   return { sql: sql.toString("utf8"), checksum: createHash("sha256").update(sql).digest("hex") };
 });
@@ -114,6 +114,14 @@ export function openDatabase(path: string, beforeMigrationCommit?: (phase?: stri
         db.exec("PRAGMA foreign_keys=ON");
         if(db.query<{foreign_keys:number},[]>("PRAGMA foreign_keys").get()?.foreign_keys!==1) throw new Error("storage_migration_failed");
       }
+    }
+    if (version <= 4) {
+      db.transaction(() => {
+        db.exec(migrations[4]!.sql);
+        validate(db, 5);
+        beforeMigrationCommit?.("p6_marker");
+        db.query("INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(5,?,?)").run(migrations[4]!.checksum, new Date().toISOString());
+      }).immediate();
     }
     validate(db, SCHEMA_VERSION);
     return db;

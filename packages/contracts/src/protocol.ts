@@ -18,12 +18,14 @@ import { StoredToolConfigurationSchema, normalizeToolConfiguration } from './too
 import { RuntimeConfigurationSchema, normalizeRuntimeConfiguration, projectRuntimePolicies } from './runtime-config';
 import { ReadSessionMessagesInputSchema, SessionMessagePageSchema } from "./messages";
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p5-v1" as const;
-export const DATABASE_SCHEMA_VERSION = 4 as const;
+import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, EventSubscribeResultSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema } from './event';
+
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p6-v1" as const;
+export const DATABASE_SCHEMA_VERSION = 5 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
-  return method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method.startsWith('evidence.read') || method === 'data.rows' || method === 'tool.read' || method === "run.active" || method === "workspace.restore" || method === "session.readSubmission" || method === "session.readInput" || method === "session.listInputs";
+  return method === "event.subscribe" || method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method.startsWith('evidence.read') || method === 'data.rows' || method === 'tool.read' || method === "run.active" || method === "workspace.restore" || method === "session.readSubmission" || method === "session.readInput" || method === "session.listInputs";
 }
 export const EmptyPayloadSchema = z.strictObject({});
 const accepted = z.strictObject({ accepted: z.literal(true) });
@@ -77,6 +79,8 @@ export const DiagnosticsViewSchema = z.strictObject({
 
 /** Each public method owns its exact input and output; private control and secrets are absent. */
 export const publicMethodSchemas = {
+  "event.read": { input: ReadEventsInputSchema, output: EventPageSchema },
+  "event.subscribe": { input: EventSubscribeInputSchema, output: EventSubscribeResultSchema },
   "model.list": { input: EmptyPayloadSchema, output: ModelDirectoryViewSchema },
   "model.read": { input: EmptyPayloadSchema, output: ModelDirectoryViewSchema },
   "model.refresh": {
@@ -214,6 +218,8 @@ export type HostPrivateMethod = keyof typeof hostPrivateMethodSchemas;
 const hostFields = { protocolVersion: z.literal(HOST_PROTOCOL_VERSION), kind: z.literal("request"), requestId: OpaqueIdSchema, instanceId: OpaqueIdSchema, operationRef: OpaqueIdSchema };
 const hostRequest = <M extends string, S extends z.ZodType>(method: M, payload: S) => z.strictObject({ ...hostFields, method: z.literal(method), payload });
 export const PublicHostRequestSchema = z.discriminatedUnion("method", [
+  hostRequest("event.read", publicMethodSchemas["event.read"].input),
+  hostRequest("event.subscribe", publicMethodSchemas["event.subscribe"].input),
   hostRequest("model.list", publicMethodSchemas["model.list"].input),
   hostRequest("model.read", publicMethodSchemas["model.read"].input),
   hostRequest("model.refresh", publicMethodSchemas["model.refresh"].input),
@@ -291,7 +297,7 @@ export const AgentNoticeSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("agent.persistence_failed"), ...agentIdentity, error: AppErrorSchema }),
 ]);
 export const RuntimeNoticeSchema = z.union([
-  ProviderNoticeSchema, AgentNoticeSchema,
+  ProviderNoticeSchema, AgentNoticeSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema,
   z.strictObject({ type: z.literal("auth.prompt"), prompt: AuthPromptViewSchema }),
   z.strictObject({ type: z.literal("auth.notify"), notification: AuthNotifyViewSchema }),
   z.strictObject({ type: z.literal("auth.finished"), attempt: AuthAttemptViewSchema }),

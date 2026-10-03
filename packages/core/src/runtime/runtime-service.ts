@@ -13,6 +13,7 @@ import type { QueryExecutionContext } from '../../../contracts/src/query';
 import type { RunScope } from '../../../contracts/src/run';
 import { normalizeToolConfiguration } from '../../../contracts/src/tool-config';
 import { normalizeRuntimeConfiguration, projectRuntimePolicies } from '../../../contracts/src/runtime-config';
+import type { StreamSnapshot } from '../../../contracts/src/event';
 
 type Execution = { handle: RunHandle; operationRef: string; abort: AbortController; nativeTerminal: boolean; cause: "user" | "deadline" | "shutdown" | null;
   cancelAt: string | null; stopped: boolean; executionStarted: boolean | null; fact: FinalProviderFact | FinalAgentFact | null;
@@ -35,7 +36,8 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   constructor(readonly instanceId: string, private readonly settings: () => PublishedSettings, private readonly modelRuntime: ModelRuntimePort<Resolved>,
     private readonly store: RuntimeRunStore, private readonly credentials: CredentialScope, private readonly startCall: ModelCallStarter,
     private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void,
-    private readonly agent: (AgentRuntimePort<Resolved> & NativeSessionBindings) | undefined, private readonly modelControlBusy: () => boolean) {}
+    private readonly agent: (AgentRuntimePort<Resolved> & NativeSessionBindings) | undefined, private readonly modelControlBusy: () => boolean,
+    private readonly stream?: (snapshot: StreamSnapshot) => void) {}
   get activeHandle(): RunHandle | null { return this.execution?.handle ?? null; }
   get persistencePending() { return this.execution?.pendingSave ?? this.recoveries.size > 0; }
   get stopPending() { return !!this.execution?.cause && !this.execution.stopped; }
@@ -334,6 +336,8 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         scope: input.scope, referenceDate: input.referenceDate, timezone: input.timezone, signal: execution.abort.signal, deadlineAt,
         agentPolicy: input.agentPolicy, runtimeConfiguration: input.runtimeConfiguration, toolConfiguration: input.toolConfiguration, measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot }, {
         startCall: time => this.startCall(execution.handle.runId, "main", time), preview: text => this.preview(execution, text),
+        stream: snapshot => { if (snapshot.runId !== execution.handle.runId || snapshot.sessionId !== execution.handle.sessionId) return;
+          try { this.stream?.(structuredClone(snapshot)); } catch { try { this.report(safeError('preview_delivery_failed')); } catch {} } },
         inputStore: this.store, admissionClosed: () => { execution.acceptingInputs = false; },
         fatal: error => { this.checkpoint(execution, error); execution.abort.abort(); },
         nativeTerminal: outcome => { execution.nativeTerminal = true; if (outcome.error && !execution.cause) this.checkpoint(execution, outcome.error); },

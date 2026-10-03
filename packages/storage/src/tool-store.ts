@@ -5,6 +5,9 @@ import { isDeepStrictEqual } from "node:util";
 import { AppErrorSchema, PositiveIdSchema, safeError, type AppError } from "../../contracts/src/error";
 import { BUSINESS_RULES, createQuerySchemas, ChangesQuerySchema, CurrentQuerySchema, QueryParamsSchema, EvidenceSchema, QueryRecordSchema, type Evidence, type QueryRecord, type QueryStore, type QueryContext } from "../../contracts/src/query";
 import { canonicalRequest, RunScopeSchema } from "../../contracts/src/run";
+import { SqliteEventStore } from './event-store';
+import { SqliteWriteTransactions } from './write-transactions';
+import type { EventWriter } from '../../contracts/src/event';
 import { StoredToolConfigurationSchema } from '../../contracts/src/tool-config';
 import { createToolControlObservation, MeasurementContextSchema, ToolControlObservationSchema, type ToolControlObservation } from '../../contracts/src/model';
 import { ToolCallRecordSchema, ToolContextIdentitySchema, ToolExecutionModeSchema, ToolSdkDeliverySchema, type ToolCallIdentity, type ToolCallRecord,
@@ -65,7 +68,7 @@ export function initializeToolStorage(db: Database): void {
 type CallRow = { id: number; run_id: number; session_id: number; native_tool_call_id: string; tool_name: string; tool_version: string; model_call_id?: number | null; stopped_at?: string | null;
   requested_at: string; started_at: string | null;
   effect: string; execution_mode: string; args_json: string; status: ToolCallRecord["status"]; result_json: string | null;
-  error_json: string | null; delivery_json: string | null };
+  error_json: string | null; delivery_json: string | null; ended_at:string|null };
 type QueryRow = { input_id?:number|null; id: number; session_id: number; run_id: number; call_ref: string; kind: QueryRecord["kind"];
   params_json: string; params_hash: string; batch_ids_json: string; result_json: string; result_hash: string; created_at: string;
   source?: QueryRecord['source']; catalog_revision?: number; material_version?: string; based_on_query_id?: number | null };
@@ -75,11 +78,31 @@ type EvidenceRow = { id: number; query_id: number; batch_ids_json: string; snaps
 
 export class SqliteToolStore implements ToolCallStore, QueryStore {
   private readonly p3: boolean;
-  constructor(private readonly db: Database) {
+  private readonly events: EventWriter | undefined;
+  constructor(private readonly db: Database, events?: EventWriter, private readonly transactions=SqliteWriteTransactions.forDatabase(db)) {
+    this.events=events??(db.query("SELECT name FROM sqlite_schema WHERE name='runtime_events'").get()?new SqliteEventStore(db,transactions):undefined);
     this.p3 = db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name='catalog_state'").get() !== null;
   }
+  private event(row:CallRow,type:'tool_requested'|'tool_started'|'tool_finished',at:string):void {
+    if(!this.events)return;
+    const queryIds=this.db.query<{id:number},[number,string]>('SELECT id FROM queries WHERE run_id=? AND call_ref=? ORDER BY id').all(row.run_id,`${row.run_id}:${row.native_tool_call_id}`).map(query=>query.id);
+    const result=row.result_json===null?null:decode(row.result_json);
+    // A read tool can reference the original Query without creating a second one.
+    const reference=result&&typeof result==='object'&&'queryId'in result?PositiveIdSchema.safeParse(result.queryId):null;
+    if(reference?.success){
+      const query=this.db.query<{id:number},[number,number,number]>('SELECT id FROM queries WHERE run_id=? AND id=? AND session_id=?').get(row.run_id,reference.data,row.session_id);
+      if(query&&!queryIds.includes(query.id))queryIds.push(query.id);
+    }
+    const error=row.error_json===null?null:AppErrorSchema.parse(decode(row.error_json)).code;
+    const status=row.status;
+    const payload={contract:'medclaw.event/v1' as const,callId:row.id,nativeToolCallId:row.native_tool_call_id,status,queryIds,errorCode:error};
+    if(type==='tool_requested'&&status==='requested')this.events.appendInTransaction({type,payload:{...payload,status:'requested'},runId:row.run_id,sessionId:row.session_id,source:'tool',sourceConnection:null,sourceSequence:null,toolCallId:row.id,occurredAt:at,receivedAt:at});
+    else if(type==='tool_started'&&status==='running')this.events.appendInTransaction({type,payload:{...payload,status:'running'},runId:row.run_id,sessionId:row.session_id,source:'tool',sourceConnection:null,sourceSequence:null,toolCallId:row.id,occurredAt:at,receivedAt:at});
+    else if(type==='tool_finished'&&terminal(status))this.events.appendInTransaction({type,payload:{...payload,status:status as 'succeeded'|'failed'|'cancelled'},runId:row.run_id,sessionId:row.session_id,source:'tool',sourceConnection:null,sourceSequence:null,toolCallId:row.id,occurredAt:at,receivedAt:at});
+    else fail('state_conflict');
+  }
   withQueryTransaction<T>(action: () => T): T {
-    try { return this.db.transaction(action).immediate(); }
+    try { return this.transactions.immediate(action); }
     catch (error) { if (error instanceof Error && error.name === 'SQLiteError') fail('storage_write_failed'); throw error; }
   }
 
@@ -123,7 +146,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
     return protect(() => { this.identity(context, false); const row = this.callRow(context); return row ? this.call(row) : null; }, "storage_read_failed");
   }
   request(tool: ToolCallIdentity, input: unknown, context: ToolExecutionContext): ToolCallRecord {
-    return protect(() => this.db.transaction(() => {
+    return protect(() => this.transactions.immediate(() => {
       this.identity(context, true);
       const args = json(input);
       const prior = this.callRow(context);
@@ -137,11 +160,12 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
         VALUES(?,?,?,?,?,?,?,?,'requested',?)`).run(context.sessionId, context.runId, context.nativeToolCallId, tool.name, tool.version, tool.effect, tool.executionMode, args, new Date().toISOString());
       if (this.p3) this.db.query(`UPDATE tool_calls SET model_call_id=(SELECT MAX(id) FROM model_calls WHERE run_id=? AND session_id=?)
         WHERE session_id=? AND native_tool_call_id=?`).run(context.runId, context.sessionId, context.sessionId, context.nativeToolCallId);
+      const saved=this.callRow(context)!;this.event(saved,'tool_requested',saved.requested_at);
       return this.call(this.callRow(context)!);
-    }).immediate(), "storage_write_failed");
+    }), "storage_write_failed");
   }
   recordFailedRequest(tool: ToolCallIdentity, input: unknown, context: ToolExecutionContext, error: AppError, requestedAt: string): void {
-    protect(() => this.db.transaction(() => {
+    protect(() => this.transactions.immediate(() => {
       this.identity(context, false);
       if (this.callRow(context)) fail('state_conflict');
       if (!ToolExecutionModeSchema.safeParse(tool.executionMode).success || !tool.name || !tool.version || !Number.isFinite(Date.parse(requestedAt))) fail('invalid_argument');
@@ -149,7 +173,8 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       this.db.query(`INSERT INTO tool_calls(session_id,run_id,native_tool_call_id,tool_name,tool_version,effect,execution_mode,args_json,status,error_json,requested_at,ended_at${this.p3 ? ',model_call_id' : ''})
         VALUES(?,?,?,?,?,?,?,?,'failed',?,?,?${this.p3 ? ',(SELECT MAX(id) FROM model_calls WHERE run_id=?)' : ''})`).run(context.sessionId, context.runId, context.nativeToolCallId, tool.name,
           tool.version, tool.effect, tool.executionMode, json(input), json(problem), requestedAt, new Date().toISOString(), ...(this.p3 ? [context.runId] : []));
-    }).immediate(), 'storage_write_failed');
+      const saved=this.callRow(context)!;this.event(saved,'tool_finished',saved.ended_at!);
+    }), 'storage_write_failed');
   }
   private delivery(row: CallRow): Record<string, unknown> {
     if (row.delivery_json !== null) {
@@ -176,17 +201,17 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
     return { ...delivery, control };
   }
   mergeControl(context: ToolExecutionContext, patch: Partial<ToolControlObservation>): ToolCallRecord {
-    return protect(() => this.db.transaction(() => {
+    return protect(() => this.transactions.immediate(() => {
       this.identity(context, false);
       const row = this.callRow(context);
       if (!row) fail('operation_not_found');
       const delivery = this.withControl(row, patch);
       this.db.query('UPDATE tool_calls SET delivery_json=? WHERE id=?').run(json(delivery), row.id);
       return this.call(this.callRow(context)!);
-    }).immediate(), 'storage_write_failed');
+    }), 'storage_write_failed');
   }
   transition(callId: number, from: ToolCallRecord["status"], to: ToolCallRecord["status"], result?: ToolResult<unknown>, control?: ToolControlObservation): ToolCallRecord {
-    return protect(() => this.db.transaction(() => {
+    return protect(() => this.transactions.immediate(() => {
       id(callId);
       const row = this.db.query<CallRow, [number]>("SELECT * FROM tool_calls WHERE id=?").get(callId);
       if (!row) fail("operation_not_found");
@@ -213,11 +238,13 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
         this.db.query('UPDATE tool_calls SET delivery_json=? WHERE id=?').run(json(delivery), callId);
       }
       if (this.p3 && from === "running" && terminal(to)) this.db.query("UPDATE tool_calls SET stopped_at=? WHERE id=?").run(now, callId);
-      return this.call(this.db.query<CallRow, [number]>("SELECT * FROM tool_calls WHERE id=?").get(callId)!);
-    }).immediate(), "storage_write_failed");
+      const saved=this.db.query<CallRow, [number]>("SELECT * FROM tool_calls WHERE id=?").get(callId)!;
+      this.event(saved,to==='running'?'tool_started':'tool_finished',now);
+      return this.call(saved);
+    }), "storage_write_failed");
   }
   recordDelivery(context: ToolExecutionContext, nativeEntryId: string, message?: ToolSdkDelivery): void {
-    protect(() => this.db.transaction(() => {
+    protect(() => this.transactions.immediate(() => {
       this.identity(context, false);
       if (typeof nativeEntryId !== "string" || nativeEntryId.length < 1 || nativeEntryId.length > 256) fail("invalid_argument");
       const row = this.callRow(context);
@@ -233,11 +260,11 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       this.db.query("UPDATE tool_calls SET delivery_json=? WHERE id=?").run(json({ ...this.delivery(row), contract: "medclaw.tool-delivery/v1", resultRecorded: true, sdkReturned: true, nativeEntryId,
         deliveredAt: new Date().toISOString(), nextModelCallId: null, consumedAt: null, error: null,
         ...(message !== undefined ? { message } : {}) }), row.id);
-    }).immediate(), "storage_write_failed");
+    }), "storage_write_failed");
   }
 
   recordConsumption(context: ToolExecutionContext, nextCallId: string, evidence?: 'provider_input_verified'): void {
-    protect(() => this.db.transaction(() => {
+    protect(() => this.transactions.immediate(() => {
       this.identity(context, false);
       if (evidence !== undefined && evidence !== 'provider_input_verified') fail('invalid_argument');
       const row = this.callRow(context);
@@ -251,7 +278,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       if (previous.nextModelCallId) return;
       this.db.query("UPDATE tool_calls SET delivery_json=? WHERE id=?").run(json({ ...receipt, nextModelCallId: nextCallId, consumedAt: new Date().toISOString(),
         ...(evidence === undefined ? {} : { consumptionEvidence: evidence }) }), row.id);
-    }).immediate(), "storage_write_failed");
+    }), "storage_write_failed");
   }
 
   readToolObservations(input: { cutoffAt: string; maxToolCallId?: number | null; limit: number; windowDays: number }): { maxToolCallId: number | null; observations: ToolObservation[] } {
@@ -344,7 +371,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
     return protect(() => { id(queryId); return this.db.query<EvidenceRow, [number]>("SELECT * FROM query_evidence WHERE query_id=? ORDER BY id").all(queryId).map(row => this.evidence(row)); }, "storage_read_failed");
   }
   commitQuery(input: Omit<QueryRecord, "id">, inputEvidence: Omit<Evidence, "id" | "queryId">[], context: QueryContext): QueryRecord {
-    return protect(() => this.db.transaction(() => {
+    return protect(() => this.transactions.immediate(() => {
       cancelled(context); this.identity(context, true);
       if (input.runId !== context.runId || input.sessionId !== context.sessionId || input.callRef !== ("callRef" in context ? context.callRef : `${context.runId}:${context.nativeToolCallId}`)
         || !input.batchIds.every(batch => context.scope.batchIds.includes(batch))) fail("access_denied");
@@ -430,7 +457,8 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
           json({ queryId, kind: input.kind, resultHash: input.resultHash, source, rowCount: input.rows.length,
             ...('workspaceRevision' in context ? { workspaceRevision: context.workspaceRevision } : {}) }), input.createdAt);
       cancelled(context); this.identity(context, true);
+      this.events?.appendInTransaction({type:'query_completed',payload:{contract:'medclaw.event/v1',queryId,resultHash:input.resultHash,batchIds:input.batchIds},runId:input.runId,sessionId:input.sessionId,source:source==='user_form'?'application':'tool',sourceConnection:null,sourceSequence:null,toolCallId:'nativeToolCallId'in context?this.callRow(context)?.id??null:null,occurredAt:input.createdAt,receivedAt:input.createdAt});
       return this.readQuery(queryId)!;
-    }).immediate(), "storage_write_failed");
+    }), "storage_write_failed");
   }
 }

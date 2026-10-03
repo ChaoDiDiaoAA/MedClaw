@@ -3,7 +3,7 @@ import { clampThinkingLevel } from "@earendil-works/pi-ai/compat";
 import { performance } from "node:perf_hooks";
 import { isAbsolute, join } from "node:path";
 import { mkdir } from "node:fs/promises";
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { release } from 'node:os';
 import type { ToolConfiguration } from '../../contracts/src/tool-config';
 import type { RunScope } from '../../contracts/src/run';
@@ -14,7 +14,7 @@ import { safeError } from "../../contracts/src/error";
 import { type AgentExecutionObservation, type AgentRuntimePort, type FinalCallFact, type ProviderOutcome } from "../../contracts/src/run";
 import type { NativeSessionBindings, NativeSessionPreview, InputAdapterPort, InputSettlementProof } from "../../contracts/src/session";
 import { PiInputAdapter } from './input-adapter';
-import { outcomeOf, textOf, type PiModelRuntime, type ResolvedModel } from "./model-runtime";
+import { outcomeOf, type PiModelRuntime, type ResolvedModel } from "./model-runtime";
 import { createPiNativeTools, createPiToolDefinitions, observePiToolDelivery, createPiRunControlBinding } from "./pi-tool-adapter";
 import type { ToolRegistry } from "../../core/src/tools/registry";
 import type { ToolExecutor } from "../../core/src/tools/executor";
@@ -22,18 +22,21 @@ import type { ToolRecorder } from "../../core/src/tools/recorder";
 import type { ToolExecutionContext, ToolSdkDelivery } from "../../contracts/src/tool";
 import type { ReadSessionMessagesInput, SessionMessagePage } from "@medclaw/contracts/messages";
 import { matchProviderToolReceipts, sameToolReceipt, projectMessageText, projectSessionMessages } from "./messages";
+import { EventAdapter } from './event-adapter';
 
 type ExecutionInput = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[0];
 type Callbacks = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[1];
 type RunTools = { registry: ToolRegistry; executor: ToolExecutor };
 type Binding = { manager: SessionManager; nativeSessionId: string; entryRuns: Map<string, number>; session?: AgentSession; toolSignature?: string; lastRunId?: number; bindTools?: () => () => void; available: boolean; execution?: { input: ExecutionInput; callbacks: Callbacks; toolCalls: Set<string>;
   observers: Promise<void>[]; facts: (FinalCallFact | null)[]; lastOutcome: ProviderOutcome | null; unsupported: boolean;
-  registrationFailed: boolean; abort: () => void; control: RunControl; tools?: RunTools } };
+  registrationFailed: boolean; currentModelCallId: string | null; abort: () => void; control: RunControl; tools?: RunTools } };
 const unavailable = (reason: "host_restart" | "native_state_invalid"): NativeSessionPreview => ({ available: false, reason, leafId: null, messages: [], truncated: false });
 const unobservedFailure = (code: string): ProviderOutcome => ({ sdkStopReason: "pending", text: "", responseModel: null, callState: "failed",
   usage: { inputTokens: null, outputTokens: null, cost: null, costCurrency: null, source: null, unavailableReason: "call_not_observed" }, error: safeError(code) });
 
 export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSessionBindings {
+  private readonly eventAdapter = new EventAdapter();
+  readSnapshots(runId: number) { return this.eventAdapter.readSnapshots(runId); }
   private readonly sessions = new Map<number, Binding>();
   private readonly controls = new Map<number, RunControl>();
   private readonly inputs = new Map<number, PiInputAdapter>();
@@ -156,6 +159,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           let recorder;
           try { recorder = callbacks.startCall(new Date().toISOString()); }
           catch (error) { execution.registrationFailed = true; throw error; }
+          execution.currentModelCallId = recorder.callId ?? null;
           const index = execution.facts.push(null) - 1;
           let stream;
           try {
@@ -250,7 +254,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
       signal: input.signal, deadlineAt: input.deadlineAt, totalTimeoutMs: input.resolved.policy.timeoutMs,
       measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot });
     this.controls.set(input.runId, control);
-    const execution: NonNullable<Binding["execution"]> = { input, callbacks, observers: [], facts: [], toolCalls: new Set(), lastOutcome: null, unsupported: false, registrationFailed: false, abort, control, tools: this.tools?.configure?.(control.configuration) ?? this.tools };
+    const execution: NonNullable<Binding["execution"]> = { input, callbacks, observers: [], facts: [], toolCalls: new Set(), lastOutcome: null, unsupported: false, registrationFailed: false, currentModelCallId: null, abort, control, tools: this.tools?.configure?.(control.configuration) ?? this.tools };
     binding.execution = execution; input.signal.addEventListener("abort", abort, { once: true });
     const terminal = () => {
       if (execution.registrationFailed) execution.lastOutcome = unobservedFailure("storage_write_failed");
@@ -285,10 +289,14 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         this.inputs.set(input.runId, adapter);
       }
       unsubscribeTools = binding.bindTools?.();
-      unsubscribe = session.subscribe(event => {
-        if (event.type === "message_update" && event.message.role === "assistant") {
-          try { callbacks.preview(textOf(event.message)); } catch { /* Optional preview does not change the execution. */ }
-        }
+      unsubscribe = this.eventAdapter.attach({ session, manager, runId: originalRunId, sessionId: input.sessionId, streamConnection: randomUUID(),
+        readCurrentModelCallId: () => execution.currentModelCallId,
+        readToolIdentity: nativeToolCallId => {
+          if (!this.tools || !input.scope || !input.referenceDate || !input.timezone) return null;
+          const record = this.tools.recorder.read({ runId: originalRunId, sessionId: input.sessionId, nativeToolCallId,
+            scope: input.scope, referenceDate: input.referenceDate, timezone: input.timezone, signal: input.signal });
+          return record?.runId === originalRunId && record.sessionId === input.sessionId && record.nativeToolCallId === nativeToolCallId ? { toolCallId: record.id } : null;
+        }, emit: snapshot => callbacks.stream?.(snapshot),
       });
       if (input.inputId != null) {
         await this.inputs.get(input.runId)!.deliver({ inputId: input.inputId, sessionId: input.sessionId, targetRunId: input.runId, mode: 'send', text: input.text, stopEpoch: 0 });

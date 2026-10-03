@@ -42,6 +42,35 @@ export class HostController {
   private credentialCount = 0;
   private preview: Extract<DesktopNotice, { type: "provider.preview" | "agent.preview" }> | null = null;
   private previewTimer: ReturnType<typeof setTimeout> | null = null;
+  private streams = new Map<string, Extract<DesktopNotice, { type: 'event.stream' }>>();
+  private streamRevisions = new Map<string, number>();
+  private streamTimer: ReturnType<typeof setTimeout> | null = null;
+  private diagnostic(error: AppError) { try { this.options.onError?.(error); } catch { /* Reporting cannot alter Host control. */ } }
+  private deliverNotice(notice: DesktopNotice) {
+    try { this.options.onNotice?.(structuredClone(notice)); }
+    catch { this.diagnostic(safeError('preview_delivery_failed')); }
+  }
+  private clearStreams() {
+    if (this.streamTimer) clearTimeout(this.streamTimer);
+    this.streamTimer = null; this.streams.clear(); this.streamRevisions.clear();
+  }
+  private streamNotice(notice: Extract<DesktopNotice, { type: 'event.stream' }>) {
+    const snapshot = notice.snapshot;
+    const objectId = snapshot.type === 'message.snapshot' ? snapshot.messageId : snapshot.nativeToolCallId;
+    const key = JSON.stringify([notice.subscriptionId, snapshot.runId, snapshot.streamConnection, snapshot.type, objectId]);
+    if (snapshot.revision <= (this.streamRevisions.get(key) ?? 0)) return;
+    this.streamRevisions.delete(key); this.streamRevisions.set(key, snapshot.revision);
+    if (this.streamRevisions.size > 512) this.streamRevisions.delete(this.streamRevisions.keys().next().value!);
+    if (snapshot.phase === 'ended') { this.streams.delete(key); this.deliverNotice(notice); return; }
+    this.streams.set(key, structuredClone(notice));
+    // Overflow discards temporary display data only. Same-sid snapshot refresh
+    // recovers the latest bounded source; it never re-enters execution.
+    if (this.streams.size > 256) this.streams.delete(this.streams.keys().next().value!);
+    if (!this.streamTimer) this.streamTimer = setTimeout(() => {
+      this.streamTimer = null; const notices = [...this.streams.values()]; this.streams.clear();
+      notices.forEach(value => this.deliverNotice(value));
+    }, 32);
+  }
   constructor(private readonly options: HostControllerOptions) {
     if (!isAbsolute(options.dataRoot) || !isAbsolute(options.hostEntry)) throw new Error("invalid_argument");
     mkdirSync(options.dataRoot, { recursive: true });
@@ -61,7 +90,7 @@ export class HostController {
     } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
   }
   read(): HostView { return { ...this.view, canStart: this.child === null && this.lockAvailable(), error: this.view.error ? { ...this.view.error } : null }; }
-  private status() { this.options.onNotice?.({ type: "host.status", host: this.read() }); }
+  private status() { this.deliverNotice({ type: "host.status", host: this.read() }); }
   private settle(requestId: string, result: Result<unknown>) {
     const pending = this.pending.get(requestId);
     if (!pending) return;
@@ -79,7 +108,7 @@ export class HostController {
     this.view = { ...this.view, state: this.child ? "stopping" : "failed", error };
     this.handshake?.reject(error); this.handshake = null;
     this.interrupt(error);
-    this.options.onError?.(error); this.status();
+    this.diagnostic(error); this.status();
     this.child?.kill();
   }
   private write(line: string, current: () => boolean = () => true): Promise<void> {
@@ -148,7 +177,7 @@ export class HostController {
       const frame = parseHostFrame(line, this.view.instanceId!);
       if (frame.kind === "reply") {
         const pending = this.pending.get(frame.requestId);
-        if (!pending) { this.options.onError?.(safeError("invalid_frame")); continue; }
+        if (!pending) { this.diagnostic(safeError("invalid_frame")); continue; }
         const schema = pending.method in hostPrivateMethodSchemas
           ? hostPrivateMethodSchemas[pending.method as HostPrivateMethod]
           : publicMethodSchemas[pending.method as PublicHostRequest["method"]];
@@ -158,18 +187,19 @@ export class HostController {
         const child = this.child;
         void this.credential(frame).catch(() => { if (this.child === child) this.fail("invalid_frame"); });
       } else if (frame.kind === "notice") {
-        if (frame.notice.type === "provider.preview" || frame.notice.type === "agent.preview") {
+        if (frame.notice.type === 'event.stream') this.streamNotice(frame.notice);
+        else if (frame.notice.type === "provider.preview" || frame.notice.type === "agent.preview") {
           // ponytail: one root Run needs one pending preview; use per-Run slots when subruns ship.
           this.preview = structuredClone(frame.notice);
           if (!this.previewTimer) {
             this.previewTimer = setTimeout(() => {
               this.previewTimer = null; const preview = this.preview; this.preview = null;
-              if (preview) { try { this.options.onNotice?.(preview); } catch { this.options.onError?.(safeError("preview_delivery_failed")); } }
+              if (preview) this.deliverNotice(preview);
             }, 32);
           }
         } else {
           if ((frame.notice.type === "provider.settled" || frame.notice.type === "provider.persistence_failed" || frame.notice.type === "agent.settled" || frame.notice.type === "agent.persistence_failed") && this.preview?.runId === frame.notice.runId) this.preview = null;
-          this.options.onNotice?.(structuredClone(frame.notice));
+          this.deliverNotice(frame.notice);
         }
       } else throw new Error("invalid_frame");
     }
@@ -179,25 +209,26 @@ export class HostController {
     if (this.child) throw new Error("runtime_busy");
     if (!this.lockAvailable()) {
       this.view = { ...this.view, state: "failed", error: safeError("host_stop_unconfirmed") };
-      this.options.onError?.(this.view.error!); this.status(); return this.read();
+      this.diagnostic(this.view.error!); this.status(); return this.read();
     }
     const instanceId = randomUUID(); const startupToken = randomUUID();
     this.view = { instanceId, state: "starting", canStart: false, sdkVersion: null, schemaVersion: null, error: null };
     this.buffer = Buffer.alloc(0); this.writes = { tail: Promise.resolve(), count: 0 };
+    this.clearStreams();
     const ready = new Promise<HostReady>((resolve, reject) => { this.handshake = { resolve, reject }; });
     void ready.catch(() => {});
     const child = spawn(this.options.bunExecutable ?? "bun", ["--no-env-file", resolve(this.options.hostEntry)], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, AWS_MAX_ATTEMPTS: "1", MEDCLAW_INSTANCE_ID: instanceId, MEDCLAW_STARTUP_TOKEN: startupToken } });
     this.child = child;
     this.exited = new Promise<void>(done => child.once("close", () => {
       if (this.child === child) {
-        this.child = null; this.preview = null;
+        this.child = null; this.preview = null; this.clearStreams();
         const stopped = this.view.state === "stopping" && (!this.view.error || this.view.error.code === "host_stop_unconfirmed");
         const failed = this.view.error !== null;
         const error = this.view.error ?? safeError("host_interrupted");
         this.handshake?.reject(error); this.handshake = null;
         this.interrupt(error);
         this.view = { ...this.view, state: stopped ? "stopped" : "failed", canStart: true, error: stopped ? null : error };
-        if (!stopped && !failed) this.options.onError?.(error);
+        if (!stopped && !failed) this.diagnostic(error);
         this.options.onExit?.(instanceId); this.status();
       }
       done();
@@ -227,12 +258,18 @@ export class HostController {
     } finally { clearTimeout(timer); }
     return this.read();
   }
-  async request(method: HostMethod, payload: unknown, operationRef: string = randomUUID(), requestId: string = randomUUID()): Promise<Result<unknown>> {
+  async request(method: HostMethod, payload: unknown, operationRef: string = randomUUID(), requestId: string = randomUUID(), expectedInstanceId?: string): Promise<Result<unknown>> {
+    if (expectedInstanceId && expectedInstanceId !== this.view.instanceId) return { ok: false, error: safeError('host_interrupted', undefined, { operationRef }) };
     if (!this.child || (this.view.state !== "ready" && !(this.view.state === "stopping" && method === "host.shutdown"))) return { ok: false, error: safeError("host_not_ready") };
     const frame = HostRequestSchema.parse({ protocolVersion: HOST_PROTOCOL_VERSION, kind: "request", instanceId: this.view.instanceId, requestId, operationRef, method, payload });
     if (this.pending.has(requestId)) throw new Error("state_conflict");
     if (this.pending.size >= 256) return { ok: false, error: safeError("runtime_busy", undefined, { operationRef }) };
     const line = encodeHostFrame(frame);
+    if (method === 'event.subscribe' && (frame.payload as { action: string }).action === 'close') {
+      const sid = (frame.payload as { subscriptionId: string }).subscriptionId;
+      for (const key of this.streams.keys()) if (JSON.parse(key)[0] === sid) this.streams.delete(key);
+      for (const key of this.streamRevisions.keys()) if (JSON.parse(key)[0] === sid) this.streamRevisions.delete(key);
+    }
     let pending: Pending;
     const reply = new Promise<Result<unknown>>(resolve => {
       const timer = setTimeout(() => this.settle(requestId, { ok: false, error: safeError(isReadOnlyMethod(method) ? "host_not_ready" : "operation_result_unknown", undefined, { operationRef }) }), 10000);
@@ -249,7 +286,7 @@ export class HostController {
     const child = this.child;
     if (!child) return this.read();
     const exited = this.exited;
-    this.view.state = "stopping"; this.status(); this.preview = null;
+    this.view.state = "stopping"; this.status(); this.preview = null; this.clearStreams();
     void this.request("host.shutdown", { expectedInstanceId }).catch(() => {});
     await waitForExit(exited);
     if (this.child === child) { child.kill(); await waitForExit(exited); }

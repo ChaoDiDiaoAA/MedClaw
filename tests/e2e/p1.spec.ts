@@ -1,10 +1,14 @@
 import { test, expect, _electron as electron, type ElectronApplication, type Page } from "@playwright/test";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, resolve, join } from "node:path";
 import { createServer, type Server } from "node:http";
+import type { MessageStreamSnapshot, OpenEventSubscriptionInput } from '../../packages/contracts/src/event';
+
+type ObservedStream = { instanceId: string | null; subscriptionId: string; snapshot: MessageStreamSnapshot };
+type EventMain = typeof globalThis & { __p1EventGate: { active: Record<string, OpenEventSubscriptionInput> } };
 
 const root = resolve(import.meta.dirname, "../..");
 const bun = process.env.MEDCLAW_BUN_EXECUTABLE ?? "bun";
@@ -23,7 +27,13 @@ async function launchDesktop() {
   const loader = join(dirname(core), "lib/server/electron/loader.js");
   const env: Record<string, string> = { ...Object.fromEntries(Object.entries(process.env).flatMap(([key, value]) => value === undefined ? [] : [[key, value]])), MEDCLAW_HOST_ENTRY: join(root, "apps/host/src/main.ts"), MEDCLAW_BUN_EXECUTABLE: execFileSync(bun, ["-e", "process.stdout.write(process.execPath)"], { encoding: "utf8" }).trim() };
   delete env.ELECTRON_RUN_AS_NODE;
-  app = await electron.launch({ executablePath: electronPath, args: ["-r", loader, join(root, ".build/desktop/main/index.cjs"), "--medclaw-data-root", dataRoot], env, timeout: 30000 });
+  const eventSeam = join(dataRoot, 'event-observation.cjs');
+  writeFileSync(eventSeam, `const {ipcMain}=require('electron'),original=ipcMain.handle.bind(ipcMain);const state=globalThis.__p1EventGate={active:{}};
+    ipcMain.handle=(channel,listener)=>original(channel,async(event,envelope)=>{const result=await listener(event,envelope);
+      if(channel==='medclaw:request'&&envelope.method==='event.subscribe'&&result.ok){const p=envelope.payload;
+        if(p.action==='open')state.active[p.subscriptionId]=structuredClone(p);else delete state.active[p.subscriptionId];}
+      return result;});`);
+  app = await electron.launch({ executablePath: electronPath, args: ["-r", loader, '-r', eventSeam, join(root, ".build/desktop/main/index.cjs"), "--medclaw-data-root", dataRoot], env, timeout: 30000 });
   page = await app.firstWindow();
   const startupErrors: string[] = [];
   const onError = (error: Error) => startupErrors.push(error.message);
@@ -38,6 +48,22 @@ async function chooseSessionModel(name: string) {
   await page.getByRole("button", { name: "Select " + name, exact: true }).click();
   await page.getByRole("button", { name: "Use for this session", exact: true }).click();
   await page.getByRole("button", { name: "Chat", exact: true }).click();
+}
+const temporaryOutput = (runId: number) => page.locator(`[data-testid="temporary-message"][data-run-id="${runId}"] .answer-text`);
+async function observedStream(runId: number): Promise<ObservedStream> {
+  await expect.poll(() => app.evaluate((_, id) => Object.values((globalThis as EventMain).__p1EventGate.active).some(input => input.runId === id), runId)).toBe(true);
+  const original = await app.evaluate((_, id) => Object.values((globalThis as EventMain).__p1EventGate.active).findLast(input => input.runId === id)!, runId);
+  const refreshed = await page.evaluate(input => window.medclaw.request('event.subscribe', input), original);
+  if (!refreshed.ok || refreshed.data.action !== 'open') throw new Error('Expected actual original display subscription ack');
+  const snapshot = refreshed.data.snapshots.findLast((value): value is MessageStreamSnapshot => value.type === 'message.snapshot' && value.blocks.some(block => block.text === '你好😀'));
+  if (!snapshot || snapshot.streamConnection !== refreshed.data.streamConnection) throw new Error('Expected actual assistant snapshot on the original connection');
+  const run = await page.evaluate(id => window.medclaw.request('run.read', { runId: id }), runId);
+  const host = await page.evaluate(() => window.medclaw.request('host.read', {}));
+  if (!run.ok || run.data.kind !== 'one' || run.data.run?.kind !== 'agent' || !host.ok) throw new Error('Expected original Agent Run and Host facts for stream injection');
+  const notice = { instanceId: host.data.instanceId, subscriptionId: original.subscriptionId, snapshot };
+  expect(notice.snapshot.runId).toBe(run.data.run.id); expect(notice.snapshot.sessionId).toBe(run.data.run.sessionId);
+  expect(notice.instanceId).toBe(host.data.instanceId); expect(notice.subscriptionId).toBeTruthy(); expect(notice.snapshot.streamConnection).toBeTruthy();
+  return notice;
 }
 test.beforeAll(async () => {
   test.setTimeout(90000);
@@ -135,24 +161,37 @@ test("actual Electron custom model publishes, calls once, stops and reads the or
   expect(firstRun.ok && firstRun.data.kind === "one" && firstRun.data.run?.inputText).toBe(firstText);
   const identity = await page.evaluate(() => window.medclaw.request("host.read", {}));
   if (!identity.ok || !identity.data.instanceId) throw new Error("Expected the ready fixture Host identity");
-  await app.evaluate(({ BrowserWindow }, instanceId) => {
-    const content = BrowserWindow.getAllWindows()[0]!.webContents;
-    content.send("medclaw:notice", { type: "agent.preview", instanceId, sessionId: 1, noticeSequence: 999, runId: 1, text: "late terminal preview", truncated: false });
-    content.send("medclaw:notice", { type: "agent.preview", instanceId: "old-ui-fixture-instance", sessionId: 1, noticeSequence: 999, runId: 1, text: "old instance preview", truncated: false });
-  }, identity.data.instanceId);
   await expect(firstReply).toHaveText("你好😀 OK");
   await expect(page.getByTestId("run-output")).toHaveCount(0);
+  await expect(page.getByTestId('temporary-run-area')).toHaveCount(0);
   expect(requests).toHaveLength(1);
   await page.getByLabel("Message text").fill("slow");
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await expect(page.getByRole("button", { name: "Stop generating", exact: true })).toBeEnabled();
   await expect.poll(() => requests.length).toBe(2);
-  await expect(page.getByTestId("run-output")).toHaveText("你好😀");
-  await app.evaluate(({ BrowserWindow }, instanceId) => {
+  await expect(temporaryOutput(2)).toHaveText("你好😀");
+  const activeStream = await observedStream(2);
+  expect(activeStream.snapshot.revision).toBeGreaterThan(1);
+  expect(activeStream.snapshot.phase).toBe('streaming');
+  await app.evaluate(({ BrowserWindow }, observed) => {
     const content = BrowserWindow.getAllWindows()[0]!.webContents;
-    for (let repeat = 0; repeat < 2; repeat++) content.send("medclaw:notice", { type: "agent.preview", instanceId, sessionId: 1, noticeSequence: 1, runId: 2, text: "你好😀", truncated: false });
-  }, identity.data.instanceId);
-  await expect(page.getByTestId("run-output")).toHaveText("你好😀");
+    // Labelled negative frames use the proved active subscription; Run 1 is the
+    // actual saved original Run, not an invented successful stream identity.
+    const lateText = 'late terminal preview', oldText = 'old instance preview';
+    content.send("medclaw:notice", { type: "event.stream", instanceId: observed.instanceId, subscriptionId: observed.subscriptionId, snapshot: { ...observed.snapshot, runId: 1, messageId: observed.snapshot.messageId + '.late', ordinal: observed.snapshot.ordinal + 1, revision: observed.snapshot.revision + 1, phase: 'ended', nativeEntryId: null, blocks: [{ contentIndex: 0, text: lateText }], totalChars: lateText.length, truncated: false } });
+    content.send("medclaw:notice", { type: "event.stream", instanceId: "old-ui-fixture-instance", subscriptionId: observed.subscriptionId, snapshot: { ...observed.snapshot, revision: observed.snapshot.revision + 1, blocks: [{ contentIndex: 0, text: oldText }], totalChars: oldText.length, truncated: false } });
+    for (let repeat = 0; repeat < 2; repeat++) content.send("medclaw:notice", { type: "event.stream", ...observed });
+    const staleText = 'stale revision text', foreignText = 'old connection text';
+    content.send("medclaw:notice", { type: "event.stream", instanceId: observed.instanceId, subscriptionId: observed.subscriptionId, snapshot: { ...observed.snapshot, revision: observed.snapshot.revision - 1, blocks: [{ contentIndex: 0, text: staleText }], totalChars: staleText.length, truncated: false } });
+    content.send("medclaw:notice", { type: "event.stream", instanceId: observed.instanceId, subscriptionId: observed.subscriptionId, snapshot: { ...observed.snapshot, streamConnection: 'old.' + observed.snapshot.streamConnection, revision: observed.snapshot.revision + 1, blocks: [{ contentIndex: 0, text: foreignText }], totalChars: foreignText.length, truncated: false } });
+  }, activeStream);
+  await expect(temporaryOutput(2)).toHaveText("你好😀");
+  await expect(firstReply).toHaveText("你好😀 OK");
+  await expect(page.locator('.messages')).not.toContainText('late terminal preview');
+  await expect(page.locator('.messages')).not.toContainText('old instance preview');
+  await expect(page.locator('.messages')).not.toContainText('stale revision text');
+  await expect(page.locator('.messages')).not.toContainText('old connection text');
+  expect(requests).toHaveLength(2);
   await page.getByRole("button", { name: "Stop generating", exact: true }).click();
   await expect(page.getByText("Cancelled and saved", { exact: true })).toBeVisible();
   expect(requests).toHaveLength(2);
@@ -426,7 +465,10 @@ test("streaming preserves an upward scroll and a busy draft until return latest"
   await input.fill("scroll response");
   await send.click();
   await expect.poll(() => requests.length).toBe(before + 1);
-  await expect(page.getByTestId("run-output")).toContainText("首段流式文本");
+  const active = await page.evaluate(() => window.medclaw.request('run.active', {}));
+  if (!active.ok || !active.data || active.data.sessionId === null) throw new Error('Expected the original active Session Run for scrolling');
+  const output = temporaryOutput(active.data.runId);
+  await expect(output).toContainText("首段流式文本");
   await input.fill("next draft kept while busy");
   await expect(send).toBeDisabled();
   await input.press("Enter");
@@ -439,7 +481,7 @@ test("streaming preserves an upward scroll and a busy draft until return latest"
   await expect(latest).toBeVisible();
   if (!continueScroll) throw new Error("Expected the controlled native stream continuation");
   continueScroll();
-  await expect(page.getByTestId("run-output")).toContainText("滚动测试新增增量");
+  await expect(output).toContainText("滚动测试新增增量");
   expect(await messages.evaluate(element => element.scrollTop)).toBe(0);
   await latest.click();
   await expect.poll(() => messages.evaluate(element => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(64);

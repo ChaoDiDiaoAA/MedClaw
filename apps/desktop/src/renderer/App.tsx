@@ -15,6 +15,7 @@ import { SettingsPage } from "./settings-page";
 import { RunDetails } from "./run-details";
 import { DataWorkspace } from "./data-workspace";
 import { QueryHistory } from "./query-history";
+import { useRunEvents } from "./use-run-events";
 import "./styles.css";
 
 export interface DesktopBridge {
@@ -179,11 +180,12 @@ export function App() {
       const prior = hostRef.current.instanceId; hostRef.current = notice.host; setHost(notice.host);
       if (notice.host.state !== "ready") { setDirectoryCurrent(false); setControl(null); setWorkspaceConfirmed(false); }
       if (notice.host.instanceId !== prior) {
-        setPrompt(null); setAuthNotify(null); setAuthAttempt(null); setDetails({}); setSessions([]); sessionsRef.current = [];
-        setActive(null); setControl(null); setWorkspace(null); workspaceRef.current = null; setRun(null); runRef.current = null;
+        setPrompt(null); setAuthNotify(null); setAuthAttempt(null);
+        // Keep read-only, previously verified facts visible during reconnection.
+        // Admission still requires fresh Host/control/workspace confirmation.
+        setActive(null); setControl(null);
         setCatalog(null); catalogRef.current = null; catalogRead.current++;
-        previews.current.clear(); settled.current.clear(); selectedRuns.current.clear(); setPreview(null);
-        inspectedRun.current = null;
+        previews.current.clear(); settled.current.clear(); setPreview(null);
         sessionReadOrder.current.clear(); sessionReads.current.clear(); sessionReadAgain.current.clear(); cancelBusy.current.clear(); setCancellingInputs([]);
       } return;
     }
@@ -364,6 +366,9 @@ export function App() {
   }
   async function closeDetails() { await updateUi({ detailOpen: false }); detailsButton.current?.focus(); }
   const current = workspace?.sessionId ?? null, currentDetail = current ? details[current] ?? null : null, draft = current ? drafts[current] ?? null : null;
+  const runEvents = useRunEvents(host, run, page === 'chat' || ui.detailOpen && ui.detailTab === 'runtime', (runId, sessionId) => {
+    void readActive(); void readRun(runId); void readSession(sessionId); void refreshInputs(sessionId);
+  });
   const runningSession = sessions.find(s => s.id === active?.sessionId);
   const queueRun = current && currentDetail?.session.inputControl ? selectedRuns.current.get(current) ?? null : null;
   const queueRootInput = queueRun?.inputId && current ? inputQueue.snapshots[current]?.items.find(value => value.id === queueRun.inputId) ?? null : null;
@@ -375,7 +380,7 @@ export function App() {
     <main className="workspace">
       <header className="page-header"><div className="header-title">{ui.navCollapsed && <button className="quiet" onClick={() => void updateUi({ navCollapsed: false })}>Expand navigation</button>}<h1>{{ chat: "Chat", data: "Data Workspace", queries: "Query History", models: "Models", settings: "Settings" }[page]}</h1></div><button ref={detailsButton} className="quiet" onClick={() => void updateUi({ detailOpen: !ui.detailOpen })}>View run details</button></header>
       {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="Dismiss notice" onClick={() => setError(null)}>×</button></div>}
-      <section className="page-content chat-page" hidden={page !== "chat"}><Chat visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} directory={directory} directoryCurrent={directoryCurrent} host={host} active={active} control={control} run={run} preview={preview}
+      <section className="page-content chat-page" hidden={page !== "chat"}><Chat visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} directory={directory} directoryCurrent={directoryCurrent} host={host} active={active} control={control} run={run} preview={preview} events={runEvents.state} onFinalSource={runEvents.setFinalSource}
         workspace={workspace} workspaceConfirmed={workspaceConfirmed} onWorkspace={updateWorkspace} dataDefaults={catalog}
         session={currentDetail} draft={draft} selecting={selecting || !workspaceConfirmed} sending={sending === current} runningTitle={runningSession ? sessionDisplayTitle(runningSession) : null}
         queueRun={queueRun} queueRootInput={queueRootInput} inputs={current ? inputQueue.snapshots[current] ?? null : null} cancellingInputs={cancellingInputs}
@@ -388,7 +393,7 @@ export function App() {
         prompt={prompt} notification={authNotify} attempt={authAttempt} onChanged={changed} onAccepted={acceptedProvider} onError={setError} /></section>
       <section className="page-content" hidden={page !== "settings"}><SettingsPage ui={ui} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost} /></section>
     </main>
-    {ui.detailOpen && <RunDetails run={run} host={host} viewSessionId={current} tab={ui.detailTab} active={active} control={control} onTab={tab => void updateUi({ detailTab: tab })} onClose={() => void closeDetails()} onError={setError}
+    {ui.detailOpen && <RunDetails run={run} host={host} viewSessionId={current} tab={ui.detailTab} active={active} control={control} events={runEvents.state} onResumeGap={runEvents.resumeGap} onTab={tab => void updateUi({ detailTab: tab })} onClose={() => void closeDetails()} onError={setError}
       onQuery={(queryId, sessionId) => { if (workspaceRef.current?.sessionId !== sessionId) void selectSession(sessionId); setRequestedQuery(queryId); setPage("queries"); }}
       onRun={value => { inspectedRun.current = value.id; runRef.current = value; setRun(value); setPreview(null); }} onRetrySaved={() => { void readActive(); if (activeRef.current?.sessionId) { void readSession(activeRef.current.sessionId); void refreshInputs(activeRef.current.sessionId); } }} />}
   </div>;
