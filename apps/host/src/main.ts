@@ -5,6 +5,7 @@ import { PublishedSettingsSchema } from "../../../packages/contracts/src/model.t
 import { AppErrorSchema, safeError, OpaqueIdSchema, type Result } from "../../../packages/contracts/src/error.ts";
 import { openDatabase, SCHEMA_VERSION } from "../../../packages/storage/src/database.ts";
 import { Repositories } from "../../../packages/storage/src/repositories.ts";
+import { describeDataSelection, queryRowKeys } from '../../../packages/storage/src/workspace-selection.ts';
 import { PiModelRuntime, CatalogStore, SDK_VERSION, installedSdkVersion, type ResolvedModel } from "../../../packages/runtime-pi/src/model-runtime.ts";
 import { BridgeCredentialStore } from "../../../packages/runtime-pi/src/credential-store.ts";
 import { ModelCallRecorder } from "../../../packages/runtime-pi/src/model-call-recorder.ts";
@@ -200,7 +201,7 @@ async function initialize(raw: unknown) {
   sessions = new SessionService(config.instanceId, repositories, agent, (input, context) => application!.runs.submitAgent(input, context),
     () => application!.runs.activeHandle, sessionId => application!.runs.readInputControl(sessionId),
     (inputId, context) => application!.runs.cancelInput(inputId, context));
-  workspace = new WorkspaceService(repositories);
+  workspace = new WorkspaceService(repositories, artifacts);
   await sendRaw(`${JSON.stringify({ protocolVersion: HOST_PROTOCOL_VERSION, instanceId: config.instanceId, sdkVersion: actualVersion, schemaVersion: SCHEMA_VERSION, configVersion: settings.configVersion, dataRoot: config.paths.dataRoot })}\n`);
   runtimeLog.add("host_ready");
   startupPhase = "ready";
@@ -229,8 +230,9 @@ function frozenConfiguration(runId: number) {
 }
 function queryView(queryId: number, page: number, pageSize: number) {
   const saved = toolStore.readQuery(queryId); if (!saved) throw new Error('operation_not_found');
-  const context = readContext(saved.runId), query = queries.read(queryId, context);
-  return { query: summary(query), page: queries.page({ queryId, page, pageSize }, context),
+  const context = readContext(saved.runId, false), query = queries.read(queryId, context);
+  const resultPage = queries.page({ queryId, page, pageSize }, context), keys = queryRowKeys(query);
+  return { query: summary(query), page: { ...resultPage, targetVersion: query.resultHash, rowKeys: keys.slice((resultPage.page - 1) * resultPage.pageSize, resultPage.page * resultPage.pageSize) },
     evidence: evidence.readQuery(queryId, context).slice(0, BUSINESS_RULES.evidenceSummaryLimit).map(evidenceSummary) };
 }
 function dataCatalog(page: number, pageSize: number) {
@@ -300,7 +302,10 @@ async function dispatch(request: HostRequest): Promise<unknown> {
       const table = kind === 'devices' ? 'snapshots' : 'change_events', column = kind === 'devices' ? 'batch_id' : 'new_batch_id';
       const totalRows = database!.query<{ count: number }, [number]>(`SELECT COUNT(*) AS count FROM ${table} WHERE ${column}=?`).get(batchId)!.count;
       const ids = database!.query<{ id: number }, [number, number, number]>(`SELECT id FROM ${table} WHERE ${column}=? ORDER BY id LIMIT ? OFFSET ?`).all(batchId, pageSize, (page - 1) * pageSize).map(row => row.id);
-      return { kind, items: kind === 'devices' ? catalog.readSnapshotsById(ids) : catalog.readChanges([batchId], catalog.readBatches([batchId]).flatMap(batch => batch.previousBatchId === null ? [] : [batch.previousBatchId]), null).slice((page - 1) * pageSize, page * pageSize), totalRows, page, pageSize };
+      const selectedBatch = catalog.readBatches([batchId]), previousIds = selectedBatch.flatMap(batch => batch.previousBatchId === null ? [] : [batch.previousBatchId]);
+      const items = kind === 'devices' ? catalog.readSnapshotsById(ids) : catalog.readChanges([batchId], previousIds, null).slice((page - 1) * pageSize, page * pageSize);
+      const batches = catalog.readBatches([...new Set([batchId, ...previousIds])]);
+      return { kind, items, selections: items.map(item => describeDataSelection(item, batches)), totalRows, page, pageSize };
     }
     case 'query.execute': {
       const previous = database!.query<{ id: number }, [string]>("SELECT id FROM queries WHERE source='user_form' AND call_ref=CAST(run_id AS TEXT)||':'||?").get(request.operationRef);
@@ -330,9 +335,10 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case 'evidence.read': {
       const payload = createPublicMethodSchemas()['evidence.read'].input.parse(request.payload);
       const saved = toolStore.readQuery(payload.queryId); if (!saved) throw new Error('operation_not_found');
-      const context = readContext(saved.runId), record = evidence.read(payload.evidenceId, context);
+      const context = readContext(saved.runId, false), record = evidence.read(payload.evidenceId, context);
       if (record.queryId !== payload.queryId) throw new Error('access_denied');
-      return { ...evidence.rows(payload, context), evidence: evidenceSummary(record) };
+      const rows = evidence.rows(payload, context);
+      return { ...rows, evidence: evidenceSummary(record), targetVersion: record.resultHash, rowKeys: rows.items.map(item => `snapshot:${item.id}`) };
     }
     case 'tool.read': {
       const { runId, page, pageSize } = createPublicMethodSchemas()['tool.read'].input.parse(request.payload), context = readContext(runId, false);

@@ -21,10 +21,10 @@ export function acceptSubmissionDraft(draft: SessionDraft, original: NonNullable
     || draft.pending.input.clientSequence !== original.input.clientSequence) return draft;
   return { ...draft, pending: null, resendConfirmed: false, text: draft.text === original.input.text ? "" : draft.text };
 }
-export function SessionList(props: { sessions: SessionView[]; current: number | null; running: number | null; creating: boolean; canCreate: boolean;
+export function SessionList(props: { sessions: SessionView[]; current: number | null; running: number | null; creating: boolean; canCreate: boolean; canRecoverCreate?: boolean; canSelect?: boolean;
   creationUnknown: boolean; nextBefore: number | null; onCreate: () => void; onRecoverCreate: () => void; onSelect: (id: number) => void; onMore: () => void }) {
   return <section className="session-list" aria-label="Sessions"><button className="primary" disabled={!props.canCreate || props.creating || props.creationUnknown} onClick={props.onCreate}>{props.creating ? "Creating…" : "New Session"}</button>
-    {props.creationUnknown && <button onClick={props.onRecoverCreate} disabled={!props.canCreate || props.creating}>Recover original creation</button>}
-    {props.sessions.map(session => <div className="session-row" key={session.id}><button className={session.id === props.current ? "selected" : ""} aria-pressed={session.id === props.current} onClick={() => props.onSelect(session.id)}>{sessionDisplayTitle(session)}</button>{session.id === props.running && <span className="tiny">Running</span>}</div>)}
+    {props.creationUnknown && <button onClick={props.onRecoverCreate} disabled={!(props.canRecoverCreate ?? props.canCreate) || props.creating}>Recover original creation</button>}
+    {props.sessions.map(session => <div className="session-row" key={session.id}><button disabled={props.canSelect === false} className={session.id === props.current ? "selected" : ""} aria-pressed={session.id === props.current} onClick={() => props.onSelect(session.id)}>{sessionDisplayTitle(session)}</button>{session.id === props.running && <span className="tiny">Running</span>}</div>)}
     {props.nextBefore && <button onClick={props.onMore}>More sessions</button>}</section>;
 }
