@@ -4,6 +4,7 @@ import { ModelChoiceSchema, ReferenceDateSchema, TimezoneSchema } from "./model"
 import { RevisionSchema, WorkspaceViewSchema } from "./workspace";
 import type { WorkspaceView, WorkspaceChange } from "./workspace";
 import type { StoredOperation, RunHandle } from "./run";
+import type { ReadSessionMessagesInput, SessionMessagePage } from "./messages";
 
 export const NewSessionInputSchema = z.strictObject({ selectOnCreate: z.literal(true).default(true), expectedWorkspaceRevision: RevisionSchema });
 export const SelectSessionInputSchema = z.strictObject({ sessionId: PositiveIdSchema, expectedWorkspaceRevision: RevisionSchema });
@@ -46,6 +47,7 @@ export type NativeSessionPreview = SessionDetail["history"] & { leafId: string |
 export type NativeSessionBindings = {
   allocate: () => { nativeSessionId: string; bind: (sessionId: number) => void; discard: () => void };
   read: (sessionId: number) => NativeSessionPreview;
+  readMessages: (input: ReadSessionMessagesInput) => SessionMessagePage;
 };
 /** Product persistence port; native SDK objects stay in the Host's adapter. */
 export interface SessionStore {
@@ -57,5 +59,6 @@ export interface SessionStore {
   updateWorkspace(change: WorkspaceChange, expectedRevision: number, time: string): WorkspaceView;
   findOperation(operationRef: string): StoredOperation | null;
   findSubmission(input: ReadSubmissionRequest): SubmitResult | null;
+  readMessageLinks(sessionId: number, nativeEntryIds: readonly string[]): Map<string, { runId: number; toolCallRef: string; references: string[] }>;
   active(): RunHandle | null;
 }

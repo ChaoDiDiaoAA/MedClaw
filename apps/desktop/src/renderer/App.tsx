@@ -46,11 +46,14 @@ export function App() {
   const [prompt, setPrompt] = useState<AuthPromptView | null>(null), [authNotify, setAuthNotify] = useState<AuthNotifyView | null>(null), [authAttempt, setAuthAttempt] = useState<AuthAttemptView | null>(null);
   const hostRef = useRef(host), runRef = useRef(run), workspaceRef = useRef(workspace), sessionsRef = useRef(sessions), draftsRef = useRef(drafts), directoryRef = useRef(directory), catalogRef = useRef(catalog);
   const selectedRuns = useRef(new Map<number, RunView>()), settled = useRef(new Set<number>());
+  const inspectedRun = useRef<number | null>(null);
   const previews = useRef(new Map<number, { sessionId: number | null; sequence: number; text: string; truncated: boolean }>());
   const selectBusy = useRef(false), desiredSession = useRef<number | null>(null), sendBusy = useRef<number | null>(null), createBusy = useRef(false);
   const creation = useRef<{ operationRef: string; input: NewSessionInput; model: ModelChoice | null } | null>(null);
   const directoryRead = useRef(0), activeRead = useRef(0), detailsButton = useRef<HTMLButtonElement>(null);
   const workspaceChangeBusy = useRef(false);
+  const sessionReadOrder = useRef(new Map<number, number>()), mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   hostRef.current = host; runRef.current = run; workspaceRef.current = workspace; sessionsRef.current = sessions; draftsRef.current = drafts; directoryRef.current = directory; catalogRef.current = catalog;
 
   const editDraft = useCallback((sessionId: number, patch: Partial<SessionDraft>) => {
@@ -100,17 +103,19 @@ export function App() {
       if (!prior || value.id >= prior.id) selectedRuns.current.set(value.sessionId, value);
     }
     if (released(value)) { settled.current.add(runId); previews.current.delete(runId); }
-    if (value.kind === "provider" && runRef.current?.id === runId || value.kind === "agent" && workspaceRef.current?.sessionId === value.sessionId
+    if (inspectedRun.current === value.id || value.kind === "provider" && runRef.current?.id === runId || inspectedRun.current === null && value.kind === "agent" && workspaceRef.current?.sessionId === value.sessionId
       && selectedRuns.current.get(value.sessionId)?.id === value.id) {
       runRef.current = value; setRun(value);
       const cached = previews.current.get(runId); setPreview(cached && !settled.current.has(runId) ? cached : null);
     }
   }, []);
   const readSession = useCallback(async (sessionId: number) => {
-    const instance = hostRef.current.instanceId, result = await window.medclaw.request("session.read", { sessionId });
-    if (instance !== hostRef.current.instanceId) return;
+    const instance = hostRef.current.instanceId, order = (sessionReadOrder.current.get(sessionId) ?? 0) + 1;
+    sessionReadOrder.current.set(sessionId, order);
+    const result = await window.medclaw.request("session.read", { sessionId });
+    if (!mounted.current || instance !== hostRef.current.instanceId || sessionReadOrder.current.get(sessionId) !== order) return;
     if (!result.ok) { setError(errorMessage(result.error)); return; }
-    if (result.data) { ensureDraft(sessionId); setDetails(old => ({ ...old, [sessionId]: result.data! })); }
+    if (result.data?.session.id === sessionId) { ensureDraft(sessionId); setDetails(old => ({ ...old, [sessionId]: result.data! })); }
   }, [ensureDraft]);
   const readSessions = useCallback(async (beforeSessionId?: number) => {
     const instance = hostRef.current.instanceId, result = await window.medclaw.request("session.list", { ...(beforeSessionId ? { beforeSessionId } : {}), limit: 20 });
@@ -122,9 +127,13 @@ export function App() {
   }, []);
   const applyWorkspace = useCallback((value: WorkspaceView, instance: string | null) => {
     if (instance !== hostRef.current.instanceId || value.revision < (workspaceRef.current?.revision ?? 0)) return;
+    const selectionChanged = value.sessionId !== workspaceRef.current?.sessionId;
+    if (selectionChanged) inspectedRun.current = null;
     workspaceRef.current = value; setWorkspace(value); setWorkspaceConfirmed(true);
-    const cached = value.sessionId ? selectedRuns.current.get(value.sessionId) ?? null : null;
-    runRef.current = cached; setRun(cached); setPreview(cached ? previews.current.get(cached.id) ?? null : null);
+    if (selectionChanged || !runRef.current) {
+      const cached = value.sessionId ? selectedRuns.current.get(value.sessionId) ?? null : null;
+      runRef.current = cached; setRun(cached); setPreview(cached ? previews.current.get(cached.id) ?? null : null);
+    }
     if (value.sessionId) {
       void readSession(value.sessionId);
       void window.medclaw.request("run.read", { recent: true, sessionId: value.sessionId, limit: 1 }).then(result => {
@@ -155,6 +164,8 @@ export function App() {
         setActive(null); setControl(null); setWorkspace(null); workspaceRef.current = null; setRun(null); runRef.current = null;
         setCatalog(null); catalogRef.current = null; catalogRead.current++;
         previews.current.clear(); settled.current.clear(); selectedRuns.current.clear(); setPreview(null);
+        inspectedRun.current = null;
+        sessionReadOrder.current.clear();
       } return;
     }
     if (notice.instanceId && notice.instanceId !== hostRef.current.instanceId) return;
@@ -228,6 +239,7 @@ export function App() {
   }
   async function acceptedAgent(value: SubmitResult, pending: NonNullable<SessionDraft["pending"]>) {
     if (value.sessionId !== pending.input.sessionId || value.clientSequence !== pending.input.clientSequence) { setError("The acceptance reply does not match the original submission. Keep it and read its result."); return; }
+    if (workspaceRef.current?.sessionId === value.sessionId) inspectedRun.current = null;
     const draft = draftsRef.current[value.sessionId];
     if (draft) { const next = acceptSubmissionDraft(draft, pending); if (next !== draft) editDraft(value.sessionId, next); }
     await Promise.all([readRun(value.runId), readSession(value.sessionId), readActive()]);
@@ -268,6 +280,7 @@ export function App() {
     setError(errorMessage(result.error)); void readUi(); return false;
   }
   async function acceptedProvider(value: ProviderAccepted) {
+    inspectedRun.current = null;
     const result = await window.medclaw.request("run.read", { runId: value.runId });
     if (result.ok && result.data.kind === "one") { runRef.current = result.data.run; setRun(result.data.run); setPreview(previews.current.get(value.runId) ?? null); }
     setPage("chat"); await readActive();
@@ -288,7 +301,7 @@ export function App() {
     <main className="workspace">
       <header className="page-header"><div className="header-title">{ui.navCollapsed && <button className="quiet" onClick={() => void updateUi({ navCollapsed: false })}>Expand navigation</button>}<h1>{{ chat: "Chat", data: "Data Workspace", queries: "Query History", models: "Models", settings: "Settings" }[page]}</h1></div><button ref={detailsButton} className="quiet" onClick={() => void updateUi({ detailOpen: !ui.detailOpen })}>View run details</button></header>
       {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="Dismiss notice" onClick={() => setError(null)}>×</button></div>}
-      <section className="page-content chat-page" hidden={page !== "chat"}><Chat directory={directory} directoryCurrent={directoryCurrent} host={host} active={active} control={control} run={run} preview={preview}
+      <section className="page-content chat-page" hidden={page !== "chat"}><Chat visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} directory={directory} directoryCurrent={directoryCurrent} host={host} active={active} control={control} run={run} preview={preview}
         workspace={workspace} workspaceConfirmed={workspaceConfirmed} onWorkspace={updateWorkspace} dataDefaults={catalog}
         session={currentDetail} draft={draft} selecting={selecting || !workspaceConfirmed} sending={sending === current} runningTitle={runningSession ? sessionDisplayTitle(runningSession) : null}
         onDraft={patch => { if (current) editDraft(current, patch); }} onUseForSession={useForSession} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} /></section>
@@ -301,7 +314,7 @@ export function App() {
     </main>
     {ui.detailOpen && <RunDetails run={run} host={host} viewSessionId={current} tab={ui.detailTab} active={active} control={control} onTab={tab => void updateUi({ detailTab: tab })} onClose={() => void closeDetails()} onError={setError}
       onQuery={(queryId, sessionId) => { if (workspaceRef.current?.sessionId !== sessionId) void selectSession(sessionId); setRequestedQuery(queryId); setPage("queries"); }}
-      onRun={value => { runRef.current = value; setRun(value); setPreview(null); }} onRetrySaved={() => void readActive()} />}
+      onRun={value => { inspectedRun.current = value.id; runRef.current = value; setRun(value); setPreview(null); }} onRetrySaved={() => void readActive()} />}
   </div>;
 }
 createRoot(document.getElementById("root")!).render(<App />);

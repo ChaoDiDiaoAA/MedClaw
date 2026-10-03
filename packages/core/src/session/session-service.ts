@@ -3,7 +3,8 @@ import type { RunHandle } from "../../../contracts/src/run";
 import { NewSessionInputSchema, SessionDetailSchema, SubmitInputSchema } from "../../../contracts/src/session";
 import type { NativeSessionBindings, NewSessionInput, NewSessionResult, SelectSessionInput, SessionStore, SubmitInput, SubmitResult, ReadSubmissionRequest } from "../../../contracts/src/session";
 import type { CommandContext } from "../../../contracts/src/protocol";
-import { OpaqueIdSchema, serviceResult, type Result } from "../../../contracts/src/error";
+import { OpaqueIdSchema, safeError, serviceResult, type Result } from "../../../contracts/src/error";
+import { ReadSessionMessagesInputSchema, SessionMessagePageSchema, type ReadSessionMessagesInput, type SessionMessagePage } from "../../../contracts/src/messages";
 
 export class SessionService {
   constructor(private readonly instanceId: string, private readonly store: SessionStore, private readonly native: NativeSessionBindings,
@@ -55,7 +56,30 @@ export class SessionService {
     if (!existing.ok) return existing;
     return existing.data ? { ok: true, data: existing.data } : this.submitAgent(input, context);
   }
-  readSubmission(input: ReadSubmissionRequest) { return serviceResult(() => this.store.findSubmission(input), "storage_read_failed", { sessionId: input.sessionId }); }
+  readMessages(input: ReadSessionMessagesInput): Promise<Result<SessionMessagePage>> {
+    return serviceResult(() => {
+      const parsed = ReadSessionMessagesInputSchema.safeParse(input);
+      if (!parsed.success) throw safeError("input_invalid");
+      const session = this.store.readSession(parsed.data.sessionId);
+      if (!session) throw new Error("session_not_found");
+      const native = this.native.readMessages(parsed.data);
+      if (native.sessionId !== session.id || native.nativeSessionId !== session.nativeSessionId || !SessionMessagePageSchema.safeParse(native).success) throw safeError("session_history_invalid");
+      const links = this.store.readMessageLinks(session.id, native.items.map(item => item.nativeEntryId));
+      const items = native.items.map(item => {
+        const link = links.get(item.nativeEntryId);
+        if (!link) return item;
+        if (item.displayRole !== "tool_result" || item.toolCallRef !== link.toolCallRef || item.runId !== null && item.runId !== link.runId) throw safeError("session_history_invalid");
+        return { ...item, runId: link.runId, references: [...new Set([...item.references, ...link.references])].slice(0, 16) };
+      });
+      const result = SessionMessagePageSchema.safeParse({ ...native, items });
+      if (!result.success) throw safeError("session_history_invalid");
+      return result.data;
+    }, "storage_read_failed", { sessionId: input.sessionId });
+  }
+  readSubmission(input: ReadSubmissionRequest) { return serviceResult(() => {
+    if (!this.store.readSession(input.sessionId)) throw new Error("session_not_found");
+    return this.store.findSubmission(input);
+  }, "storage_read_failed", { sessionId: input.sessionId }); }
   private validateContext(context: CommandContext) {
     if (context.instanceId !== this.instanceId) throw new Error("host_protocol_mismatch");
     OpaqueIdSchema.parse(context.operationRef);

@@ -14,6 +14,7 @@ import { safeError, type Result } from "../../packages/contracts/src/error";
 import type { DesktopNotice } from "../../packages/contracts/src/protocol";
 import { DATABASE_SCHEMA_VERSION } from "../../packages/contracts/src/protocol";
 import { providerFixture } from "../fixtures/p1-provider";
+import { SessionMessagePageSchema } from "../../packages/contracts/src/messages";
 
 function unwrap<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
 async function until(check: () => boolean | Promise<boolean>, timeout = 5000) {
@@ -74,6 +75,10 @@ test("actual slow Host streams to A while viewing B; busy Send and Stop keep the
     const a = await c.create(), b = await c.create(); await c.select(a.session.id);
     const accepted = SubmitResultSchema.parse(unwrap(await c.host.request("session.submit", await c.input(a.session.id, "A-slow"), "slow-a")));
     await c.service.requested; await c.select(b.session.id);
+    const browsing = await c.workspace();
+    expect(await c.host.request("session.messages.read", { sessionId: a.session.id })).toMatchObject({ ok: true, data: { sessionId: a.session.id } });
+    expect(await c.host.request("session.messages.read", { sessionId: b.session.id })).toMatchObject({ ok: true, data: { items: [] } });
+    expect(await c.workspace()).toEqual(browsing); expect(c.service.requests).toHaveLength(1);
     expect(RuntimeControlViewSchema.parse(unwrap(await c.host.request("run.control.read", {})))).toMatchObject({ activeRootRun: { runId: accepted.runId, sessionId: a.session.id }, acceptingNewRuns: false });
     expect(await c.host.request("session.submit", await c.input(b.session.id, "B-draft"), "busy-b")).toMatchObject({ ok: false, error: { code: "state_conflict", reason: "runtime_busy" } });
     await until(() => c.notices.some(n => n.type === "agent.preview"));
@@ -91,6 +96,7 @@ test("Host restart keeps metadata and original acceptance but cannot restore P2 
     const accepted = unwrap(await c.host.request("session.submit", original, "original")); await c.idle();
     const old = c.host.read().instanceId!; expect(await c.host.restart(old)).toMatchObject({ state: "ready", error: null });
     expect(c.host.read().instanceId).not.toBe(old);
+    expect(await c.host.request("session.messages.read", { sessionId: a.session.id })).toMatchObject({ ok: false, error: { code: "resource_unavailable" } });
     expect(SessionDetailSchema.parse(unwrap(await c.host.request("session.read", { sessionId: a.session.id })))).toMatchObject({ session: { id: a.session.id, leafId: null }, history: { available: false, reason: "host_restart", messages: [] } });
     expect(unwrap(await c.host.request("session.submit", original, "original"))).toEqual(accepted);
     expect(await c.host.request("session.submit", await c.input(a.session.id, "cannot resume"), "new-old-session")).toMatchObject({ ok: false, error: { code: "session_history_invalid" } });
@@ -144,8 +150,33 @@ test("lost acceptance reply is unknown; original lookup and resubmission issue o
     const reply = await c.host.request("session.submit", input, "original-lost", "drop-accepted-reply");
     expect(reply).toMatchObject({ ok: false, error: { code: "operation_result_unknown", operationRef: "original-lost" } });
     const saved = SubmitResultSchema.parse(unwrap(await c.host.request("session.readSubmission", { sessionId: a.session.id, clientSequence: input.clientSequence })));
+    const messagePage = SessionMessagePageSchema.parse(unwrap(await c.host.request("session.messages.read", { sessionId: a.session.id })));
+    expect(messagePage.items.find(item => item.displayRole === "user")).toMatchObject({ text: "lost-reply-input", runId: saved.runId });
+    expect(ReadRunResultSchema.parse(unwrap(await c.host.request("run.read", { runId: saved.runId })))).toMatchObject({ kind: "one", run: { id: saved.runId, sessionId: a.session.id } });
+    expect(c.service.requests).toHaveLength(1);
     expect(unwrap(await c.host.request("session.submit", input, "original-lost"))).toEqual(saved); expect(c.service.requests).toHaveLength(1);
     transport.settle = original;
+  } finally { await c.close(); }
+}, 30000);
+
+test("message reads keep session, workspace, run and provider facts unchanged through the Host", async () => {
+  const c = await setup();
+  try {
+    const a = await c.create(), input = await c.input(a.session.id, "saved message"), accepted = SubmitResultSchema.parse(unwrap(await c.host.request("session.submit", input, "message-read-run"))); await c.idle();
+    const b = await c.create(), before = await c.workspace(), native = SessionDetailSchema.parse(unwrap(await c.host.request("session.read", { sessionId: a.session.id })));
+    const db = new Database(c.host.paths.databasePath, { readonly: true });
+    try {
+      const snapshot = () => ({ sessions: db.query("SELECT * FROM sessions").all(), runs: db.query("SELECT * FROM runs").all(), calls: db.query("SELECT * FROM model_calls").all(), tools: db.query("SELECT * FROM tool_calls").all(), queries: db.query("SELECT * FROM queries").all(), answers: db.query("SELECT * FROM answers").all(), migrations: db.query("SELECT * FROM schema_migrations").all() });
+      const facts = snapshot();
+      const page = SessionMessagePageSchema.parse(unwrap(await c.host.request("session.messages.read", { sessionId: a.session.id })));
+      expect(page).toMatchObject({ sessionId: a.session.id, nativeSessionId: a.session.nativeSessionId, leafId: native.session.leafId, source: "native_memory", hasMore: false });
+      expect(page.items.filter(item => item.displayRole === "user")).toMatchObject([{ text: "saved message", runId: accepted.runId }]);
+      expect(await c.host.request("session.messages.read", { sessionId: b.session.id })).toMatchObject({ ok: true, data: { items: [], leafId: null } });
+      expect(await c.host.request("session.messages.read", { sessionId: 999 })).toMatchObject({ ok: false, error: { code: "input_invalid", reason: "session_not_found" } });
+      expect(await c.host.request("session.readSubmission", { sessionId: 999, clientSequence: 1 })).toMatchObject({ ok: false, error: { code: "input_invalid", reason: "session_not_found" } });
+      expect(await c.workspace()).toEqual(before); expect(SessionDetailSchema.parse(unwrap(await c.host.request("session.read", { sessionId: a.session.id }))).session.leafId).toBe(native.session.leafId);
+      expect(snapshot()).toEqual(facts); expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]); expect(db.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" }); expect(c.host.read().schemaVersion).toBe(3); expect(c.service.requests).toHaveLength(1);
+    } finally { db.close(); }
   } finally { await c.close(); }
 }, 30000);
 
@@ -156,6 +187,7 @@ test("readonly missing-table faults stay storage errors, never null lookup or em
     const obstruction = new Database(c.host.paths.databasePath); // Isolated fault injection, not a product writer.
     try { obstruction.exec("DROP TABLE runs"); } finally { obstruction.close(); }
     expect(await c.host.request("session.readSubmission", { sessionId: a.session.id, clientSequence: 1 })).toMatchObject({ ok: false, error: { code: "storage_read_failed" } });
+    expect(await c.host.request("session.messages.read", { sessionId: a.session.id })).toMatchObject({ ok: false, error: { code: "storage_read_failed" } });
     expect(await c.host.request("run.control.read", {})).toMatchObject({ ok: false, error: { code: "storage_read_failed" } });
     expect(c.service.requests).toHaveLength(0);
   } finally { await c.close(); }

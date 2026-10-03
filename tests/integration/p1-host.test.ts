@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,7 +33,7 @@ if(mode==="duplicate"){process.stdout.write([reply,reply,{...reply,requestId:"un
 if(mode==="preview"){for(let i=0;i<64;i++)send({protocolVersion:hello.protocolVersion,kind:"notice",instanceId:hello.instanceId,notice:{type:"provider.preview",runId:1,text:"preview-"+i,truncated:false}});setTimeout(()=>send({protocolVersion:hello.protocolVersion,kind:"notice",instanceId:hello.instanceId,notice:{type:"provider.settled",runId:1}}),80);}
 send(reply);return;}
 if(frame.method==="host.shutdown"){send({protocolVersion:hello.protocolVersion,kind:"reply",instanceId:hello.instanceId,requestId:frame.requestId,result:{ok:true,data:{executionStopped:true,databaseClosed:true}}});if(mode!=="ack-without-exit")setTimeout(()=>process.exit(0),5);return;}
-if(mode==="lost-reply"&&frame.method==="model.list"){appendFileSync(${JSON.stringify(join(root, "received.jsonl"))},JSON.stringify(frame)+"\\n");return;}
+if(mode==="lost-reply"&&["model.list","session.messages.read","session.readSubmission","session.create"].includes(frame.method)){appendFileSync(${JSON.stringify(join(root, "received.jsonl"))},JSON.stringify(frame)+"\\n");return;}
 if(frame.method==="model.list"){const requestId="private-"+frame.requestId;pending.set(requestId,frame);send({protocolVersion:hello.protocolVersion,kind:"private",instanceId:hello.instanceId,requestId,secret:true,method:"credential.read",payload:{providerId:"p1-offline",context:{purpose:"runtime",operationRef:frame.operationRef}}});}
 });lines.on("close",()=>process.exit(0));`);
   return { root, entry };
@@ -437,7 +437,7 @@ test("pending commands stay bounded and a lost reply reports the original operat
     expect(await host.request("model.list", {}, "overflow-op")).toMatchObject({ ok: false, error: { code: "runtime_busy", operationRef: "overflow-op" } });
     await expect(host.request("model.list", {}, "another-op", "request-0")).rejects.toThrow("state_conflict");
     const results = await Promise.all(requests);
-    results.forEach((result, i) => expect(result).toMatchObject({ ok: false, error: { code: "operation_result_unknown", operationRef: `original-op-${i}` } }));
+    results.forEach((result, i) => expect(result).toMatchObject({ ok: false, error: { code: "host_not_ready", operationRef: `original-op-${i}` } }));
     const received = readFileSync(join(root, "received.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line) as { operationRef: string });
     expect(received).toHaveLength(256);
     expect(new Set(received.map(frame => frame.operationRef)).size).toBe(256);
@@ -447,6 +447,26 @@ test("pending commands stay bounded and a lost reply reports the original operat
     if (host.read().instanceId && !host.read().canStart) await host.stop(host.read().instanceId!);
     rmSync(root, { recursive: true, force: true });
   }
+}, 25000);
+
+test("reader lost replies and rejected pipe writes preserve readonly errors without retrying", async () => {
+  const { HostController } = await import("../../apps/desktop/src/main/host-controller");
+  const { root, entry } = await fixture("lost-reply"), host = new HostController({ dataRoot: root, hostEntry: entry, bunExecutable: process.execPath });
+  try {
+    expect((await host.start()).state).toBe("ready");
+    const replies = await Promise.all([host.request("session.messages.read", { sessionId: 1 }, "messages-timeout"), host.request("session.readSubmission", { sessionId: 1, clientSequence: 1 }, "lookup-timeout"), host.request("session.create", { expectedWorkspaceRevision: 0 }, "write-timeout")]);
+    expect(replies).toMatchObject([{ ok: false, error: { code: "host_not_ready", operationRef: "messages-timeout" } }, { ok: false, error: { code: "host_not_ready", operationRef: "lookup-timeout" } }, { ok: false, error: { code: "operation_result_unknown", operationRef: "write-timeout" } }]);
+    expect(readFileSync(join(root, "received.jsonl"), "utf8").trim().split("\n")).toHaveLength(3);
+    const child = (host as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    const write = spyOn(child.stdin, "write").mockImplementation((...args: unknown[]) => { const callback = args.at(-1) as (error: Error) => void; queueMicrotask(() => callback(new Error("fixture rejected write"))); return true; });
+    try {
+      expect(await host.request("session.messages.read", { sessionId: 1 }, "messages-write-reject")).toMatchObject({ ok: false, error: { code: "host_interrupted" } });
+      expect(await host.request("session.readSubmission", { sessionId: 1, clientSequence: 1 }, "lookup-write-reject")).toMatchObject({ ok: false, error: { code: "host_interrupted" } });
+      expect(await host.request("session.create", { expectedWorkspaceRevision: 0 }, "mutation-write-reject")).toMatchObject({ ok: false, error: { code: "operation_result_unknown" } });
+    } finally { write.mockRestore(); }
+    expect((host as unknown as { pending: Map<string, unknown> }).pending.size).toBe(0);
+    expect(readFileSync(join(root, "received.jsonl"), "utf8").trim().split("\n")).toHaveLength(3);
+  } finally { if (host.read().instanceId && !host.read().canStart) await host.stop(host.read().instanceId!); rmSync(root, { recursive: true, force: true }); }
 }, 25000);
 
 test("a silent handshake times out once and only confirmed close makes a failed Host startable", async () => {

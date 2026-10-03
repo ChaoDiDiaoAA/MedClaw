@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
 import { RunScopeSchema } from '../../packages/contracts/src/run';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -115,6 +115,7 @@ test('production PiAgentRuntime executes business and native tools in one frozen
       referenceDate: request.referenceDate, timezone: request.timezone, signal: new AbortController().signal });
     expect(recorded?.modelCallId).toBe(observed.calls[0]!.callId);
     expect(recorded?.nextModelCallId).toBe(observed.calls[1]!.callId);
+    expect(recorded?.consumptionEvidence).toBe('provider_input_verified');
     expect(recorded?.sdkDelivery?.toolCallId).toBe('write-call');
     const endedAt = new Date().toISOString();
     const fact = { status: 'completed' as const, outputText: observed.lastOutcome!.text, stoppedAt: endedAt, endedAt,
@@ -131,19 +132,26 @@ test('production PiAgentRuntime executes business and native tools in one frozen
   } finally { server.stop(true); db.close(); await rm(root, { recursive: true, force: true }); }
 }, 15000);
 
-test.each(['request-before-commit', 'request-after-commit', 'result', 'delivery'] as const)('necessary %s save failure retains the root and retry saves facts without another native effect', async fault => {
+test.each(['request-before-commit', 'request-after-commit', 'result', 'delivery', 'consumption-before-commit', 'consumption-after-commit',
+  'consumption-before-commit-second-retry', 'consumption-after-commit-second-retry'] as const)('necessary %s save failure retains the root and retry saves facts without another native effect', async fault => {
   const root = await mkdtemp(join(tmpdir(), 'medclaw-p3-save-')), db = openDatabase(join(root, 'app.sqlite'));
   let requests = 0;
+  const batchConsumption = fault.startsWith('consumption'), payloads: Record<string, unknown>[] = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
-    await request.json(); requests++;
-    const delta = requests === 1 ? { role: 'assistant', tool_calls: [{ index: 0, id: 'write-1', type: 'function', function: { name: 'write', arguments: '{"path":"proof.txt","content":"one real effect"}' } }] } : { role: 'assistant', content: 'Done' };
+    payloads.push(await request.json() as Record<string, unknown>); requests++;
+    const delta = requests === 1 ? { role: 'assistant', tool_calls: [
+      { index: 0, id: 'write-1', type: 'function', function: { name: 'write', arguments: '{"path":"proof.txt","content":"one real effect"}' } },
+      ...(batchConsumption ? [{ index: 1, id: 'write-2', type: 'function', function: { name: 'write', arguments: '{"path":"proof-second.txt","content":"second real effect"}' } }] : []),
+    ] } : { role: 'assistant', content: 'Done' };
     return new Response(`data: ${JSON.stringify({ id: 'fixture', model: 'fixture', choices: [{ index: 0, delta, finish_reason: requests === 1 ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
   } });
   let app: Application<ResolvedModel> | undefined;
   try {
     const repo = new Repositories(db), store = new SqliteToolStore(db), registry = new ToolRegistry([]), notices: RuntimeNotice[] = [];
     const originalRequest = store.request.bind(store), originalTransition = store.transition.bind(store), originalDelivery = store.recordDelivery.bind(store);
-    let failing = true;
+    const originalConsumption = store.recordConsumption.bind(store);
+    let originalEvidence: Parameters<typeof store.recordConsumption> | undefined;
+    let failing = true, secondRetryFailure = fault.endsWith('second-retry');
     store.request = (...args) => {
       if (failing && fault.startsWith('request')) {
         if (fault === 'request-after-commit') originalRequest(...args);
@@ -153,6 +161,15 @@ test.each(['request-before-commit', 'request-after-commit', 'result', 'delivery'
     };
     store.transition = (...args) => { if (failing && fault === 'result' && args[2] === 'succeeded') throw new Error('storage_write_failed'); return originalTransition(...args); };
     store.recordDelivery = (...args) => { if (failing && fault === 'delivery') throw new Error('storage_write_failed'); return originalDelivery(...args); };
+    store.recordConsumption = (...args) => {
+      if (failing && batchConsumption && args[0].nativeToolCallId === 'write-1') {
+        originalEvidence ??= args;
+        if (fault.includes('after-commit')) originalConsumption(...args);
+        throw new Error('storage_write_failed');
+      }
+      if (!failing && secondRetryFailure && args[0].nativeToolCallId === 'write-2') throw new Error('storage_write_failed');
+      return originalConsumption(...args);
+    };
     const recorder = new ToolRecorder(store, (error, context) => app?.runs.failToolPersistence(context.runId, error));
     const credentials = new InMemoryCredentialStore(); await credentials.modify('p3-save', async () => ({ type: 'api_key', key: 'fixture' }));
     const runtime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
@@ -176,11 +193,57 @@ test.each(['request-before-commit', 'request-after-commit', 'result', 'delivery'
     expect(await app.runs.readControl()).toMatchObject({ ok: true, data: { acceptingNewRuns: false, activeRootRun: { runId: accepted.data.runId } } });
     expect(db.query('SELECT status FROM runs WHERE id=?').get(accepted.data.runId)).toEqual({ status: 'failed' });
     if (!fault.startsWith('request')) expect(await readFile(join(root, 'runtime', String(accepted.data.runId), 'work', 'scratch', 'proof.txt'), 'utf8')).toBe('one real effect');
-    expect(requests).toBe(1);
+    expect(requests).toBe(fault.startsWith('consumption') ? 2 : 1);
+    if (originalEvidence) {
+      expect(originalEvidence[2]).toBe('provider_input_verified');
+      expect(store.readCall(originalEvidence[0])).toMatchObject({ status: 'succeeded', sdkReturned: true, nativeToolCallId: 'write-1' });
+      expect(store.readCall(originalEvidence[0])?.consumptionEvidence).toBe(fault.includes('after-commit') ? 'provider_input_verified' : undefined);
+    }
+    const originalReceipts = batchConsumption ? ['write-1', 'write-2'].map(nativeToolCallId => store.readCall({ ...originalEvidence![0], nativeToolCallId })!) : [];
+    const work = join(root, 'runtime', String(accepted.data.runId), 'work', 'scratch');
+    const originalFileTimes = batchConsumption ? await Promise.all(['proof.txt', 'proof-second.txt'].map(async name => (await stat(join(work, name), { bigint: true })).mtimeNs)) : [];
+    if (batchConsumption) {
+      expect(await readFile(join(work, 'proof-second.txt'), 'utf8')).toBe('second real effect');
+      expect(originalReceipts).toHaveLength(2);
+      for (const record of originalReceipts) {
+        expect(record).toMatchObject({ status: 'succeeded', sdkReturned: true });
+        expect(record.nativeEntryId).toBeTruthy();
+        const text = record.sdkDelivery!.content.map(part => (part as { text: string }).text).join('\n');
+        expect(payloads[1]!.messages).toEqual(expect.arrayContaining([{ role: 'tool', tool_call_id: record.nativeToolCallId, content: text }]));
+      }
+      expect(recorder.persistencePending(accepted.data.runId)).toBe(true);
+    }
     failing = false;
+    if (secondRetryFailure) {
+      expect(await app.runs.retrySave(accepted.data.runId)).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+      expect(await app.runs.readControl()).toMatchObject({ ok: true, data: { acceptingNewRuns: false, activeRootRun: { runId: accepted.data.runId } } });
+      expect(recorder.persistencePending(accepted.data.runId)).toBe(true);
+      expect(store.readCall({ ...originalEvidence![0], nativeToolCallId: 'write-1' })).toMatchObject({ nextModelCallId: originalEvidence![1], consumptionEvidence: 'provider_input_verified' });
+      expect(store.readCall({ ...originalEvidence![0], nativeToolCallId: 'write-2' })?.consumptionEvidence).toBeUndefined();
+      expect(requests).toBe(2);
+      secondRetryFailure = false;
+    }
     expect(await app.runs.retrySave(accepted.data.runId)).toMatchObject({ ok: true, data: { status: 'failed', cleanup: { stopConfirmed: true, requiredPersistenceComplete: true } } });
-    expect(db.query('SELECT tool_name,status FROM tool_calls').all()).toEqual([{ tool_name: 'write', status: fault.startsWith('request') ? 'failed' : 'succeeded' }]);
+    expect(db.query('SELECT tool_name,status FROM tool_calls').all()).toEqual([
+      { tool_name: 'write', status: fault.startsWith('request') ? 'failed' : 'succeeded' },
+      ...(batchConsumption ? [{ tool_name: 'write', status: 'succeeded' }] : []),
+    ]);
     expect(await app.runs.readControl()).toMatchObject({ ok: true, data: { acceptingNewRuns: true } });
-    expect(requests).toBe(1);
+    expect(requests).toBe(fault.startsWith('consumption') ? 2 : 1);
+    if (originalEvidence) {
+      expect(store.readCall(originalEvidence[0])).toMatchObject({ nextModelCallId: originalEvidence[1], consumptionEvidence: 'provider_input_verified',
+        status: 'succeeded', sdkReturned: true });
+      expect(await readFile(join(root, 'runtime', String(accepted.data.runId), 'work', 'scratch', 'proof.txt'), 'utf8')).toBe('one real effect');
+      expect(db.query('SELECT COUNT(*) n FROM model_calls').get()).toEqual({ n: 2 });
+      expect(db.query('SELECT COUNT(*) n FROM tool_calls').get()).toEqual({ n: 2 });
+      for (const original of originalReceipts) {
+        const saved = store.readCall({ ...originalEvidence[0], nativeToolCallId: original.nativeToolCallId })!;
+        expect(saved).toMatchObject({ nextModelCallId: originalEvidence[1], consumptionEvidence: 'provider_input_verified',
+          status: 'succeeded', sdkReturned: true, nativeEntryId: original.nativeEntryId });
+        expect(saved.sdkDelivery).toEqual(original.sdkDelivery);
+      }
+      expect(await Promise.all(['proof.txt', 'proof-second.txt'].map(async name => (await stat(join(work, name), { bigint: true })).mtimeNs))).toEqual(originalFileTimes);
+      expect(recorder.persistencePending(accepted.data.runId)).toBe(false);
+    }
   } finally { try { await app?.shutdown(); } finally { server.stop(true); db.close(); await rm(root, { recursive: true, force: true }); } }
 }, 15000);

@@ -14,13 +14,14 @@ import { WorkspaceViewSchema, UpdateWorkspaceRequestSchema } from "./workspace";
 import { ImportPreviewRequestSchema, ImportCommitRequestSchema, ImportPreviewSchema, ImportOperationSchema, ImportReferenceSchema, ArtifactSchema, DataCatalogSchema, DataRowsSchema } from "./data";
 import { EvidenceViewSchema, PageSchema, QueryParamsSchema, QuerySummarySchema, QueryViewSchema } from './query';
 import { RunToolsViewSchema } from './tool';
+import { ReadSessionMessagesInputSchema, SessionMessagePageSchema } from "./messages";
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p3-v1" as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p4-v1" as const;
 export const DATABASE_SCHEMA_VERSION = 3 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
-  return method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method.startsWith('evidence.read') || method === 'data.rows' || method === 'tool.read' || method === "run.active" || method === "workspace.restore";
+  return method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method.startsWith('evidence.read') || method === 'data.rows' || method === 'tool.read' || method === "run.active" || method === "workspace.restore" || method === "session.readSubmission";
 }
 export const EmptyPayloadSchema = z.strictObject({});
 const accepted = z.strictObject({ accepted: z.literal(true) });
@@ -88,6 +89,7 @@ export const publicMethodSchemas = {
   "session.select": { input: SelectSessionInputSchema, output: WorkspaceViewSchema },
   "session.list": { input: ListSessionsRequestSchema, output: SessionPageSchema },
   "session.read": { input: z.strictObject({ sessionId: PositiveIdSchema }), output: SessionDetailSchema.nullable() },
+  "session.messages.read": { input: ReadSessionMessagesInputSchema, output: SessionMessagePageSchema },
   "session.submit": { input: SubmitInputSchema, output: SubmitResultSchema },
   "session.readSubmission": { input: ReadSubmissionRequestSchema, output: SubmitResultSchema.nullable() },
   "workspace.read": { input: EmptyPayloadSchema, output: WorkspaceViewSchema },
@@ -184,6 +186,7 @@ export const PublicHostRequestSchema = z.discriminatedUnion("method", [
   hostRequest("session.select", publicMethodSchemas["session.select"].input),
   hostRequest("session.list", publicMethodSchemas["session.list"].input),
   hostRequest("session.read", publicMethodSchemas["session.read"].input),
+  hostRequest("session.messages.read", publicMethodSchemas["session.messages.read"].input),
   hostRequest("session.submit", publicMethodSchemas["session.submit"].input),
   hostRequest("session.readSubmission", publicMethodSchemas["session.readSubmission"].input),
   hostRequest("workspace.read", publicMethodSchemas["workspace.read"].input),

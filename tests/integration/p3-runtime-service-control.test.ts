@@ -83,6 +83,7 @@ async function fixture(timeoutMs = 120000) {
     toolNames: ['read_data_scope'],
     allocate: () => ({ nativeSessionId: 'unused', bind: () => {}, discard: () => {} }),
     read: () => ({ available: true, reason: null, leafId: null, messages: [], truncated: false }),
+    readMessages: () => { throw new Error('Unexpected fixture message read'); },
     describe: () => ({ requestedThinkingLevel: 'off', effectiveThinkingLevel: 'off' }),
     captureToolProfiles: scope => {
       expect(scope.allowedToolNames).toEqual(['read_data_scope']);

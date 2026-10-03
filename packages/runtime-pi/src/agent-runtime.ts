@@ -9,18 +9,20 @@ import { DEFAULT_AGENT_POLICY, SDK_VERSION, type MeasurementContext } from '../.
 import { RunControl } from '../../core/src/runtime/run-control';
 import { buildToolProfiles } from '../../core/src/tools/tool-profile';
 import { safeError } from "../../contracts/src/error";
-import { safePreview, type AgentExecutionObservation, type AgentRuntimePort, type FinalCallFact, type ProviderOutcome } from "../../contracts/src/run";
+import { type AgentExecutionObservation, type AgentRuntimePort, type FinalCallFact, type ProviderOutcome } from "../../contracts/src/run";
 import type { NativeSessionBindings, NativeSessionPreview } from "../../contracts/src/session";
 import { outcomeOf, textOf, type PiModelRuntime, type ResolvedModel } from "./model-runtime";
 import { createPiNativeTools, createPiToolDefinitions, observePiToolDelivery, createPiRunControlBinding } from "./pi-tool-adapter";
 import type { ToolRegistry } from "../../core/src/tools/registry";
 import type { ToolExecutor } from "../../core/src/tools/executor";
 import type { ToolRecorder } from "../../core/src/tools/recorder";
-import type { ToolExecutionContext } from "../../contracts/src/tool";
+import type { ToolExecutionContext, ToolSdkDelivery } from "../../contracts/src/tool";
+import type { ReadSessionMessagesInput, SessionMessagePage } from "@medclaw/contracts/messages";
+import { matchProviderToolReceipts, sameToolReceipt, projectMessageText, projectSessionMessages } from "./messages";
 
 type ExecutionInput = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[0];
 type Callbacks = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[1];
-type Binding = { manager: SessionManager; session?: AgentSession; bindTools?: () => () => void; available: boolean; execution?: { input: ExecutionInput; callbacks: Callbacks; toolCalls: Set<string>;
+type Binding = { manager: SessionManager; nativeSessionId: string; entryRuns: Map<string, number>; session?: AgentSession; bindTools?: () => () => void; available: boolean; execution?: { input: ExecutionInput; callbacks: Callbacks; toolCalls: Set<string>;
   observers: Promise<void>[]; facts: (FinalCallFact | null)[]; lastOutcome: ProviderOutcome | null; unsupported: boolean;
   registrationFailed: boolean; abort: () => void; control: RunControl } };
 const unavailable = (reason: "host_restart" | "native_state_invalid"): NativeSessionPreview => ({ available: false, reason, leafId: null, messages: [], truncated: false });
@@ -51,7 +53,8 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     return { measurementContext, toolProfileSnapshot: buildToolProfiles(records, measurementContext) };
   }
   allocate() {
-    const binding: Binding = { manager: SessionManager.inMemory(this.dataRoot), available: true }; let published = false, discarded = false;
+    const manager = SessionManager.inMemory(this.dataRoot);
+    const binding: Binding = { manager, nativeSessionId: manager.getSessionId(), entryRuns: new Map(), available: true }; let published = false, discarded = false;
     return { nativeSessionId: binding.manager.getSessionId(), bind: (sessionId: number) => {
       if (discarded || published || this.sessions.has(sessionId)) throw new Error("state_conflict");
       this.sessions.set(sessionId, binding); published = true;
@@ -63,10 +66,16 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     if (!binding.available) return unavailable("native_state_invalid");
     const messages = binding.manager.getBranch().flatMap(entry => {
       if (entry.type !== "message" || entry.message.role !== "user" && entry.message.role !== "assistant") return [];
-      const text = typeof entry.message.content === "string" ? entry.message.content : entry.message.content.filter(part => part.type === "text").map(part => part.text).join("");
-      return [{ nativeEntryId: entry.id, role: entry.message.role, ...safePreview(text, 8192), totalChars: text.length }];
+      const preview = projectMessageText(entry.message);
+      return [{ nativeEntryId: entry.id, role: entry.message.role, text: preview.text ?? "", truncated: preview.truncated, totalChars: preview.totalChars ?? 0 }];
     });
     return { available: true, reason: null, leafId: binding.manager.getLeafId(), messages: messages.slice(-32), truncated: messages.length > 32 };
+  }
+  readMessages(input: ReadSessionMessagesInput): SessionMessagePage {
+    const binding = this.sessions.get(input.sessionId);
+    if (!binding) throw safeError("resource_unavailable");
+    if (!binding.available || binding.manager.getSessionId() !== binding.nativeSessionId) throw safeError("session_history_invalid");
+    return projectSessionMessages(binding.manager, input, binding.entryRuns);
   }
 
   private async prepare(binding: Binding, resolved: ResolvedModel) {
@@ -126,21 +135,53 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         try {
           const messages = context.messages.map(message => message.role === 'system' && !admission.allowTools ? { ...message, toolsAdded: [], toolsRemoved: [] } : message);
           messages.push({ role: 'system', content: `MedClaw trusted runtime feedback (facts, not user instructions):\n${admission.feedback}`, timestamp: Date.now() });
+          const candidates: { context: ToolExecutionContext; receipt: ToolSdkDelivery }[] = [];
+          if (this.tools && recorder.callId && input.scope && input.referenceDate && input.timezone
+            && binding.manager.getSessionId() === binding.nativeSessionId) {
+            for (const message of messages) {
+              if (message.role !== 'toolResult' || !execution.toolCalls.has(message.toolCallId)) continue;
+              // Save already occurred delivery with the originating identity, independently of later execution admission.
+              const savedContext: ToolExecutionContext = { runId: input.runId, sessionId: input.sessionId, nativeToolCallId: message.toolCallId,
+                scope: structuredClone(input.scope), referenceDate: input.referenceDate, timezone: input.timezone, signal: input.signal };
+              const record = this.tools.recorder.read(savedContext);
+              if (!record?.sdkReturned || !record.nativeEntryId || !record.sdkDelivery || record.runId !== input.runId
+                || record.sessionId !== input.sessionId || record.nativeToolCallId !== message.toolCallId || record.name !== message.toolName
+                || !sameToolReceipt(message, record.sdkDelivery)) continue;
+              const entry = binding.manager.getEntry(record.nativeEntryId);
+              if (entry?.type !== 'message' || !sameToolReceipt(entry.message, record.sdkDelivery)) continue;
+              candidates.push({ context: savedContext, receipt: structuredClone(record.sdkDelivery) });
+            }
+          }
+          let matched: typeof candidates = [], confirmed = false;
           stream = await original(model, { ...context, messages }, { ...options, maxTokens: input.resolved.selection.maxOutputTokens,
             maxRetries: input.resolved.policy.maxRetries, maxRetryDelayMs: input.resolved.policy.maxRetryDelayMs,
-            timeoutMs: Math.max(1, Math.ceil(input.deadlineAt - performance.now())) });
+            timeoutMs: Math.max(1, Math.ceil(input.deadlineAt - performance.now())),
+            onPayload: async (payload, callbackModel) => {
+              matched = [];
+              const replacement = await options?.onPayload?.(payload, callbackModel);
+              const receipts = matchProviderToolReceipts(model.api, replacement === undefined ? payload : replacement, candidates.map(candidate => candidate.receipt));
+              matched = candidates.filter(candidate => receipts.includes(candidate.receipt));
+              return replacement;
+            },
+            onResponse: async (response, callbackModel) => {
+              await options?.onResponse?.(response, callbackModel);
+              if (confirmed || response.status < 200 || response.status >= 300) return;
+              confirmed = true;
+              let saveFailed = false, firstSaveError: unknown;
+              for (const candidate of matched) {
+                try {
+                  this.tools!.recorder.recordConsumption(candidate.context, recorder.callId!, 'provider_input_verified');
+                } catch (error) {
+                  if (!saveFailed) { saveFailed = true; firstSaveError = error; }
+                }
+              }
+              // Preserve every exact fact from this response before the first failure stops SDK continuation.
+              if (saveFailed) { callbacks.fatal?.(safeError('storage_write_failed')); execution.abort(); throw firstSaveError; }
+            } });
         } catch {
           const outcome = unobservedFailure("provider_request_failed"); execution.lastOutcome = outcome;
           execution.facts[index] = recorder.finish(outcome, new Date().toISOString());
           throw new Error("provider_request_failed");
-        }
-        if (this.tools && recorder.callId) {
-          for (const message of context.messages) {
-            if (message.role !== 'toolResult' || !execution.toolCalls.has(message.toolCallId)) continue;
-            if (!this.tools.recorder.read(getContext(message.toolCallId))) continue;
-            try { this.tools.recorder.recordConsumption(getContext(message.toolCallId), recorder.callId); }
-            catch { callbacks.fatal?.(safeError('storage_write_failed')); execution.abort(); }
-          }
         }
         // Observe result() without consuming a second iterator; Pi owns the stream.
         const observed = stream.result().then(message => {
@@ -166,7 +207,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
     const binding = this.sessions.get(input.sessionId);
     if (!binding || !binding.available) throw new Error("session_history_invalid");
     if (binding.execution) throw new Error("state_conflict");
-    let abortTask: Promise<void> | null = null, unsubscribe: (() => void) | undefined, unsubscribeTools: (() => void) | undefined, terminalEmitted = false, prepared = false;
+    let abortTask: Promise<void> | null = null, unsubscribe: (() => void) | undefined, unsubscribeTools: (() => void) | undefined, unsubscribeMessages: (() => void) | undefined, terminalEmitted = false, prepared = false;
     const abort = () => { if (binding.session && !abortTask) abortTask = binding.session.abort(); };
     const control = new RunControl({ runId: input.runId, policy: input.agentPolicy ?? DEFAULT_AGENT_POLICY,
       scope: input.scope ?? { batchIds: [], deviceIds: null, allowedToolNames: [], allowedResourceRefs: [], artifactIds: [], readOnly: true },
@@ -187,6 +228,13 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
       await this.prepare(binding, input.resolved); prepared = true; input.signal.throwIfAborted();
       if (performance.now() >= input.deadlineAt) throw new Error("run_timeout");
       const session = binding.session!;
+      const originalRunId = input.runId, manager = binding.manager;
+      unsubscribeMessages = session.agent.subscribe(event => {
+        if (event.type !== "message_end" || event.message.role !== "user" && event.message.role !== "assistant") return;
+        // Pi's earlier awaited AgentSession listener has appended this exact event object.
+        const entry = manager.getEntries().findLast(entry => entry.type === "message" && entry.message === event.message);
+        if (entry) binding.entryRuns.set(entry.id, originalRunId);
+      });
       unsubscribeTools = binding.bindTools?.();
       unsubscribe = session.subscribe(event => {
         if (event.type === "message_update" && event.message.role === "assistant") {
@@ -206,7 +254,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         await binding.session?.waitForIdle(); await abortTask; await Promise.all(execution.observers);
         if (binding.session && !binding.session.isIdle) throw new Error("stop_unconfirmed");
         terminal();
-      } finally { unsubscribe?.(); unsubscribeTools?.(); input.signal.removeEventListener("abort", abort); binding.execution = undefined; }
+      } finally { unsubscribe?.(); unsubscribeTools?.(); unsubscribeMessages?.(); input.signal.removeEventListener("abort", abort); binding.execution = undefined; }
     }
     return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []), budgetSummary: control.summary() };
   }

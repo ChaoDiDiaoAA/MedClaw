@@ -235,12 +235,12 @@ export class HostController {
     const line = encodeHostFrame(frame);
     let pending: Pending;
     const reply = new Promise<Result<unknown>>(resolve => {
-      const timer = setTimeout(() => this.settle(requestId, { ok: false, error: safeError("operation_result_unknown", undefined, { operationRef }) }), 10000);
+      const timer = setTimeout(() => this.settle(requestId, { ok: false, error: safeError(isReadOnlyMethod(method) ? "host_not_ready" : "operation_result_unknown", undefined, { operationRef }) }), 10000);
       pending = { method, operationRef, timer, resolve };
       this.pending.set(requestId, pending);
     });
     void this.write(line, () => this.pending.get(requestId) === pending).catch(() => {
-      if (this.pending.get(requestId) === pending) this.settle(requestId, { ok: false, error: safeError("operation_result_unknown", undefined, { operationRef }) });
+      if (this.pending.get(requestId) === pending) this.settle(requestId, { ok: false, error: safeError(isReadOnlyMethod(method) ? "host_interrupted" : "operation_result_unknown", undefined, { operationRef }) });
     });
     return reply;
   }

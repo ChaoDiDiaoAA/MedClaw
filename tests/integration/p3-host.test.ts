@@ -15,6 +15,7 @@ import { WorkspaceViewSchema } from '../../packages/contracts/src/workspace';
 import { RuntimeControlViewSchema, ReadRunResultSchema } from '../../packages/contracts/src/run';
 import { safeError, type Result } from '../../packages/contracts/src/error';
 import { QueryParamsSchema, QueryViewSchema } from '../../packages/contracts/src/query';
+import { SessionMessagePageSchema } from '../../packages/contracts/src/messages';
 
 function unwrap<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
 async function until(check: () => Promise<boolean>, timeout = 15000) {
@@ -92,6 +93,17 @@ test('P3 production Host imports through Main tokens, freezes trusted scope and 
       expect(db.query('SELECT source FROM queries').all()).toEqual([{ source: 'agent_tool' }]);
       expect(db.query('SELECT count(*) n FROM query_evidence').get()).toEqual({ n: 1 });
       expect(db.query('SELECT reference_date, json_extract(config_json, \'$.referenceDate\') config_reference_date FROM runs').all()).toEqual([{ reference_date: '2026-01-02', config_reference_date: '2026-01-02' }]);
+      const original = { run: db.query('SELECT * FROM runs').all(), query: db.query('SELECT * FROM queries').all(), evidence: db.query('SELECT * FROM query_evidence').all(), answer: db.query('SELECT * FROM answers').all(), tool: db.query('SELECT * FROM tool_calls').all() };
+      const page = SessionMessagePageSchema.parse(unwrap(await f.host.request('session.messages.read', { sessionId: session.session.id })));
+      const receipt = page.items.find(item => item.displayRole === 'tool_result');
+      expect(receipt).toMatchObject({ toolCallRef: 'current-call', runId: accepted.runId, references: [`run:${accepted.runId}`, 'tool:1', 'query:1', 'evidence:1'] });
+      expect(db.query("SELECT json_extract(delivery_json,'$.nativeEntryId') entry FROM tool_calls").get()).toEqual({ entry: receipt!.nativeEntryId });
+      const view = unwrap(await f.host.request('tool.read', { runId: accepted.runId })) as { items: { inputPreview: string; resultPreview: string; nativeOutputTruncated: boolean | null }[] };
+      expect(view.items[0]).toMatchObject({ inputPreview: 'query_current_devices: arguments omitted', resultPreview: 'query_current_devices: saved result succeeded', nativeOutputTruncated: null });
+      expect(JSON.stringify(view)).not.toContain('813');
+      expect({ run: db.query('SELECT * FROM runs').all(), query: db.query('SELECT * FROM queries').all(), evidence: db.query('SELECT * FROM query_evidence').all(), answer: db.query('SELECT * FROM answers').all(), tool: db.query('SELECT * FROM tool_calls').all() }).toEqual(original);
+      expect(db.query('SELECT native_leaf_id FROM answers').all()).toEqual([{ native_leaf_id: null }]);
+      expect(f.requests).toHaveLength(2);
     } finally { db.close(); }
     renameSync(f.source, `${f.source}-moved`);
     expect(await f.host.request('import.recover', { operationRef: 'import-1' })).toMatchObject({ ok: true, data: { state: 'imported' } });
