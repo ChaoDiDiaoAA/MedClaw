@@ -39,18 +39,35 @@ function fixture() {
   const catalog = new SqliteCatalogStore(db), store = new SqliteToolStore(db);
   return {db,repos,catalog,store};
 }
-function savedQuery(f: ReturnType<typeof fixture>) {
+function savedQuery(f: ReturnType<typeof fixture>, deviceIds?: number[]) {
   const scope=f.repos.freezeAgentScope(f.repos.readWorkspace(),[]);
   f.db.query(`INSERT INTO runs(id,session_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at)
     VALUES(10,1,'agent','host','query-submit',1,'{"sessionId":1,"clientSequence":1}','running','answer','query','{"agent":{"nativeSessionId":"native-a"}}',?,'{}','2026-10-04','Asia/Shanghai',?)`).run(JSON.stringify(scope),at);
   const queries=new QueryService(new CatalogService(f.catalog),f.store);
   const context={sessionId:1,runId:10,nativeToolCallId:'current',scope,referenceDate:'2026-10-04',timezone:'Asia/Shanghai',signal:new AbortController().signal};
-  const page=queries.current(CurrentQuerySchema.parse({batchIds:[1,2],time:{start:'2026-10-02',endExclusive:'2026-10-03'}}),context);
+  const page=queries.current(CurrentQuerySchema.parse({batchIds:[1,2],...(deviceIds ? {deviceIds} : {}),time:{start:'2026-10-02',endExclusive:'2026-10-03'}}),context);
   f.db.query("UPDATE runs SET status='completed',ended_at=? WHERE id=10").run(at);
   return {record:f.store.readQuery(page.queryId)!, evidenceId:page.evidenceIds[0]!};
 }
 const deviceSelection={formatVersion:1 as const,kind:'device' as const,targetId:'1',targetVersion:hash2,rowKey:'snapshot:3',field:'priceCents'};
 function allWorkspace(f:ReturnType<typeof fixture>) {return f.db.query('SELECT * FROM workspace').get();}
+
+test('legacy persisted device order keeps adopted Query and every SQL byte on an empty semantic patch',()=>{
+  const f=fixture();f.repos.updateWorkspace({deviceIds:[1,2]},2,at);const q=savedQuery(f);
+  const adopted=f.repos.updateWorkspace({queryId:q.record.id,activeView:'query'},3,at);
+  f.db.query("UPDATE workspace SET device_ids_json='[2,1]'").run();const before=allWorkspace(f);
+  const result=f.repos.updateWorkspace({},adopted.revision,later);
+  expect(result.queryId).toBe(q.record.id);expect(result.revision).toBe(adopted.revision);expect(allWorkspace(f)).toEqual(before);
+});
+test('legacy persisted batch order is a semantic no-op without revision or timestamp normalization writes',()=>{
+  const f=fixture(),state=f.repos.readWorkspace();f.db.query('UPDATE workspace SET batch_refs_json=?').run(JSON.stringify([...state.batchRefs].reverse()));const before=allWorkspace(f);
+  expect(f.repos.updateWorkspace({},state.revision,later).revision).toBe(state.revision);expect(allWorkspace(f)).toEqual(before);
+});
+test('adoption deduplicates trusted saved Query filters and leaves Query facts unchanged',()=>{
+  const f=fixture(),q=savedQuery(f,[1,1]),before=f.db.query('SELECT * FROM queries').all();expect(q.record.scopeDeviceIds).toEqual([1,1]);
+  const adopted=f.repos.updateWorkspace({queryId:q.record.id},2,later);expect(adopted.deviceIds).toEqual([1]);expect(adopted.queryId).toBe(q.record.id);expect(f.db.query('SELECT * FROM queries').all()).toEqual(before);
+  const saved=allWorkspace(f);expect(()=>f.repos.updateWorkspace({deviceIds:[1,1]},adopted.revision,later)).toThrow('invalid_argument');expect(allWorkspace(f)).toEqual(saved);
+});
 function prepared(f: ReturnType<typeof fixture>, sequence = 1) {
   const workspace=f.repos.readWorkspace(),scope=f.repos.freezeAgentScope(workspace,[]);
   const model={provider:'p',modelId:'m',api:'openai-completions',endpointRef:null,credentialRef:null,configVersion:'1',maxOutputTokens:100,capabilitySource:'user_declared' as const,sdkVersion:'0.87.1' as const};

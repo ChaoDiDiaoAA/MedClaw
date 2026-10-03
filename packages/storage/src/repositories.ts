@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { isDeepStrictEqual } from "node:util";
+import { createHash } from 'node:crypto';
 import { z } from "zod";
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, safeError, type AppError } from "../../contracts/src/error";
 import { ToolSdkDeliverySchema } from "../../contracts/src/tool";
@@ -15,7 +16,7 @@ import { assertSelectionField, describeDataSelection, resolveQueryRow } from './
 import type { QueryRecord } from '../../contracts/src/query';
 import { NewSessionInputSchema, NewSessionResultSchema, SelectSessionInputSchema, SessionViewSchema, ListSessionsRequestSchema, SubmitInputSchema, ReadSubmissionRequestSchema,
   type NewSessionInput, type NewSessionResult, type SelectSessionInput, type SessionView, type SessionPage, type ReadSubmissionRequest, type SubmitResult, type SessionStore } from "../../contracts/src/session";
-import { WorkspaceStateSchema, WorkspaceViewSchema, WorkspaceChangeSchema, RevisionSchema, toWorkspaceContext, type WorkspaceState, type WorkspaceSelection, type WorkspaceView, type WorkspaceChange, type BatchRef } from "../../contracts/src/workspace";
+import { WorkspaceStateSchema, WorkspaceViewSchema, WorkspaceChangeSchema, RevisionSchema, toWorkspaceContext, type WorkspaceState, type WorkspaceSelection, type WorkspaceView, type WorkspaceChange, type BatchRef, type WorkspaceStore, type WorkspaceInspection, type WorkspaceNotice } from "../../contracts/src/workspace";
 import { businessToolSchemas } from "../../contracts/src/business-tools";
 import { StoredToolConfigurationSchema } from '../../contracts/src/tool-config';
 import { RuntimeConfigurationSchema } from '../../contracts/src/runtime-config';
@@ -99,7 +100,7 @@ function timestamp(value: string | null) {
   if (value !== null && (!Number.isFinite(Date.parse(value)) || new Date(value).toISOString() !== value)) fail("invalid_argument");
 }
 
-export class Repositories implements ProviderRunStore, SessionStore {
+export class Repositories implements ProviderRunStore, SessionStore, WorkspaceStore {
   private readonly p3: boolean;
   private readonly inputs: SqliteInputStore;
   private readonly p5: boolean;
@@ -284,9 +285,10 @@ export class Repositories implements ProviderRunStore, SessionStore {
     const row = this.db.query<{ active_session_id: number | null; revision: number; material_version: string | null;
       batch_refs_json: string; device_ids_json: string; active_query_id: number | null; active_view: string; selection_json: string | null }, []>("SELECT * FROM workspace WHERE id=1").get();
     if (!row) fail("storage_read_failed");
+    const readJson=(text:string|null):unknown=>{if(text===null)return null;try{return JSON.parse(text);}catch{fail('storage_read_failed');}};
     return checked(WorkspaceStateSchema, { revision: row.revision, sessionId: row.active_session_id, materialVersion: row.material_version ?? null,
-      batchRefs: row.batch_refs_json === undefined ? [] : decoded(row.batch_refs_json), deviceIds: row.device_ids_json === undefined ? [] : decoded(row.device_ids_json),
-      queryId: row.active_query_id ?? null, activeView: row.active_view ?? "data", selection: row.selection_json === undefined ? null : decoded(row.selection_json) }, "storage_read_failed");
+      batchRefs: row.batch_refs_json === undefined ? [] : readJson(row.batch_refs_json), deviceIds: row.device_ids_json === undefined ? [] : readJson(row.device_ids_json),
+      queryId: row.active_query_id ?? null, activeView: row.active_view ?? "data", selection: row.selection_json === undefined ? null : readJson(row.selection_json) }, "storage_read_failed");
   }
 
   private batchReferences(ids: number[]): { refs: BatchRef[]; materialVersion: string | null } {
@@ -300,6 +302,103 @@ export class Repositories implements ProviderRunStore, SessionStore {
     if (versions.size > 1) fail("invalid_argument");
     return { refs: rows.map(row => ({ id: row.id, contentHash: row.content_hash, snapshotDate: row.snapshot_date, scopeKey: row.scope_key })),
       materialVersion: rows[0]?.material_version ?? null };
+  }
+
+  inspectWorkspace(invalidArtifactIds: readonly number[] = []): WorkspaceInspection {
+    // One synchronous read snapshot fixes all DB evidence before any filesystem await.
+    return this.db.transaction(() => this.workspaceInspection(invalidArtifactIds)).deferred();
+  }
+
+  private workspaceInspection(invalidArtifactIds: readonly number[]): WorkspaceInspection {
+    const state=this.readWorkspace(), candidate:WorkspaceState=structuredClone(state), notices:WorkspaceNotice[]=[];
+    const dependencies=new Map<string,{kind:string;id:number;record:Record<string,unknown>|null}>();
+    const tables={session:'sessions',batch:'batches',import:'imports',artifact:'artifacts',device:'devices',snapshot:'snapshots',change:'change_events',query:'queries',evidence:'query_evidence'} as const;
+    type Kind=keyof typeof tables;
+    const ids=(value:unknown):number[]=>checked(z.array(PositiveIdSchema),value,'storage_read_failed');
+    const load=(kind:Kind,target:number):Record<string,unknown>|null=>{
+      const key=`${kind}:${target}`,known=dependencies.get(key);if(known)return known.record;
+      const row=this.db.query<Record<string,unknown>,[number]>(kind==='session'?'SELECT id,kind,status FROM sessions WHERE id=?':`SELECT * FROM ${tables[kind]} WHERE id=?`).get(target);
+      dependencies.set(key,{kind,id:target,record:row});
+      if(!row)return null;
+      for(const [field,value] of Object.entries(row))if(field.endsWith('_json')&&typeof value==='string') {
+        try{JSON.parse(value);}catch{fail('storage_read_failed');}
+      }
+      const ref=(type:Kind,value:unknown)=>{if(value!==null&&value!==undefined)load(type,checked(PositiveIdSchema,value,'storage_read_failed'));};
+      const members=(type:Kind,field:string)=>{if(typeof row[field]==='string')for(const id of ids(JSON.parse(row[field])))load(type,id);};
+      if(kind==='batch')ref('import',row.import_id);
+      if(kind==='import')ref('artifact',row.artifact_id);
+      if(kind==='artifact')ref('import',row.import_id);
+      if(kind==='snapshot'){ref('batch',row.batch_id);ref('device',row.device_id);}
+      if(kind==='change'){ref('batch',row.old_batch_id);ref('batch',row.new_batch_id);ref('device',row.device_id);}
+      if(kind==='query') {
+        ref('session',row.session_id);members('batch','batch_ids_json');
+        const query=new SqliteToolStore(this.db).readQuery(target)!;
+        const resultHash=createHash('sha256').update(canonicalRequest({kind:query.kind,params:query.params,batchIds:query.batchIds,scopeDeviceIds:query.scopeDeviceIds,rows:query.rows,interpretation:query.interpretation,calculationVersion:query.calculationVersion})).digest('hex');
+        if(resultHash!==query.resultHash)throw safeError('tool_output_inconsistent');
+        for(const id of query.snapshotIds)load('snapshot',id);
+        for(const id of query.eventIds)load('change',id);
+        for(const id of query.scopeDeviceIds??[])load('device',id);
+        for(const evidence of this.db.query<{id:number},[number]>('SELECT id FROM query_evidence WHERE query_id=? ORDER BY id').all(target))load('evidence',evidence.id);
+      }
+      if(kind==='evidence'){ref('query',row.query_id);members('batch','batch_ids_json');members('snapshot','snapshot_ids_json');members('change','event_ids_json');new SqliteToolStore(this.db).readEvidence(target);}
+      return row;
+    };
+    const clear=(kind:WorkspaceNotice['kind'],targetId:number)=>notices.push({code:'reference_cleared',kind,targetId:String(targetId)});
+    if(state.sessionId!==null){const row=load('session',state.sessionId);if(!row||row.kind!=='user'||row.status!=='active'){candidate.sessionId=null;clear('session',state.sessionId);}}
+    const artifactIds:number[]=[];
+    candidate.batchRefs=state.batchRefs.filter(ref=>{
+      const batch=load('batch',ref.id);
+      const owner=batch?load('import',Number(batch.import_id)):null;
+      const artifact=owner&&owner.artifact_id!==null?load('artifact',Number(owner.artifact_id)):null;
+      const valid=batch&&batch.content_hash===ref.contentHash&&batch.snapshot_date===ref.snapshotDate&&batch.scope_key===ref.scopeKey
+        &&batch.material_version===state.materialVersion&&owner&&['imported','duplicate'].includes(String(owner.state))&&artifact
+        &&artifact.import_id===owner.id&&artifact.operation_ref===owner.operation_ref&&artifact.status==='ready';
+      if(valid)artifactIds.push(Number(artifact.id));
+      if(!valid||invalidArtifactIds.includes(Number(artifact?.id))){clear('batch',ref.id);return false;}return true;
+    });
+    candidate.materialVersion=candidate.batchRefs.length?state.materialVersion:null;
+    for(const deviceId of state.deviceIds){
+      load('device',deviceId);
+      for(const ref of state.batchRefs)for(const row of this.db.query<{id:number},[number,number]>('SELECT id FROM snapshots WHERE batch_id=? AND device_id=? ORDER BY id').all(ref.id,deviceId))load('snapshot',row.id);
+    }
+    candidate.deviceIds=state.deviceIds.filter(deviceId=>{
+      const valid=load('device',deviceId)&&candidate.batchRefs.some(batch=>this.db.query('SELECT id FROM snapshots WHERE batch_id=? AND device_id=?').get(batch.id,deviceId));
+      if(!valid)clear('device',deviceId);return !!valid;
+    });
+    if(state.queryId!==null){
+      load('query',state.queryId);
+      try{this.workspaceQuery(state.queryId,candidate);}catch(error){if(error instanceof Error&&error.message==='access_denied'){candidate.queryId=null;clear('query',state.queryId);}else throw error;}
+    }
+    if(state.selection){
+      const selection=state.selection;
+      if(selection.kind==='device'||selection.rowKey?.startsWith('snapshot:'))load('snapshot',Number(selection.rowKey!.slice(9)));
+      if(selection.kind==='change')load('change',Number(selection.targetId));
+      if(selection.rowKey?.startsWith('change:'))load('change',Number(selection.rowKey.slice(7)));
+      if(selection.kind==='evidence')load('evidence',Number(selection.targetId));
+      candidate.selection=this.compatibleSelection(selection,candidate);
+      if(candidate.selection===null)clear('selection',Number(selection.targetId));
+    }
+    if(candidate.queryId===null&&['query','evidence'].includes(candidate.activeView))candidate.activeView='data';
+    const sorted=[...dependencies.values()].sort((a,b)=>a.kind.localeCompare(b.kind)||a.id-b.id).map(item=>({...item,record:item.record===null?{missing:true}:Object.fromEntries(Object.entries(item.record).map(([key,value])=>[key,key.endsWith('_json')&&typeof value==='string'?{sha256:createHash('sha256').update(value).digest('hex')}:value]))}));
+    const fingerprint=createHash('sha256').update(canonicalRequest({format:'workspace-inspection/v1',state,dependencies:sorted})).digest('hex');
+    return {state,candidate,artifactIds:[...new Set(artifactIds)].sort((a,b)=>a-b),notices,fingerprint};
+  }
+
+  commitWorkspaceRestore(expectedRevision:number,expectedFingerprint:string,candidate:WorkspaceState,time:string):WorkspaceState {
+    checked(RevisionSchema,expectedRevision);checked(WorkspaceStateSchema,candidate);timestamp(time);
+    return this.transactions.immediate(()=>{
+      const original=this.workspaceInspection([]);
+      if(original.state.revision!==expectedRevision||original.fingerprint!==expectedFingerprint)throw safeError('state_conflict',undefined,{reason:'workspace_revision_mismatch'});
+      const invalidArtifacts=original.state.batchRefs.filter(ref=>!candidate.batchRefs.some(item=>item.id===ref.id)).flatMap(ref=>{
+        const row=this.db.query<{artifact_id:number|null},[number]>('SELECT i.artifact_id FROM batches b JOIN imports i ON i.id=b.import_id WHERE b.id=?').get(ref.id);
+        return row?.artifact_id==null?[]:[row.artifact_id];
+      });
+      const verified=this.workspaceInspection(invalidArtifacts);
+      if(!isDeepStrictEqual(candidate,verified.candidate)||candidate.revision!==expectedRevision)fail('invalid_argument');
+      const saved=this.saveWorkspace(original.state,candidate,time);
+      if(saved!==original.state)this.beforeCommit?.();
+      return saved;
+    });
   }
 
   private workspaceQuery(queryId: number, state: WorkspaceState): QueryRecord {
@@ -370,7 +469,8 @@ export class Repositories implements ProviderRunStore, SessionStore {
 
   private saveWorkspace(old: WorkspaceState, candidate: WorkspaceState, time: string): WorkspaceState {
     const next = checked(WorkspaceStateSchema, candidate);
-    if (isDeepStrictEqual(old, next)) return old;
+    const semantic=(state:WorkspaceState)=>({...state,batchRefs:[...state.batchRefs].sort((a,b)=>a.id-b.id),deviceIds:[...state.deviceIds].sort((a,b)=>a-b)});
+    if (isDeepStrictEqual(semantic(old), semantic(next))) return old;
     if (old.revision === Number.MAX_SAFE_INTEGER) fail('state_conflict');
     next.revision = old.revision + 1;
     const saved = this.p3 ? this.db.query(`UPDATE workspace SET active_session_id=?,material_version=?,batch_refs_json=?,device_ids_json=?,active_query_id=?,active_view=?,selection_json=?,revision=?,updated_at=? WHERE id=1 AND revision=?`)
@@ -385,7 +485,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
     return this.transactions.immediate(() => {
       const old = this.readWorkspace();
       if (old.revision !== expectedRevision) fail("workspace_revision_mismatch");
-      const normalized = (ids: number[]) => [...ids].sort((a,b) => a-b);
+      const normalized = (ids: number[]) => [...new Set(ids)].sort((a,b) => a-b);
       let batchIds = normalized(request.batchIds ?? old.batchRefs.map(batch => batch.id));
       let explicitDevices = request.deviceIds;
       if (request.queryId != null) {
@@ -400,7 +500,7 @@ export class Repositories implements ProviderRunStore, SessionStore {
       const present = (deviceId: number) => batchIds.some(batchId => this.db.query('SELECT id FROM snapshots WHERE batch_id=? AND device_id=?').get(batchId,deviceId));
       const deviceIds = normalized(explicitDevices ?? old.deviceIds.filter(present));
       if (deviceIds.some(deviceId => !present(deviceId))) fail('access_denied');
-      const scopeChanged = !isDeepStrictEqual(batches.refs,old.batchRefs) || batches.materialVersion !== old.materialVersion || !isDeepStrictEqual(deviceIds,old.deviceIds);
+      const scopeChanged = !isDeepStrictEqual(batches.refs,[...old.batchRefs].sort((a,b)=>a.id-b.id)) || batches.materialVersion !== old.materialVersion || !isDeepStrictEqual(deviceIds,normalized(old.deviceIds));
       const queryId = request.queryId !== undefined ? request.queryId : scopeChanged ? null : old.queryId;
       const next: WorkspaceState = {...old,batchRefs:batches.refs,materialVersion:batches.materialVersion,deviceIds,queryId,activeView:request.activeView ?? old.activeView,selection:null};
       if (queryId !== null) this.workspaceQuery(queryId,next);
