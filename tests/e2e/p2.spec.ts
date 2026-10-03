@@ -54,9 +54,30 @@ test.afterAll(async () => { await app?.close(); if (server) await new Promise<vo
 const input = () => page.getByLabel("Message text", { exact: true });
 async function select(id: number) { await page.getByRole("button", { name: `New Session ${id}`, exact: true }).click(); await expect(page.getByTestId("current-session")).toContainText(`New Session ${id}`); }
 async function send(text: string) {
+  const original = await page.evaluate(async () => {
+    const workspace = await window.medclaw.request("workspace.read", {}); if (!workspace.ok || !workspace.data.sessionId) throw Error("Missing selected Session");
+    const session = await window.medclaw.request("session.read", { sessionId: workspace.data.sessionId }); if (!session.ok || !session.data) throw Error("Missing original submission sequence");
+    return { sessionId: workspace.data.sessionId, sequence: session.data.session.nextSubmissionSequence };
+  });
   await input().fill(text); await page.getByRole("button", { name: "Send", exact: true }).click();
-  await expect(page.locator(".user-message")).toContainText(text); await expect(page.getByText("Saved", { exact: true })).toBeVisible();
-  await expect(page.getByTestId("run-output")).toHaveText("P2 reply OK"); await expect(input()).toHaveValue("");
+  await expect.poll(() => page.evaluate(async original => {
+    const runs = await window.medclaw.request("run.read", { recent: true, sessionId: original.sessionId, limit: 1 });
+    if (!runs.ok || runs.data.kind !== "recent") return false;
+    const run = runs.data.runs[0]; return run?.kind === "agent" && run.clientSequence === original.sequence && run.status === "completed";
+  }, original)).toBe(true);
+  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  const facts = await page.evaluate(async () => {
+    const workspace = await window.medclaw.request("workspace.read", {}); if (!workspace.ok || !workspace.data.sessionId) throw Error("Missing selected Session");
+    const runs = await window.medclaw.request("run.read", { recent: true, sessionId: workspace.data.sessionId, limit: 1 });
+    const history = await window.medclaw.request("session.messages.read", { sessionId: workspace.data.sessionId });
+    if (!runs.ok || runs.data.kind !== "recent" || !runs.data.runs[0] || !history.ok) throw Error("Missing saved native exchange");
+    const runId = runs.data.runs[0].id;
+    return { user: history.data.items.find(item => item.runId === runId && item.displayRole === "user")?.nativeEntryId, assistant: history.data.items.findLast(item => item.runId === runId && item.displayRole === "assistant")?.nativeEntryId };
+  });
+  expect(facts.user).toBeDefined(); expect(facts.assistant).toBeDefined();
+  const history = page.getByTestId("chat-native-messages");
+  await expect(history.locator(`[data-native-entry-id="${facts.user}"] .answer-text`)).toHaveText(text);
+  await expect(history.locator(`[data-native-entry-id="${facts.assistant}"] .answer-text`)).toHaveText("P2 reply OK"); await expect(input()).toHaveValue("");
 }
 
 test("New Session and A/B navigation preserve independent drafts", async () => {
@@ -144,7 +165,7 @@ test("running A can be browsed from B without losing B draft or retargeting Stop
   expect(requests.at(-1)!.model).toBe("first");
   await select(2); await input().fill("B remains unsent");
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled(); await expect(page.getByTestId("running-session")).toContainText("New Session 1");
-  await expect(page.getByTestId("run-output")).not.toHaveText("P2 reply"); await page.getByRole("button", { name: "Stop generating", exact: true }).click();
+  await expect(page.getByTestId("run-output")).toHaveCount(0); await expect(page.getByTestId("chat-native-messages")).not.toContainText("slow A"); await page.getByRole("button", { name: "Stop generating", exact: true }).click();
   await expect(input()).toHaveValue("B remains unsent"); await expect(page.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
   await select(1); await expect(page.getByText("Cancelled and saved", { exact: true })).toBeVisible(); expect(requests).toHaveLength(before + 1);
 });
@@ -153,16 +174,19 @@ test("terminal and old-instance Agent notices cannot replace saved text; Host re
   if (!result.h.ok || !result.s.ok) throw new Error("facts unavailable");
   const run = await page.evaluate(() => window.medclaw.request("run.read", { recent: true, sessionId: 1, limit: 1 }));
   if (!run.ok || run.data.kind !== "recent") throw new Error("run unavailable");
-  const text = await page.getByTestId("run-output").innerText();
+  await page.getByRole("button", { name: "View run details", exact: true }).click(); await page.getByRole("tab", { name: "Run details", exact: true }).click();
+  await page.getByRole("button", { name: `View Run ${run.data.runs[0]!.id}`, exact: true }).click();
+  const text = await page.getByTestId("saved-output").innerText();
   await app.evaluate(({ BrowserWindow }, ids) => { const contents = BrowserWindow.getAllWindows()[0]!.webContents;
     // A bounded notification cache may evict this older known terminal Run.
     for (let runId = 1000; runId < 1052; runId++) contents.send("medclaw:notice", { type: "agent.settled", instanceId: ids.instanceId, runId, sessionId: 2, noticeSequence: 1, status: "completed" });
     for (const instanceId of [ids.instanceId, "old-host"]) contents.send("medclaw:notice", { type: "agent.preview", instanceId, runId: ids.runId, sessionId: 1, noticeSequence: 999, text: "late text", truncated: false });
   }, { instanceId: result.h.data.instanceId!, runId: run.data.runs[0]!.id });
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-  await expect(page.getByTestId("run-output")).toHaveText(text);
+  await expect(page.getByTestId("saved-output")).toHaveText(text); await expect(page.getByTestId("run-output")).toHaveCount(0);
   const restarted = await page.evaluate(instanceId => window.medclaw.request("host.restart", { expectedInstanceId: instanceId }), result.h.data.instanceId!); expect(restarted.ok).toBe(true);
   await expect(page.getByText("This session cannot continue after a restart. Create a new session.", { exact: true })).toBeVisible(); await expect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
+  await page.getByRole("button", { name: "Close run details", exact: true }).click();
 });
 
 declare global { interface Window { modelReadGate: { release(): void } } }

@@ -50,22 +50,23 @@ test("safe diagnostics use English summaries and suppress native stderr", () => 
   expect(JSON.stringify(log.read())).not.toContain("CANARY-SECRET");
 });
 
-test("P2 runner discovers only its stage and rejects empty, skipped, failed and loading-error runs", async () => {
+test.each(["P2", "P4"])("%s runner discovers only its stage and rejects empty, skipped, failed and loading-error runs", async (stage) => {
   const { discoverTests, runStage } = await import("../run");
-  const root = mkdtempSync(join(tmpdir(), "medclaw-p2-runner-"));
+  const root = mkdtempSync(join(tmpdir(), "medclaw-stage-runner-"));
+  const prefix = stage.toLowerCase();
   try {
-    expect(discoverTests("unit", "P2", root)).toEqual([]);
-    expect(await runStage("unit", "P2", { root })).toMatchObject({ discovered: 0, executed: 0, exitCode: 1 });
+    expect(discoverTests("unit", stage, root)).toEqual([]);
+    expect(await runStage("unit", stage, { root })).toMatchObject({ discovered: 0, executed: 0, exitCode: 1 });
     mkdirSync(join(root, "tests/unit"), { recursive: true });
     mkdirSync(join(root, "tests/e2e"), { recursive: true });
     writeFileSync(join(root, "tests/unit/p1.test.ts"), 'throw new Error("must not execute P1");');
-    writeFileSync(join(root, "tests/unit/p2.spec.ts"), 'throw new Error("wrong category suffix");');
-    writeFileSync(join(root, "tests/e2e/p2.spec.ts"), "");
-    const file = join(root, "tests/unit/p2-extra.test.ts");
+    writeFileSync(join(root, `tests/unit/${prefix}.spec.ts`), 'throw new Error("wrong category suffix");');
+    writeFileSync(join(root, `tests/e2e/${prefix}.spec.ts`), "");
+    const file = join(root, `tests/unit/${prefix}-extra.test.ts`);
     writeFileSync(file, 'import {test,expect} from "bun:test"; test("stage is consumed by project runner",()=>expect(Bun.argv.includes("--stage")).toBe(false)); test.skip("explicit skip",()=>{});');
-    expect(discoverTests("unit", "P2", root)).toEqual([file]);
-    expect(discoverTests("e2e", "P2", root)).toHaveLength(1);
-    expect(await runStage("unit", "P2", { root })).toMatchObject({ stage: "P2", discoveredFiles: 1, discovered: 2, executed: 1, pass: 1, fail: 0, skip: 1, exitCode: 0 });
+    expect(discoverTests("unit", stage, root)).toEqual([file]);
+    expect(discoverTests("e2e", stage, root)).toHaveLength(1);
+    expect(await runStage("unit", stage, { root })).toMatchObject({ stage, discoveredFiles: 1, discovered: 2, executed: 1, pass: 1, fail: 0, skip: 1, exitCode: 0 });
     for (const [source, expected] of [
       ['import {test} from "bun:test"; test.skip("unverified",()=>{});', { executed: 0, pass: 0, skip: 1, exitCode: 1 }],
       ['import {test,expect} from "bun:test"; test("failure",()=>expect(1).toBe(2));', { executed: 1, fail: 1, exitCode: 1 }],
@@ -73,9 +74,9 @@ test("P2 runner discovers only its stage and rejects empty, skipped, failed and 
       ["", { executed: 0, exitCode: 1 }],
     ] as const) {
       writeFileSync(file, source);
-      expect(await runStage("unit", "P2", { root })).toMatchObject(expected);
+      expect(await runStage("unit", stage, { root })).toMatchObject(expected);
     }
-    for (const args of [["unit"], ["unit", "--stage", "P4"], ["unit", "--stage", "P2", "--extra"], ["invalid", "--stage", "P2"]]) {
+    for (const args of [["unit"], ["unit", "--stage", "P99"], ["unit", "--stage", stage, "--extra"], ["invalid", "--stage", stage]]) {
       const child = Bun.spawn([process.execPath, join(import.meta.dir, "../run.ts"), ...args], { stdout: "pipe", stderr: "pipe" });
       expect(await child.exited).not.toBe(0);
       expect(await new Response(child.stderr).text()).toMatch(/Unknown|Usage/);

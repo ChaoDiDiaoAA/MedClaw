@@ -101,7 +101,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   private call(row: CallRow): ToolCallRecord {
     const delivery = row.delivery_json === null ? null : decode(row.delivery_json);
     if (delivery !== null && (typeof delivery !== "object" || !Object.hasOwn(delivery, "sdkReturned") || !Object.hasOwn(delivery, "nativeEntryId"))) fail("storage_read_failed");
-    const receipt = delivery as { sdkReturned: boolean; nativeEntryId: string | null; message?: ToolSdkDelivery; nextModelCallId?: string | null; consumedAt?: string | null; control?: ToolControlObservation } | null;
+    const receipt = delivery as { sdkReturned: boolean; nativeEntryId: string | null; message?: ToolSdkDelivery; nextModelCallId?: string | null; consumedAt?: string | null; consumptionEvidence?: unknown; control?: ToolControlObservation } | null;
     const model = row.model_call_id ? this.db.query<{ call_id: string }, [number]>("SELECT call_id FROM model_calls WHERE id=?").get(row.model_call_id) : null;
     const parsed = ToolCallRecordSchema.safeParse({ id: row.id, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id,
       name: row.tool_name, version: row.tool_version, executionMode: row.execution_mode, input: decode(row.args_json), status: row.status,
@@ -109,7 +109,8 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       sdkReturned: receipt?.sdkReturned ?? false, nativeEntryId: receipt?.nativeEntryId ?? null,
       ...(receipt?.message ? { sdkDelivery: receipt.message } : {}), ...(model ? { modelCallId: model.call_id } : {}),
       ...(row.stopped_at ? { stoppedAt: row.stopped_at } : {}), ...(receipt?.nextModelCallId ? { nextModelCallId: receipt.nextModelCallId } : {}),
-      ...(receipt?.consumedAt ? { consumedAt: receipt.consumedAt } : {}), ...(receipt?.control ? { control: receipt.control } : {}) });
+      ...(receipt?.consumedAt ? { consumedAt: receipt.consumedAt } : {}), ...(receipt?.control ? { control: receipt.control } : {}),
+      ...(receipt && Object.hasOwn(receipt, 'consumptionEvidence') ? { consumptionEvidence: receipt.consumptionEvidence } : {}) });
     return parsed.success ? parsed.data : fail("storage_read_failed");
   }
   private callRow(context: ToolExecutionContext): CallRow | null {
@@ -234,9 +235,10 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
     }).immediate(), "storage_write_failed");
   }
 
-  recordConsumption(context: ToolExecutionContext, nextCallId: string): void {
+  recordConsumption(context: ToolExecutionContext, nextCallId: string, evidence?: 'provider_input_verified'): void {
     protect(() => this.db.transaction(() => {
       this.identity(context, false);
+      if (evidence !== undefined && evidence !== 'provider_input_verified') fail('invalid_argument');
       const row = this.callRow(context);
       if (!row || row.delivery_json === null) fail("state_conflict");
       const receipt = decode(row.delivery_json);
@@ -246,7 +248,8 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       if (!next || row.model_call_id != null && next.id <= row.model_call_id) fail("state_conflict");
       const previous = this.call(row);
       if (previous.nextModelCallId) return;
-      this.db.query("UPDATE tool_calls SET delivery_json=? WHERE id=?").run(json({ ...receipt, nextModelCallId: nextCallId, consumedAt: new Date().toISOString() }), row.id);
+      this.db.query("UPDATE tool_calls SET delivery_json=? WHERE id=?").run(json({ ...receipt, nextModelCallId: nextCallId, consumedAt: new Date().toISOString(),
+        ...(evidence === undefined ? {} : { consumptionEvidence: evidence }) }), row.id);
     }).immediate(), "storage_write_failed");
   }
 

@@ -14,6 +14,23 @@ let app: ElectronApplication, page: Page, temporary: string, server: Server, nat
 const providerUserTexts: string[] = [];
 let dateQueryGate: { entered: Promise<void>; reply: Promise<void>; markEntered: () => void; release: () => void } | null = null;
 test.describe.configure({ mode: 'serial' });
+async function savedNativeReply(inputText: string) {
+  await expect.poll(() => page.evaluate(async inputText => {
+    const workspace = await window.medclaw.request('workspace.read', {}); if (!workspace.ok || !workspace.data.sessionId) return false;
+    const runs = await window.medclaw.request('run.read', { recent: true, sessionId: workspace.data.sessionId, limit: 1 });
+    return runs.ok && runs.data.kind === 'recent' && runs.data.runs[0]?.inputText === inputText && runs.data.runs[0].status === 'completed';
+  }, inputText)).toBe(true);
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  const entryId = await page.evaluate(async () => {
+    const workspace = await window.medclaw.request('workspace.read', {}); if (!workspace.ok || !workspace.data.sessionId) throw Error('Missing selected Session');
+    const runs = await window.medclaw.request('run.read', { recent: true, sessionId: workspace.data.sessionId, limit: 1 });
+    const history = await window.medclaw.request('session.messages.read', { sessionId: workspace.data.sessionId });
+    if (!runs.ok || runs.data.kind !== 'recent' || !runs.data.runs[0] || !history.ok) throw Error('Missing saved native Run');
+    const runId = runs.data.runs[0].id;
+    return history.data.items.findLast(item => item.runId === runId && item.displayRole === 'assistant')?.nativeEntryId;
+  });
+  expect(entryId).toBeDefined(); await expect(page.getByTestId('chat-native-messages').locator(`[data-native-entry-id="${entryId}"] .answer-text`)).toHaveText('P3 saved reply');
+}
 function snapshotPackage(directory: string) {
   mkdirSync(directory, { recursive: true });
   const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
@@ -201,7 +218,7 @@ test('P3 actual business tool creates a saved query with inspectable source evid
   await page.getByLabel('Reference date', { exact: true }).fill('2026-01-01');
   await page.locator('.reference-fields').screenshot({ path: test.info().outputPath('p3-reference-date-override.png') });
   await page.getByLabel('Message text', { exact: true }).fill('Query fixture data'); await page.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(page.getByTestId('run-output')).toHaveText('P3 saved reply'); await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  await savedNativeReply('Query fixture data');
   const savedRun = await page.evaluate(() => window.medclaw.request('run.read', { recent: true, sessionId: 1, limit: 1 }));
   if (!savedRun.ok || savedRun.data.kind !== 'recent' || !savedRun.data.runs[0]) throw new Error('Missing saved date-override run');
   expect(savedRun.data.runs[0].referenceDate).toBe('2026-01-01');
@@ -375,8 +392,7 @@ test('P3 active and saved Runs retain frozen budgets while Settings changes appl
     await page.getByRole('button', { name: 'Chat', exact: true }).click();
     await page.getByLabel('Message text', { exact: true }).fill('New Run after budget publication');
     await page.getByRole('button', { name: 'Send', exact: true }).click();
-    await expect(page.getByTestId('run-output')).toHaveText('P3 saved reply');
-    await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+    await savedNativeReply('New Run after budget publication');
     await expect(page.getByTestId('run-agent-policy')).toContainText('80');
     const original = await page.evaluate(id => window.medclaw.request('run.read', { runId: id }), runId);
     if (!original.ok || original.data.kind !== 'one' || original.data.run?.kind !== 'agent') throw new Error('Missing saved frozen Run');
@@ -408,7 +424,7 @@ test('P3 Run Details distinguishes after-tool failures, unconfirmed consumption 
     await expect(details.locator('dt:has-text("Model consumption") + dd')).toContainText('Included in model call');
     await project('undelivered');
     await page.getByRole('button', { name: 'Refresh tools', exact: true }).click();
-    await expect(details.locator('dt:has-text("SDK result status") + dd')).toHaveText('Not delivered');
+    await expect(details.locator('dt:has-text("SDK result status") + dd')).toHaveText('Unknown; SDK receipt unconfirmed');
     await expect(details.locator('dt:has-text("Model consumption") + dd')).toHaveText('No later model call confirmed');
     await expect(details.locator('dt:has-text("Consumption observed") + dd')).toHaveText('Not recorded');
     await project('legacy');

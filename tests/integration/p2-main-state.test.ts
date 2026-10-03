@@ -2,6 +2,7 @@ import { afterEach, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createRequire } from "node:module";
 import type { BrowserWindow } from "electron";
 import { HostController } from "../../apps/desktop/src/main/host-controller";
 import { MainSettings } from "../../apps/desktop/src/main/settings";
@@ -12,7 +13,7 @@ import type { PublicMethod, PublicPayload, PublicReturn } from "../../packages/c
 const handlers = new Map<string, (...args: unknown[]) => unknown>();
 let invoke: (channel: string, payload: unknown) => Promise<unknown> = async () => null;
 let bridge: { request<M extends PublicMethod>(method: M, payload: PublicPayload<M>, op?: string): Promise<Result<PublicReturn<M>>> };
-mock.module("electron", () => ({ ipcMain: { handle: (name: string, handler: (...args: unknown[]) => unknown) => handlers.set(name, handler), removeHandler: (name: string) => handlers.delete(name) }, shell: { openExternal: async () => {} }, dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+mock.module(createRequire(new URL("../../apps/desktop/package.json", import.meta.url)).resolve("electron"), () => ({ ipcMain: { handle: (name: string, handler: (...args: unknown[]) => unknown) => handlers.set(name, handler), removeHandler: (name: string) => handlers.delete(name) }, shell: { openExternal: async () => {} }, dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
   ipcRenderer: { on: () => {}, send: () => {}, invoke: (name: string, payload: unknown) => invoke(name, payload) }, contextBridge: { exposeInMainWorld: (_name: string, value: typeof bridge) => { bridge = value; } } }));
 const roots: string[] = [];
 afterEach(() => { handlers.clear(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -111,4 +112,27 @@ test("Preload separates invalid input from unknown invoked writes and never turn
   expect(await bridge.request("session.create", { expectedWorkspaceRevision: 0 }, "create-op")).toMatchObject({ ok: false, error: { code: "operation_result_unknown", operationRef: "create-op" } });
   invoke = async () => ({ ok: false, error: safeError("storage_read_failed") });
   expect(await bridge.request("session.readSubmission", { sessionId: 1, clientSequence: 1 })).toMatchObject({ ok: false, error: { code: "storage_read_failed" } });
+});
+
+test("Main message payload failures are narrow and malformed read output stays a protocol error", async () => {
+  const c = await setup(false);
+  for (const payload of [{ sessionId: 0 }, { sessionId: 1, afterEntryId: "" }, { sessionId: 1, extra: true }]) expect(await c.request("session.messages.read", payload)).toMatchObject({ ok: false, error: { code: "input_invalid" } });
+  expect(await c.request("session.messages.read", { sessionId: 1 }, "")).toMatchObject({ ok: false, error: { code: "invalid_argument" } });
+  expect(await c.request("session.messages.read", { sessionId: 1 }, "op", { sender: { id: 99, mainFrame: { url: "file:///desktop.html" } }, senderFrame: { url: "file:///desktop.html" } })).toMatchObject({ ok: false, error: { code: "access_denied" } });
+  expect(c.calls).toHaveLength(0); expect(c.syncs()).toBe(0);
+  c.host.request = async () => ({ ok: true, data: "broken read" });
+  for (const [method, payload] of [["session.messages.read", { sessionId: 1 }], ["session.readSubmission", { sessionId: 1, clientSequence: 1 }]] as const) expect(await c.request(method, payload)).toMatchObject({ ok: false, error: { code: "host_protocol_mismatch" } });
+  c.host.request = async () => ({ ok: false, error: safeError("storage_read_failed") });
+  expect(await c.request("session.messages.read", { sessionId: 1 })).toMatchObject({ ok: false, error: { code: "storage_read_failed" } });
+  expect(c.syncs()).toBe(0);
+});
+
+test("Preload validates message payload separately from operation identity before IPC", async () => {
+  await import("../../apps/desktop/src/preload/index"); let invoked = 0;
+  invoke = async () => { invoked++; return { ok: true, data: "broken read" }; };
+  expect(await bridge.request("session.messages.read", { sessionId: 0 } as never)).toMatchObject({ ok: false, error: { code: "input_invalid" } });
+  expect(await bridge.request("session.messages.read", { sessionId: 1 } as never, "")).toMatchObject({ ok: false, error: { code: "invalid_argument" } });
+  expect(invoked).toBe(0);
+  expect(await bridge.request("session.messages.read", { sessionId: 1 } as never)).toMatchObject({ ok: false, error: { code: "host_protocol_mismatch" } });
+  expect(invoked).toBe(1);
 });

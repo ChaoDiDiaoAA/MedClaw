@@ -131,7 +131,7 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
     }
   };
   ipcMain.handle("medclaw:request", async (event, envelope: unknown): Promise<Result<unknown>> => {
-    let method: PublicMethod | undefined, operationRef: string | undefined, replyReceived = false;
+    let method: PublicMethod | undefined, operationRef: string | undefined, replyReceived = false, parsingPayload = false;
     try {
       trusted(event);
       if (!envelope || typeof envelope !== "object" || Array.isArray(envelope) || Object.keys(envelope).some(k => !["method", "payload", "operationRef"].includes(k))) throw new Error("invalid_argument");
@@ -142,9 +142,11 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       if (method === "model.request" || method === "model.diagnose") {
         if (payload && typeof payload === "object" && !Array.isArray(payload)) payload = { referenceDate: new Date().toLocaleDateString("sv-SE"), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, ...payload };
       }
+      parsingPayload = true;
       const schema = ['data.read', 'data.rows', 'query.read', 'query.list', 'evidence.read', 'tool.read'].includes(method)
         ? createPublicMethodSchemas()[method].input : publicMethodSchemas[method].input;
       const parsed = JSON.parse(JSON.stringify(schema.parse(payload))) as unknown;
+      parsingPayload = false;
       if ((method === "import.preview" || method === "import.commit") && (parsed as { operationRef: string }).operationRef !== operationRef) throw new Error("state_conflict");
       if (method === "model.request" || method === "model.diagnose" || method === "session.submit" || method === "session.create") {
         const old = operations.get(operationRef);
@@ -156,7 +158,8 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       const data = publicMethodSchemas[method].output.parse(reply);
       return { ok: true, data };
     } catch (error) { const known = AppErrorSchema.safeParse(error); const safe = known.success ? known.data : safeError(error instanceof z.ZodError
-      ? replyReceived && method && !isReadOnlyMethod(method) ? "operation_result_unknown" : "invalid_argument"
+      ? replyReceived && method ? isReadOnlyMethod(method) ? "host_protocol_mismatch" : "operation_result_unknown"
+        : parsingPayload && method === "session.messages.read" ? "input_invalid" : "invalid_argument"
       : error instanceof Error ? error.message : "invalid_argument", error, { operationRef }); options.report(safe); return { ok: false, error: safe }; }
   });
   ipcMain.handle("medclaw:secret-input", (event, raw): Result<unknown> => { try { trusted(event); return { ok: true, data: inputs.issue(window.id, DesktopSecretInputSchema.parse(raw)) }; } catch (error) { return { ok: false, error: safeError(error instanceof Error ? error.message : "invalid_argument", error) }; } });

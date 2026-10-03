@@ -12,6 +12,7 @@ import { Application } from "../../../packages/core/src/application.ts";
 import { SessionService } from "../../../packages/core/src/session/session-service.ts";
 import { WorkspaceService } from "../../../packages/core/src/workspace/workspace-service.ts";
 import { PiAgentRuntime } from "../../../packages/runtime-pi/src/agent-runtime.ts";
+import { projectToolCall } from "../../../packages/runtime-pi/src/messages.ts";
 import { SqliteCatalogStore } from '../../../packages/storage/src/catalog-store.ts';
 import { SqliteToolStore } from '../../../packages/storage/src/tool-store.ts';
 import { SqliteImportStore } from '../../../packages/storage/src/import-store.ts';
@@ -27,7 +28,6 @@ import { ToolExecutor } from '../../../packages/core/src/tools/executor.ts';
 import { RunScopeSchema, canonicalRequest } from '../../../packages/contracts/src/run.ts';
 import { BUSINESS_RULES, createStoredQuerySchemas, QuerySummarySchema, EvidenceSummarySchema, type QueryExecutionContext, type QueryRecord, type Evidence } from '../../../packages/contracts/src/query.ts';
 import { StoredToolConfigurationSchema } from '../../../packages/contracts/src/tool-config.ts';
-import { TOOL_READ_RULES } from '../../../packages/contracts/src/tool.ts';
 import { AbsolutePathSchema } from '../../../packages/contracts/src/protocol.ts';
 import { ErrorLog } from "../../../packages/logging/src/error-log.ts";
 import { RuntimeLog } from "../../../packages/logging/src/runtime-log.ts";
@@ -238,6 +238,7 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case "session.list": return unwrap(await sessions!.list(request.payload));
     case "session.read": return unwrap(await sessions!.read(request.payload.sessionId));
     case "session.submit": return unwrap(await sessions!.submit(request.payload, request));
+    case "session.messages.read": return unwrap(await sessions!.readMessages(request.payload));
     case "session.readSubmission": return unwrap(await sessions!.readSubmission(request.payload));
     case "workspace.read": return unwrap(await workspace!.read());
     case "workspace.restore": return unwrap(await workspace!.restore());
@@ -298,15 +299,11 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     }
     case 'tool.read': {
       const { runId, page, pageSize } = createPublicMethodSchemas()['tool.read'].input.parse(request.payload), context = readContext(runId, false);
-      const { inputPreviewChars, resultPreviewChars } = TOOL_READ_RULES;
       const totalRows = database!.query<{ count: number }, [number]>('SELECT COUNT(*) AS count FROM tool_calls WHERE run_id=?').get(runId)!.count;
       const rows = database!.query<{ native_tool_call_id: string }, [number, number, number]>('SELECT native_tool_call_id FROM tool_calls WHERE run_id=? ORDER BY id LIMIT ? OFFSET ?').all(runId, pageSize, (page - 1) * pageSize);
       const items = rows.map(row => {
         const record = toolStore.readCall({ ...context, nativeToolCallId: row.native_tool_call_id })!;
-        const { input, data, sdkDelivery, ...metadata } = record;
-        const args = JSON.stringify(input), result = JSON.stringify(sdkDelivery ?? data);
-        return { ...metadata, sdkResultIsError: record.sdkReturned ? sdkDelivery?.isError ?? null : null,
-          inputPreview: args.slice(0, inputPreviewChars), resultPreview: result.slice(0, resultPreviewChars), truncated: args.length > inputPreviewChars || result.length > resultPreviewChars };
+        return projectToolCall(record);
       });
       return { runId, scope: context.scope, items, totalRows, page, pageSize };
     }

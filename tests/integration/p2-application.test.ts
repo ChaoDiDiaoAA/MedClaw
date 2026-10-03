@@ -43,6 +43,7 @@ async function setup(beforeCommit?: () => void) {
         discard: () => { discarded++; } };
     },
     read: (sessionId: number) => previews.get(sessionId) ?? { available: false, reason: "host_restart" as const, leafId: null, messages: [], truncated: false },
+    readMessages: () => { throw new Error("Unexpected fixture message read"); },
   };
   const delegate = async (_input: SubmitInput): Promise<Result<SubmitResult>> => { delegated++; return { ok: false, error: safeError("state_conflict", undefined, { reason: "runtime_busy" }) }; };
   const service = new modules[0].SessionService("host-1", repo, bindings, delegate, () => active);

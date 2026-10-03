@@ -10,7 +10,7 @@ describe("P1 stage runner", () => {
     const root = mkdtempSync(join(tmpdir(), "medclaw-p1-empty-"));
     try {
       expect(() => discoverTests("invalid" as "unit", "P1", root)).toThrow();
-      expect(() => discoverTests("unit", "P4", root)).toThrow();
+      expect(() => discoverTests("unit", "P99", root)).toThrow();
       expect(discoverTests("unit", "P1", root)).toEqual([]);
       const result = await runStage("unit", "P1", { root });
       expect(result.discovered).toBe(0);
@@ -226,13 +226,13 @@ describe("P1 read and usage boundaries", () => {
 });
 
 describe("P1 public and private protocol", () => {
-  test("public dispatch retains P1 methods in the P3 whitelist", async () => {
+  test("public dispatch retains P1 methods in the P4 whitelist", async () => {
     const { publicMethodSchemas, parsePublicPayload } = await import("../../packages/contracts/src/protocol");
     expect(Object.keys(publicMethodSchemas).sort()).toEqual([
       "model.list", "model.read", "model.refresh", "operation.cancel", "model.auth.start", "model.auth.respond",
       "model.auth.cancel", "model.auth.status", "model.custom.read", "model.custom.save", "model.configure", "model.policy.update",
       "model.config.read", "model.config.rollback", "model.request", "model.diagnose", "run.active", "run.read", "run.cancel", "run.retrySave",
-      "session.create", "session.select", "session.list", "session.read", "session.submit", "session.readSubmission", "workspace.read", "workspace.restore", "run.control.read",
+      "session.create", "session.select", "session.list", "session.read", "session.messages.read", "session.submit", "session.readSubmission", "workspace.read", "workspace.restore", "run.control.read",
       "settings.ui.read", "settings.ui.update", "diagnostics.read", "host.read", "host.start", "host.stop", "host.restart",
       "workspace.update", "data.read", "data.rows", "query.execute", "query.read", "query.list", "evidence.read", "tool.read",
       "import.preview", "import.commit", "import.read", "import.cancel", "import.recover", "evidence.readOperation", "evidence.readArtifact",

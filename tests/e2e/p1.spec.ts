@@ -123,7 +123,13 @@ test("actual Electron custom model publishes, calls once, stops and reads the or
   await expect.poll(async () => (await page.getByLabel("Message text").inputValue()).length).toBe(firstText.length);
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await expect(page.getByText("Saved", { exact: true })).toBeVisible();
-  await expect(page.getByTestId("run-output")).toContainText("你好😀 OK");
+  const firstHistory = await page.evaluate(() => window.medclaw.request("session.messages.read", { sessionId: 1 }));
+  if (!firstHistory.ok) throw new Error("Expected native messages for the original saved Run");
+  const firstReplyId = firstHistory.data.items.find(item => item.runId === 1 && item.displayRole === "assistant")?.nativeEntryId;
+  expect(firstReplyId).toBeDefined();
+  const firstReply = page.getByTestId("chat-native-messages").locator(`[data-native-entry-id="${firstReplyId}"] .answer-text`);
+  await expect(firstReply).toContainText("你好😀 OK");
+  await expect(page.getByTestId("run-output")).toHaveCount(0);
   expect(requests[0]!.text).toBe(firstText);
   const firstRun = await page.evaluate(() => window.medclaw.request("run.read", { runId: 1 }));
   expect(firstRun.ok && firstRun.data.kind === "one" && firstRun.data.run?.inputText).toBe(firstText);
@@ -134,7 +140,8 @@ test("actual Electron custom model publishes, calls once, stops and reads the or
     content.send("medclaw:notice", { type: "agent.preview", instanceId, sessionId: 1, noticeSequence: 999, runId: 1, text: "late terminal preview", truncated: false });
     content.send("medclaw:notice", { type: "agent.preview", instanceId: "old-ui-fixture-instance", sessionId: 1, noticeSequence: 999, runId: 1, text: "old instance preview", truncated: false });
   }, identity.data.instanceId);
-  await expect(page.getByTestId("run-output")).toHaveText("你好😀 OK");
+  await expect(firstReply).toHaveText("你好😀 OK");
+  await expect(page.getByTestId("run-output")).toHaveCount(0);
   expect(requests).toHaveLength(1);
   await page.getByLabel("Message text").fill("slow");
   await page.getByRole("button", { name: "Send", exact: true }).click();

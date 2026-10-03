@@ -13,12 +13,14 @@ ipcRenderer.on("medclaw:notice", (_event, raw: unknown) => {
 });
 const bridge = {
   async request<M extends PublicMethod>(method: M, payload: PublicPayload<M>, operationRef?: string): Promise<Result<PublicReturn<M>>> {
-    let name: PublicMethod, body: unknown, identity: string;
+    let name: PublicMethod, body: unknown, identity: string, parsingPayload = false;
     try {
       name = PublicMethodSchema.parse(method);
-      body = publicMethodSchemas[name].input.parse(payload);
       identity = OpaqueIdSchema.parse(operationRef ?? crypto.randomUUID());
-    } catch { return { ok: false, error: safeError("invalid_argument") }; }
+      parsingPayload = true;
+      body = publicMethodSchemas[name].input.parse(payload);
+      parsingPayload = false;
+    } catch { return { ok: false, error: safeError(parsingPayload && method === "session.messages.read" ? "input_invalid" : "invalid_argument") }; }
     try {
       const result: unknown = await ipcRenderer.invoke("medclaw:request", { method: name, payload: body, operationRef: identity });
       return resultSchema(publicMethodSchemas[name].output).parse(result) as Result<PublicReturn<M>>;

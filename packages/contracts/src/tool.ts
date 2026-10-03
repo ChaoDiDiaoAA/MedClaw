@@ -65,15 +65,18 @@ export const ToolCallRecordSchema = z.strictObject({
   stoppedAt: z.string().min(1).optional(),
   nextModelCallId: z.string().min(1).optional(),
   consumedAt: z.string().min(1).optional(),
+  consumptionEvidence: z.literal("provider_input_verified").optional(),
   control: ToolControlObservationSchema.nullable().optional(),
 });
 export type ToolCallRecord = z.infer<typeof ToolCallRecordSchema>;
 export const ToolCallViewSchema = ToolCallRecordSchema.omit({ input: true, data: true, sdkDelivery: true }).extend({
   sdkResultIsError: z.boolean().nullable().optional(),
+  nativeOutputTruncated: z.boolean().nullable().optional(),
   inputPreview: z.string(),
   resultPreview: z.string(),
   truncated: z.boolean(),
 });
+export type ToolCallView = z.infer<typeof ToolCallViewSchema>;
 export const RunToolsViewSchema = z.strictObject({
   runId: PositiveIdSchema,
   scope: RunScopeSchema,
@@ -105,6 +108,6 @@ export interface ToolCallStore {
   mergeControl?(context: ToolExecutionContext, patch: Partial<ToolControlObservation>): ToolCallRecord;
   readToolObservations?(input: { cutoffAt: string; maxToolCallId?: number | null; limit: number; windowDays: number }): { maxToolCallId: number | null; observations: ToolObservation[] };
   recordDelivery(context: ToolExecutionContext, nativeEntryId: string, message?: ToolSdkDelivery): void;
-  recordConsumption?(context: ToolExecutionContext, nextCallId: string): void;
+  recordConsumption?(context: ToolExecutionContext, nextCallId: string, evidence?: "provider_input_verified"): void;
   recordFailedRequest?(tool: ToolCallIdentity, input: unknown, context: ToolExecutionContext, error: AppError, requestedAt: string): void;
 }

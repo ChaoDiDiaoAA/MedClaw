@@ -1,9 +1,12 @@
 import type { Database } from "bun:sqlite";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
-import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, safeError, type AppError } from "../../contracts/src/error";
+import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, safeError, type AppError } from "../../contracts/src/error";
+import { ToolSdkDeliverySchema } from "../../contracts/src/tool";
+import { ToolControlObservationSchema } from "../../contracts/src/model";
+import { SqliteToolStore } from "./tool-store";
 import { NewSessionInputSchema, NewSessionResultSchema, SelectSessionInputSchema, SessionViewSchema, ListSessionsRequestSchema, SubmitInputSchema, ReadSubmissionRequestSchema,
-  type NewSessionInput, type NewSessionResult, type SelectSessionInput, type SessionView, type SessionPage, type ReadSubmissionRequest, type SubmitResult } from "../../contracts/src/session";
+  type NewSessionInput, type NewSessionResult, type SelectSessionInput, type SessionView, type SessionPage, type ReadSubmissionRequest, type SubmitResult, type SessionStore } from "../../contracts/src/session";
 import { WorkspaceViewSchema, WorkspaceChangeSchema, RevisionSchema, type WorkspaceView, type WorkspaceChange, type BatchRef } from "../../contracts/src/workspace";
 import { businessToolSchemas } from "../../contracts/src/business-tools";
 import { StoredToolConfigurationSchema } from '../../contracts/src/tool-config';
@@ -50,6 +53,11 @@ const agentConfigSchema = z.strictObject({ selection: ModelSelectionSchema, poli
   referenceDate: z.string(), timezone: z.string(), agent: P2AgentOptionsSchema.extend({ stage: z.enum(["P2", "P3"]), nativeSessionId: OpaqueIdSchema,
     tools: z.array(z.string()), autoCompaction: z.literal(false), autoRetry: z.literal(false), cacheWarming: z.literal("off") }) });
 const commonConfigSchema = z.object({ selection: ModelSelectionSchema, policy: RequestPolicySchema });
+const savedDeliverySchema = z.object({ contract: z.literal("medclaw.tool-delivery/v1"), resultRecorded: z.boolean(), sdkReturned: z.boolean(),
+  nativeEntryId: OpaqueIdSchema.nullable(), deliveredAt: TimestampSchema.nullable(), nextModelCallId: z.string().min(1).nullable(), consumedAt: TimestampSchema.nullable(),
+  error: AppErrorSchema.nullable(), message: ToolSdkDeliverySchema.optional(), control: ToolControlObservationSchema.optional(),
+  consumptionEvidence: z.literal("provider_input_verified").optional(),
+});
 const scope = { batchIds: [], deviceIds: null, allowedToolNames: [], allowedResourceRefs: [], artifactIds: [], readOnly: true };
 type RunRow = {
   kind: "provider" | "agent"; session_id: number | null; submission_operation_ref: string | null;
@@ -83,7 +91,7 @@ function timestamp(value: string | null) {
   if (value !== null && (!Number.isFinite(Date.parse(value)) || new Date(value).toISOString() !== value)) fail("invalid_argument");
 }
 
-export class Repositories implements ProviderRunStore {
+export class Repositories implements ProviderRunStore, SessionStore {
   private readonly p3: boolean;
   constructor(private readonly db: Database, private readonly beforeCommit?: () => void) {
     this.p3 = this.db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name='answers'").get() !== null;
@@ -299,7 +307,55 @@ export class Repositories implements ProviderRunStore {
   findSubmission(input: ReadSubmissionRequest): SubmitResult | null {
     const request = checked(ReadSubmissionRequestSchema, input);
     const row = this.db.query<RunRow, [number, number]>("SELECT * FROM runs WHERE session_id=? AND submission_client_sequence=?").get(request.sessionId, request.clientSequence);
-    return row ? this.submissionResult(row) : null;
+    if (!row) return null;
+    // The saved original request/config are part of the accepted identity, even on a readonly lookup.
+    try {
+      const original = checked(SubmitInputSchema, JSON.parse(row.submission_request_json!), "storage_read_failed");
+      checked(agentConfigSchema, JSON.parse(row.config_json), "storage_read_failed");
+      if (original.sessionId !== row.session_id || original.clientSequence !== row.submission_client_sequence) fail("storage_read_failed");
+      return this.submissionResult(row);
+    } catch { return fail("storage_read_failed"); }
+  }
+
+  readMessageLinks(sessionId: number, nativeEntryIds: readonly string[]): Map<string, { runId: number; toolCallRef: string; references: string[] }> {
+    id(sessionId);
+    checked(z.array(OpaqueIdSchema).max(100), nativeEntryIds);
+    const links = new Map<string, { runId: number; toolCallRef: string; references: string[] }>();
+    if (!nativeEntryIds.length) return links;
+    try {
+      // ponytail: Validate O(target Session saved receipts) so corrupt envelopes cannot vanish through JSON filtering; indexed history belongs to P9.
+      const receipts = this.db.query<{ id: number; native_tool_call_id: string; tool_name: string; delivery_json: string }, [number]>(
+        "SELECT id,native_tool_call_id,tool_name,delivery_json FROM tool_calls WHERE session_id=? AND delivery_json IS NOT NULL").all(sessionId);
+      for (const row of receipts) {
+        const saved = checked(savedDeliverySchema, JSON.parse(row.delivery_json), "storage_read_failed");
+        if (saved.sdkReturned && (saved.nativeEntryId === null || saved.deliveredAt === null || !saved.resultRecorded)
+          || saved.message && (saved.message.toolCallId !== row.native_tool_call_id || saved.message.toolName !== row.tool_name)) fail("storage_read_failed");
+      }
+      const rows = this.db.query<{ id: number; run_id: number; native_tool_call_id: string; native_entry_id: string; query_id: number | null }, [string, number]>(
+        `SELECT t.id,t.run_id,t.native_tool_call_id,json_extract(t.delivery_json,'$.nativeEntryId') AS native_entry_id,q.id AS query_id
+         FROM tool_calls t JOIN runs r ON r.id=t.run_id AND r.session_id=t.session_id AND r.kind='agent'
+         JOIN json_each(?) entry ON entry.value=json_extract(t.delivery_json,'$.nativeEntryId')
+         LEFT JOIN queries q ON q.session_id=t.session_id AND q.run_id=t.run_id AND q.call_ref=CAST(t.run_id AS TEXT)||':'||t.native_tool_call_id AND q.source='agent_tool'
+         WHERE t.session_id=? AND json_extract(t.delivery_json,'$.sdkReturned')=1`).all(JSON.stringify([...new Set(nativeEntryIds)]), sessionId);
+      const facts = new SqliteToolStore(this.db);
+      for (const row of rows) {
+        checked(PositiveIdSchema, row.run_id, "storage_read_failed"); checked(PositiveIdSchema, row.id, "storage_read_failed");
+        if (links.has(row.native_entry_id)) fail("storage_read_failed");
+        const references = [`run:${row.run_id}`, `tool:${row.id}`];
+        if (row.query_id !== null) {
+          const query = facts.readQuery(row.query_id);
+          if (!query || query.sessionId !== sessionId || query.runId !== row.run_id || query.callRef !== `${row.run_id}:${row.native_tool_call_id}`
+            || (query.source ?? "agent_tool") !== "agent_tool") fail("storage_read_failed");
+          references.push(`query:${query.id}`);
+          for (const evidence of facts.listEvidence(query.id)) {
+            if (evidence.resultHash !== query.resultHash || evidence.calculationVersion !== query.calculationVersion) fail("storage_read_failed");
+            if (references.length < 16) references.push(`evidence:${evidence.id}`);
+          }
+        }
+        links.set(row.native_entry_id, { runId: row.run_id, toolCallRef: row.native_tool_call_id, references });
+      }
+      return links;
+    } catch { return fail("storage_read_failed"); }
   }
 
   registerAgent(input: RegisterAgentInput): SubmitResult {

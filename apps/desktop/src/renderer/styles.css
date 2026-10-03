@@ -139,7 +139,11 @@ legend { padding: 0 6px; font-weight: 600; }
 .reference-fields { color: var(--muted); font-size: .82rem; margin-top: 10px; }
 .reference-fields label { display: inline-flex; width: min(44%, 270px); margin: 10px 12px 0 0; }
 .reference-fields summary { cursor: pointer; }
-.new-content { position: absolute; bottom: 220px; left: 50%; transform: translateX(-50%); box-shadow: 0 2px 12px #403c351a; }
+.new-content { align-self: center; flex-shrink: 0; margin: 6px; box-shadow: 0 2px 12px #403c351a; }
+.native-messages { margin: 20px 0 30px; min-width: 0; }
+.native-messages > .section-heading { position: sticky; top: 0; background: #faf9f7; z-index: 1; padding: 8px 0; flex-wrap: wrap; }
+.native-message { border-top: 1px solid var(--line); padding: 16px 0; overflow-wrap: anywhere; }
+.message-origin { overflow-wrap: anywhere; }
 .run-details { border-left: 1px solid var(--line); background: #fff; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .detail-header { min-height: 70px; padding: 18px 18px 10px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .detail-header h2 { font-size: 1.1rem; margin: 0; }

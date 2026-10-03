@@ -41,6 +41,7 @@ const errorDefinitions = {
   invalid_argument: ["input", "The input parameters are invalid. Check them and try again.", false],
   input_invalid: ["input", "The input object is invalid. Check it and try again.", false],
   session_history_invalid: ["session", "This session's in-process history is unavailable. Create a new session.", false],
+  resource_unavailable: ["session", "The required session history or message structure is unavailable. Read the original saved facts.", false],
   runtime_interrupted: ["runtime", "The run ended because the Host was interrupted. The original request will not be resent automatically.", false],
   state_conflict: ["runtime", "The original operation identity does not match these parameters.", false],
   workspace_revision_mismatch: ["session", "The current view has changed. Read it again before selecting.", true],

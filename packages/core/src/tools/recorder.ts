@@ -107,10 +107,13 @@ export class ToolRecorder {
       throw error;
     }
   }
-  recordConsumption(context: ToolExecutionContext, nextCallId: string) {
-    try { return this.checked(() => this.store.recordConsumption?.(context, nextCallId), 'storage_write_failed', context); }
+  recordConsumption(context: ToolExecutionContext, nextCallId: string, evidence?: 'provider_input_verified') {
+    const save = () => this.store.recordConsumption?.(context, nextCallId, evidence);
+    // A block stops new execution, but every already occurred delivery still needs its original save closure.
+    if (this.blocked(context)) throw this.defer(context, `consumed:${context.nativeToolCallId}`, save);
+    try { return this.checked(save, 'storage_write_failed', context); }
     catch (error) {
-      if (this.blocked(context)) this.defer(context, `consumed:${context.nativeToolCallId}`, () => this.store.recordConsumption?.(context, nextCallId));
+      if (this.blocked(context)) this.defer(context, `consumed:${context.nativeToolCallId}`, save);
       throw error;
     }
   }
