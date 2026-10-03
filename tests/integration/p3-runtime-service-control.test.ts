@@ -145,12 +145,16 @@ test('P3 RuntimeService freezes configured policy and profiles once and projects
   await c.waitForStart;
   const runId = accepted.data.runId;
   expect(c.profilesRead()).toBe(1);
-  expect(c.captured()).toMatchObject({ agentPolicy: c.settings.agentPolicy, measurementContext: c.measurementContext, toolProfileSnapshot: c.toolProfileSnapshot });
+  expect(c.captured()).toMatchObject({ toolConfiguration: c.settings.toolConfiguration, agentPolicy: c.settings.agentPolicy, measurementContext: c.measurementContext, toolProfileSnapshot: c.toolProfileSnapshot });
   expect(c.repo.read({ runId })).toMatchObject({ kind: 'one', run: { control: { agentPolicy: c.settings.agentPolicy, measurementContext: c.measurementContext, toolProfileSnapshot: c.toolProfileSnapshot } } });
   expect(await c.service.readControl()).toMatchObject({ ok: true, data: { budget: { runId, toolCalls: { limit: 200, used: 3 } } } });
   c.settings.agentPolicy.maxToolCalls = 999;
+  c.settings.runtimeConfiguration.runBudget.maxToolCalls = 999;
+  c.settings.toolConfiguration.maxResultBytes = 1024;
   c.toolProfileSnapshot.available = false;
   expect(c.captured()?.agentPolicy?.maxToolCalls).toBe(200);
+  expect(c.captured()?.runtimeConfiguration?.runBudget.maxToolCalls).toBe(200);
+  expect(c.service.bindQueryContext('query-form', c.repo.readWorkspace().revision)).not.toHaveProperty('toolConfiguration');
   expect(c.captured()?.toolProfileSnapshot?.available).toBe(true);
   expect(await c.service.submitAgent(c.request, { instanceId: 'instance', operationRef: 'submit' })).toEqual(accepted);
   expect(c.profilesRead()).toBe(1);

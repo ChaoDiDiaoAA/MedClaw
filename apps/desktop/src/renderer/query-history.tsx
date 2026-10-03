@@ -22,24 +22,24 @@ export function QueryHistory(props: { visible: boolean; requestedQueryId: number
   async function readHistory(beforeQueryId?: number) {
     const instanceId = target.current.instanceId, sessionId = target.current.sessionId, token = ++listOrder.current;
     if (!sessionId) return;
-    const result = await window.medclaw.request('query.list', { sessionId, limit: 20, ...(beforeQueryId ? { beforeQueryId } : {}) });
+    const result = await window.medclaw.request('query.list', { sessionId, ...(beforeQueryId ? { beforeQueryId } : {}) });
     if (!mounted.current || instanceId !== target.current.instanceId || sessionId !== target.current.sessionId || token !== listOrder.current) return;
     if (result.ok) setHistory(old => beforeQueryId && old ? { items: [...old.items, ...result.data.items.filter(query => !old.items.some(known => known.id === query.id))], nextBeforeQueryId: result.data.nextBeforeQueryId } : result.data);
     else props.onError(errorMessage(result.error));
   }
-  async function readQuery(queryId: number, page = 1) {
+  async function readQuery(queryId: number, page?: number) {
     if (target.current.queryId !== queryId) { target.current.queryId = queryId; setView(null); setEvidence(null); }
     const scope = capture(); setLoading(true);
-    const result = await window.medclaw.request('query.read', { queryId, page, pageSize: 50 });
+    const result = await window.medclaw.request('query.read', { queryId, page });
     if (!owns(scope)) return;
     if (result.ok && result.data.query.id === queryId && result.data.query.sessionId === scope.sessionId) setView(result.data);
     else props.onError(result.ok ? 'The saved query belongs to another session.' : errorMessage(result.error));
     setLoading(false);
   }
-  async function readEvidence(evidenceId: number, page = 1) {
+  async function readEvidence(evidenceId: number, page?: number) {
     const queryId = target.current.queryId; if (!queryId) return;
     const scope = capture(); setLoading(true);
-    const result = await window.medclaw.request('evidence.read', { queryId, evidenceId, page, pageSize: 50 });
+    const result = await window.medclaw.request('evidence.read', { queryId, evidenceId, page });
     if (!owns(scope)) return;
     if (result.ok && result.data.evidence.queryId === queryId && result.data.evidence.id === evidenceId) setEvidence(result.data);
     else props.onError(result.ok ? 'The evidence reply does not match this query.' : errorMessage(result.error));
@@ -70,10 +70,10 @@ export function QueryHistory(props: { visible: boolean; requestedQueryId: number
   async function findOriginal() {
     if (!pending) return;
     const original = pending, instanceId = target.current.instanceId;
-    const result = await window.medclaw.request('query.list', { sessionId: original.sessionId, limit: 50 });
+    const result = await window.medclaw.request('query.list', { sessionId: original.sessionId });
     if (!mounted.current || instanceId !== target.current.instanceId) return;
     if (!result.ok) { props.onError(errorMessage(result.error)); return; }
-    const query = result.data.items.find(query => query.callRef === original.operationRef);
+    const query = result.data.items.find(query => query.callRef === `${original.runId}:${original.operationRef}`);
     if (!query) { props.onError('The original query was not found on this history page. Keep its operation ID; resend the original request to read a saved result without creating a replacement Run.'); return; }
     setPending(value => value?.operationRef === original.operationRef ? null : value);
     if (target.current.sessionId === original.sessionId) await readQuery(query.id);

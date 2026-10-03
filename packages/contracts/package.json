@@ -5,6 +5,8 @@
   "exports": {
     "./error": "./src/error.ts",
     "./model": "./src/model.ts",
+    "./tool-config": "./src/tool-config.ts",
+    "./runtime-config": "./src/runtime-config.ts",
     "./run": "./src/run.ts",
     "./session": "./src/session.ts",
     "./workspace": "./src/workspace.ts",

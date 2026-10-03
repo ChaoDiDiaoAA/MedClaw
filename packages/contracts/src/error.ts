@@ -28,6 +28,7 @@ const errorDefinitions = {
   tool_not_found: ["tool", "Tool not found.", false],
   tool_input_invalid: ["tool", "The tool input is invalid.", false],
   tool_output_invalid: ["tool", "The tool output does not meet the contract and cannot be used as a valid result.", false],
+  tool_result_too_large: ["tool", "The final tool text exceeds the per-call delivery limit. Read the original saved facts with a smaller page or narrower output.", false],
   tool_call_limit: ["tool", "The run reached its configured tool call budget. Review the saved results and unresolved items.", false],
   tool_timeout: ["tool", "The tool exceeded its execution time. Confirm the original operation stopped before retrying.", true],
   tool_output_inconsistent: ["tool", "The tool result conflicts with its business contract. Read the original saved facts before using it.", false],

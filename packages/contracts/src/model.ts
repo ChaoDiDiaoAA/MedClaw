@@ -2,6 +2,9 @@ import { z } from "zod";
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } from "./error";
 import type { AppError } from "./error";
 import type { ProviderOutcome } from "./run";
+import { StoredToolConfigurationSchema, normalizeToolConfiguration } from './tool-config';
+import { AgentPolicySchema, RequestPolicySchema, RuntimeConfigurationSchema, normalizeRuntimeConfiguration, projectRuntimePolicies } from './runtime-config';
+export { DEFAULT_AGENT_POLICY, DEFAULT_REQUEST_POLICY, AgentPolicySchema, RequestPolicySchema } from './runtime-config';
 
 export const SDK_VERSION = "0.87.1" as const;
 export const SETTINGS_SCHEMA_VERSION = "medclaw.settings/p1-v1" as const;
@@ -28,28 +31,9 @@ export const ModelSelectionSchema = z.strictObject({
   configVersion: ConfigVersionSchema, credentialRef: CredentialRefSchema.nullable(), maxOutputTokens: positiveLimit,
   capabilitySource: z.enum(["pi_catalog", "user_declared"]), sdkVersion: z.literal(SDK_VERSION),
 });
-export const DEFAULT_REQUEST_POLICY = Object.freeze({ timeoutMs: 120000, maxRetries: 0, maxRetryDelayMs: 2000 } as const);
-export const RequestPolicySchema = z.strictObject({
-  timeoutMs: z.number().int().min(1000).max(Number.MAX_SAFE_INTEGER), maxRetries: z.union([z.literal(0), z.literal(1)]),
-  maxRetryDelayMs: z.number().int().min(1).max(5000),
-});
-export const DEFAULT_AGENT_POLICY = Object.freeze({
-  version: 'medclaw.agent-policy/v1',
-  maxToolCalls: 24,
-  maxModelCalls: 12,
-  singleToolTimeoutMs: 30000,
-  maxRecoveryAttempts: 2,
-} as const);
 const safeCount = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const elapsedMs = z.number().finite().nonnegative();
 const controlCode = z.string().min(1).max(128).regex(/^[a-z][a-z0-9_.:-]*$/);
-export const AgentPolicySchema = z.strictObject({
-  version: z.literal('medclaw.agent-policy/v1'),
-  maxToolCalls: PositiveIdSchema,
-  maxModelCalls: PositiveIdSchema,
-  singleToolTimeoutMs: PositiveIdSchema,
-  maxRecoveryAttempts: safeCount,
-});
 export const MeasurementContextSchema = z.strictObject({
   version: z.literal('medclaw.tool-measurement/v1'),
   sdkVersion: nonblank(128),
@@ -67,9 +51,11 @@ export const ToolProfileSchema = z.strictObject({
   sampleCount: safeCount,
   completeSamples: safeCount,
   p95Ms: elapsedMs.nullable(),
+  percentile: z.number().finite().gt(0).max(1).optional(),
+  latencyQuantileMs: elapsedMs.nullable().optional(),
   timeoutRate: z.number().finite().min(0).max(1).nullable(),
   reliability: z.record(nonblank(256), safeCount),
-});
+}).refine(profile => profile.percentile === undefined || profile.percentile === 0.95 || profile.p95Ms === null, 'Other quantiles must not be labeled P95');
 export const ToolProfileSnapshotSchema = z.strictObject({
   version: z.literal('medclaw.tool-profile/v1'),
   cutoffAt: TimestampSchema,
@@ -79,7 +65,7 @@ export const ToolProfileSnapshotSchema = z.strictObject({
   perGroupLimit: PositiveIdSchema,
   minimumCompleteSamples: PositiveIdSchema,
   available: z.boolean(),
-  profiles: z.array(ToolProfileSchema).max(2000),
+  profiles: z.array(ToolProfileSchema),
 });
 export const ToolValidationStatusSchema = z.enum(['passed', 'failed', 'not_applicable', 'not_reached', 'unknown']);
 export const ToolAdmissionStatusSchema = z.enum(['passed', 'blocked', 'failed', 'not_reached', 'unknown']);
@@ -205,15 +191,28 @@ export const CustomProviderDefinitionSchema = z.strictObject({
   providerId: ProviderIdSchema, name: nonblank(256), api: ApiIdSchema, baseUrl: CustomBaseUrlSchema,
   models: z.array(CustomModelDefinitionSchema).min(1).max(10000),
 }).refine(provider => new Set(provider.models.map(model => model.id)).size === provider.models.length, "Duplicate model ID");
-export const SettingsSnapshotSchema = z.strictObject({
+export const SettingsSnapshotObjectSchema = z.strictObject({
   schemaVersion: z.literal(SETTINGS_SCHEMA_VERSION), configVersion: ConfigVersionSchema,
   model: z.strictObject({ provider: ProviderIdSchema, modelId: ModelIdSchema }).nullable(),
   customProviders: z.array(z.strictObject({ definition: CustomProviderDefinitionSchema, credentialRef: CredentialRefSchema.nullable() })).max(10000),
-  credentialRefs: z.record(ProviderIdSchema, CredentialRefSchema.nullable()), requestPolicy: RequestPolicySchema,
-  agentPolicy: AgentPolicySchema.default(DEFAULT_AGENT_POLICY),
+  credentialRefs: z.record(ProviderIdSchema, CredentialRefSchema.nullable()), requestPolicy: RequestPolicySchema.optional(),
+  agentPolicy: AgentPolicySchema.optional(),
+  runtimeConfiguration: RuntimeConfigurationSchema.optional(),
+  toolConfiguration: StoredToolConfigurationSchema.optional(),
   ui: DesktopDisplayPreferencesSchema.default(DEFAULT_DISPLAY_PREFERENCES),
 }).refine(settings => new Set(settings.customProviders.map(provider => provider.definition.providerId)).size === settings.customProviders.length, "Duplicate custom provider ID");
-export const PublishedSettingsSchema = SettingsSnapshotSchema.safeExtend({ previous: SettingsSnapshotSchema.nullable(), rollbackFromVersion: ConfigVersionSchema.nullable() });
+function normalizeSettings<T extends z.infer<typeof SettingsSnapshotObjectSchema>>(settings: T, context: z.RefinementCtx) {
+  try {
+    const toolConfiguration = normalizeToolConfiguration(settings);
+    const runtimeConfiguration = normalizeRuntimeConfiguration(settings);
+    return { ...settings, runtimeConfiguration, toolConfiguration, ...projectRuntimePolicies(runtimeConfiguration) };
+  } catch {
+    context.addIssue({ code: 'custom', path: ['toolConfiguration'], message: 'Conflicting runtime configuration and policy' });
+    return z.NEVER;
+  }
+}
+export const SettingsSnapshotSchema = SettingsSnapshotObjectSchema.transform(normalizeSettings);
+export const PublishedSettingsSchema = SettingsSnapshotObjectSchema.safeExtend({ previous: SettingsSnapshotSchema.nullable(), rollbackFromVersion: ConfigVersionSchema.nullable() }).transform(normalizeSettings);
 export const ProviderRequestSchema = z.strictObject({
   text: z.string().refine(value => value.trim().length > 0, "Text must not be blank"), model: ModelChoiceSchema,
   referenceDate: ReferenceDateSchema, timezone: TimezoneSchema, priorRunId: PositiveIdSchema.optional(),

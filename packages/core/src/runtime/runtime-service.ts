@@ -2,13 +2,15 @@ import { isDeepStrictEqual } from "node:util";
 import { performance } from "node:perf_hooks";
 import { safeError, serviceResult, type AppError } from "../../../contracts/src/error";
 import type { Command, CommandContext, RuntimeNotice } from "../../../contracts/src/protocol";
-import { AgentPolicySchema, DEFAULT_AGENT_POLICY, type BudgetSummary, type CredentialScope, type DiagnoseRequest, type ModelRuntimePort, type ProviderAccepted, type ProviderRequest, type PublishedSettings, type ResolvedProviderSelection } from "../../../contracts/src/model";
+import { type BudgetSummary, type CredentialScope, type DiagnoseRequest, type ModelRuntimePort, type ProviderAccepted, type ProviderRequest, type PublishedSettings, type ResolvedProviderSelection } from "../../../contracts/src/model";
 import { canonicalRequest, RuntimeControlViewSchema, safePreview, type AgentRuntimePort, type CancelRunResult, type FinalAgentFact,
   type FinalProviderFact, type ModelCallRecorderPort, type ModelCallStarter, type ProviderOutcome, type RuntimeRunStore, type RunCleanupRecord,
   type RunHandle, type RunView, type StartRunInput } from "../../../contracts/src/run";
 import { SubmitInputSchema, type NativeSessionBindings, type SubmitInput, type SubmitResult } from "../../../contracts/src/session";
 import type { QueryExecutionContext } from '../../../contracts/src/query';
 import type { RunScope } from '../../../contracts/src/run';
+import { normalizeToolConfiguration } from '../../../contracts/src/tool-config';
+import { normalizeRuntimeConfiguration, projectRuntimePolicies } from '../../../contracts/src/runtime-config';
 
 type Execution = { handle: RunHandle; operationRef: string; abort: AbortController; nativeTerminal: boolean; cause: "user" | "deadline" | "shutdown" | null;
   cancelAt: string | null; stopped: boolean; executionStarted: boolean | null; fact: FinalProviderFact | FinalAgentFact | null;
@@ -103,12 +105,14 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
           config.credentialRefs[request.model.provider] ?? null, config.requestPolicy, true);
         this.recheck(context.operationRef, config.configVersion);
         const workspace = this.store.readWorkspace(), scope = this.store.freezeAgentScope(workspace, this.agent.toolNames ?? []);
-        const agentPolicy = structuredClone(AgentPolicySchema.parse(config.agentPolicy ?? DEFAULT_AGENT_POLICY));
+        const toolConfiguration = normalizeToolConfiguration(config);
+        const runtimeConfiguration = normalizeRuntimeConfiguration(config);
+        const agentPolicy = projectRuntimePolicies(runtimeConfiguration).agentPolicy;
         let profiles: ReturnType<NonNullable<AgentRuntimePort<Resolved>['captureToolProfiles']>> | undefined;
         try { profiles = this.agent.captureToolProfiles?.(scope); } catch { /* Missing statistics use the frozen configured timeout. */ }
         const started = await this.start({ sessionId: request.sessionId, inputId: null, text: request.text, model: resolved.selection, policy: resolved.policy, goal: "answer",
           workspace, scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: resolved.policy.timeoutMs,
-          agentPolicy, ...(profiles ? structuredClone(profiles) : {}),
+          agentPolicy, runtimeConfiguration, toolConfiguration, ...(profiles ? structuredClone(profiles) : {}),
           agentOptions: this.agent.describe(resolved), submission: { operationRef: context.operationRef, originalSubmitInput: request }, resolved });
         if (!started.ok) throw started.error;
         return { sessionId: request.sessionId, clientSequence: request.clientSequence, inputId: null, runId: started.data.runId } satisfies SubmitResult;
@@ -152,6 +156,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       const text = kind === "main" ? (payload as ProviderRequest).text : "请仅回复 OK。";
       const accepted = this.store.registerProvider({ operationRef: command.operationRef, method, originalRequest: payload, instanceId: this.instanceId,
         goal: kind === "main" ? "answer" : "verify", inputText: text, selection: resolved.selection, policy: resolved.policy,
+        runtimeConfiguration: structuredClone(config.runtimeConfiguration),
         referenceDate: payload.referenceDate, timezone: payload.timezone, priorRunId: payload.priorRunId, createdAt: now() });
       const execution = this.begin({ runId: accepted.runId, kind: "provider", sessionId: null }, command.operationRef);
       this.reservation = null;
@@ -230,7 +235,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       const observed = await this.credentials({ purpose: "runtime", operationRef: execution.operationRef, credentialRef: input.model.credentialRef }, () => { entered = true; return this.agent!.execute({
         runId: execution.handle.runId, sessionId: input.sessionId, text: input.text, resolved: input.resolved, agentOptions: input.agentOptions,
         scope: input.scope, referenceDate: input.referenceDate, timezone: input.timezone, signal: execution.abort.signal, deadlineAt,
-        agentPolicy: input.agentPolicy, measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot }, {
+        agentPolicy: input.agentPolicy, runtimeConfiguration: input.runtimeConfiguration, toolConfiguration: input.toolConfiguration, measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot }, {
         startCall: time => this.startCall(execution.handle.runId, "main", time), preview: text => this.preview(execution, text),
         fatal: error => { this.checkpoint(execution, error); execution.abort.abort(); },
         nativeTerminal: outcome => { execution.nativeTerminal = true; if (outcome.error && !execution.cause) this.checkpoint(execution, outcome.error); },

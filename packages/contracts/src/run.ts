@@ -5,11 +5,13 @@ import type { AppError } from "./error";
 import type { AgentPolicy, BudgetSummary, DiagnoseRequest, MeasurementContext, ModelSelection, ProviderAccepted, ProviderRequest, RequestPolicy, ToolProfileSnapshot } from "./model";
 import type { NewSessionInput, NewSessionResult, SubmitInput, SubmitResult, SessionStore } from "./session";
 import type { WorkspaceView } from "./workspace";
+import { StoredToolConfigurationSchema, type ToolConfiguration } from './tool-config';
+import { RuntimeConfigurationSchema, type RuntimeConfiguration } from './runtime-config';
 
 export const RunStatusSchema = z.enum(["created", "running", "completed", "failed", "cancelled"]);
 export const SdkStopReasonSchema = z.enum(["stop", "length", "toolUse", "error", "aborted", "deferred"]);
 export const RunScopeSchema = z.strictObject({
-  batchIds: z.array(PositiveIdSchema).max(10000), deviceIds: z.array(PositiveIdSchema).max(10000).nullable(),
+  batchIds: z.array(PositiveIdSchema), deviceIds: z.array(PositiveIdSchema).nullable(),
   allowedToolNames: z.array(z.string().min(1).max(256)).max(1000), allowedResourceRefs: z.array(z.string().min(1).max(256)).max(1000),
   artifactIds: z.array(PositiveIdSchema).max(10000), readOnly: z.boolean(),
 });
@@ -43,7 +45,7 @@ export const RunCleanupSummarySchema = RunCleanupRecordSchema.omit({ contract: t
 });
 const runFields = {
   id: PositiveIdSchema, status: RunStatusSchema, operationRef: OpaqueIdSchema, instanceId: OpaqueIdSchema, inputId: z.null(),
-  inputText: z.string().max(65536), inputPage: InputPageSchema, model: ModelSelectionSchema, policy: RequestPolicySchema, priorRunId: PositiveIdSchema.nullable(),
+  inputText: z.string().max(65536), inputPage: InputPageSchema, runtimeConfiguration: RuntimeConfigurationSchema.nullable().optional(), model: ModelSelectionSchema, policy: RequestPolicySchema, priorRunId: PositiveIdSchema.nullable(),
   referenceDate: ReferenceDateSchema, timezone: TimezoneSchema, createdAt: TimestampSchema, startedAt: TimestampSchema.nullable(),
   cancelRequestedAt: TimestampSchema.nullable(), stoppedAt: TimestampSchema.nullable(), endedAt: TimestampSchema.nullable(), error: AppErrorSchema.nullable(),
   cleanup: RunCleanupRecordSchema.nullable(), answerRef: PositiveIdSchema.nullable(), output: OutputPageSchema, persistence: z.literal("committed"),
@@ -54,6 +56,8 @@ export const AgentRunViewSchema = z.strictObject({ ...runFields, kind: z.literal
   clientSequence: PositiveIdSchema, nativeSessionId: OpaqueIdSchema, goal: z.literal("answer"),
   calls: z.array(ModelCallViewSchema).max(50), nextCallOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
   control: z.strictObject({
+    toolConfiguration: StoredToolConfigurationSchema.nullable().optional(),
+    runtimeConfiguration: RuntimeConfigurationSchema.nullable().optional(),
     agentPolicy: AgentPolicySchema.nullable(),
     measurementContext: MeasurementContextSchema.nullable(),
     toolProfileSnapshot: ToolProfileSnapshotSchema.nullable(),
@@ -143,7 +147,7 @@ export interface RegisterProviderInput {
   operationRef: string; method: "model.request" | "model.diagnose";
   originalRequest: ProviderRequest | DiagnoseRequest;
   instanceId: string; goal: "answer" | "verify"; inputText: string;
-  selection: ModelSelection; policy: RequestPolicy;
+  selection: ModelSelection; policy: RequestPolicy; runtimeConfiguration?: RuntimeConfiguration;
   referenceDate: string; timezone: string; priorRunId?: number; createdAt: string;
 }
 export interface ProviderOperation {
@@ -165,6 +169,8 @@ export interface AgentStartFields {
   sessionId: number; inputId: null; text: string; model: ModelSelection; policy: RequestPolicy; goal: "answer";
   workspace: WorkspaceView; scope: RunScope; referenceDate: string; timezone: string; timeoutMs: number; agentOptions: P2AgentOptions;
   agentPolicy?: AgentPolicy;
+  runtimeConfiguration?: RuntimeConfiguration;
+  toolConfiguration?: ToolConfiguration;
   measurementContext?: MeasurementContext;
   toolProfileSnapshot?: ToolProfileSnapshot;
   submission: { operationRef: string; originalSubmitInput: SubmitInput };
@@ -181,7 +187,7 @@ export type AgentRuntimePort<Resolved> = {
   readBudget?: (runId: number) => RuntimeBudgetView | null;
   describe: (resolved: Resolved) => P2AgentOptions;
   execute: (input: { runId: number; sessionId: number; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number;
-    scope?: RunScope; referenceDate?: string; timezone?: string; agentPolicy?: AgentPolicy; measurementContext?: MeasurementContext; toolProfileSnapshot?: ToolProfileSnapshot },
+    scope?: RunScope; referenceDate?: string; timezone?: string; agentPolicy?: AgentPolicy; runtimeConfiguration?: RuntimeConfiguration; toolConfiguration?: ToolConfiguration; measurementContext?: MeasurementContext; toolProfileSnapshot?: ToolProfileSnapshot },
     callbacks: { startCall: (time: string) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
       fatal?: (error: AppError) => void }) => Promise<AgentExecutionObservation>;
 };

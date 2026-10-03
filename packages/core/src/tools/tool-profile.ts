@@ -3,6 +3,19 @@ import { MeasurementContextSchema, ToolProfileSnapshotSchema, type MeasurementCo
 import { canonicalRequest, type RunScope } from '@medclaw/contracts/run';
 import { ToolObservationSchema, type ToolObservation } from '@medclaw/contracts/tool';
 
+export const TOOL_PROFILE_RULES = Object.freeze({
+  windowDays: 30,
+  observationLimit: 2000,
+  perGroupLimit: 50,
+  minimumCompleteSamples: 20,
+  percentile: 0.95,
+  timeoutRateFallback: 0.2,
+  batchCountBounds: [1, 31],
+  timeSpanDaysBounds: [1, 31],
+  pageSizeBounds: [100, 500],
+  nativeInputBytesBounds: [4096, 65536],
+});
+
 type Observations = {
   maxToolCallId: number | null;
   observations: ToolObservation[];
@@ -12,10 +25,12 @@ const sizeBucket = (size: number | null, low: number, high: number, labels: stri
 
 /** Input dimensions are known before execution; result size is deliberately absent. */
 export function groupWorkload(input: unknown, scope?: RunScope, native = false): string {
+  const stats = TOOL_PROFILE_RULES;
+  const bucket = (size: number | null, bounds: number[], labels: string[]) => sizeBucket(size, bounds[0]!, bounds[1]!, labels);
   const fields = input !== null && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
   if (native) {
     const bytes = Buffer.byteLength(canonicalRequest(input) ?? 'null', 'utf8');
-    return `batches=n/a;days=n/a;page=n/a;bytes=${sizeBucket(bytes, 4096, 65536, ['0-4KiB', '4-64KiB', '64KiB+'])}`;
+    return `batches=n/a;days=n/a;page=n/a;bytes=${bucket(bytes, stats.nativeInputBytesBounds, ['0-4KiB', '4-64KiB', '64KiB+'])}`;
   }
   const count = Array.isArray(fields.batchIds) ? fields.batchIds.length : typeof fields.batchId === 'number' ? 1 : scope?.batchIds.length ?? null;
   const batches = count === 0 ? null : count;
@@ -24,19 +39,20 @@ export function groupWorkload(input: unknown, scope?: RunScope, native = false):
   const end = typeof time.endExclusive === 'string' ? Date.parse(`${time.endExclusive}T00:00:00.000Z`) : NaN;
   const days = Number.isFinite(start) && Number.isFinite(end) && end > start ? Math.ceil((end - start) / 86400000) : null;
   const page = typeof fields.pageSize === 'number' ? fields.pageSize : null;
-  return `batches=${sizeBucket(batches, 1, 31, ['1', '2-31', '32+'])};days=${sizeBucket(days, 1, 31, ['1', '2-31', '32+'])};page=${sizeBucket(page, 100, 500, ['1-100', '101-500', '501+'])};bytes=n/a`;
+  return `batches=${bucket(batches, stats.batchCountBounds, ['1', '2-31', '32+'])};days=${bucket(days, stats.timeSpanDaysBounds, ['1', '2-31', '32+'])};page=${bucket(page, stats.pageSizeBounds, ['1-100', '101-500', '501+'])};bytes=n/a`;
 }
 
 export function buildToolProfiles(input: Observations | null, context: MeasurementContext): ToolProfileSnapshot {
   const measurement = MeasurementContextSchema.parse(context);
+  const statistics = TOOL_PROFILE_RULES;
   const snapshot: ToolProfileSnapshot = {
     version: 'medclaw.tool-profile/v1',
     cutoffAt: measurement.cutoffAt,
     maxToolCallId: measurement.maxToolCallId,
-    windowDays: 30,
-    observationLimit: 2000,
-    perGroupLimit: 50,
-    minimumCompleteSamples: 20,
+    windowDays: statistics.windowDays,
+    observationLimit: statistics.observationLimit,
+    perGroupLimit: statistics.perGroupLimit,
+    minimumCompleteSamples: statistics.minimumCompleteSamples,
     available: input !== null,
     profiles: [],
   };
@@ -45,8 +61,8 @@ export function buildToolProfiles(input: Observations | null, context: Measureme
   const groups = new Map<string, ToolObservation[]>();
   const observations = input.observations.filter(row => ToolObservationSchema.safeParse(row).success
     && measurement.maxToolCallId !== null && row.id <= measurement.maxToolCallId
-    && Date.parse(row.requestedAt) <= cutoff && Date.parse(row.requestedAt) >= cutoff - 30 * 86400000)
-    .sort((a, b) => b.id - a.id).slice(0, 2000);
+    && Date.parse(row.requestedAt) <= cutoff && Date.parse(row.requestedAt) >= cutoff - statistics.windowDays * 86400000)
+    .sort((a, b) => b.id - a.id).slice(0, statistics.observationLimit);
   for (const row of observations) {
     const stored = row.measurementContext;
     if (!stored || !row.control?.workloadBucket || !row.control.environmentKey || stored.environmentKey !== row.control.environmentKey) continue;
@@ -58,7 +74,7 @@ export function buildToolProfiles(input: Observations | null, context: Measureme
   for (const rows of groups.values()) {
     const first = rows[0]!;
     const stored = first.measurementContext!;
-    const executions = rows.filter(row => row.startedAt !== null).slice(0, 50);
+    const executions = rows.filter(row => row.startedAt !== null).slice(0, statistics.perGroupLimit);
     const known = executions.filter(row => row.stoppedAt !== null && row.status !== 'running' && row.status !== 'requested');
     const timeouts = known.filter(row => row.control?.timeoutRequestedAt !== null && row.control?.timeoutRequestedAt !== undefined);
     const complete = executions.filter(row => row.status === 'succeeded' && row.stoppedAt !== null
@@ -118,7 +134,11 @@ export function buildToolProfiles(input: Observations | null, context: Measureme
       workloadBucket: first.control!.workloadBucket!,
       sampleCount: executions.length,
       completeSamples: complete.length,
-      p95Ms: complete.length >= 20 && (timeoutRate === null || timeoutRate < 0.2) ? complete[Math.ceil(complete.length * 0.95) - 1]! : null,
+      percentile: statistics.percentile,
+      latencyQuantileMs: complete.length >= statistics.minimumCompleteSamples && (timeoutRate === null || timeoutRate < statistics.timeoutRateFallback)
+        ? complete[Math.ceil(complete.length * statistics.percentile) - 1]! : null,
+      p95Ms: statistics.percentile === 0.95 && complete.length >= statistics.minimumCompleteSamples
+        && (timeoutRate === null || timeoutRate < statistics.timeoutRateFallback) ? complete[Math.ceil(complete.length * statistics.percentile) - 1]! : null,
       timeoutRate,
       reliability,
     });

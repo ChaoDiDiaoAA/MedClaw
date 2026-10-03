@@ -89,9 +89,9 @@ export type ImportResult = z.infer<typeof ImportResultSchema>;
 export type ImportOperation = z.infer<typeof ImportOperationSchema>;
 export type Artifact = z.infer<typeof ArtifactSchema>;
 export const DataCatalogSchema = z.strictObject({
-  batches: z.array(BatchSchema).max(500),
+  batches: z.array(BatchSchema),
   page: z.number().int().positive(),
-  pageSize: z.number().int().min(1).max(500),
+  pageSize: z.number().int().min(1),
   batchCount: z.number().int().nonnegative(),
   deviceCount: z.number().int().nonnegative(),
   snapshotCount: z.number().int().nonnegative(),
@@ -101,8 +101,8 @@ export const DataCatalogSchema = z.strictObject({
   timezone: z.string().nullable(),
 });
 export const DataRowsSchema = z.discriminatedUnion('kind', [
-  z.strictObject({ kind: z.literal('devices'), items: z.array(SnapshotSchema).max(100), totalRows: z.number().int().nonnegative(), page: z.number().int().positive(), pageSize: z.number().int().min(1).max(100) }),
-  z.strictObject({ kind: z.literal('changes'), items: z.array(ChangeSchema).max(100), totalRows: z.number().int().nonnegative(), page: z.number().int().positive(), pageSize: z.number().int().min(1).max(100) }),
+  z.strictObject({ kind: z.literal('devices'), items: z.array(SnapshotSchema), totalRows: z.number().int().nonnegative(), page: z.number().int().positive(), pageSize: z.number().int().min(1) }),
+  z.strictObject({ kind: z.literal('changes'), items: z.array(ChangeSchema), totalRows: z.number().int().nonnegative(), page: z.number().int().positive(), pageSize: z.number().int().min(1) }),
 ]);
 
 export const SnapshotMetadataSchema = z.object({

@@ -16,7 +16,7 @@ import { ToolExecutor } from '../../packages/core/src/tools/executor';
 import { ToolRecorder } from '../../packages/core/src/tools/recorder';
 import { ToolRegistry } from '../../packages/core/src/tools/registry';
 import { createBusinessTools } from '../../packages/core/src/tools/tools';
-import { buildToolProfiles } from '../../packages/core/src/tools/tool-profile';
+import { buildToolProfiles, TOOL_PROFILE_RULES } from '../../packages/core/src/tools/tool-profile';
 import { PiModelRuntime } from '../../packages/runtime-pi/src/model-runtime';
 import { createPiRunControlBinding, createPiToolDefinitions, observePiToolDelivery } from '../../packages/runtime-pi/src/pi-tool-adapter';
 import { SqliteCatalogStore } from '../../packages/storage/src/catalog-store';
@@ -183,7 +183,7 @@ function toolMessage(fixture: Fixture, id: string) {
   return entry.message;
 }
 
-test('committed Query survives after failure and same-parameter new identity cannot recalculate it before original read recovery', async () => {
+for (const afterFailure of ['throw', 'malformed result']) test(`committed Query survives after ${afterFailure} and same-parameter new identity cannot recalculate it before original read recovery`, async () => {
   const fixture = await setup([
     () => ({ id: 'query-original', name: 'query_current_devices', arguments: currentInput }),
     fixture => {
@@ -203,7 +203,10 @@ test('committed Query survives after failure and same-parameter new identity can
     },
   ], session => {
     session.agent.afterToolCall = async context => {
-      if (context.toolCall.id === 'query-original') throw new Error('Fixture original after failure.');
+      if (context.toolCall.id === 'query-original') {
+        if (afterFailure === 'throw') throw new Error('Fixture original after failure.');
+        return JSON.parse('{"content":[{"type":"unsupported"}]}');
+      }
     };
   });
   await fixture.session.prompt('Query the explicit day and recover the original result if delivery fails.');
@@ -257,7 +260,7 @@ test('SDK rejected parameters yield safe real history and only-invalid-field cor
   expect(fixture.control.readBudget().recovery.episodeId).toBeNull();
   expect(failed.control?.workloadBucket).not.toBeNull();
   const cutoffAt = new Date().toISOString();
-  const observations = fixture.store.readToolObservations({ cutoffAt });
+  const observations = fixture.store.readToolObservations({ limit: TOOL_PROFILE_RULES.observationLimit, windowDays: TOOL_PROFILE_RULES.windowDays, cutoffAt });
   expect(observations.observations.find(row => row.id === failed.id)).toMatchObject({
     startedAt: null,
     measurementContext: fixture.measurementContext,
@@ -346,7 +349,7 @@ test('actual snapshot inconsistency persists business validation failure and reb
   });
   expect(failed.sdkDelivery?.isError).toBe(true);
   const cutoffAt = new Date().toISOString();
-  const observations = fixture.store.readToolObservations({ cutoffAt });
+  const observations = fixture.store.readToolObservations({ limit: TOOL_PROFILE_RULES.observationLimit, windowDays: TOOL_PROFILE_RULES.windowDays, cutoffAt });
   expect(observations.observations.find(row => row.id === failed.id)?.control?.businessValidation.post).toBe('failed');
   const profiles = buildToolProfiles(observations, { ...fixture.measurementContext, cutoffAt, maxToolCallId: observations.maxToolCallId });
   const profile = profiles.profiles.find(profile => profile.name === 'query_current_devices')!;

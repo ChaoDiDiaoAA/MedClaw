@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from 'zod';
-import { ChangesQuerySchema, CurrentQuerySchema, PageSchema, QueryInterpretationSchema, QueryPageSchema, QueryParamsSchema, type Batch, type CatalogSummary, type ChangesQueryInput, type CurrentQueryInput, type Evidence, type QueryContext, type QueryExecutionContext, type QueryParams, type QueryRecord, type QueryStore, type Snapshot } from "../../../contracts/src/query";
+import { BUSINESS_RULES, createQuerySchemas, QueryInterpretationSchema, QueryPageSchema, type Batch, type CatalogSummary, type ChangesQueryInput, type CurrentQueryInput, type Evidence, type QueryContext, type QueryExecutionContext, type QueryParams, type QueryParamsInput, type QueryRecord, type QueryStore, type Snapshot } from "../../../contracts/src/query";
 import { AppErrorSchema, PositiveIdSchema, safeError, type Result } from "../../../contracts/src/error";
 import { canonicalRequest } from "../../../contracts/src/run";
 import type { ToolExecutionContext } from "../../../contracts/src/tool";
@@ -40,7 +40,7 @@ export class QueryService {
   }
   current(input: CurrentQueryInput, context: ToolExecutionContext) {
     return this.transaction(() => {
-    const params = CurrentQuerySchema.parse(input); this.assertFilters(params, context);
+    const params = createQuerySchemas().CurrentQuerySchema.parse(input); this.assertFilters(params, context);
     const previous = this.replay("current", params, context); if (previous) return this.project(previous, params, context);
     const result = this.calculateCurrent(params, context);
     return this.project(this.commit('current', params, result.batchIds, result.rows, result.snapshotIds, result.eventIds, result.warnings, context), params, context);
@@ -62,7 +62,7 @@ export class QueryService {
   }
   changes(input: ChangesQueryInput, context: ToolExecutionContext) {
     return this.transaction(() => {
-    const params = ChangesQuerySchema.parse(input); this.assertFilters(params, context);
+    const params = createQuerySchemas().ChangesQuerySchema.parse(input); this.assertFilters(params, context);
     const previous = this.replay("changes", params, context); if (previous) return this.project(previous, params, context);
     const result = this.calculateChanges(params, context);
     return this.project(this.commit('changes', params, result.batchIds, result.rows, result.snapshotIds, result.eventIds, result.warnings, context), params, context);
@@ -112,18 +112,18 @@ export class QueryService {
       deviceIds: params.deviceIds ?? undefined, region: params.region ?? undefined, manufacturer: params.manufacturer ?? undefined,
       category: params.category ?? undefined, distributor: params.distributor ?? undefined, status: params.status ?? undefined };
   }
-  async execute(input: QueryParams, context: QueryExecutionContext): Promise<Result<QueryRecord>> {
+  async execute(input: QueryParamsInput, context: QueryExecutionContext): Promise<Result<QueryRecord>> {
     try {
       return this.transaction(() => {
-      const params = QueryParamsSchema.parse(input);
+      const params = createQuerySchemas().QueryParamsSchema.parse(input);
       const filters = this.listingFilters(params);
       this.assertFilters(filters, context);
       const prior = this.replay(params.kind, params, context);
       if (prior) return { ok: true, data: prior };
       if (context.basedOnQueryId != null) this.read(context.basedOnQueryId, context);
       let result: Calculation;
-      if (params.kind === 'current') result = this.calculateCurrent(CurrentQuerySchema.parse({ ...filters, snapshotMode: params.snapshotMode }), context);
-      else if (params.kind === 'changes') result = this.calculateChanges(ChangesQuerySchema.parse({ ...filters, changeKind: params.changeKind ?? undefined,
+      if (params.kind === 'current') result = this.calculateCurrent(createQuerySchemas().CurrentQuerySchema.parse({ ...filters, snapshotMode: params.snapshotMode }), context);
+      else if (params.kind === 'changes') result = this.calculateChanges(createQuerySchemas().ChangesQuerySchema.parse({ ...filters, changeKind: params.changeKind ?? undefined,
         changeField: params.changeField ?? undefined, direction: params.direction ?? undefined, threshold: params.threshold ?? undefined }), context);
       else result = this.calculateSummary(params, context);
       const record = this.commit(params.kind, params, result.batchIds, result.rows, result.snapshotIds, result.eventIds, result.warnings, context);
@@ -196,7 +196,7 @@ export class QueryService {
       source = { rows: snapshots.map(row => ({ ...Object.fromEntries(Object.entries(row).filter(([, value]) => value === null || typeof value === 'number' || typeof value === 'string')),
         deviceId: row.deviceId, date: batches.find(batch => batch.id === row.batchId)!.snapshotDate, scopeKey: batches.find(batch => batch.id === row.batchId)!.scopeKey })),
         snapshotIds: snapshots.map(row => row.id), eventIds: [] };
-    } else source = this.calculateChanges(ChangesQuerySchema.parse({ ...filters, changeKind: params.changeKind ?? undefined, changeField: params.changeField ?? undefined,
+    } else source = this.calculateChanges(createQuerySchemas().ChangesQuerySchema.parse({ ...filters, changeKind: params.changeKind ?? undefined, changeField: params.changeField ?? undefined,
       direction: params.direction ?? undefined, threshold: params.threshold ?? undefined }), context, params.kind !== 'trend');
     const price = params.metric === 'sum_price' || params.metric === 'mean_price';
     const groups = new Map<string, { dimensions: QueryRecord['rows'][number]; items: QueryRecord['rows'] }>();
@@ -254,8 +254,8 @@ export class QueryService {
   }
   private commit(kind: QueryRecord["kind"], params: CurrentQueryInput | ChangesQueryInput | QueryParams, batchIds: number[], rows: QueryRecord["rows"], snapshotIds: number[], eventIds: number[], warnings: string[], context: QueryContext) {
     this.catalog.checkActive(context);
-    // ponytail: freeze at most 100,000 rows in JSON; move result paging to indexed SQL if the dataset grows beyond this ceiling.
-    if (rows.length > 100000) throw new Error("query_result_too_large");
+    // ponytail: freeze rows in JSON up to the fixed capacity ceiling; use indexed SQL paging if larger results are needed.
+    if (rows.length > BUSINESS_RULES.maxSavedRows) throw new Error("query_result_too_large");
     const scopeDeviceIds = params.deviceIds ?? context.scope.deviceIds;
     const batches = this.catalog.batches(batchIds, context), groups = new Map<string, typeof batches>();
     const interpretation = this.interpretation(kind, params, batches, rows, context);
@@ -312,7 +312,7 @@ export class QueryService {
     return structuredClone({ ...record, interpretation: record.interpretation ?? this.interpretation(record.kind, record.params, batches, record.rows) });
   }
   page(input: { queryId: number; page: number; pageSize: number }, context: QueryContext) {
-    const record = this.read(input.queryId, context); return this.project(record, PageSchema.parse({ page: input.page, pageSize: input.pageSize }), context);
+    const record = this.read(input.queryId, context); return this.project(record, createQuerySchemas().PageSchema.parse({ page: input.page, pageSize: input.pageSize }), context);
   }
   async readQueryResult(queryId: number, context: QueryContext): Promise<Result<QueryRecord>> {
     try { return { ok: true, data: this.read(queryId, context) }; }

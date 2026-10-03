@@ -3,7 +3,7 @@ import { PositiveIdSchema } from "./error";
 import { ReferenceDateSchema } from './model';
 
 export const RevisionSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
-const distinctIds = z.array(PositiveIdSchema).max(10000).refine(ids => new Set(ids).size === ids.length, 'Duplicate identities');
+const distinctIds = z.array(PositiveIdSchema).refine(ids => new Set(ids).size === ids.length, 'Duplicate identities');
 export const BatchRefSchema = z.strictObject({
   id: PositiveIdSchema,
   contentHash: z.string().min(1),
@@ -25,7 +25,7 @@ export const WorkspaceViewSchema = z.strictObject({
   revision: RevisionSchema,
   sessionId: PositiveIdSchema.nullable(),
   materialVersion: z.string().min(1).nullable(),
-  batchRefs: z.array(BatchRefSchema).max(10000).refine(refs => new Set(refs.map(ref => ref.id)).size === refs.length, 'Duplicate batches'),
+  batchRefs: z.array(BatchRefSchema).refine(refs => new Set(refs.map(ref => ref.id)).size === refs.length, 'Duplicate batches'),
   deviceIds: distinctIds,
   queryId: PositiveIdSchema.nullable(),
   activeView: z.enum(['data', 'changes', 'query', 'evidence']),

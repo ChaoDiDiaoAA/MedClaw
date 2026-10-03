@@ -1,7 +1,7 @@
 import { ipcMain, shell, dialog, type BrowserWindow } from "electron";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
-import { publicMethodSchemas, PublicMethodSchema, DesktopSecretInputSchema, DesktopSecretDiscardSchema, DesktopImportDirectorySchema, isReadOnlyMethod, type PublicMethod, type PrivateCredentialFrame, type DiagnosticsView, type RuntimeNotice } from "../../../../packages/contracts/src/protocol.ts";
+import { createPublicMethodSchemas, publicMethodSchemas, PublicMethodSchema, DesktopSecretInputSchema, DesktopSecretDiscardSchema, DesktopImportDirectorySchema, isReadOnlyMethod, type PublicMethod, type PublicPayload, type PrivateCredentialFrame, type DiagnosticsView, type RuntimeNotice } from "../../../../packages/contracts/src/protocol.ts";
 import { AppErrorSchema, OpaqueIdSchema, safeError, type Result } from "../../../../packages/contracts/src/error.ts";
 import { AuthLinkUrlSchema, type PublishedSettings } from "../../../../packages/contracts/src/model.ts";
 import { HostController } from "./host-controller.ts";
@@ -58,14 +58,14 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       case "host.restart": return host.restart((raw as { expectedInstanceId: string }).expectedInstanceId);
       case "settings.ui.read": { const s = settings.read(); return { configVersion: s.configVersion, ui: s.ui }; }
       case "settings.ui.update": { const p = raw as { expectedConfigVersion: string; patch: PublishedSettings["ui"] }; const s = await publish(p.expectedConfigVersion, { ui: p.patch }, "ui"); if (host.read().state === "ready") await synchronize(); options.notify({ type: "config.changed", configVersion: s.configVersion }); return { configVersion: s.configVersion, ui: s.ui }; }
-      case "model.config.read": { const s = settings.read(); return { configVersion: s.configVersion, previousConfigVersion: s.previous?.configVersion ?? null, rollbackFromVersion: s.rollbackFromVersion, policy: s.requestPolicy, agentPolicy: s.agentPolicy }; }
+      case "model.config.read": { const s = settings.read(); return { configVersion: s.configVersion, previousConfigVersion: s.previous?.configVersion ?? null, rollbackFromVersion: s.rollbackFromVersion, policy: s.requestPolicy, agentPolicy: s.agentPolicy, runtimeConfiguration: s.runtimeConfiguration, toolConfiguration: s.toolConfiguration }; }
       case "diagnostics.read": return options.diagnostics((raw as { categories: string[] }).categories);
       case "model.configure": {
         await synchronize(); const p = raw as { provider: string; modelId: string; expectedConfigVersion: string };
         const s = await publish(p.expectedConfigVersion, { model: { provider: p.provider, modelId: p.modelId }, credentialRefs: credentials.captureRefs() }, "model");
         const dir = await request("model.read", {}) as { selection: unknown }; return { configVersion: s.configVersion, selection: dir.selection };
       }
-      case "model.policy.update": { await synchronize(); const p = raw as { expectedConfigVersion: string; policy: PublishedSettings["requestPolicy"]; agentPolicy?: PublishedSettings['agentPolicy'] }; const s = await publish(p.expectedConfigVersion, { requestPolicy: p.policy, ...(p.agentPolicy ? { agentPolicy: p.agentPolicy } : {}) }, "policy"); return { configVersion: s.configVersion, policy: s.requestPolicy, agentPolicy: s.agentPolicy }; }
+      case "model.policy.update": { await synchronize(); const p = raw as PublicPayload<'model.policy.update'>; const s = await publish(p.expectedConfigVersion, { ...(p.policy ? { requestPolicy: p.policy } : {}), ...(p.agentPolicy ? { agentPolicy: p.agentPolicy } : {}), ...(p.runtimeConfiguration ? { runtimeConfiguration: p.runtimeConfiguration } : {}), ...(p.toolConfiguration ? { toolConfiguration: p.toolConfiguration } : {}) }, "policy"); return { configVersion: s.configVersion, policy: s.requestPolicy, agentPolicy: s.agentPolicy, runtimeConfiguration: s.runtimeConfiguration, toolConfiguration: s.toolConfiguration }; }
       case "model.config.rollback": {
         await synchronize(); const p = raw as { expectedConfigVersion: string; targetConfigVersion: string };
         if (!(await request("run.control.read", {}) as { acceptingNewRuns: boolean }).acceptingNewRuns) throw new Error("runtime_busy");
@@ -142,7 +142,9 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       if (method === "model.request" || method === "model.diagnose") {
         if (payload && typeof payload === "object" && !Array.isArray(payload)) payload = { referenceDate: new Date().toLocaleDateString("sv-SE"), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, ...payload };
       }
-      const parsed = JSON.parse(JSON.stringify(publicMethodSchemas[method].input.parse(payload))) as unknown;
+      const schema = ['data.read', 'data.rows', 'query.read', 'query.list', 'evidence.read', 'tool.read'].includes(method)
+        ? createPublicMethodSchemas()[method].input : publicMethodSchemas[method].input;
+      const parsed = JSON.parse(JSON.stringify(schema.parse(payload))) as unknown;
       if ((method === "import.preview" || method === "import.commit") && (parsed as { operationRef: string }).operationRef !== operationRef) throw new Error("state_conflict");
       if (method === "model.request" || method === "model.diagnose" || method === "session.submit" || method === "session.create") {
         const old = operations.get(operationRef);

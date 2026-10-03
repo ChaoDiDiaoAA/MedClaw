@@ -2,6 +2,15 @@ import { z } from "zod";
 import { AppErrorSchema, PositiveIdSchema, TimestampSchema, type AppError } from "./error";
 import { RunScopeSchema, type RunScope } from "./run";
 import { MeasurementContextSchema, ReferenceDateSchema, TimezoneSchema, ToolControlObservationSchema, type ToolControlObservation } from "./model";
+import type { ToolConfiguration } from './tool-config';
+
+export const TOOL_READ_RULES = Object.freeze({
+  defaultPage: 1,
+  defaultPageSize: 20,
+  maxPageSize: 50,
+  inputPreviewChars: 8192,
+  resultPreviewChars: 16384,
+});
 
 export const ToolExecutionModeSchema = z.enum(["sequential", "parallel"]);
 export type ToolExecutionMode = z.infer<typeof ToolExecutionModeSchema>;
@@ -24,6 +33,7 @@ export type ToolExecutionContext = {
   runId: number; sessionId: number; nativeToolCallId: string; scope: RunScope;
   referenceDate: string; timezone: string; signal: AbortSignal;
   checkActive?: () => void;
+  toolConfiguration?: ToolConfiguration;
 };
 export const ToolContextIdentitySchema = z.object({
   runId: PositiveIdSchema, sessionId: PositiveIdSchema, nativeToolCallId: z.string().min(1).max(256),
@@ -60,17 +70,17 @@ export const ToolCallRecordSchema = z.strictObject({
 export type ToolCallRecord = z.infer<typeof ToolCallRecordSchema>;
 export const ToolCallViewSchema = ToolCallRecordSchema.omit({ input: true, data: true, sdkDelivery: true }).extend({
   sdkResultIsError: z.boolean().nullable().optional(),
-  inputPreview: z.string().max(8192),
-  resultPreview: z.string().max(16384),
+  inputPreview: z.string(),
+  resultPreview: z.string(),
   truncated: z.boolean(),
 });
 export const RunToolsViewSchema = z.strictObject({
   runId: PositiveIdSchema,
   scope: RunScopeSchema,
-  items: z.array(ToolCallViewSchema).max(50),
+  items: z.array(ToolCallViewSchema),
   totalRows: z.number().int().nonnegative(),
   page: z.number().int().positive(),
-  pageSize: z.number().int().min(1).max(50),
+  pageSize: z.number().int().min(1),
 });
 export const ToolObservationSchema = z.strictObject({
   id: PositiveIdSchema,
@@ -93,7 +103,7 @@ export interface ToolCallStore {
   readCall(context: ToolExecutionContext): ToolCallRecord | null;
   transition(id: number, from: ToolCallRecord["status"], to: ToolCallRecord["status"], result?: ToolResult<unknown>, control?: ToolControlObservation): ToolCallRecord;
   mergeControl?(context: ToolExecutionContext, patch: Partial<ToolControlObservation>): ToolCallRecord;
-  readToolObservations?(input: { cutoffAt: string; maxToolCallId?: number | null; limit?: number }): { maxToolCallId: number | null; observations: ToolObservation[] };
+  readToolObservations?(input: { cutoffAt: string; maxToolCallId?: number | null; limit: number; windowDays: number }): { maxToolCallId: number | null; observations: ToolObservation[] };
   recordDelivery(context: ToolExecutionContext, nativeEntryId: string, message?: ToolSdkDelivery): void;
   recordConsumption?(context: ToolExecutionContext, nextCallId: string): void;
   recordFailedRequest?(tool: ToolCallIdentity, input: unknown, context: ToolExecutionContext, error: AppError, requestedAt: string): void;

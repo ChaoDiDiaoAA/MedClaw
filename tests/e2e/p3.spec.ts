@@ -18,7 +18,7 @@ function snapshotPackage(directory: string) {
   mkdirSync(directory, { recursive: true });
   const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
   const csv = (values: string[]) => values.map(value => `"${value.replaceAll('"', '""')}"`).join(',');
-  const masters = Array.from({ length: 55 }, (_, index) => ({ record_type: 'master', device_id: String(index + 1).padStart(5, '0'), device_name: index === 0 ? 'UI fixture device' : `UI fixture device ${index + 1}`, source_submission_id: '00009', source_applicant: 'Applicant', category: 'Category', manufacturer: 'Synthetic manufacturer' }));
+  const masters = Array.from({ length: 105 }, (_, index) => ({ record_type: 'master', device_id: String(index + 1).padStart(5, '0'), device_name: index === 0 ? 'UI fixture device' : `UI fixture device ${index + 1}`, source_submission_id: '00009', source_applicant: 'Applicant', category: 'Category', manufacturer: 'Synthetic manufacturer' }));
   const sourceLock = { schema: 'medclaw.source-lock/v1', sources: [{ source: 'fixture', path: 'original.csv', sha256: 'a'.repeat(64) }] };
   const lockHash = hash(canonicalRequest(sourceLock)), cohortHash = hash(canonicalRequest(masters));
   writeFileSync(join(directory, 'source-lock.json'), JSON.stringify(sourceLock));
@@ -122,6 +122,7 @@ test.afterAll(async () => {
 
 test('P3 Settings publishes configurable Agent budgets with the existing policy version', async () => {
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  for (const name of ['RunBudget', 'LLM request', 'Tool result']) await expect(page.getByRole('group', { name, exact: true })).toBeVisible();
   await expect(page.getByLabel('Tool call budget', { exact: true })).toHaveValue('24');
   await expect(page.getByLabel('Model call budget', { exact: true })).toHaveValue('12');
   await page.getByLabel('Run timeout (milliseconds)', { exact: true }).fill('600000');
@@ -129,18 +130,32 @@ test('P3 Settings publishes configurable Agent budgets with the existing policy 
   await page.getByLabel('Model call budget', { exact: true }).fill('40');
   await page.getByLabel('Tool timeout (milliseconds)', { exact: true }).fill('100000');
   await page.getByLabel('Recovery round budget', { exact: true }).fill('0');
+  await page.getByLabel('Result text limit (UTF-8 bytes)', { exact: true }).fill('2048');
   await page.getByRole('button', { name: 'Publish request policy', exact: true }).click();
   await expect(page.getByRole('status').filter({ hasText: 'Request policy published; applies to the next run' })).toBeVisible();
   const changed = await page.evaluate(() => window.medclaw.request('model.config.read', {}));
   if (!changed.ok) throw new Error(changed.error.code);
   expect(changed.data.policy.timeoutMs).toBe(600000);
   expect(changed.data.agentPolicy).toMatchObject({ maxToolCalls: 80, maxModelCalls: 40, singleToolTimeoutMs: 100000, maxRecoveryAttempts: 0 });
+  expect(changed.data.toolConfiguration).toEqual({ maxResultBytes: 2048 });
+  expect(changed.data.runtimeConfiguration.runBudget).toMatchObject({ maxToolCalls: 80, timeoutMs: 600000 });
+  await expect(page.getByRole('group', { name: 'RunBudget', exact: true }).locator('input')).toHaveCount(5);
+  await expect(page.getByRole('group', { name: 'LLM request', exact: true }).locator('input, select')).toHaveCount(2);
+  await expect(page.getByRole('group', { name: 'Tool result', exact: true }).locator('input')).toHaveCount(1);
+  const conflict = await page.evaluate(async () => {
+    const current = await window.medclaw.request('model.config.read', {});
+    if (!current.ok) throw new Error(current.error.code);
+    return window.medclaw.request('model.policy.update', { expectedConfigVersion: current.data.configVersion, runtimeConfiguration: current.data.runtimeConfiguration, agentPolicy: { ...current.data.agentPolicy, maxToolCalls: 1 } });
+  });
+  expect(conflict).toMatchObject({ ok: false, error: { code: 'invalid_argument' } });
   await page.reload();
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await expect(page.getByLabel('Tool call budget', { exact: true })).toHaveValue('80');
+  await expect(page.getByLabel('Result text limit (UTF-8 bytes)', { exact: true })).toHaveValue('2048');
   await page.getByLabel('Run timeout (milliseconds)', { exact: true }).fill('120000');
   await page.getByLabel('Tool call budget', { exact: true }).fill('24');
   await page.getByLabel('Model call budget', { exact: true }).fill('12');
+  await page.getByLabel('Result text limit (UTF-8 bytes)', { exact: true }).fill('262144');
   await page.getByLabel('Tool timeout (milliseconds)', { exact: true }).fill('30000');
   await page.getByLabel('Recovery round budget', { exact: true }).fill('2');
   await page.getByRole('button', { name: 'Publish request policy', exact: true }).click();
@@ -163,7 +178,7 @@ test('P3 imports the authorized directory, applies batches and preserves the cha
     return { commits: state.commits, reads: state.reads, operationRef: state.operationRef };
   });
   expect(delayed.commits).toBe(1); expect(delayed.reads).toBe(2); expect(delayed.operationRef).toBe(originalOperation);
-  await expect(page.getByTestId('import-result')).toContainText('110 accepted rows');
+  await expect(page.getByTestId('import-result')).toContainText('210 accepted rows');
   await page.getByRole('button', { name: 'Read batch 2 devices', exact: true }).click(); await expect(page.getByTestId('data-rows')).toContainText('80 CNY cents');
   await page.getByRole('button', { name: 'Read batch 2 changes', exact: true }).click(); await expect(page.getByTestId('data-rows')).toContainText('Ratio: -0.2');
   await page.getByRole('button', { name: 'Select batches on this page', exact: true }).click(); await page.getByRole('button', { name: 'Apply 2 selected batches', exact: true }).click();
@@ -277,18 +292,18 @@ test('P3 query dates and quantities remain explicit across stale snapshots, resu
     await expect(result.getByTestId('query-requested-date')).toHaveText('2026-01-01');
     await expect(result.getByTestId('query-data-dates')).toHaveText('2026-01-01');
     await expect(result.getByTestId('query-snapshot-selection')).toHaveText('Exact date');
-    await expect(result.getByTestId('query-quantity')).toHaveText('55 records');
+    await expect(result.getByTestId('query-quantity')).toHaveText('105 records');
     await expect(result.getByTestId('query-interpretation')).toContainText('Snapshot records');
     await expect(result.getByTestId('query-interpretation')).toContainText('All statuses');
     await page.getByRole('button', { name: 'Next result page', exact: true }).click();
-    await expect(result.getByTestId('query-results').getByRole('row')).toHaveCount(6);
-    await expect(result.getByTestId('query-quantity')).toHaveText('55 records');
+    await expect(result.getByTestId('query-results').getByRole('row')).toHaveCount(51);
+    await expect(result.getByTestId('query-quantity')).toHaveText('105 records');
     await result.getByRole('button', { name: /Read evidence \d+/, exact: false }).first().click();
     const evidence = page.getByLabel('Query evidence', { exact: true });
-    await expect(evidence.getByTestId('query-quantity')).toHaveText('55 records');
+    await expect(evidence.getByTestId('query-quantity')).toHaveText('105 records');
     await evidence.getByRole('button', { name: 'Next evidence page', exact: true }).click();
     await expect(evidence.getByRole('row')).toHaveCount(6);
-    await expect(evidence.getByTestId('query-quantity')).toHaveText('55 records');
+    await expect(evidence.getByTestId('query-quantity')).toHaveText('105 records');
     await expect(evidence).toContainText('Showing 5 evidence snapshots');
     await page.getByLabel('On date', { exact: true }).fill('');
     await page.getByRole('button', { name: 'Run query', exact: true }).click();
@@ -296,14 +311,14 @@ test('P3 query dates and quantities remain explicit across stale snapshots, resu
     await expect(result.getByTestId('query-data-dates')).toHaveText('2026-01-02');
     await page.getByRole('combobox', { name: 'Status', exact: true }).selectOption('active');
     await page.getByRole('button', { name: 'Run query', exact: true }).click();
-    await expect(result.getByTestId('query-quantity')).toHaveText('54 records');
+    await expect(result.getByTestId('query-quantity')).toHaveText('104 records');
     await expect(result.getByTestId('query-interpretation')).toContainText('active');
     await page.getByRole('combobox', { name: 'Snapshot mode', exact: true }).selectOption('as_of');
     await page.getByLabel('As of date', { exact: true }).fill('2026-01-03');
     await page.getByRole('button', { name: 'Run query', exact: true }).click();
     await expect(result.getByTestId('query-requested-date')).toHaveText('2026-01-03');
     await expect(result.getByTestId('query-data-dates')).toHaveText('2026-01-02');
-    await expect(result.getByTestId('query-quantity')).toHaveText('54 records');
+    await expect(result.getByTestId('query-quantity')).toHaveText('104 records');
     await expect(result.getByTestId('query-snapshot-selection')).toHaveText('Latest on or before requested date');
     await expect(result.getByRole('status')).toContainText('Some selected data scopes use earlier snapshots');
     await expect(result.getByRole('status')).toContainText('The complete quantity for the requested date is unknown');
@@ -314,7 +329,7 @@ test('P3 query dates and quantities remain explicit across stale snapshots, resu
     await page.getByRole('combobox', { name: 'Snapshot mode', exact: true }).selectOption('exact_date');
     await page.getByRole('button', { name: 'Run query', exact: true }).click();
     await expect(page.getByRole('alert').filter({ hasText: 'Required dates or predecessor batches are missing' })).toBeVisible();
-    await expect(result.getByTestId('query-quantity')).toHaveText('54 records');
+    await expect(result.getByTestId('query-quantity')).toHaveText('104 records');
     await page.getByRole('combobox', { name: 'Query kind', exact: true }).selectOption('trend');
     await expect(result.getByTestId('query-snapshot-selection')).toHaveText('Latest on or before requested date');
     await expect(page.getByLabel('Start date', { exact: true })).toBeVisible();
@@ -322,7 +337,10 @@ test('P3 query dates and quantities remain explicit across stale snapshots, resu
     await page.getByRole('combobox', { name: 'Query kind', exact: true }).selectOption('changes');
     await expect(page.getByLabel('Start date', { exact: true })).toBeVisible();
     await expect(page.getByLabel('End date (exclusive)', { exact: true })).toBeVisible();
-  } finally { dateQueryGate.release(); dateQueryGate = null; }
+  } finally {
+    dateQueryGate.release(); dateQueryGate = null;
+
+  }
 });
 
 test('P3 active and saved Runs retain frozen budgets while Settings changes apply to the next Run', async () => {

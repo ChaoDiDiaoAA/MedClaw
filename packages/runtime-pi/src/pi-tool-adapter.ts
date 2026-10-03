@@ -7,7 +7,7 @@ import { createReadToolDefinition, createGrepToolDefinition, createFindToolDefin
 import { AppErrorSchema, safeError } from "../../contracts/src/error";
 import { ToolSdkDeliverySchema, type AnyToolDefinition, type ToolCallIdentity, type ToolCallRecord, type ToolExecutionContext, type ToolResult } from "../../contracts/src/tool";
 import type { ToolRegistry } from "../../core/src/tools/registry";
-import type { ToolExecutor } from "../../core/src/tools/executor";
+import { ToolExecutor } from "../../core/src/tools/executor";
 import type { ToolRecorder } from "../../core/src/tools/recorder";
 import type { RunControl } from '../../core/src/runtime/run-control';
 import type { ToolControlObservation } from '../../contracts/src/model';
@@ -22,7 +22,9 @@ function inputIssues(schema: z.ZodType, input: unknown): ToolControlObservation[
     .map(path => ({ code: 'tool_input_invalid', stage: 'input', fieldPath: path.length <= 32 && path.every(part => /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(String(part))) ? path.map(String) : [] }))).slice(0, 100);
 }
 function sanitizeSdkRefusal(control: RunControl | undefined, id: string, result: AgentToolResult<unknown>, schema: z.ZodType | undefined, input: unknown): void {
-  if (!control || control.observation(id).failureClass !== null) return;
+  if (!control) return;
+  const existing = control.observation(id);
+  if (existing.failureClass !== null && (existing.failureStage !== 'sdk' || !['tool_input_invalid', 'tool_not_found'].includes(existing.failureClass))) return;
   const issues = schema ? inputIssues(schema, input) : [];
   const code = schema ? 'tool_input_invalid' : 'tool_not_found';
   control.updateObservation(id, { inputValidation: schema ? 'failed' : 'not_reached', validationIssues: issues });
@@ -30,6 +32,10 @@ function sanitizeSdkRefusal(control: RunControl | undefined, id: string, result:
   // Pi awaits this observer before creating its history message from the same result object.
   result.content = [{ type: 'text', text: JSON.stringify({ status: 'failed', error: safeError(code), validationIssues: issues }) }];
   result.details = {};
+}
+function checkDelivery(result: AgentToolResult<unknown>, isError: boolean, context: ToolExecutionContext, control?: RunControl, record?: ToolCallRecord | null) {
+  const checked = ToolExecutor.afterToolUse('sdk_delivery', result, context, control, { isError, record });
+  return { result: checked.result as AgentToolResult<unknown>, isError: checked.isError };
 }
 function normalizedInput(tool: AnyToolDefinition, input: unknown): unknown {
   const args = z.record(z.string(), z.json()).safeParse(input);
@@ -104,9 +110,13 @@ export function observePiToolDelivery(
             stage: observed?.failureStage ?? 'sdk', recordId: call.id });
           recorder.finish(call.id, { status: context.signal.aborted ? "cancelled" : "failed",
             error: safeError(context.signal.aborted ? "tool_cancelled" : reason ?? "tool_input_invalid") }, "requested", getControl?.()?.observation(event.toolCallId));
-          // SDK validation errors have SDK text, not the adapter's serialized ToolResult.
+          const checked = checkDelivery(event.result, event.isError, context, getControl?.(), recorder.read(context));
+          Object.assign(event.result, checked.result); event.isError = checked.isError;
+          // Normalize before the snapshots Pi will compare with its actual history receipt.
           sdkRejections.set(event.toolCallId, { recordId: call.id, content: structuredClone(event.result.content), details: structuredClone(event.result.details) });
         }
+        const checked = checkDelivery(event.result, event.isError, context, getControl?.(), recorder.read(context));
+        Object.assign(event.result, checked.result); event.isError = checked.isError;
         finalized.set(event.toolCallId, { content: structuredClone(event.result.content), details: structuredClone(event.result.details), isError: event.isError });
       } catch { throw recorder.failPersistence(context); }
     }
@@ -153,7 +163,15 @@ export function createPiRunControlBinding(session: AgentSession, registry: Pick<
     if (!control) return before?.(context, signal);
     const business = registry.get(context.toolCall.name);
     const prepared = business?.inputSchema.safeParse(context.args);
-    const rejected = control.admitToolCall(id, context.toolCall.name, prepared?.success ? prepared.data : context.args);
+    const executionContext = getContext(id, signal);
+    const nativeName = ['read', 'grep', 'find', 'ls', 'edit', 'write', 'bash', 'powershell'].includes(context.toolCall.name);
+    const tool = business ?? (nativeName ? { name: context.toolCall.name, version: VERSION,
+      effect: ['read', 'grep', 'find', 'ls'].includes(context.toolCall.name) ? 'READ' as const : 'LOCAL_WRITE' as const,
+      executionMode: 'parallel' as const } : undefined);
+    let rejected: ReturnType<typeof safeError> | null = null;
+    try { ToolExecutor.beforeToolUse('sdk_admission', context.toolCall.name, prepared?.success ? prepared.data : context.args,
+      executionContext, recorder, control, tool); }
+    catch (native) { const parsed = AppErrorSchema.safeParse(native); rejected = parsed.success ? parsed.data : safeError(native instanceof Error ? native.message : 'internal_error'); }
     if (recorder.read(getContext(id, signal))?.sdkReturned) return rejected ? { block: true, reason: JSON.stringify(rejected) } : undefined;
     control.updateObservation(id, { inputValidation: 'passed', preflightStatus: rejected ? 'blocked' : 'passed' });
     if (rejected) {
@@ -182,29 +200,26 @@ export function createPiRunControlBinding(session: AgentSession, registry: Pick<
         usage: delivered.sdkDelivery.usage });
       return { ...restored, isError: delivered.sdkDelivery.isError };
     }
+    let checked: ReturnType<typeof checkDelivery>;
     try {
       const override = await after?.(context, signal);
       const final = { ...context.result, content: override?.content ?? context.result.content,
         details: override?.details ?? context.result.details, usage: override?.usage ?? context.result.usage,
         terminate: override?.terminate ?? context.result.terminate };
       const isError = override?.isError ?? context.isError;
-      const content = z.array(z.union([
-        z.object({ type: z.literal('text'), text: z.string() }).passthrough(),
-        z.object({ type: z.literal('image'), data: z.string(), mimeType: z.string().min(1) }).passthrough(),
-      ])).safeParse(final.content);
-      if (!content.success || context.isError && !isError) throw new Error('tool_postprocess_failed');
-      wireValue(final);
-      control.updateObservation(id, { postflightStatus: 'passed' });
-      save(id, signal);
-      return override;
+      const validated = ToolExecutor.afterToolUse('sdk_delivery', final, getContext(id, signal), control,
+        { isError, wasError: context.isError, record: delivered });
+      checked = { result: validated.result as AgentToolResult<unknown>, isError: validated.isError };
+      if (control.observation(id).postflightStatus !== 'failed') control.updateObservation(id, { postflightStatus: 'passed' });
     } catch {
       control.updateObservation(id, { postflightStatus: 'failed', hookFailure: { stage: 'afterToolCall', code: 'tool_postprocess_failed' } });
       const record = recorder.read(getContext(id, signal));
       const queryId = record?.data && typeof record.data === 'object' && 'queryId' in record.data && typeof record.data.queryId === 'number' ? record.data.queryId : null;
       control.noteFailure(id, { code: 'tool_postprocess_failed', stage: 'after_hook', recordId: record?.id, queryId });
-      save(id, signal);
-      throw new Error(JSON.stringify(safeError('tool_postprocess_failed')));
+      checked = { result: { content: [{ type: 'text', text: JSON.stringify(safeError('tool_postprocess_failed')) }], details: {} }, isError: true };
     }
+    save(id, signal);
+    return { ...checked.result, isError: checked.isError };
   };
   return () => session.agent.subscribe(async (event, signal) => {
     const control = getControl();
@@ -214,7 +229,11 @@ export function createPiRunControlBinding(session: AgentSession, registry: Pick<
       const context = getContext(event.toolCallId, signal), record = recorder.read(context);
       if (event.isError && control.observation(event.toolCallId).failureClass === null) {
         const known = registry.get(event.toolName) || ['read', 'grep', 'find', 'ls', 'edit', 'write', 'bash', 'powershell'].includes(event.toolName);
-        if (!known) sanitizeSdkRefusal(control, event.toolCallId, event.result, undefined, undefined);
+        if (!known) {
+          sanitizeSdkRefusal(control, event.toolCallId, event.result, undefined, undefined);
+          const checked = checkDelivery(event.result, event.isError, context, control);
+          Object.assign(event.result, checked.result); event.isError = checked.isError;
+        }
         else {
           const queryId = record?.status === 'succeeded' && record.data && typeof record.data === 'object'
             && 'queryId' in record.data && typeof record.data.queryId === 'number' ? record.data.queryId : null;
@@ -274,9 +293,14 @@ export function createPiNativeTools(
   const identity = (tool: PiToolDefinition): ToolCallIdentity => ({ name: tool.name, version: VERSION,
     effect: ["read", "grep", "find", "ls"].includes(tool.name) ? "READ" : "LOCAL_WRITE",
     executionMode: tool.executionMode ?? session?.agent.toolExecution ?? "parallel" });
-  const fatal = (context: ToolExecutionContext): Error => new Error(JSON.stringify(recorder.failPersistence(context)));
+  const fatal = (context: ToolExecutionContext, native?: unknown): Error => {
+    const known = AppErrorSchema.safeParse(native);
+    const error = known.success && known.data.category !== 'storage' ? known.data
+      : native instanceof z.ZodError ? safeError('invalid_argument') : recorder.failPersistence(context);
+    return new Error(JSON.stringify(error));
+  };
   const save = (id: number, result: ToolResult<unknown>, context: ToolExecutionContext, from: "requested" | "running") => {
-    try { recorder.finish(id, result, from, getControl?.()?.finishToolExecution(context.nativeToolCallId, result)); } catch { throw fatal(context); }
+    try { recorder.finish(id, result, from, getControl?.()?.finishToolExecution(context.nativeToolCallId, result)); } catch (native) { throw fatal(context, native); }
   };
   const definitions = originals.map(tool => ({
     ...tool,
@@ -299,27 +323,15 @@ export function createPiNativeTools(
         return structuredClone(cached.data);
       }
       if (record.status === "running") throw new Error(JSON.stringify(safeError("operation_result_unknown")));
-      if (!context.scope.allowedToolNames.includes(tool.name) || context.scope.readOnly && metadata.effect === "LOCAL_WRITE" || context.signal.aborted) {
-        const error = safeError(context.signal.aborted ? "tool_cancelled" : "access_denied");
-        const message = JSON.stringify(error);
-        const failure = { status: context.signal.aborted ? 'cancelled' as const : 'failed' as const, error, data: { nativeError: message } };
-        recorder.finish(record.id, failure, 'requested', control?.finishToolExecution(nativeToolCallId, failure, {
-          admission: { status: 'blocked', reason: error.code }, inputValidation: 'passed', businessValidation: { pre: 'not_applicable', post: 'not_applicable' } }));
-        throw new Error(message);
+      try { context = ToolExecutor.beforeToolUse('execution', tool.name, input, context, recorder, control, metadata); }
+      catch (native) {
+        const parsed = AppErrorSchema.safeParse(native);
+        const error = parsed.success ? parsed.data : safeError(native instanceof Error ? native.message : 'internal_error');
+        const failure = { status: error.code === 'tool_cancelled' ? 'cancelled' as const : 'failed' as const, error, data: { nativeError: JSON.stringify(error) } };
+        save(record.id, failure, context, 'requested');
+        throw new Error(failure.data.nativeError);
       }
-      if (control) {
-        try {
-          const lease = control.beginToolExecution(nativeToolCallId, tool.name, VERSION, input, context.signal);
-          context = { ...context, signal: lease.signal, checkActive: lease.checkActive };
-          context.checkActive?.();
-        } catch (error) {
-          const code = error instanceof Error ? error.message : 'internal_error';
-          const result = { status: 'failed' as const, error: safeError(code), data: { nativeError: JSON.stringify(safeError(code)) } };
-          recorder.finish(record.id, result, 'requested', control.finishToolExecution(nativeToolCallId, result));
-          throw new Error(result.data.nativeError);
-        }
-      }
-      try { recorder.start(record.id); } catch { control?.releaseToolExecution(nativeToolCallId); throw fatal(context); }
+      try { recorder.start(record.id); } catch (native) { control?.releaseToolExecution(nativeToolCallId); throw fatal(context, native); }
       let result: AgentToolResult<unknown>;
       try {
         // All eight defaults use ctx.cwd; preserve model/session metadata and bind the original Run directory.
@@ -330,7 +342,7 @@ export function createPiNativeTools(
         const failed = { status: context.signal.aborted && !timedOut ? 'cancelled' as const : 'failed' as const,
           error: safeError(timedOut ? 'tool_timeout' : context.signal.aborted ? 'tool_cancelled' : 'internal_error'), data: { nativeError } };
         const observation = control?.finishToolExecution(nativeToolCallId, failed, { outputValidation: 'not_reached', businessValidation: { pre: 'not_applicable', post: 'not_applicable' } });
-        try { recorder.finish(record.id, failed, 'running', observation); } catch { throw fatal(context); }
+        try { recorder.finish(record.id, failed, 'running', observation); } catch (native) { throw fatal(context, native); }
         throw error;
       }
       let saved: unknown;
@@ -340,13 +352,10 @@ export function createPiNativeTools(
         recorder.finish(record.id, failure, 'running', control?.finishToolExecution(nativeToolCallId, failure, { outputValidation: 'failed' }));
         throw new Error(JSON.stringify(failure.error));
       }
-      let code: string | null = null;
-      try { context.checkActive?.(); } catch (error) { code = error instanceof Error ? error.message : 'internal_error'; }
-      const final: ToolResult<unknown> = code || context.signal.aborted ? { status: code === 'tool_timeout' ? 'failed' : 'cancelled',
-        error: safeError(code ?? 'tool_cancelled'), data: saved } : { status: 'succeeded', data: saved };
+      const final = ToolExecutor.afterToolUse('execution_settlement', { status: 'succeeded', data: saved }, context, control, { outputSchema: nativeResult, native: true });
       const observation = control?.finishToolExecution(nativeToolCallId, final, { outputValidation: nativeResult.safeParse(saved).success ? 'passed' : 'failed',
         businessValidation: { pre: 'not_applicable', post: 'not_applicable' } });
-      try { recorder.finish(record.id, final, 'running', observation); } catch { throw fatal(context); }
+      try { recorder.finish(record.id, final, 'running', observation); } catch (native) { throw fatal(context, native); }
       if (final.status !== 'succeeded') throw new Error(JSON.stringify(final.error));
       return result;
     },
@@ -379,7 +388,9 @@ export function createPiNativeTools(
             save(record.id, { status: context.signal.aborted ? "cancelled" : "failed",
               error: safeError(context.signal.aborted ? "tool_cancelled" : reason ?? (prepared.valid ? "access_denied" : "tool_input_invalid")), data: { nativeError: text } }, context, "requested");
           }
-        } catch { throw fatal(context); }
+          const checked = checkDelivery(event.result, event.isError, context, getControl?.(), recorder.read(context));
+          Object.assign(event.result, checked.result); event.isError = checked.isError;
+        } catch (native) { throw fatal(context, native); }
       }
       if (event.type !== "message_end" || event.message.role !== "toolResult" || !byName.has(event.message.toolName)) return;
       const context = getContext(event.message.toolCallId, signal);
@@ -393,7 +404,7 @@ export function createPiNativeTools(
         if (!record || !finished(record) || record.name !== tool.name || !entry || !attempts.has(event.message.toolCallId)
           || !isDeepStrictEqual(record.input, preparedNativeInput(tool, attempts.get(event.message.toolCallId)).input)) throw fatal(context);
         if (!record.sdkReturned) recorder.recordDelivery(context, entry.id, ToolSdkDeliverySchema.parse(wireValue(event.message)));
-      } catch { throw fatal(context); }
+      } catch (native) { throw fatal(context, native); }
       finally { attempts.delete(event.message.toolCallId); }
     });
     return () => { unsubscribe(); attempts.clear(); };

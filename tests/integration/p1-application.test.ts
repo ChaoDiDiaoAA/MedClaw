@@ -10,6 +10,7 @@ import { PiModelRuntime } from "../../packages/runtime-pi/src/model-runtime.ts";
 import { ModelCallRecorder } from "../../packages/runtime-pi/src/model-call-recorder.ts";
 import { Application } from "../../packages/core/src/application.ts";
 import { PublishedSettingsSchema } from "../../packages/contracts/src/model.ts";
+import { mergeRuntimeConfigurationPolicies } from '../../packages/contracts/src/runtime-config';
 import type { RuntimeNotice } from "../../packages/contracts/src/protocol.ts";
 import { providerFixture } from "../fixtures/p1-provider.ts";
 
@@ -90,7 +91,7 @@ test("published selection and policy cannot change a frozen active request", asy
     const accepted = await ctx.app.submitProvider(ctx.command);
     await until(() => ctx.fixture.requests.length === 1);
     const original = ctx.app.config;
-    const next = { ...original, configVersion: "2", requestPolicy: { ...original.requestPolicy, timeoutMs: 2000 }, ui: { ...original.ui, navCollapsed: true } };
+    const next = { ...original, configVersion: "2", ...mergeRuntimeConfigurationPolicies(original, { requestPolicy: { ...original.requestPolicy, timeoutMs: 2000 } }), ui: { ...original.ui, navCollapsed: true } };
     await ctx.app.prepareConfig("publish-token", next);
     ctx.app.commitConfig("publish-token", "2");
     // Lost commit reply can be looked up under the same token/version.

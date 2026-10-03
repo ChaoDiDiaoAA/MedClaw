@@ -7,6 +7,8 @@ import { tmpdir } from 'node:os';
 import { HostController } from '../../apps/desktop/src/main/host-controller';
 import { FileTokens } from '../../apps/desktop/src/main/file-tokens';
 import { MainSettings, atomicWriteJson } from '../../apps/desktop/src/main/settings';
+import { TOOL_CONFIG, type ToolConfiguration } from '../../packages/contracts/src/tool-config';
+import { mergeRuntimeConfigurationPolicies } from '../../packages/contracts/src/runtime-config';
 import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
 import { DATABASE_SCHEMA_VERSION, type PrivateCredentialFrame } from '../../packages/contracts/src/protocol';
 import { ImportPreviewSchema, ImportOperationSchema } from '../../packages/contracts/src/data';
@@ -28,7 +30,7 @@ function singleDayPackage(root: string) {
   const files = readdirSync(root).sort().map(path => { const bytes = readFileSync(join(root, path)); return { path, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') }; });
   writeFileSync(join(root, 'manifest.json'), JSON.stringify({ status: 'complete', files, businessFiles: 1, businessRows: 813, businessBytes: files.find(file => file.path === 'zhejiang_2026-01-01.csv')!.bytes, totalPayloadBytes: files.reduce((sum, file) => sum + file.bytes, 0) }));
 }
-async function setup(holdFinal = false) {
+async function setup(holdFinal = false, configuration: ToolConfiguration = structuredClone(TOOL_CONFIG)) {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p3-host-')), source = join(root, 'source'); singleDayPackage(source);
   const requests: Record<string, unknown>[] = [], privateRequests: PrivateCredentialFrame[] = [];
   let releaseFinal!: () => void;
@@ -54,13 +56,18 @@ async function setup(holdFinal = false) {
     return { ok: false, error: safeError('access_denied') };
   } });
   const settings = new MainSettings(host.paths.settingsPath).read();
-  atomicWriteJson(host.paths.settingsPath, PublishedSettingsSchema.parse({ ...settings, model: { provider: 'p3-fixture', modelId: 'fixture' }, customProviders: [{ credentialRef: null, definition: { providerId: 'p3-fixture', name: 'Fixture', api: 'openai-completions', baseUrl: `http://127.0.0.1:${provider.port}/v1`, models: [{ id: 'fixture', name: 'Fixture', input: ['text'], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }] } }], requestPolicy: { timeoutMs: 10000, maxRetries: 0, maxRetryDelayMs: 2000 } }));
+  atomicWriteJson(host.paths.settingsPath, PublishedSettingsSchema.parse({ ...settings, model: { provider: 'p3-fixture', modelId: 'fixture' }, customProviders: [{ credentialRef: null, definition: { providerId: 'p3-fixture', name: 'Fixture', api: 'openai-completions', baseUrl: `http://127.0.0.1:${provider.port}/v1`, models: [{ id: 'fixture', name: 'Fixture', input: ['text'], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }] } }], toolConfiguration: configuration, ...mergeRuntimeConfigurationPolicies(settings, { requestPolicy: { timeoutMs: 10000, maxRetries: 0, maxRetryDelayMs: 2000 } }) }));
   expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion: DATABASE_SCHEMA_VERSION, error: null });
   const issue = (operationRef: string) => tokens.issue(7, host.read().instanceId!, operationRef, source).fileToken;
   const workspace = async () => WorkspaceViewSchema.parse(unwrap(await host.request('workspace.read', {})));
   const preview = async (operationRef: string, fileToken = issue(operationRef)) => ({ fileToken, preview: ImportPreviewSchema.parse(unwrap(await host.request('import.preview', { operationRef, fileToken, mappingVersion: 'medclaw.snapshot/v1' }, operationRef))) });
   const close = async () => { releaseFinal(); try { if (host.read().instanceId && !host.read().canStart) await host.stop(host.read().instanceId!); } finally { provider.stop(true); rmSync(root, { recursive: true, force: true }); } };
-  return { root, source, host, tokens, issue, workspace, preview, requests, privateRequests, close, releaseFinal };
+  const publisher = new MainSettings(host.paths.settingsPath, {
+    prepare: async (token, candidate) => unwrap(await host.request('settings.prepare', { token, candidate })),
+    commit: async (token, publishedVersion) => unwrap(await host.request('settings.commit', { token, publishedVersion })),
+    abort: async token => unwrap(await host.request('settings.abort', { token })),
+  });
+  return { root, source, host, tokens, issue, workspace, preview, requests, privateRequests, close, releaseFinal, publisher };
 }
 
 test('P3 production Host imports through Main tokens, freezes trusted scope and executes an actual Pi business tool', async () => {
@@ -101,19 +108,34 @@ test('P3 production Host imports through Main tokens, freezes trusted scope and 
 }, 30000);
 
 test('manual queries bind the original active Agent Run and replay after completion without a new model request', async () => {
-  const f = await setup(true); try {
+  const configuration = structuredClone(TOOL_CONFIG);
+  const f = await setup(true, configuration); try {
     const { preview, fileToken } = await f.preview('import');
     const imported = ImportOperationSchema.parse(unwrap(await f.host.request('import.commit', { operationRef: 'import', previewHash: preview.previewHash, fileToken }, 'import')));
     const session = NewSessionResultSchema.parse(unwrap(await f.host.request('session.create', { expectedWorkspaceRevision: (await f.workspace()).revision }, 'session-a')));
     const selected = WorkspaceViewSchema.parse(unwrap(await f.host.request('workspace.update', { expectedRevision: (await f.workspace()).revision, change: { batchIds: imported.result!.batchIds } })));
-    const params = QueryParamsSchema.parse({ kind: 'aggregate', population: 'snapshot', snapshotMode: 'exact_date', batchIds: [1], metric: 'count' });
+    const params = { kind: 'aggregate', population: 'snapshot', snapshotMode: 'exact_date', batchIds: [1], metric: 'count' };
     expect(await f.host.request('query.execute', { params, expectedRevision: selected.revision }, 'before-run')).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
     const accepted = SubmitResultSchema.parse(unwrap(await f.host.request('session.submit', { sessionId: session.session.id, clientSequence: 1, text: 'List imported devices.', mode: 'send',
       expectedRevision: selected.revision, expectedBatchIds: [1], expectedQueryId: null, model: { provider: 'p3-fixture', modelId: 'fixture', expectedConfigVersion: '1' }, referenceDate: '2026-01-01', timezone: 'Asia/Shanghai' }, 'ask')));
     await until(async () => f.requests.length === 2);
+    const nextConfiguration = structuredClone(configuration);
+    await f.publisher.publish('1', { toolConfiguration: nextConfiguration }, { kind: 'policy' });
     const request = { params, expectedRevision: selected.revision };
     const manual = QueryViewSchema.parse(unwrap(await f.host.request('query.execute', request, 'manual-query')));
     expect(manual).toMatchObject({ query: { runId: accepted.runId, sessionId: session.session.id, source: 'user_form', callRef: `${accepted.runId}:manual-query`, totalRows: 1 }, page: { rows: [{ value: 813 }] } });
+    expect(manual.query.params).toMatchObject({ pageSize: 50, sort: 'asc' });
+    expect(manual.page.pageSize).toBe(50);
+    const savedEvidence = new Database(f.host.paths.databasePath);
+    try {
+      savedEvidence.query(`INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,
+        calculation_version,material_version,source_bundle_id,source_lock_hash,result_hash,filters_json,provenance)
+        SELECT query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,
+        calculation_version,material_version,source_bundle_id,source_lock_hash,result_hash,filters_json,provenance
+        FROM query_evidence WHERE query_id=? LIMIT 1`).run(manual.query.id);
+    } finally { savedEvidence.close(); }
+    expect(QueryViewSchema.parse(unwrap(await f.host.request('query.execute', request, 'manual-query'))).evidence).toHaveLength(2);
+    expect(QueryViewSchema.parse(unwrap(await f.host.request('query.read', { queryId: manual.query.id }))).evidence).toHaveLength(2);
     expect('rows' in manual.query).toBe(false);
     expect('snapshotIds' in manual.query).toBe(false);
     expect(f.requests).toHaveLength(2);

@@ -6,10 +6,14 @@ import { performance } from 'node:perf_hooks';
 import { openDatabase } from '../../packages/storage/src/database';
 import { Repositories } from '../../packages/storage/src/repositories';
 import { DEFAULT_AGENT_POLICY, type MeasurementContext, type ToolProfileSnapshot } from '../../packages/contracts/src/model';
-import { RunCleanupRecordSchema, RuntimeBudgetViewSchema } from '../../packages/contracts/src/run';
+import { canonicalRequest, RunCleanupRecordSchema, RuntimeBudgetViewSchema } from '../../packages/contracts/src/run';
 import { SubmitInputSchema } from '../../packages/contracts/src/session';
-import { ToolContextIdentitySchema } from '../../packages/contracts/src/tool';
-import { RunControl } from '../../packages/core/src/runtime/run-control';
+import { TOOL_READ_RULES, ToolContextIdentitySchema } from '../../packages/contracts/src/tool';
+import { BUSINESS_RULES } from '../../packages/contracts/src/query';
+import { RUNTIME_CONFIG } from '../../packages/contracts/src/runtime-config';
+import { TOOL_CONFIG } from '../../packages/contracts/src/tool-config';
+import { groupWorkload, TOOL_PROFILE_RULES } from '../../packages/core/src/tools/tool-profile';
+import { RunControl, RUN_CONTROL_RULES } from '../../packages/core/src/runtime/run-control';
 
 const roots: string[] = [];
 const handles: ReturnType<typeof openDatabase>[] = [];
@@ -82,7 +86,7 @@ test('P3 Run saves policy and profile once, replays original submission, and doe
   const agentPolicy = { ...DEFAULT_AGENT_POLICY, maxToolCalls: 200 };
   const { runId } = repo.registerAgent({ ...input, agentPolicy, measurementContext: measurement, toolProfileSnapshot: profile });
   const result = repo.read({ runId });
-  expect(result.kind === 'one' && result.run?.kind === 'agent' ? result.run.control : null).toEqual({ agentPolicy, measurementContext: measurement, toolProfileSnapshot: profile });
+  expect(result.kind === 'one' && result.run?.kind === 'agent' ? result.run.control : null).toEqual({ runtimeConfiguration: null, toolConfiguration: null, agentPolicy, measurementContext: measurement, toolProfileSnapshot: profile });
   expect(repo.registerAgent({ ...input, agentPolicy: { ...agentPolicy, maxToolCalls: 10 } }).runId).toBe(runId);
   const saved = db.query<{ config_json: string }, [number]>('SELECT config_json FROM runs WHERE id=?').get(runId)!;
   const config = JSON.parse(saved.config_json);
@@ -154,4 +158,38 @@ test('P3 unresolved native call identities retain their full contract through ac
   expect(RuntimeBudgetViewSchema.safeParse({ ...control.readBudget(), recovery: { ...control.readBudget().recovery,
     unresolvedItems: ['x'.repeat(257)] } }).success).toBe(false);
   expect(RunCleanupRecordSchema.safeParse({ ...cleanup, budgetSummary: { ...control.summary(), unresolvedItems: [''] } }).success).toBe(false);
+});
+
+
+test('old Run configuration and non-P95 profile are preserved without reactivating old configuration', () => {
+  const { repo, db, input } = fixture();
+  const { runId } = repo.registerAgent(input);
+  const original = db.query<{ config_json: string }, [number]>('SELECT config_json FROM runs WHERE id=?').get(runId)!;
+  const oldTools = {
+    runtime: { maxCalls: 24, maxModelCalls: 12, maxTimeoutMs: 120000, singleToolTimeoutMs: 30000, maxRecoveryAttempts: 2, maxResultBytes: 4096 },
+    scheduling: { ...RUN_CONTROL_RULES, timeoutMultiplier: 9 },
+    statistics: { ...TOOL_PROFILE_RULES, percentile: 0.5 },
+    native: { read: { offset: 7, limit: 2 }, grep: { limit: 2, context: 20, ignoreCase: true, literal: true }, find: { limit: 2 }, ls: { limit: 2 }, bash: { timeout: 2 }, powershell: { timeout: 2 } },
+    business: { ...BUSINESS_RULES, defaultPageSize: 2, maxPageSize: 2, evidencePageSize: 2, querySort: 'desc' },
+    presentation: { ...TOOL_READ_RULES, defaultPageSize: 2 },
+  };
+  const oldProfile: ToolProfileSnapshot = { ...profile, profiles: [{ name: 'read_data_scope', version: '1.0.0', sdkVersion: measurement.sdkVersion,
+    measurementVersion: measurement.version, environmentKey: measurement.environmentKey, workloadBucket: groupWorkload({}, input.scope),
+    sampleCount: 20, completeSamples: 20, percentile: 0.5, latencyQuantileMs: 100, p95Ms: null, timeoutRate: 0, reliability: {} }] };
+  const raw = JSON.stringify({ ...JSON.parse(original.config_json), toolConfiguration: oldTools, agentPolicy: DEFAULT_AGENT_POLICY, measurementContext: measurement, toolProfileSnapshot: oldProfile });
+  db.query('UPDATE runs SET config_json=? WHERE id=?').run(raw, runId);
+  const read = repo.read({ runId });
+  if (read.kind !== 'one' || read.run?.kind !== 'agent') throw new Error('Expected saved Agent Run');
+  expect(canonicalRequest(read.run.control?.toolConfiguration)).toBe(canonicalRequest(oldTools));
+  expect(read.run.control?.runtimeConfiguration).toBeNull();
+  expect(read.run.control?.toolProfileSnapshot).toEqual(oldProfile);
+  const recent = repo.read({ recent: true });
+  expect(recent.kind === 'recent' && recent.runs[0]?.kind === 'agent' ? recent.runs[0].control?.toolProfileSnapshot : null).toEqual(oldProfile);
+  expect(db.query<{ config_json: string }, [number]>('SELECT config_json FROM runs WHERE id=?').get(runId)!.config_json).toBe(raw);
+  const control = new RunControl({ runId: runId + 1, runtimeConfiguration: RUNTIME_CONFIG, toolConfiguration: TOOL_CONFIG,
+    scope: input.scope, signal: new AbortController().signal, deadlineAt: performance.now() + 120000, measurementContext: measurement, toolProfileSnapshot: oldProfile });
+  try {
+    control.beginToolExecution('read', 'read_data_scope', '1.0.0', {});
+    expect(control.observation('read').effectiveTimeoutMs).toBe(30000);
+  } finally { control.dispose(); }
 });

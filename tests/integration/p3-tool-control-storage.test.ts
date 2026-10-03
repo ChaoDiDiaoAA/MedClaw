@@ -1,3 +1,4 @@
+import { TOOL_PROFILE_RULES } from '../../packages/core/src/tools/tool-profile';
 import { afterEach, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { safeError } from '../../packages/contracts/src/error';
@@ -134,17 +135,19 @@ test('P3 observation window freezes the maximum ID across all ages and skips lat
   const { db, store, context } = fixture();
   const old = store.request(tool, {}, context);
   db.query('UPDATE tool_calls SET requested_at=? WHERE id=?').run('2026-01-01T00:00:00.000Z', old.id);
-  const first = store.readToolObservations({ cutoffAt: '2026-10-02T00:00:00.000Z' });
+  const first = store.readToolObservations({ limit: TOOL_PROFILE_RULES.observationLimit, windowDays: TOOL_PROFILE_RULES.windowDays, cutoffAt: '2026-10-02T00:00:00.000Z' });
   expect(first.maxToolCallId).toBe(old.id);
   expect(first.observations).toHaveLength(0);
   const recent = store.request(tool, {}, { ...context, nativeToolCallId: 'recent' });
   db.query('UPDATE tool_calls SET requested_at=? WHERE id=?').run('2026-10-01T00:00:00.000Z', recent.id);
-  expect(store.readToolObservations({ cutoffAt: '2026-10-02T00:00:00.000Z', maxToolCallId: first.maxToolCallId }).observations).toHaveLength(0);
-  const latest = store.readToolObservations({ cutoffAt: '2026-10-02T00:00:00.000Z' });
+  expect(store.readToolObservations({ limit: TOOL_PROFILE_RULES.observationLimit, windowDays: TOOL_PROFILE_RULES.windowDays, cutoffAt: '2026-10-02T00:00:00.000Z', maxToolCallId: first.maxToolCallId }).observations).toHaveLength(0);
+  const latest = store.readToolObservations({ limit: TOOL_PROFILE_RULES.observationLimit, windowDays: TOOL_PROFILE_RULES.windowDays, cutoffAt: '2026-10-02T00:00:00.000Z' });
   expect(latest.maxToolCallId).toBe(recent.id);
   expect(latest.observations[0]).toMatchObject({ id: recent.id, control: null, measurementContext: null, sdkReturned: false, consumedAt: null });
-  expect(() => store.readToolObservations({ cutoffAt: 'bad-date' })).toThrow('invalid_argument');
-  expect(() => store.readToolObservations({ cutoffAt: '2026-10-02T00:00:00.000Z', limit: 2001 })).toThrow('invalid_argument');
+  expect(() => store.readToolObservations({ limit: TOOL_PROFILE_RULES.observationLimit, windowDays: TOOL_PROFILE_RULES.windowDays, cutoffAt: 'bad-date' })).toThrow('invalid_argument');
+  expect(store.readToolObservations({ windowDays: TOOL_PROFILE_RULES.windowDays, cutoffAt: '2026-10-02T00:00:00.000Z', limit: 2001 }).observations).toHaveLength(1);
+  expect(store.readToolObservations({ limit: TOOL_PROFILE_RULES.observationLimit, cutoffAt: '2026-10-02T00:00:00.000Z', windowDays: 366 }).observations).toHaveLength(2);
+  expect(() => store.readToolObservations({ windowDays: TOOL_PROFILE_RULES.windowDays, cutoffAt: '2026-10-02T00:00:00.000Z', limit: 0 })).toThrow('invalid_argument');
 });
 
 test('P3 saved Query metadata rejects corrupted parameter hashes and conflicting duplicate identities', () => {

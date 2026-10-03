@@ -6,8 +6,10 @@ import { z } from "zod";
 import {
   AgentPolicySchema, ConfigVersionSchema, DEFAULT_AGENT_POLICY, DEFAULT_DISPLAY_PREFERENCES, DEFAULT_REQUEST_POLICY,
   DesktopDisplayPreferencesSchema, PublishedSettingsSchema, RequestPolicySchema, SETTINGS_SCHEMA_VERSION,
-  SettingsSnapshotSchema, type DesktopDisplayPreferences, type PublishedSettings, type SettingsSnapshot,
+  SettingsSnapshotObjectSchema, type DesktopDisplayPreferences, type PublishedSettings, type SettingsSnapshot,
 } from "../../../../packages/contracts/src/model";
+import { StoredToolConfigurationSchema, normalizeToolConfiguration, type StoredToolConfiguration } from '../../../../packages/contracts/src/tool-config';
+import { RuntimeConfigurationSchema, mergeRuntimeConfigurationPolicies } from '../../../../packages/contracts/src/runtime-config';
 
 function fail(code: string): never { throw Object.assign(new Error(code), { code }); }
 export function atomicWriteJson(path: string, value: unknown): void {
@@ -33,7 +35,8 @@ export interface SettingsCoordinator {
   abort(token: string): Promise<unknown>;
   readVersion?(): Promise<string>;
 }
-export type SettingsPatch = Partial<Pick<SettingsSnapshot, "model" | "customProviders" | "credentialRefs" | "requestPolicy" | "agentPolicy">> & {
+export type SettingsPatch = Partial<Pick<SettingsSnapshot, "model" | "customProviders" | "credentialRefs" | "requestPolicy" | "agentPolicy" | 'runtimeConfiguration'>> & {
+  toolConfiguration?: StoredToolConfiguration;
   ui?: Partial<DesktopDisplayPreferences>;
 };
 export interface PublishOptions {
@@ -43,11 +46,13 @@ export interface PublishOptions {
   onUnpublished?(): Promise<void>;
 }
 const patchSchema = z.strictObject({
-  model: SettingsSnapshotSchema.shape.model.optional(),
-  customProviders: SettingsSnapshotSchema.shape.customProviders.optional(),
-  credentialRefs: SettingsSnapshotSchema.shape.credentialRefs.optional(),
+  model: SettingsSnapshotObjectSchema.shape.model.optional(),
+  customProviders: SettingsSnapshotObjectSchema.shape.customProviders.optional(),
+  credentialRefs: SettingsSnapshotObjectSchema.shape.credentialRefs.optional(),
   requestPolicy: RequestPolicySchema.optional(), ui: DesktopDisplayPreferencesSchema.partial().optional(),
   agentPolicy: AgentPolicySchema.optional(),
+  runtimeConfiguration: RuntimeConfigurationSchema.optional(),
+  toolConfiguration: StoredToolConfigurationSchema.optional(),
 });
 function snapshot(value: PublishedSettings): SettingsSnapshot {
   const { previous, rollbackFromVersion, ...current } = value;
@@ -70,10 +75,10 @@ export class MainSettings {
       return parsed.data;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") fail("config_read_failed");
-      const initial: PublishedSettings = {
+      const initial = PublishedSettingsSchema.parse({
         schemaVersion: SETTINGS_SCHEMA_VERSION, configVersion: "1", model: null, customProviders: [], credentialRefs: {},
         requestPolicy: { ...DEFAULT_REQUEST_POLICY }, agentPolicy: { ...DEFAULT_AGENT_POLICY }, ui: { ...DEFAULT_DISPLAY_PREFERENCES }, previous: null, rollbackFromVersion: null,
-      };
+      });
       try { this.writeJson(this.path, initial); } catch { return fail("config_write_failed"); }
       return initial;
     }
@@ -101,7 +106,11 @@ export class MainSettings {
         rollbackFromVersion = current.previous.configVersion;
       } else {
         if (Object.keys(parsed.data).length === 0) fail("invalid_argument");
-        next = { ...snapshot(current), ...parsed.data, ui: { ...current.ui, ...parsed.data.ui } };
+        try {
+          next = { ...snapshot(current), ...parsed.data, ...mergeRuntimeConfigurationPolicies(current, parsed.data),
+            toolConfiguration: normalizeToolConfiguration({ toolConfiguration: parsed.data.toolConfiguration ?? current.toolConfiguration }),
+            ui: { ...current.ui, ...parsed.data.ui } };
+        } catch { fail('invalid_argument'); }
       }
       const candidate = PublishedSettingsSchema.safeParse({ ...next, configVersion: (BigInt(current.configVersion) + 1n).toString(),
         previous: snapshot(current), rollbackFromVersion });

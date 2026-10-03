@@ -3,6 +3,9 @@ import type { MeasurementContext } from '../../packages/contracts/src/model';
 import { createToolControlObservation } from '../../packages/contracts/src/model';
 import type { ToolObservation } from '../../packages/contracts/src/tool';
 import { buildToolProfiles, groupWorkload } from '../../packages/core/src/tools/tool-profile';
+import { RUNTIME_CONFIG } from '../../packages/contracts/src/runtime-config';
+import { RunControl } from '../../packages/core/src/runtime/run-control';
+import { performance } from 'node:perf_hooks';
 
 const measurement: MeasurementContext = {
   version: 'medclaw.tool-measurement/v1',
@@ -95,4 +98,27 @@ test('P3 reliability separates expected refusals, cancellation and persistence f
   expect(profile.reliability.expectedDataShortages).toBe(1);
   expect(profile.reliability.persistenceFailures).toBe(1);
   expect(buildToolProfiles(null, measurement)).toMatchObject({ available: false, profiles: [] });
+});
+
+test('fixed P95 statistics and latency multiplier drive timeout within the shared Run budget', () => {
+  const observations = Array.from({ length: 20 }, (_, index) => observation(index + 1, (index + 1) * 100));
+  observations.push({ ...observation(21, 99999), requestedAt: '2026-08-01T00:00:00.000Z' });
+  const snapshot = buildToolProfiles({ maxToolCallId: 100, observations }, measurement);
+  expect(snapshot.profiles[0]).toMatchObject({ sampleCount: 20, completeSamples: 20, percentile: 0.95, latencyQuantileMs: 1900, p95Ms: 1900 });
+  const runtimeConfiguration = { ...RUNTIME_CONFIG, runBudget: { ...RUNTIME_CONFIG.runBudget, timeoutMs: 10000, singleToolTimeoutMs: 5000 } };
+  const scope = { batchIds: [1], deviceIds: null, allowedToolNames: ['read_batch'], allowedResourceRefs: [], artifactIds: [], readOnly: true };
+  const control = new RunControl({ runId: 1, runtimeConfiguration, scope, signal: new AbortController().signal,
+    deadlineAt: performance.now() + 10000, measurementContext: measurement, toolProfileSnapshot: snapshot });
+  try {
+    control.beginToolExecution('read', 'read_batch', '1.0.0', { batchIds: [1] });
+    expect(control.observation('read').effectiveTimeoutMs).toBe(3800);
+  } finally { control.dispose(); }
+  const historical = structuredClone(snapshot);
+  Object.assign(historical.profiles[0]!, { percentile: 0.5, latencyQuantileMs: 200, p95Ms: null });
+  const previous = new RunControl({ runId: 2, runtimeConfiguration, scope, signal: new AbortController().signal,
+    deadlineAt: performance.now() + 10000, measurementContext: measurement, toolProfileSnapshot: historical });
+  try {
+    previous.beginToolExecution('historical', 'read_batch', '1.0.0', { batchIds: [1] });
+    expect(previous.observation('historical').effectiveTimeoutMs).toBe(5000);
+  } finally { previous.dispose(); }
 });

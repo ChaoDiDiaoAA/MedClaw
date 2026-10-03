@@ -1,5 +1,5 @@
 import { afterEach, expect, mock, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BrowserWindow } from "electron";
@@ -22,7 +22,7 @@ const accepted = { sessionId: 1, clientSequence: 1, inputId: null, runId: 7 };
 async function setup(prior: boolean, policyPublication = false) {
   const root = mkdtempSync(join(tmpdir(), "medclaw-p2-ipc-")); roots.push(root);
   const calls: { method: string; payload: unknown; op?: string }[] = []; let syncs = 0;
-  const host = { read: () => ({ state: "ready", instanceId: "host-1" }), request: async (method: string, payload: unknown, op?: string) => {
+  const host = { read: () => ({ state: "ready", instanceId: "host-1", canStart: false, sdkVersion: null, schemaVersion: null, error: null }), request: async (method: string, payload: unknown, op?: string) => {
     calls.push({ method, payload, op }); return { ok: true, data: method === "run.read" ? { kind: "one", run: null } : method === "session.readSubmission" ? prior ? accepted : null : accepted };
   } } as unknown as HostController;
   const settings = new MainSettings(join(root, "settings.json"), policyPublication ? { async prepare() {}, async commit() {}, async abort() {} } : undefined);
@@ -33,13 +33,20 @@ async function setup(prior: boolean, policyPublication = false) {
   registerIpc({ window, host, settings, credentials, inputs: new SecretInputs(), diagnostics: async () => { throw new Error("unused"); }, report: () => {}, notify: () => {} });
   const event = { sender: { id: 10, mainFrame }, senderFrame: mainFrame };
   async function request(method: string, payload: unknown, op = "original-operation", from = event) { return await handlers.get("medclaw:request")!(from, { method, payload, operationRef: op }) as Result<unknown>; }
-  return { calls, request, syncs: () => syncs, host };
+  return { calls, request, syncs: () => syncs, host, settingsPath: join(root, 'settings.json') };
 }
 test("Main checks original Session identity before current configuration/auth synchronization", async () => {
   const c = await setup(true);
   expect(await c.request("session.submit", submission)).toEqual({ ok: true, data: accepted }); expect(c.syncs()).toBe(0);
   expect(c.calls.at(-1)).toEqual({ method: "session.submit", payload: submission, op: "original-operation" });
   expect(c.calls.some(c => c.method === "session.readSubmission")).toBe(true);
+});
+
+test('Host state remains readable when Settings are malformed', async () => {
+  const c = await setup(false);
+  writeFileSync(c.settingsPath, '{');
+  expect(await c.request('host.read', {})).toMatchObject({ ok: true, data: { state: 'ready' } });
+  expect(await c.request('model.config.read', {})).toMatchObject({ ok: false, error: { code: 'config_read_failed' } });
 });
 
 test("Main exposes and publishes Agent policy through the existing policy IPC without widening UI", async () => {
@@ -52,6 +59,19 @@ test("Main exposes and publishes Agent policy through the existing policy IPC wi
   expect(await c.request("model.policy.update", { expectedConfigVersion: "2", policy: { ...policy, timeoutMs: 900000 } }, "policy-2")).toMatchObject({ ok: true, data: { agentPolicy, configVersion: "3" } });
   expect(await c.request("model.policy.update", { expectedConfigVersion: "1", policy, agentPolicy }, "policy-conflict")).toMatchObject({ ok: false, error: { code: "config_conflict" } });
   expect(await c.request("settings.ui.update", { expectedConfigVersion: "3", patch: { agentPolicy } }, "policy-ui")).toMatchObject({ ok: false, error: { code: "invalid_argument" } });
+});
+
+test('Main policy IPC publishes minimal runtime and tool configuration and rejects explicit conflicts', async () => {
+  const { RUNTIME_CONFIG } = await import('../../packages/contracts/src/runtime-config');
+  const { DEFAULT_AGENT_POLICY } = await import('../../packages/contracts/src/model');
+  const c = await setup(false, true);
+  const toolConfiguration = { maxResultBytes: 2048 };
+  const runtimeConfiguration = structuredClone(RUNTIME_CONFIG);
+  runtimeConfiguration.runBudget.maxToolCalls = 5;
+  expect(await c.request('model.policy.update', { expectedConfigVersion: '1', runtimeConfiguration, toolConfiguration }, 'complete-config')).toMatchObject({ ok: true, data: { configVersion: '2', toolConfiguration, agentPolicy: { maxToolCalls: 5 } } });
+  expect(await c.request('model.config.read', {})).toMatchObject({ ok: true, data: { toolConfiguration } });
+  expect(await c.request('model.policy.update', { expectedConfigVersion: '2', runtimeConfiguration, toolConfiguration, agentPolicy: DEFAULT_AGENT_POLICY }, 'conflicting-config')).toMatchObject({ ok: false, error: { code: 'invalid_argument' } });
+  expect(await c.request('model.config.read', {})).toMatchObject({ ok: true, data: { configVersion: '2', toolConfiguration } });
 });
 test("new Session Send synchronizes configuration after read-only identity probes", async () => {
   const c = await setup(false); expect(await c.request("session.submit", submission)).toMatchObject({ ok: false, error: { code: "config_write_failed" } });

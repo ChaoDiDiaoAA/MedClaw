@@ -26,7 +26,7 @@ export const SessionDetailSchema = z.strictObject({
 export const SubmitInputSchema = z.strictObject({
   clientSequence: PositiveIdSchema, sessionId: PositiveIdSchema, text: z.string().refine(text => text.trim().length > 0, "Text must not be blank"),
   mode: z.literal("send"), expectedRevision: RevisionSchema,
-  expectedBatchIds: z.array(PositiveIdSchema).max(10000).refine(ids => new Set(ids).size === ids.length, 'Duplicate batches'),
+  expectedBatchIds: z.array(PositiveIdSchema).refine(ids => new Set(ids).size === ids.length, 'Duplicate batches'),
   expectedQueryId: PositiveIdSchema.nullable(),
   model: ModelChoiceSchema, referenceDate: ReferenceDateSchema, timezone: TimezoneSchema,
 });

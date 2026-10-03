@@ -22,6 +22,9 @@ import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
 import { Application } from '../../packages/core/src/application';
 import type { ResolvedModel } from '../../packages/runtime-pi/src/model-runtime';
 import type { RuntimeNotice } from '../../packages/contracts/src/protocol';
+import { SqliteCatalogStore } from '../../packages/storage/src/catalog-store';
+import { EvidenceReader } from '../../packages/core/src/evidence/evidence-reader';
+import { createBusinessTools } from '../../packages/core/src/tools/tools';
 
 test('production PiAgentRuntime executes business and native tools in one frozen Run, then records a final model request', async () => {
   const root = await mkdtemp(join(tmpdir(), 'medclaw-p3-runtime-'));
@@ -129,6 +132,108 @@ test('production PiAgentRuntime executes business and native tools in one frozen
     expect(repo.isFinalSaved(accepted.runId, fact)).toBe(true);
     expect(db.query('SELECT text,native_leaf_id FROM answers WHERE run_id=?').get(accepted.runId)).toEqual({ text: observed.lastOutcome!.text, native_leaf_id: null });
   } finally { server.stop(true); db.close(); await rm(root, { recursive: true, force: true }); }
+}, 15000);
+
+test('production PiAgentRuntime closes recovery only after actual delivery of the original Query read', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'medclaw-p3-production-recovery-'));
+  const db = openDatabase(join(root, 'app.sqlite'));
+  const requests: Record<string, unknown>[] = [];
+  const providerErrors: unknown[] = [];
+  const originalInput = { batchIds: [1], time: { start: '2026-01-01', endExclusive: '2026-01-02' } };
+  let originalQueryId: number | undefined;
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    const body = await request.json() as Record<string, unknown>;
+    requests.push(body);
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    const feedback = messages.flatMap(message => message && typeof message === 'object' && 'role' in message && message.role === 'system'
+      && 'content' in message && typeof message.content === 'string' && message.content.startsWith('MedClaw trusted runtime feedback')
+      ? [JSON.parse(message.content.split('\n')[1]!)] : []).at(-1);
+    try {
+      if (requests.length === 2) {
+        expect(feedback.failures).toMatchObject([{ id: 'query-original', delivered: true }]);
+        originalQueryId = (db.query<{ id: number }, []>('SELECT id FROM queries').get())?.id;
+        expect(originalQueryId).toBeDefined();
+      }
+      if (requests.length === 3) expect(db.query('SELECT COUNT(*) AS n FROM queries').get()).toEqual({ n: 1 });
+      if (requests.length === 4) {
+        expect(feedback.failures).toEqual([]);
+        expect(db.query('SELECT COUNT(*) AS n FROM queries').get()).toEqual({ n: 1 });
+      }
+    } catch (error) { providerErrors.push(error); }
+    const call = requests.length === 1 ? { id: 'query-original', name: 'query_current_devices', args: originalInput }
+      : requests.length === 2 ? { id: 'query-recalculate', name: 'query_current_devices', args: originalInput }
+      : requests.length === 3 ? { id: 'query-read', name: 'read_query', args: { queryId: originalQueryId } } : null;
+    const delta = call ? { role: 'assistant', tool_calls: [{ index: 0, id: call.id, type: 'function',
+      function: { name: call.name, arguments: JSON.stringify(call.args) } }] } : { role: 'assistant', content: 'Original Query recovered.' };
+    return new Response(`data: ${JSON.stringify({ id: 'fixture', model: 'fixture', choices: [{ index: 0, delta, finish_reason: call ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`,
+      { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  let agent: PiAgentRuntime | undefined;
+  try {
+    const createdAt = new Date().toISOString();
+    db.query(`INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_hash,preview_request_json,created_at,updated_at)
+      VALUES(1,'import','fixture','imported','hash','{}',?,?)`).run(createdAt, createdAt);
+    db.query('UPDATE catalog_state SET revision=1,updated_at=?').run(createdAt);
+    db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,
+      expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at)
+      VALUES(1,1,'scope','2026-01-01','浙江','fixture/v1','bundle','lock','content','full','cohort',1,1,'[]','{}',1,NULL,1,?)`).run(createdAt);
+    db.query('UPDATE batches SET metadata_json=? WHERE id=1').run(JSON.stringify({ referenceDate: '2026-01-01', timezone: 'Asia/Shanghai' }));
+    const sources = JSON.stringify([{ sourceId: 'fixture', file: 'saved-source.csv', recordId: 'device-1', row: 1, sha256: 'a'.repeat(64) }]);
+    db.query(`INSERT INTO devices(id,source_device_id,source_bundle_id,source_submission_id,source_refs_json,created_at)
+      VALUES(1,'device-1','bundle','submission',?,?)`).run(sources, createdAt);
+    // A valid large row exceeds the frozen SDK text ceiling after its Query has committed.
+    db.query(`INSERT INTO snapshots(id,batch_id,device_id,device_name,category,region,price_cents,currency,unit,status,manufacturer,distributor,
+      source_row_ref,source_refs_json,field_origins_json)
+      VALUES(1,1,1,?,'Fixture','浙江',100,'CNY','件','active','Fixture manufacturer','Fixture distributor','1:1',?,'{}')`).run('Device '.repeat(1000), sources);
+    const repo = new Repositories(db), store = new SqliteToolStore(db), catalog = new CatalogService(new SqliteCatalogStore(db));
+    const queries = new QueryService(catalog, store), evidence = new EvidenceReader(catalog, queries, store);
+    const registry = new ToolRegistry(createBusinessTools({ catalog, queries, evidence }));
+    const recorder = new ToolRecorder(store), executor = new ToolExecutor(registry, recorder);
+    const credentials = new InMemoryCredentialStore();
+    await credentials.modify('production-recovery', async () => ({ type: 'api_key', key: 'fixture-only' }));
+    const runtime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
+    await runtime.installCustom([{ providerId: 'production-recovery', name: 'Recovery fixture', api: 'openai-completions', baseUrl: `http://127.0.0.1:${server.port}/v1`,
+      models: [{ id: 'fixture', name: 'Fixture', input: ['text'], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }] }]);
+    agent = new PiAgentRuntime(runtime, root, { registry, recorder, executor });
+    const native = agent.allocate(), session = repo.createSession({ expectedWorkspaceRevision: 0 }, 'create', native.nativeSessionId, createdAt).session;
+    native.bind(session.id);
+    repo.updateWorkspace({ batchIds: [1] }, repo.readWorkspace().revision, createdAt);
+    const workspace = repo.readWorkspace(), scope = repo.freezeAgentScope(workspace, agent.toolNames ?? []);
+    const request = SubmitInputSchema.parse({ sessionId: session.id, clientSequence: 1, text: 'Recover the committed Query by its original identity.', mode: 'send',
+      expectedRevision: workspace.revision, expectedBatchIds: [1], expectedQueryId: null,
+      model: { provider: 'production-recovery', modelId: 'fixture', expectedConfigVersion: '1' }, referenceDate: '2026-01-01', timezone: 'Asia/Shanghai' });
+    const policy = { timeoutMs: 30000, maxRetries: 0 as const, maxRetryDelayMs: 2000 };
+    const agentPolicy = { version: 'medclaw.agent-policy/v1' as const, maxToolCalls: 24, maxModelCalls: 4, singleToolTimeoutMs: 30000, maxRecoveryAttempts: 2 };
+    const toolConfiguration = { maxResultBytes: 2048 };
+    const resolved = await runtime.resolve(request.model, '1', null, policy), agentOptions = agent.describe(resolved);
+    const accepted = repo.registerAgent({ sessionId: session.id, inputId: null, text: request.text, model: resolved.selection, policy, goal: 'answer', workspace,
+      scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: policy.timeoutMs, agentOptions, agentPolicy, toolConfiguration,
+      submission: { operationRef: 'send', originalSubmitInput: request }, instanceId: 'fixture', createdAt });
+    const observed = await agent.execute({ runId: accepted.runId, sessionId: session.id, text: request.text, resolved, agentOptions, scope,
+      referenceDate: request.referenceDate, timezone: request.timezone, agentPolicy, toolConfiguration,
+      signal: new AbortController().signal, deadlineAt: performance.now() + 30000 }, {
+      startCall: time => new ModelCallRecorder(repo, accepted.runId, 'main', time), preview: () => {}, nativeTerminal: () => {},
+    });
+    if (providerErrors.length) throw providerErrors[0];
+    expect(observed.lastOutcome).toMatchObject({ text: 'Original Query recovered.', error: null });
+    expect(requests).toHaveLength(4);
+    expect(observed.budgetSummary).toMatchObject({ toolCalls: 3, modelCalls: 4, unresolvedItems: [] });
+    const identity = (nativeToolCallId: string) => ({ runId: accepted.runId, sessionId: session.id, nativeToolCallId, scope,
+      referenceDate: request.referenceDate, timezone: request.timezone, signal: new AbortController().signal });
+    const original = store.readCall(identity('query-original'))!;
+    expect(original).toMatchObject({ status: 'succeeded', data: { queryId: originalQueryId }, sdkReturned: true,
+      control: { failureClass: 'tool_result_too_large', failureStage: 'sdk_delivery' }, sdkDelivery: { isError: true } });
+    expect(store.readCall(identity('query-recalculate'))).toMatchObject({ status: 'failed', error: { code: 'operation_result_unknown' } });
+    expect(store.readCall(identity('query-read'))).toMatchObject({ status: 'succeeded', data: { queryId: originalQueryId }, sdkReturned: true,
+      control: { recoveryAction: 'recovered', repairOfToolCallId: original.id }, sdkDelivery: { isError: false } });
+    expect(db.query('SELECT COUNT(*) AS n FROM queries').get()).toEqual({ n: 1 });
+    expect(db.query('SELECT COUNT(*) AS n FROM query_evidence').get()).toEqual({ n: 1 });
+    agent.releaseToolFacts(accepted.runId);
+  } finally {
+    const sessions = agent && Reflect.get(agent, 'sessions') as Map<number, { session?: { dispose(): void } }> | undefined;
+    sessions?.get(1)?.session?.dispose();
+    server.stop(true); db.close(); await rm(root, { recursive: true, force: true });
+  }
 }, 15000);
 
 test.each(['request-before-commit', 'request-after-commit', 'result', 'delivery'] as const)('necessary %s save failure retains the root and retry saves facts without another native effect', async fault => {

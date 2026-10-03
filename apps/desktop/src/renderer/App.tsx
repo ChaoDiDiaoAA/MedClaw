@@ -85,7 +85,7 @@ export function App() {
   }, []);
   const readCatalog = useCallback(async (page = 1) => {
     const instance = hostRef.current.instanceId, order = ++catalogRead.current;
-    const result = await window.medclaw.request("data.read", { page, pageSize: 50 });
+    const result = await window.medclaw.request("data.read", { page });
     if (instance !== hostRef.current.instanceId || order !== catalogRead.current) return;
     if (result.ok) { catalogRef.current = result.data; setCatalog(result.data); } else setError(errorMessage(result.error));
   }, []);

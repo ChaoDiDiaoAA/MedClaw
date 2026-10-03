@@ -27,7 +27,7 @@ export function DataWorkspace(props: { host: HostView; workspace: WorkspaceView 
     if (rowTarget.current.batchId !== batchId || rowTarget.current.kind !== kind) setRows(null);
     setRowBatch(batchId); setRowKind(kind); rowTarget.current = { instanceId: props.host.instanceId, batchId, kind };
     const target = { ...rowTarget.current }, order = ++rowOrder.current; setRowsLoading(true);
-    const result = await window.medclaw.request('data.rows', { batchId, kind, page, pageSize: 50 });
+    const result = await window.medclaw.request('data.rows', { batchId, kind, page });
     if (!mounted.current || order !== rowOrder.current || target.instanceId !== rowTarget.current.instanceId || target.batchId !== rowTarget.current.batchId || target.kind !== rowTarget.current.kind) return;
     if (result.ok && result.data.kind === kind) setRows(result.data); else props.onError(result.ok ? 'The data reply does not match this view.' : errorMessage(result.error));
     setRowsLoading(false);

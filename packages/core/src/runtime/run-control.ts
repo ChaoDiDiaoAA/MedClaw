@@ -2,9 +2,21 @@ import { performance } from 'node:perf_hooks';
 import { safeError, type AppError } from '../../../contracts/src/error';
 import { createToolControlObservation, type AgentPolicy, type BudgetSummary, type MeasurementContext, type ToolControlObservation, type ToolProfileSnapshot } from '../../../contracts/src/model';
 import { canonicalRequest, type RunScope, type RuntimeBudgetView } from '../../../contracts/src/run';
-import { groupWorkload } from '../tools/tool-profile';
+import { groupWorkload, TOOL_PROFILE_RULES } from '../tools/tool-profile';
+import { normalizeToolConfiguration, type ToolConfiguration } from '@medclaw/contracts/tool-config';
+import { normalizeRuntimeConfiguration, RUNTIME_CONFIG, type RuntimeConfiguration } from '@medclaw/contracts/runtime-config';
 
-type Failure = { code: string; stage: string; recordId: number | null; queryId: number | null; evidenceId: number | null; delivered: boolean };
+export const RUN_CONTROL_RULES = Object.freeze({
+  callConvergenceRatio: 0.75,
+  remainingTimeConvergenceRatio: 0.25,
+  answerReserveMaxMs: 10000,
+  answerReserveRatio: 0.1,
+  readTimeoutFloorMs: 1000,
+  workTimeoutFloorMs: 5000,
+  timeoutMultiplier: 2,
+});
+
+type Failure = { code: string; stage: string; recordId: number | null; queryId: number | null; evidenceId: number | null; queryCommitUnknown?: boolean; delivered: boolean };
 type Attempt = {
   name: string;
   raw: unknown;
@@ -18,13 +30,15 @@ type Attempt = {
 };
 type Options = {
   runId: number;
-  policy: AgentPolicy;
+  policy?: AgentPolicy;
   scope: RunScope;
   signal: AbortSignal;
   deadlineAt: number;
-  totalTimeoutMs: number;
+  totalTimeoutMs?: number;
   measurementContext?: MeasurementContext | null;
   toolProfileSnapshot?: ToolProfileSnapshot | null;
+  toolConfiguration?: ToolConfiguration;
+  runtimeConfiguration?: RuntimeConfiguration;
 };
 
 /** One Run's control facts; Pi remains the sole owner of loop and scheduling. */
@@ -43,7 +57,16 @@ export class RunControl {
   private recoveryAttempts = 0;
   private stopReason: string | null = null;
   private readonly options: Options;
-  constructor(options: Options) { this.options = { ...options, policy: structuredClone(options.policy), scope: structuredClone(options.scope) }; }
+  private readonly configurationSnapshot: ToolConfiguration;
+  private readonly runtimeSnapshot: RuntimeConfiguration;
+  constructor(options: Options) {
+    this.configurationSnapshot = normalizeToolConfiguration(options.toolConfiguration);
+    this.runtimeSnapshot = normalizeRuntimeConfiguration({ runtimeConfiguration: options.runtimeConfiguration, agentPolicy: options.policy,
+      requestPolicy: options.totalTimeoutMs === undefined ? undefined : { timeoutMs: options.totalTimeoutMs, ...(options.runtimeConfiguration?.llm ?? RUNTIME_CONFIG.llm) } });
+    this.options = { ...options, scope: structuredClone(options.scope) };
+  }
+  get configuration(): ToolConfiguration { return structuredClone(this.configurationSnapshot); }
+  get runtimeConfiguration(): RuntimeConfiguration { return structuredClone(this.runtimeSnapshot); }
 
   private remaining() { return Math.max(0, this.options.deadlineAt - performance.now()); }
   checkActive = () => {
@@ -52,19 +75,21 @@ export class RunControl {
   };
   admitModelCall(): { allowTools: boolean; feedback: string } {
     this.checkActive();
-    if (this.modelCalls >= this.options.policy.maxModelCalls) {
+    if (this.modelCalls >= this.runtimeSnapshot.runBudget.maxModelCalls) {
       this.modelAdmissionsRejected++;
       this.stopReason = 'agent_call_limit';
       throw new Error('agent_call_limit');
     }
     this.modelCalls++;
-    const reserve = Math.min(10000, this.options.totalTimeoutMs * 0.1);
-    this.allowTools = this.modelCalls < this.options.policy.maxModelCalls && this.toolCalls < this.options.policy.maxToolCalls
-      && this.remaining() > reserve && (!this.episodeId || this.episodeUsed < this.options.policy.maxRecoveryAttempts);
+    const scheduling = RUN_CONTROL_RULES;
+    const reserve = Math.min(scheduling.answerReserveMaxMs, this.runtimeSnapshot.runBudget.timeoutMs * scheduling.answerReserveRatio);
+    this.allowTools = this.modelCalls < this.runtimeSnapshot.runBudget.maxModelCalls && this.toolCalls < this.runtimeSnapshot.runBudget.maxToolCalls
+      && this.remaining() > reserve && (!this.episodeId || this.episodeUsed < this.runtimeSnapshot.runBudget.maxRecoveryAttempts);
     if (this.episodeId && this.allowTools) { this.episodeUsed++; this.recoveryAttempts++; }
-    if (!this.allowTools && this.episodeId && this.episodeUsed >= this.options.policy.maxRecoveryAttempts) this.stopReason = 'tool_recovery_limit';
-    this.convergenceRequested ||= this.toolCalls >= this.options.policy.maxToolCalls * 0.75
-      || this.modelCalls >= this.options.policy.maxModelCalls * 0.75 || this.remaining() < this.options.totalTimeoutMs * 0.25;
+    if (!this.allowTools && this.episodeId && this.episodeUsed >= this.runtimeSnapshot.runBudget.maxRecoveryAttempts) this.stopReason = 'tool_recovery_limit';
+    this.convergenceRequested ||= this.toolCalls >= this.runtimeSnapshot.runBudget.maxToolCalls * scheduling.callConvergenceRatio
+      || this.modelCalls >= this.runtimeSnapshot.runBudget.maxModelCalls * scheduling.callConvergenceRatio
+      || this.remaining() < this.runtimeSnapshot.runBudget.timeoutMs * scheduling.remainingTimeConvergenceRatio;
     return { allowTools: this.allowTools, feedback: this.feedback() };
   }
 
@@ -75,7 +100,7 @@ export class RunControl {
       return;
     }
     this.toolCalls++;
-    const allowed = this.allowTools && this.toolCalls <= this.options.policy.maxToolCalls;
+    const allowed = this.allowTools && this.toolCalls <= this.runtimeSnapshot.runBudget.maxToolCalls;
     this.attempts.set(id, { name, raw: structuredClone(raw), allowed, observation: createToolControlObservation({
       admission: { status: allowed ? 'not_reached' : 'blocked', reason: allowed ? null : 'tool_call_limit' },
       environmentKey: this.options.measurementContext?.environmentKey ?? null,
@@ -96,7 +121,7 @@ export class RunControl {
     else if (this.options.scope.readOnly && ['edit', 'write', 'bash', 'powershell'].includes(name)) reason = 'access_denied';
     else if (this.options.signal.aborted) reason = 'tool_cancelled';
     else if (this.remaining() <= 0) reason = 'run_timeout';
-    const committed = [...this.failures].find(([failedId, failure]) => failedId !== id && failure.queryId !== null
+    const committed = [...this.failures].find(([failedId, failure]) => failedId !== id && (failure.queryId !== null || failure.queryCommitUnknown)
       && this.attempts.get(failedId)?.name === name && this.attempts.get(failedId)?.prepared === value);
     if (!reason && committed && ['query_current_devices', 'query_device_changes'].includes(name)) {
       reason = 'operation_result_unknown';
@@ -130,13 +155,21 @@ export class RunControl {
     const profile = this.options.toolProfileSnapshot?.profiles.find(profile => profile.name === name && profile.version === version
       && profile.workloadBucket === bucket && profile.environmentKey === this.options.measurementContext?.environmentKey
       && profile.sdkVersion === this.options.measurementContext?.sdkVersion && profile.measurementVersion === this.options.measurementContext?.version);
-    const floor = ['query_current_devices', 'query_device_changes', 'edit', 'write', 'bash', 'powershell'].includes(name) ? 5000 : 1000;
-    const reserve = Math.min(10000, this.options.totalTimeoutMs * 0.1);
+    const scheduling = RUN_CONTROL_RULES, statistics = TOOL_PROFILE_RULES;
+    const floor = ['query_current_devices', 'query_device_changes', 'edit', 'write', 'bash', 'powershell'].includes(name)
+      ? scheduling.workTimeoutFloorMs : scheduling.readTimeoutFloorMs;
+    const reserve = Math.min(scheduling.answerReserveMaxMs, this.runtimeSnapshot.runBudget.timeoutMs * scheduling.answerReserveRatio);
     const available = Math.max(0, this.remaining() - reserve);
-    if (available < Math.min(floor, this.options.policy.singleToolTimeoutMs)) throw new Error('run_timeout');
-    const estimate = profile && profile.completeSamples >= 20 && profile.p95Ms !== null && (profile.timeoutRate ?? 0) < 0.2
-      ? Math.max(floor, 2 * profile.p95Ms) : this.options.policy.singleToolTimeoutMs;
-    const timeout = Math.min(estimate, this.options.policy.singleToolTimeoutMs, available);
+    const fields = prepared !== null && typeof prepared === 'object' ? prepared as Record<string, unknown> : {};
+    const nativeTimeout = ['bash', 'powershell'].includes(name) && typeof fields.timeout === 'number' && fields.timeout > 0
+      ? fields.timeout * 1000 : Infinity;
+    if (available < Math.min(floor, this.runtimeSnapshot.runBudget.singleToolTimeoutMs, nativeTimeout)) throw new Error('run_timeout');
+    const quantile = profile?.percentile === statistics.percentile ? profile.latencyQuantileMs
+      : profile?.percentile === undefined && statistics.percentile === 0.95 ? profile?.p95Ms : null;
+    const estimate = profile && profile.completeSamples >= statistics.minimumCompleteSamples && quantile !== null && quantile !== undefined
+      && (profile.timeoutRate ?? 0) < statistics.timeoutRateFallback
+      ? Math.max(floor, scheduling.timeoutMultiplier * quantile) : this.runtimeSnapshot.runBudget.singleToolTimeoutMs;
+    const timeout = Math.min(estimate, this.runtimeSnapshot.runBudget.singleToolTimeoutMs, available, nativeTimeout);
     const controller = new AbortController(), started = performance.now(), deadline = started + timeout;
     const signal = AbortSignal.any([this.options.signal, controller.signal, ...(sdkSignal ? [sdkSignal] : [])]);
     const lease = { controller, signal, timer: undefined as unknown as ReturnType<typeof setTimeout>, started, deadline, requested: null as number | null, finished: false };
@@ -189,7 +222,7 @@ export class RunControl {
     if (result.status !== 'succeeded') this.noteFailure(id, { code: result.error?.code ?? 'internal_error', stage: attempt.observation.failureStage ?? 'execution' });
     return this.observation(id);
   }
-  noteFailure(id: string, failure: { code: string; stage: string; recordId?: number | null; queryId?: number | null; evidenceId?: number | null }): void {
+  noteFailure(id: string, failure: { code: string; stage: string; recordId?: number | null; queryId?: number | null; evidenceId?: number | null; queryCommitUnknown?: boolean }): void {
     const attempt = this.attempts.get(id);
     if (!attempt) return;
     if (attempt.observation.failureClass === null) {
@@ -198,16 +231,19 @@ export class RunControl {
       attempt.observation.failureClass = failure.code;
       attempt.observation.failureVisibility = ['tool_output_inconsistent', 'tool_output_invalid'].includes(failure.code) ? 'implicit' : 'explicit';
     }
-    if (['tool_cancelled', 'access_denied', 'run_timeout', 'storage_write_failed'].includes(failure.code)
-      || failure.code === 'operation_result_unknown' && attempt.observation.recoveryAction === 'read_original_required') return;
+    if (failure.queryCommitUnknown) attempt.observation.recoveryAction = 'read_original_required';
+    if (!failure.queryCommitUnknown && (['tool_cancelled', 'access_denied', 'run_timeout', 'storage_write_failed'].includes(failure.code)
+      || failure.code === 'operation_result_unknown' && attempt.observation.recoveryAction === 'read_original_required')) return;
     this.episodeId ??= `${this.options.runId}:repair:${++this.episodeSequence}`;
     attempt.observation.repairEpisodeId = this.episodeId;
     const prior = this.failures.get(id);
     this.failures.set(id, { code: prior?.code ?? failure.code, stage: prior?.stage ?? failure.stage, recordId: failure.recordId ?? prior?.recordId ?? null,
-      queryId: failure.queryId ?? prior?.queryId ?? null, evidenceId: failure.evidenceId ?? prior?.evidenceId ?? null, delivered: prior?.delivered ?? false });
+      queryId: failure.queryId ?? prior?.queryId ?? null, evidenceId: failure.evidenceId ?? prior?.evidenceId ?? null,
+      queryCommitUnknown: failure.queryCommitUnknown ?? prior?.queryCommitUnknown, delivered: prior?.delivered ?? false });
   }
   private canRepair(failed: Attempt, failure: Failure, name: string, prepared: unknown, raw: unknown): boolean {
     if (!failed) return false;
+    if (failure.queryCommitUnknown) return false;
     if (failure.queryId !== null) return prepared !== null && typeof prepared === 'object'
       && ['read_query', 'read_query_page'].includes(name) && 'queryId' in prepared && prepared.queryId === failure.queryId;
     if (failed.name !== name) return false;
@@ -237,10 +273,10 @@ export class RunControl {
     }
   }
   readBudget(): RuntimeBudgetView {
-    return { runId: this.options.runId, toolCalls: { limit: this.options.policy.maxToolCalls, used: this.toolCalls, remaining: Math.max(0, this.options.policy.maxToolCalls - this.toolCalls) },
-      modelCalls: { limit: this.options.policy.maxModelCalls, used: this.modelCalls, remaining: Math.max(0, this.options.policy.maxModelCalls - this.modelCalls) },
+    return { runId: this.options.runId, toolCalls: { limit: this.runtimeSnapshot.runBudget.maxToolCalls, used: this.toolCalls, remaining: Math.max(0, this.runtimeSnapshot.runBudget.maxToolCalls - this.toolCalls) },
+      modelCalls: { limit: this.runtimeSnapshot.runBudget.maxModelCalls, used: this.modelCalls, remaining: Math.max(0, this.runtimeSnapshot.runBudget.maxModelCalls - this.modelCalls) },
       remainingTimeMs: this.remaining(), recovery: { episodeId: this.episodeId, used: this.episodeUsed,
-        remaining: Math.max(0, this.options.policy.maxRecoveryAttempts - this.episodeUsed), unresolvedItems: [...this.failures.keys()] } };
+        remaining: Math.max(0, this.runtimeSnapshot.runBudget.maxRecoveryAttempts - this.episodeUsed), unresolvedItems: [...this.failures.keys()] } };
   }
   feedback(): string {
     return JSON.stringify({ budget: this.readBudget(), converge: this.convergenceRequested, allowTools: this.allowTools,

@@ -3,8 +3,9 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import { AppErrorSchema, PositiveIdSchema, safeError, type AppError } from "../../contracts/src/error";
-import { ChangesQuerySchema, CurrentQuerySchema, QueryParamsSchema, EvidenceSchema, QueryRecordSchema, type Evidence, type QueryRecord, type QueryStore, type QueryContext } from "../../contracts/src/query";
+import { BUSINESS_RULES, createQuerySchemas, ChangesQuerySchema, CurrentQuerySchema, QueryParamsSchema, EvidenceSchema, QueryRecordSchema, type Evidence, type QueryRecord, type QueryStore, type QueryContext } from "../../contracts/src/query";
 import { canonicalRequest, RunScopeSchema } from "../../contracts/src/run";
+import { StoredToolConfigurationSchema } from '../../contracts/src/tool-config';
 import { createToolControlObservation, MeasurementContextSchema, ToolControlObservationSchema, type ToolControlObservation } from '../../contracts/src/model';
 import { ToolCallRecordSchema, ToolContextIdentitySchema, ToolExecutionModeSchema, ToolSdkDeliverySchema, type ToolCallIdentity, type ToolCallRecord,
   ToolObservationSchema, type ToolObservation, type ToolCallStore, type ToolExecutionContext, type ToolResult, type ToolSdkDelivery } from "../../contracts/src/tool";
@@ -249,16 +250,18 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
     }).immediate(), "storage_write_failed");
   }
 
-  readToolObservations(input: { cutoffAt: string; maxToolCallId?: number | null; limit?: number }): { maxToolCallId: number | null; observations: ToolObservation[] } {
+  readToolObservations(input: { cutoffAt: string; maxToolCallId?: number | null; limit: number; windowDays: number }): { maxToolCallId: number | null; observations: ToolObservation[] } {
     return protect(() => this.db.transaction(() => {
       const cutoff = Date.parse(input.cutoffAt);
-      const limit = input.limit ?? 2000;
-      if (!Number.isFinite(cutoff) || new Date(cutoff).toISOString() !== input.cutoffAt || !Number.isSafeInteger(limit) || limit < 1 || limit > 2000) fail('invalid_argument');
+      const limit = input.limit;
+      const windowDays = input.windowDays;
+      if (!Number.isFinite(cutoff) || new Date(cutoff).toISOString() !== input.cutoffAt || !Number.isSafeInteger(limit) || limit < 1
+        || !Number.isSafeInteger(windowDays) || windowDays < 1 || windowDays > Math.floor(Number.MAX_SAFE_INTEGER / 86400000)) fail('invalid_argument');
       if (input.maxToolCallId !== undefined && input.maxToolCallId !== null) id(input.maxToolCallId);
       const maximum = this.db.query<{ maximum: number | null }, [string]>('SELECT MAX(id) AS maximum FROM tool_calls WHERE requested_at<=?').get(input.cutoffAt)!.maximum;
       const maxToolCallId = input.maxToolCallId === undefined ? maximum : input.maxToolCallId;
       if (maxToolCallId === null) return { maxToolCallId, observations: [] };
-      const since = new Date(cutoff - 30 * 86400000).toISOString();
+      const since = new Date(Math.max(-8640000000000000, cutoff - windowDays * 86400000)).toISOString();
       const rows = this.db.query<CallRow & { config_json: string }, [number, string, string, number]>(
         'SELECT t.*,r.config_json FROM tool_calls t JOIN runs r ON r.id=t.run_id WHERE t.id<=? AND t.requested_at>=? AND t.requested_at<=? ORDER BY t.id DESC LIMIT ?')
         .all(maxToolCallId, since, input.cutoffAt, limit);
@@ -358,6 +361,21 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
           || json(prior.scopeDeviceIds) !== json(input.scopeDeviceIds)) fail('state_conflict');
         return prior;
       }
+      // Validate the saved snapshot without reactivating removed business settings.
+      const run = this.db.query<{ config_json?: string | null }, [number]>('SELECT * FROM runs WHERE id=?').get(context.runId);
+      if (run?.config_json != null) {
+        const saved = decode(run.config_json);
+        if (saved === null || typeof saved !== 'object' || Array.isArray(saved)) fail('storage_read_failed');
+        if (Object.hasOwn(saved, 'toolConfiguration')) {
+          const frozen = StoredToolConfigurationSchema.safeParse((saved as Record<string, unknown>).toolConfiguration);
+          if (!frozen.success) fail('storage_read_failed');
+        }
+      }
+      const policySchemas = createQuerySchemas();
+      const policySchema = 'kind' in params.data ? policySchemas.QueryParamsSchema
+        : input.kind === 'current' ? policySchemas.CurrentQuerySchema : policySchemas.ChangesQuerySchema;
+      if (!policySchema.safeParse(params.data).success) fail('invalid_argument');
+      if (input.rows.length > BUSINESS_RULES.maxSavedRows) throw safeError('query_result_too_large');
       const references = this.p3 ? this.db.query<{ id: number; material_version: string; source_bundle_id: string; source_lock_hash: string }, [string]>(
         'SELECT id,material_version,source_bundle_id,source_lock_hash FROM batches WHERE id IN (SELECT value FROM json_each(?))').all(json(input.batchIds)) : [];
       if (this.p3) {

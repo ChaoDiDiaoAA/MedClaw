@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 import { HostController } from "../../apps/desktop/src/main/host-controller";
 import { MainSettings, atomicWriteJson } from "../../apps/desktop/src/main/settings";
 import { PublishedSettingsSchema } from "../../packages/contracts/src/model";
+import { mergeRuntimeConfigurationPolicies } from '../../packages/contracts/src/runtime-config';
 import { NewSessionResultSchema, SessionDetailSchema, SubmitResultSchema, type SubmitInput } from "../../packages/contracts/src/session";
 import { RuntimeControlViewSchema, ReadRunResultSchema } from "../../packages/contracts/src/run";
 import { WorkspaceViewSchema } from "../../packages/contracts/src/workspace";
@@ -31,7 +32,7 @@ async function setup(mode: Parameters<typeof providerFixture>[0] = "success") {
   const definition = { providerId: "p2-fixture", name: "Fixture", api: "openai-completions", baseUrl: service.url,
     models: [{ id: "fixture", name: "Fixture", input: ["text"], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }] };
   atomicWriteJson(host.paths.settingsPath, PublishedSettingsSchema.parse({ ...initial, model: { provider: "p2-fixture", modelId: "fixture" },
-    customProviders: [{ definition, credentialRef: null }], requestPolicy: { timeoutMs: mode === "slow" ? 10000 : 5000, maxRetries: 0, maxRetryDelayMs: 2000 } }));
+    customProviders: [{ definition, credentialRef: null }], ...mergeRuntimeConfigurationPolicies(initial, { requestPolicy: { timeoutMs: mode === "slow" ? 10000 : 5000, maxRetries: 0, maxRetryDelayMs: 2000 } }) }));
   expect(await host.start()).toMatchObject({ state: "ready", schemaVersion: DATABASE_SCHEMA_VERSION, error: null });
   async function workspace() { return WorkspaceViewSchema.parse(unwrap(await host.request("workspace.read", {}))); }
   async function create(op: string = crypto.randomUUID()) { return NewSessionResultSchema.parse(unwrap(await host.request("session.create", { expectedWorkspaceRevision: (await workspace()).revision }, op))); }

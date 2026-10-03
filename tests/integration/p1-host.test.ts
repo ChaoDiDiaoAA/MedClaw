@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { mergeRuntimeConfigurationPolicies } from '../../packages/contracts/src/runtime-config';
 
 async function fixture(mode = "normal") {
   const root = mkdtempSync(join(tmpdir(), "medclaw P1 中文 -"));
@@ -213,7 +214,7 @@ test("actual Host recovers an interrupted slow Run only after its owned writer e
       models: [{ id: "fixture", name: "Fixture", input: ["text"], reasoning: false, contextWindow: 8192, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }],
     };
     atomicWriteJson(host.paths.settingsPath, PublishedSettingsSchema.parse({ ...initial, model: { provider: "p1-fixture", modelId: "fixture" },
-      customProviders: [{ definition, credentialRef: null }], requestPolicy: { ...initial.requestPolicy, timeoutMs: 30000 },
+      customProviders: [{ definition, credentialRef: null }], ...mergeRuntimeConfigurationPolicies(initial, { requestPolicy: { ...initial.requestPolicy, timeoutMs: 30000 } }),
     }));
     expect(await host.start()).toMatchObject({ state: "ready", error: null });
     const oldInstance = host.read().instanceId!;
@@ -311,7 +312,7 @@ test("actual Host orderly shutdown aborts native retry wait and restart never re
     atomicWriteJson(host.paths.settingsPath, PublishedSettingsSchema.parse({ ...initial, model: { provider: "p1-fixture", modelId: "fixture" },
       customProviders: [{ credentialRef: null, definition: { providerId: "p1-fixture", name: "Fixture", api: "openai-completions", baseUrl: service.url,
         models: [{ id: "fixture", name: "Fixture", input: ["text"], reasoning: false, contextWindow: 8192, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }],
-      } }], requestPolicy: { timeoutMs: 30000, maxRetries: 1, maxRetryDelayMs: 2000 },
+      } }], ...mergeRuntimeConfigurationPolicies(initial, { requestPolicy: { timeoutMs: 30000, maxRetries: 1, maxRetryDelayMs: 2000 } }),
     }));
     expect(await host.start()).toMatchObject({ state: "ready", error: null });
     const oldInstance = host.read().instanceId!;
@@ -382,7 +383,7 @@ test("actual Host keeps a failed required save closed through forced shutdown an
     atomicWriteJson(host.paths.settingsPath, PublishedSettingsSchema.parse({ ...initial, model: { provider: "p1-fixture", modelId: "fixture" },
       customProviders: [{ credentialRef: null, definition: { providerId: "p1-fixture", name: "Fixture", api: "openai-completions", baseUrl: service.url,
         models: [{ id: "fixture", name: "Fixture", input: ["text"], reasoning: false, contextWindow: 8192, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }],
-      } }], requestPolicy: { ...initial.requestPolicy, timeoutMs: 30000 },
+      } }], ...mergeRuntimeConfigurationPolicies(initial, { requestPolicy: { ...initial.requestPolicy, timeoutMs: 30000 } }),
     }));
     expect(await host.start()).toMatchObject({ state: "ready", error: null });
     const oldInstance = host.read().instanceId!;

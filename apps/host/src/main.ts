@@ -1,6 +1,6 @@
 import { open, readFile, unlink, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep, join } from "node:path";
-import { HostHelloSchema, HostRequestSchema, HostPrivateRequestSchema, PrivateCredentialReplySchema, NoticeFrameSchema, encodeHostFrame, publicMethodSchemas, hostPrivateMethodSchemas, isReadOnlyMethod, MAX_FRAME_BYTES, HOST_PROTOCOL_VERSION, type HostHello, type HostRequest, type RuntimeNotice, type PrivateCredentialMethod } from "../../../packages/contracts/src/protocol.ts";
+import { HostHelloSchema, HostRequestSchema, HostPrivateRequestSchema, PrivateCredentialReplySchema, NoticeFrameSchema, encodeHostFrame, publicMethodSchemas, createPublicMethodSchemas, hostPrivateMethodSchemas, isReadOnlyMethod, MAX_FRAME_BYTES, HOST_PROTOCOL_VERSION, type HostHello, type HostRequest, type RuntimeNotice, type PrivateCredentialMethod } from "../../../packages/contracts/src/protocol.ts";
 import { PublishedSettingsSchema } from "../../../packages/contracts/src/model.ts";
 import { AppErrorSchema, safeError, OpaqueIdSchema, type Result } from "../../../packages/contracts/src/error.ts";
 import { openDatabase, SCHEMA_VERSION } from "../../../packages/storage/src/database.ts";
@@ -25,7 +25,9 @@ import { ToolRegistry } from '../../../packages/core/src/tools/registry.ts';
 import { ToolRecorder } from '../../../packages/core/src/tools/recorder.ts';
 import { ToolExecutor } from '../../../packages/core/src/tools/executor.ts';
 import { RunScopeSchema, canonicalRequest } from '../../../packages/contracts/src/run.ts';
-import { QuerySummarySchema, EvidenceSummarySchema, type QueryExecutionContext, type QueryRecord, type Evidence } from '../../../packages/contracts/src/query.ts';
+import { BUSINESS_RULES, createStoredQuerySchemas, QuerySummarySchema, EvidenceSummarySchema, type QueryExecutionContext, type QueryRecord, type Evidence } from '../../../packages/contracts/src/query.ts';
+import { StoredToolConfigurationSchema } from '../../../packages/contracts/src/tool-config.ts';
+import { TOOL_READ_RULES } from '../../../packages/contracts/src/tool.ts';
 import { AbsolutePathSchema } from '../../../packages/contracts/src/protocol.ts';
 import { ErrorLog } from "../../../packages/logging/src/error-log.ts";
 import { RuntimeLog } from "../../../packages/logging/src/runtime-log.ts";
@@ -150,9 +152,19 @@ async function initialize(raw: unknown) {
   catalog = new SqliteCatalogStore(database); toolStore = new SqliteToolStore(database);
   const catalogService = new CatalogService(catalog);
   queries = new QueryService(catalogService, toolStore); evidence = new EvidenceReader(catalogService, queries, toolStore);
-  const registry = new ToolRegistry(createBusinessTools({ catalog: catalogService, queries, evidence }));
   const recorder = new ToolRecorder(toolStore, (error, context) => application?.runs.failToolPersistence(context.runId, error));
-  const agent = new PiAgentRuntime(runtime, config.paths.dataRoot, { registry, recorder, executor: new ToolExecutor(registry, recorder) });
+  const configure = () => {
+    const registry = new ToolRegistry(createBusinessTools({ catalog: catalogService, queries, evidence }));
+    const executor = new ToolExecutor(registry, recorder, {
+      findCommittedQuery: context => {
+        const saved = toolStore.findQuery(`${context.runId}:${context.nativeToolCallId}`);
+        return saved && (saved.kind === 'current' || saved.kind === 'changes')
+          ? { id: saved.id, sessionId: saved.sessionId, runId: saved.runId, kind: saved.kind, callRef: saved.callRef } : null;
+      },
+    });
+    return { registry, executor };
+  };
+  const agent = new PiAgentRuntime(runtime, config.paths.dataRoot, { ...configure(), recorder, configure });
   artifacts = new ArtifactStore(database, join(config.paths.dataRoot, 'artifacts'));
   imports = new ImportService({ store: new SqliteImportStore(database), artifacts, instanceId: config.instanceId,
     resolveToken: async (fileToken, operationRef) => AbsolutePathSchema.parse(await credentials('file.resolve', { fileToken, operationRef })) });
@@ -177,16 +189,23 @@ function evidenceSummary(record: Evidence) {
   return EvidenceSummarySchema.parse({ ...metadata, snapshotCount: snapshotIds.length, eventCount: eventIds.length });
 }
 function readContext(runId: number, requireSelectedSession = true): QueryExecutionContext {
-  const row = database!.query<{ kind: string; session_id: number | null; scope_json: string; reference_date: string; timezone: string }, [number]>(
-    'SELECT kind,session_id,scope_json,reference_date,timezone FROM runs WHERE id=?').get(runId);
+  const row = database!.query<{ kind: string; session_id: number | null; scope_json: string; reference_date: string; timezone: string; config_json: string }, [number]>(
+    'SELECT kind,session_id,scope_json,reference_date,timezone,config_json FROM runs WHERE id=?').get(runId);
   if (!row || row.kind !== 'agent' || row.session_id === null || requireSelectedSession && repositories.readWorkspace().sessionId !== row.session_id) throw new Error('access_denied');
   return { runId, inputId: null, sessionId: row.session_id, source: 'user_form', callRef: `read:${runId}`,
-    scope: RunScopeSchema.parse(JSON.parse(row.scope_json)), referenceDate: row.reference_date, timezone: row.timezone, signal: new AbortController().signal };
+    scope: RunScopeSchema.parse(JSON.parse(row.scope_json)), referenceDate: row.reference_date, timezone: row.timezone,
+    signal: new AbortController().signal };
+}
+function frozenConfiguration(runId: number) {
+  const row = database!.query<{ config_json: string }, [number]>('SELECT config_json FROM runs WHERE id=?').get(runId);
+  const value = row ? JSON.parse(row.config_json).toolConfiguration : undefined;
+  return value === undefined ? undefined : StoredToolConfigurationSchema.parse(value);
 }
 function queryView(queryId: number, page: number, pageSize: number) {
   const saved = toolStore.readQuery(queryId); if (!saved) throw new Error('operation_not_found');
   const context = readContext(saved.runId), query = queries.read(queryId, context);
-  return { query: summary(query), page: queries.page({ queryId, page, pageSize }, context), evidence: evidence.readQuery(queryId, context).map(evidenceSummary) };
+  return { query: summary(query), page: queries.page({ queryId, page, pageSize }, context),
+    evidence: evidence.readQuery(queryId, context).slice(0, BUSINESS_RULES.evidenceSummaryLimit).map(evidenceSummary) };
 }
 function dataCatalog(page: number, pageSize: number) {
   const counts = (table: 'batches' | 'devices' | 'snapshots' | 'change_events') => database!.query<{ count: number }, []>(`SELECT COUNT(*) AS count FROM ${table}`).get()!.count;
@@ -233,9 +252,12 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case 'import.cancel': return unwrap(await imports.cancel(request.payload.operationRef));
     case 'import.recover': return unwrap(await imports.recover(request.payload.operationRef));
     case 'evidence.readArtifact': return unwrap(await artifacts.read(request.payload.artifactId));
-    case 'data.read': return dataCatalog(request.payload.page, request.payload.pageSize);
+    case 'data.read': {
+      const { page, pageSize } = createPublicMethodSchemas()['data.read'].input.parse(request.payload);
+      return dataCatalog(page, pageSize);
+    }
     case 'data.rows': {
-      const { batchId, kind, page, pageSize } = request.payload;
+      const { batchId, kind, page, pageSize } = createPublicMethodSchemas()['data.rows'].input.parse(request.payload);
       if (catalog.readBatches([batchId]).length !== 1) throw new Error('access_denied');
       const table = kind === 'devices' ? 'snapshots' : 'change_events', column = kind === 'devices' ? 'batch_id' : 'new_batch_id';
       const totalRows = database!.query<{ count: number }, [number]>(`SELECT COUNT(*) AS count FROM ${table} WHERE ${column}=?`).get(batchId)!.count;
@@ -246,36 +268,45 @@ async function dispatch(request: HostRequest): Promise<unknown> {
       const previous = database!.query<{ id: number }, [string]>("SELECT id FROM queries WHERE source='user_form' AND call_ref=CAST(run_id AS TEXT)||':'||?").get(request.operationRef);
       if (previous) {
         const saved = toolStore.readQuery(previous.id)!;
-        if (canonicalRequest(saved.params) !== canonicalRequest(request.payload.params)) throw new Error('state_conflict');
+        const configuration = frozenConfiguration(saved.runId);
+        const params = createStoredQuerySchemas(configuration).QueryParamsSchema.parse(request.payload.params);
+        if (canonicalRequest(saved.params) !== canonicalRequest(params)) throw new Error('state_conflict');
         const activity = database!.query<{ details_json: string }, [number]>("SELECT details_json FROM business_events WHERE query_id=? AND type='query_committed'").get(saved.id);
         if (!activity || JSON.parse(activity.details_json).workspaceRevision !== request.payload.expectedRevision) throw new Error('state_conflict');
-        return queryView(saved.id, request.payload.params.page, request.payload.params.pageSize);
+        return queryView(saved.id, params.page, params.pageSize);
       }
       const context = app.runs.bindQueryContext(request.operationRef, request.payload.expectedRevision);
       const saved = unwrap(await queries.execute(request.payload.params, context));
-      return queryView(saved.id, request.payload.params.page, request.payload.params.pageSize);
+      return queryView(saved.id, saved.params.page, saved.params.pageSize);
     }
-    case 'query.read': return queryView(request.payload.queryId, request.payload.page, request.payload.pageSize);
+    case 'query.read': {
+      const { queryId, page, pageSize } = createPublicMethodSchemas()['query.read'].input.parse(request.payload);
+      return queryView(queryId, page, pageSize);
+    }
     case 'query.list': {
-      if (repositories.readWorkspace().sessionId !== request.payload.sessionId) throw new Error('access_denied');
-      const rows = database!.query<{ id: number }, [number, number, number]>('SELECT id FROM queries WHERE session_id=? AND id<? ORDER BY id DESC LIMIT ?').all(request.payload.sessionId, request.payload.beforeQueryId ?? Number.MAX_SAFE_INTEGER, request.payload.limit + 1);
-      return { items: rows.slice(0, request.payload.limit).map(row => { const saved = toolStore.readQuery(row.id)!; return summary(queries.read(row.id, readContext(saved.runId))); }), nextBeforeQueryId: rows.length > request.payload.limit ? rows[request.payload.limit - 1]!.id : null };
+      const { sessionId, beforeQueryId, limit } = createPublicMethodSchemas()['query.list'].input.parse(request.payload);
+      if (repositories.readWorkspace().sessionId !== sessionId) throw new Error('access_denied');
+      const rows = database!.query<{ id: number }, [number, number, number]>('SELECT id FROM queries WHERE session_id=? AND id<? ORDER BY id DESC LIMIT ?').all(sessionId, beforeQueryId ?? Number.MAX_SAFE_INTEGER, limit + 1);
+      return { items: rows.slice(0, limit).map(row => { const saved = toolStore.readQuery(row.id)!; return summary(queries.read(row.id, readContext(saved.runId))); }), nextBeforeQueryId: rows.length > limit ? rows[limit - 1]!.id : null };
     }
     case 'evidence.read': {
-      const saved = toolStore.readQuery(request.payload.queryId); if (!saved) throw new Error('operation_not_found');
-      const context = readContext(saved.runId), record = evidence.read(request.payload.evidenceId, context);
-      if (record.queryId !== request.payload.queryId) throw new Error('access_denied');
-      return { ...evidence.rows(request.payload, context), evidence: evidenceSummary(record) };
+      const payload = createPublicMethodSchemas()['evidence.read'].input.parse(request.payload);
+      const saved = toolStore.readQuery(payload.queryId); if (!saved) throw new Error('operation_not_found');
+      const context = readContext(saved.runId), record = evidence.read(payload.evidenceId, context);
+      if (record.queryId !== payload.queryId) throw new Error('access_denied');
+      return { ...evidence.rows(payload, context), evidence: evidenceSummary(record) };
     }
     case 'tool.read': {
-      const { runId, page, pageSize } = request.payload, context = readContext(runId, false);
+      const { runId, page, pageSize } = createPublicMethodSchemas()['tool.read'].input.parse(request.payload), context = readContext(runId, false);
+      const { inputPreviewChars, resultPreviewChars } = TOOL_READ_RULES;
       const totalRows = database!.query<{ count: number }, [number]>('SELECT COUNT(*) AS count FROM tool_calls WHERE run_id=?').get(runId)!.count;
       const rows = database!.query<{ native_tool_call_id: string }, [number, number, number]>('SELECT native_tool_call_id FROM tool_calls WHERE run_id=? ORDER BY id LIMIT ? OFFSET ?').all(runId, pageSize, (page - 1) * pageSize);
       const items = rows.map(row => {
         const record = toolStore.readCall({ ...context, nativeToolCallId: row.native_tool_call_id })!;
         const { input, data, sdkDelivery, ...metadata } = record;
         const args = JSON.stringify(input), result = JSON.stringify(sdkDelivery ?? data);
-        return { ...metadata, sdkResultIsError: record.sdkReturned ? sdkDelivery?.isError ?? null : null, inputPreview: args.slice(0, 8192), resultPreview: result.slice(0, 16384), truncated: args.length > 8192 || result.length > 16384 };
+        return { ...metadata, sdkResultIsError: record.sdkReturned ? sdkDelivery?.isError ?? null : null,
+          inputPreview: args.slice(0, inputPreviewChars), resultPreview: result.slice(0, resultPreviewChars), truncated: args.length > inputPreviewChars || result.length > resultPreviewChars };
       });
       return { runId, scope: context.scope, items, totalRows, page, pageSize };
     }
@@ -301,7 +332,7 @@ async function request(raw: unknown) {
     try { result = { ok: true, data: schema.parse(data) }; }
     catch { throw safeError(isReadOnlyMethod(frame.method) ? "host_protocol_mismatch" : "operation_result_unknown", undefined, { operationRef: frame.operationRef }); }
   } catch (error) { const known = AppErrorSchema.safeParse(error); const safe = known.success ? { ...known.data, operationRef: frame.operationRef }
-    : safeError(error instanceof Error ? error.message : "internal_error", error, { operationRef: frame.operationRef }); errorLog.add(safe); result = { ok: false, error: safe }; }
+    : safeError(error instanceof Error && error.name === 'ZodError' ? 'invalid_argument' : error instanceof Error ? error.message : "internal_error", error, { operationRef: frame.operationRef }); errorLog.add(safe); result = { ok: false, error: safe }; }
   if (terminating) return;
   await sendRaw(encodeHostFrame({ protocolVersion: HOST_PROTOCOL_VERSION, kind: "reply", instanceId: frame.instanceId, requestId: frame.requestId, result } as never));
   if (frame.method === "host.shutdown" && result.ok) { closing = true; await writes; process.exit(0); }

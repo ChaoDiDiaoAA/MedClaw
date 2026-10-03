@@ -12,8 +12,10 @@ import { ListSessionsRequestSchema, NewSessionInputSchema, NewSessionResultSchem
   SessionDetailSchema, SessionPageSchema, SubmitInputSchema, SubmitResultSchema } from "./session";
 import { WorkspaceViewSchema, UpdateWorkspaceRequestSchema } from "./workspace";
 import { ImportPreviewRequestSchema, ImportCommitRequestSchema, ImportPreviewSchema, ImportOperationSchema, ImportReferenceSchema, ArtifactSchema, DataCatalogSchema, DataRowsSchema } from "./data";
-import { EvidenceViewSchema, PageSchema, QueryParamsSchema, QuerySummarySchema, QueryViewSchema } from './query';
-import { RunToolsViewSchema } from './tool';
+import { BUSINESS_RULES, createQuerySchemas, EvidenceViewSchema, PageSchema, QueryRequestParamsSchema, QuerySummarySchema, QueryViewSchema } from './query';
+import { TOOL_READ_RULES, RunToolsViewSchema } from './tool';
+import { StoredToolConfigurationSchema, normalizeToolConfiguration } from './tool-config';
+import { RuntimeConfigurationSchema, normalizeRuntimeConfiguration, projectRuntimePolicies } from './runtime-config';
 
 export const HOST_PROTOCOL_VERSION = "medclaw.host/p3-v1" as const;
 export const DATABASE_SCHEMA_VERSION = 3 as const;
@@ -29,6 +31,35 @@ const expectedVersion = { expectedConfigVersion: ConfigVersionSchema };
 const instanceControl = z.strictObject({ expectedInstanceId: OpaqueIdSchema });
 const configurableSelection = z.strictObject({ configVersion: ConfigVersionSchema, selection: ModelSelectionSchema });
 const uiResult = z.strictObject({ configVersion: ConfigVersionSchema, ui: DesktopDisplayPreferencesSchema });
+const policyUpdateInput = z.strictObject({
+  ...expectedVersion,
+  policy: RequestPolicySchema.optional(),
+  agentPolicy: AgentPolicySchema.optional(),
+  runtimeConfiguration: RuntimeConfigurationSchema.optional(),
+  toolConfiguration: StoredToolConfigurationSchema.optional(),
+}).superRefine((input, context) => {
+  if (!input.policy && !input.agentPolicy && !input.toolConfiguration && !input.runtimeConfiguration) context.addIssue({ code: 'custom', message: 'At least one policy or tool configuration is required' });
+  try { normalizeRuntimeConfiguration({ ...input, requestPolicy: input.policy }); }
+  catch { context.addIssue({ code: 'custom', path: ['runtimeConfiguration'], message: 'Conflicting runtime configuration and policy' }); }
+});
+const policyResultFields = {
+  configVersion: ConfigVersionSchema,
+  policy: RequestPolicySchema,
+  agentPolicy: AgentPolicySchema,
+  runtimeConfiguration: RuntimeConfigurationSchema.optional(),
+  toolConfiguration: StoredToolConfigurationSchema.optional(),
+};
+function normalizePolicyResult<T extends z.infer<z.ZodObject<typeof policyResultFields>>>(result: T, context: z.RefinementCtx) {
+  try {
+    const toolConfiguration = normalizeToolConfiguration({ toolConfiguration: result.toolConfiguration });
+    const runtimeConfiguration = normalizeRuntimeConfiguration({ ...result, requestPolicy: result.policy });
+    const projection = projectRuntimePolicies(runtimeConfiguration);
+    return { ...result, policy: projection.requestPolicy, agentPolicy: projection.agentPolicy, runtimeConfiguration, toolConfiguration };
+  } catch {
+    context.addIssue({ code: 'custom', path: ['toolConfiguration'], message: 'Conflicting runtime configuration and policy' });
+    return z.NEVER;
+  }
+}
 export const DiagnosticsCategorySchema = z.enum(["versions", "host", "errors", "runtime", "prompt_trace"]);
 export const DiagnosticsEntrySchema = z.strictObject({
   category: z.enum(["errors", "runtime", "prompt_trace"]), source: z.enum(["main", "host"]), at: TimestampSchema,
@@ -73,10 +104,10 @@ export const publicMethodSchemas = {
     output: z.strictObject({ configVersion: ConfigVersionSchema, definition: CustomProviderDefinitionSchema, registered: z.boolean() }),
   },
   "model.configure": { input: ModelChoiceSchema, output: configurableSelection },
-  "model.policy.update": { input: z.strictObject({ ...expectedVersion, policy: RequestPolicySchema, agentPolicy: AgentPolicySchema.optional() }), output: z.strictObject({ configVersion: ConfigVersionSchema, policy: RequestPolicySchema, agentPolicy: AgentPolicySchema }) },
+  "model.policy.update": { input: policyUpdateInput, output: z.strictObject(policyResultFields).transform(normalizePolicyResult) },
   "model.config.read": {
     input: EmptyPayloadSchema,
-    output: z.strictObject({ configVersion: ConfigVersionSchema, previousConfigVersion: ConfigVersionSchema.nullable(), rollbackFromVersion: ConfigVersionSchema.nullable(), policy: RequestPolicySchema, agentPolicy: AgentPolicySchema }),
+    output: z.strictObject({ ...policyResultFields, previousConfigVersion: ConfigVersionSchema.nullable(), rollbackFromVersion: ConfigVersionSchema.nullable() }).transform(normalizePolicyResult),
   },
   "model.config.rollback": {
     input: z.strictObject({ ...expectedVersion, targetConfigVersion: ConfigVersionSchema }),
@@ -93,13 +124,13 @@ export const publicMethodSchemas = {
   "workspace.read": { input: EmptyPayloadSchema, output: WorkspaceViewSchema },
   "workspace.restore": { input: EmptyPayloadSchema, output: WorkspaceViewSchema },
   "workspace.update": { input: UpdateWorkspaceRequestSchema, output: WorkspaceViewSchema },
-  'data.read': { input: PageSchema, output: DataCatalogSchema },
-  'data.rows': { input: z.strictObject({ kind: z.enum(['devices', 'changes']), batchId: PositiveIdSchema, page: z.number().int().positive().default(1), pageSize: z.number().int().min(1).max(100).default(50) }), output: DataRowsSchema },
-  'query.execute': { input: z.strictObject({ params: QueryParamsSchema, expectedRevision: z.number().int().nonnegative() }), output: QueryViewSchema },
-  'query.read': { input: PageSchema.extend({ queryId: PositiveIdSchema }), output: QueryViewSchema },
-  'query.list': { input: z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: z.number().int().min(1).max(50).default(20) }), output: z.strictObject({ items: z.array(QuerySummarySchema).max(50), nextBeforeQueryId: PositiveIdSchema.nullable() }) },
-  'evidence.read': { input: z.strictObject({ queryId: PositiveIdSchema, evidenceId: PositiveIdSchema, page: z.number().int().positive().default(1), pageSize: z.number().int().min(1).max(100).default(50) }), output: EvidenceViewSchema },
-  'tool.read': { input: z.strictObject({ runId: PositiveIdSchema, page: z.number().int().positive().default(1), pageSize: z.number().int().min(1).max(50).default(20) }), output: RunToolsViewSchema },
+  'data.read': { input: PageSchema.extend({ page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional() }), output: DataCatalogSchema },
+  'data.rows': { input: PageSchema.extend({ page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional(), kind: z.enum(['devices', 'changes']), batchId: PositiveIdSchema }), output: DataRowsSchema },
+  'query.execute': { input: z.strictObject({ params: QueryRequestParamsSchema, expectedRevision: z.number().int().nonnegative() }), output: QueryViewSchema },
+  'query.read': { input: PageSchema.extend({ page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional(), queryId: PositiveIdSchema }), output: QueryViewSchema },
+  'query.list': { input: z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.optional() }), output: z.strictObject({ items: z.array(QuerySummarySchema), nextBeforeQueryId: PositiveIdSchema.nullable() }) },
+  'evidence.read': { input: PageSchema.extend({ page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional(), queryId: PositiveIdSchema, evidenceId: PositiveIdSchema }), output: EvidenceViewSchema },
+  'tool.read': { input: z.strictObject({ runId: PositiveIdSchema, page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional() }), output: RunToolsViewSchema },
   "import.preview": { input: ImportPreviewRequestSchema, output: ImportPreviewSchema },
   "import.commit": { input: ImportCommitRequestSchema, output: ImportOperationSchema },
   "import.read": { input: ImportReferenceSchema, output: ImportOperationSchema.nullable() },
@@ -125,6 +156,20 @@ export const publicMethodSchemas = {
   "host.restart": { input: instanceControl, output: HostViewSchema },
 } as const;
 export type PublicMethod = keyof typeof publicMethodSchemas;
+/** Wire contracts stay structural; trusted owners apply the current or frozen policy. */
+export function createPublicMethodSchemas() {
+  const query = createQuerySchemas();
+  const presentation = TOOL_READ_RULES;
+  return {
+    ...publicMethodSchemas,
+    'data.read': { ...publicMethodSchemas['data.read'], input: query.PageSchema },
+    'data.rows': { ...publicMethodSchemas['data.rows'], input: query.PageSchema.extend({ kind: z.enum(['devices', 'changes']), batchId: PositiveIdSchema }) },
+    'query.read': { ...publicMethodSchemas['query.read'], input: query.PageSchema.extend({ queryId: PositiveIdSchema }) },
+    'query.list': { ...publicMethodSchemas['query.list'], input: z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.max(presentation.maxPageSize).default(presentation.defaultPageSize) }) },
+    'evidence.read': { ...publicMethodSchemas['evidence.read'], input: query.PageSchema.extend({ queryId: PositiveIdSchema, evidenceId: PositiveIdSchema, pageSize: PositiveIdSchema.max(BUSINESS_RULES.maxPageSize).default(BUSINESS_RULES.evidencePageSize) }) },
+    'tool.read': { ...publicMethodSchemas['tool.read'], input: z.strictObject({ runId: PositiveIdSchema, page: PositiveIdSchema.default(presentation.defaultPage), pageSize: PositiveIdSchema.max(presentation.maxPageSize).default(presentation.defaultPageSize) }).refine(value => Number.isSafeInteger((value.page - 1) * value.pageSize), 'Page offset must be a safe integer') },
+  };
+}
 export type PublicPayload<M extends PublicMethod> = z.input<(typeof publicMethodSchemas)[M]["input"]>;
 export type ParsedPublicPayload<M extends PublicMethod> = z.output<(typeof publicMethodSchemas)[M]["input"]>;
 export type PublicReturn<M extends PublicMethod> = z.output<(typeof publicMethodSchemas)[M]["output"]>;

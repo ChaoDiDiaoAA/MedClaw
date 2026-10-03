@@ -45,7 +45,7 @@ test.beforeAll(async () => {
     const unconfigured = await window.medclaw.request("model.custom.save", { expectedConfigVersion: saved.data.configVersion,
       definition: { providerId: "p2-unconfigured", name: "Unconfigured fixture", api: "openai-completions", baseUrl,
         models: [{ id: "missing-key", name: "P2 unconfigured", input: ["text"], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }] } });
-    if (!unconfigured.ok) throw new Error("setup unconfigured: " + unconfigured.error.code);
+    if (!unconfigured.ok) throw new Error("setup unconfigured: " + unconfigured.error.code + " " + JSON.stringify(await window.medclaw.request("diagnostics.read", { categories: ["errors"] })));
     return window.medclaw.request("model.configure", { provider: "p2-ui", modelId: "first", expectedConfigVersion: unconfigured.data.configVersion });
   }, baseUrl);
   expect(configured.ok).toBe(true);

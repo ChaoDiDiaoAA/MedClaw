@@ -232,7 +232,7 @@ test("custom definition updates all models and persisted Unicode output pages re
   await page.getByLabel("Output limit", { exact: true }).fill("2048");
   await page.getByLabel("Output limit matches the service configuration").check();
   await page.getByRole("button", { name: "Add model", exact: true }).click();
-  const second = page.locator("fieldset").nth(1);
+  const second = page.locator("fieldset").filter({ has: page.getByLabel("Model ID", { exact: true }) }).nth(1);
   await second.getByLabel("Model ID", { exact: true }).fill("fixture-second");
   await second.getByLabel("Model name", { exact: true }).fill("Second fixture model");
   await second.getByLabel("Image capability metadata").check();
@@ -327,9 +327,10 @@ test("reopening Electron restores published custom models, preferences and runs 
   await page.getByRole("button", { name: "Models", exact: true }).click();
   await page.getByRole("button", { name: /Edit P1 UI fixture/ }).click();
   await expect(page.getByLabel("New API Key")).toHaveValue("");
-  await expect(page.locator("fieldset")).toHaveCount(2);
-  await expect(page.locator("fieldset").nth(0).getByLabel("Model name", { exact: true })).toHaveValue("UI fixture model updated");
-  await expect(page.locator("fieldset").nth(1).getByLabel("Image capability metadata")).toBeChecked();
+  const modelDefinitions = page.locator("fieldset").filter({ has: page.getByLabel("Model ID", { exact: true }) });
+  await expect(modelDefinitions).toHaveCount(2);
+  await expect(modelDefinitions.nth(0).getByLabel("Model name", { exact: true })).toHaveValue("UI fixture model updated");
+  await expect(modelDefinitions.nth(1).getByLabel("Image capability metadata")).toBeChecked();
   expect(requests).toHaveLength(before);
   expect(await page.locator("body").innerText()).not.toContain("P1-UI-SECRET-CANARY");
 });

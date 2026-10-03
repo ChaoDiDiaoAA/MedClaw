@@ -1,12 +1,13 @@
 import { z } from "zod";
+import { createBusinessToolSchemas } from '@medclaw/contracts/business-tools';
 import { PositiveIdSchema } from "../../../contracts/src/error";
-import { BusinessDataSchema, BusinessDateSchema, PageSchema, TimeRangeSchema, type Batch, type BusinessData, type CatalogFilters, type CatalogStore, type Device, type PageInput, type QueryContext, type QueryParams, type Snapshot, type SnapshotReference } from "../../../contracts/src/query";
+import { BusinessDataSchema, BusinessDateSchema, createQuerySchemas, TimeRangeSchema, type Batch, type BusinessData, type CatalogFilters, type CatalogStore, type Device, type PageInput, type QueryContext, type QueryParams, type Snapshot, type SnapshotReference } from "../../../contracts/src/query";
 import { RunScopeSchema } from "../../../contracts/src/run";
 import { TimezoneSchema } from "../../../contracts/src/model";
 import { ToolContextIdentitySchema, type ToolExecutionContext } from "../../../contracts/src/tool";
 
 export function pageItems<T>(items: T[], input: PageInput) {
-  const { page, pageSize } = PageSchema.parse({ page: input.page, pageSize: input.pageSize });
+  const { page, pageSize } = createQuerySchemas().PageSchema.parse({ page: input.page, pageSize: input.pageSize });
   return { items: structuredClone(items.slice((page - 1) * pageSize, page * pageSize)), totalRows: items.length, page, pageSize };
 }
 function freeze(value: unknown): void {
@@ -216,13 +217,13 @@ export class CatalogService {
     this.assertContext(context); return structuredClone({ scope: context.scope, referenceDate: context.referenceDate, timezone: context.timezone });
   }
   listBatches(input: PageInput & { time?: z.infer<typeof TimeRangeSchema> }, context: ToolExecutionContext) {
-    this.assertContext(context); const time = input.time && TimeRangeSchema.parse(input.time);
+    this.assertContext(context); const time = input.time && createQuerySchemas().TimeRangeSchema.parse(input.time);
     const batches = context.scope.batchIds.length ? this.batches(context.scope.batchIds, context) : [];
     return pageItems(batches.filter(batch => !time || inRange(batch.snapshotDate, time)), input);
   }
   readBatch(batchId: number, context: ToolExecutionContext) { return structuredClone(this.batches([batchId], context)[0]!); }
   selectBatches(ids: number[], time: z.infer<typeof TimeRangeSchema> | undefined, mode: "exact_date" | "as_of", context: QueryContext, region?: string) {
-    const all = this.batches(ids, context).filter(batch => region === undefined || batch.region === region), target = time ? TimeRangeSchema.parse(time) : { start: context.referenceDate, endExclusive: nextDate(context.referenceDate) };
+    const all = this.batches(ids, context).filter(batch => region === undefined || batch.region === region), target = time ? createQuerySchemas().TimeRangeSchema.parse(time) : { start: context.referenceDate, endExclusive: nextDate(context.referenceDate) };
     if (mode === "exact_date" && nextDate(target.start) !== target.endExclusive) throw new Error("invalid_argument");
     const selected: Batch[] = [];
     for (const scopeKey of new Set(all.map(batch => batch.scopeKey))) {
@@ -235,7 +236,9 @@ export class CatalogService {
     return selected;
   }
   checkCoverage(input: { time: z.infer<typeof TimeRangeSchema>; snapshotMode: "exact_date" | "as_of"; requirePredecessor: boolean }, context: ToolExecutionContext) {
-    this.assertContext(context); const time = TimeRangeSchema.parse(input.time), all = context.scope.batchIds.length ? this.batches(context.scope.batchIds, context) : [];
+    this.assertContext(context);
+    input = createBusinessToolSchemas().check_data_coverage.input.parse(input);
+    const time = input.time, all = context.scope.batchIds.length ? this.batches(context.scope.batchIds, context) : [];
     const selected = new Map<number, Batch>(), missingDates = new Set<string>();
     for (const scopeKey of new Set(all.map(batch => batch.scopeKey))) {
       this.checkActive(context);
@@ -255,11 +258,14 @@ export class CatalogService {
       complete: all.length > 0 && missingDates.size === 0 && missingPredecessorBatchIds.length === 0 && (!input.requirePredecessor || [...selected.values()].every(batch => batch.previousBatchId !== null)) };
   }
   listFilterValues(input: PageInput & { field: "manufacturer" | "distributor" | "category" | "status" | "region"; batchIds: number[] }, context: ToolExecutionContext) {
+    input = createBusinessToolSchemas().list_filter_values.input.parse(input);
     const values = [...new Set(this.snapshots(input.batchIds, context).map(row => row[input.field]).filter((value): value is string => value !== null && value.length > 0))].sort();
     const page = pageItems(values, input); return { values: page.items, totalRows: page.totalRows, page: page.page, pageSize: page.pageSize };
   }
   resolveDevice(input: PageInput & { text: string; matchBy: "name" | "source_id" | "submission_id" }, context: ToolExecutionContext) {
-    this.assertContext(context); const text = z.string().trim().min(1).max(512).parse(input.text).toLocaleLowerCase("en-US");
+    this.assertContext(context);
+    input = createBusinessToolSchemas().resolve_device.input.parse(input);
+    const text = input.text.toLocaleLowerCase("en-US");
     const available = context.scope.batchIds.length ? this.snapshots(context.scope.batchIds, context) : [];
     const ids = [...new Set(available.filter(row => {
       const device = this.device(row.deviceId)!;

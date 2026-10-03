@@ -6,6 +6,8 @@ import { NewSessionInputSchema, NewSessionResultSchema, SelectSessionInputSchema
   type NewSessionInput, type NewSessionResult, type SelectSessionInput, type SessionView, type SessionPage, type ReadSubmissionRequest, type SubmitResult } from "../../contracts/src/session";
 import { WorkspaceViewSchema, WorkspaceChangeSchema, RevisionSchema, type WorkspaceView, type WorkspaceChange, type BatchRef } from "../../contracts/src/workspace";
 import { businessToolSchemas } from "../../contracts/src/business-tools";
+import { StoredToolConfigurationSchema } from '../../contracts/src/tool-config';
+import { RuntimeConfigurationSchema } from '../../contracts/src/runtime-config';
 import {
   DiagnoseRequestSchema, ModelSelectionSchema, ProviderRequestSchema, RequestPolicySchema, ReferenceDateSchema, TimezoneSchema,
   AgentPolicySchema, MeasurementContextSchema, ToolProfileSnapshotSchema,
@@ -37,9 +39,11 @@ const providerConfigSchema = z.object({
     z.object({ operationRef: z.string().min(1).max(512), method: z.literal("model.request"), originalRequest: ProviderRequestSchema }).strict(),
     z.object({ operationRef: z.string().min(1).max(512), method: z.literal("model.diagnose"), originalRequest: DiagnoseRequestSchema }).strict(),
   ]),
-  selection: ModelSelectionSchema, policy: RequestPolicySchema,
+  selection: ModelSelectionSchema, policy: RequestPolicySchema, runtimeConfiguration: RuntimeConfigurationSchema.optional(),
 }).strict();
 const agentConfigSchema = z.strictObject({ selection: ModelSelectionSchema, policy: RequestPolicySchema,
+  toolConfiguration: StoredToolConfigurationSchema.optional(),
+  runtimeConfiguration: RuntimeConfigurationSchema.optional(),
   agentPolicy: AgentPolicySchema.optional(),
   measurementContext: MeasurementContextSchema.optional(),
   toolProfileSnapshot: ToolProfileSnapshotSchema.optional(),
@@ -121,6 +125,7 @@ export class Repositories implements ProviderRunStore {
       id: row.id, kind: row.kind, status: row.status, operationRef: row.kind === "provider" ? this.providerConfig(row).providerRequest.operationRef : row.submission_operation_ref,
       instanceId: row.instance_id, sessionId: row.session_id, inputId: null, goal: row.goal, inputText: inputPage.text, inputPage,
       model: config.selection, policy: config.policy, priorRunId: row.prior_run_id,
+      ...(row.kind === 'provider' ? { runtimeConfiguration: this.providerConfig(row).runtimeConfiguration ?? null } : {}),
       referenceDate: row.reference_date, timezone: row.timezone, createdAt: row.created_at,
       startedAt: row.started_at, cancelRequestedAt: row.cancel_requested_at, stoppedAt: row.stopped_at,
       endedAt: row.ended_at, error: decoded(row.error_json), cleanup: cleanup.success ? cleanup.data : null,
@@ -129,7 +134,9 @@ export class Repositories implements ProviderRunStore {
       calls: row.kind === "provider" ? calls : calls.slice(callOffset, callOffset + callLimit), persistence: "committed",
       ...(agent ? { clientSequence: row.submission_client_sequence, nativeSessionId: agent.agent.nativeSessionId,
         nextCallOffset: callOffset + callLimit < calls.length ? callOffset + callLimit : null,
-        control: agent.agentPolicy || agent.measurementContext || agent.toolProfileSnapshot ? {
+        control: agent.runtimeConfiguration || agent.toolConfiguration || agent.agentPolicy || agent.measurementContext || agent.toolProfileSnapshot ? {
+          runtimeConfiguration: agent.runtimeConfiguration ?? null,
+          toolConfiguration: agent.toolConfiguration ?? null,
           agentPolicy: agent.agentPolicy ?? null,
           measurementContext: agent.measurementContext ?? null,
           toolProfileSnapshot: agent.toolProfileSnapshot ?? null,
@@ -323,6 +330,8 @@ export class Repositories implements ProviderRunStore {
       checked(OpaqueIdSchema, input.instanceId);
       const config = checked(agentConfigSchema, { selection: input.model, policy: input.policy, referenceDate: request.referenceDate,
         ...(input.agentPolicy ? { agentPolicy: input.agentPolicy } : {}),
+        ...(input.runtimeConfiguration ? { runtimeConfiguration: input.runtimeConfiguration } : {}),
+        ...(input.toolConfiguration ? { toolConfiguration: input.toolConfiguration } : {}),
         ...(input.measurementContext ? { measurementContext: input.measurementContext } : {}),
         ...(input.toolProfileSnapshot ? { toolProfileSnapshot: input.toolProfileSnapshot } : {}),
         timezone: request.timezone, agent: { ...input.agentOptions, stage: input.scope.allowedToolNames.length ? "P3" : "P2", nativeSessionId: session.nativeSessionId, tools: input.scope.allowedToolNames,
@@ -357,7 +366,8 @@ export class Repositories implements ProviderRunStore {
           input.goal !== (input.method === "model.request" ? "answer" : "verify") ||
           input.inputText !== (input.method === "model.request" ? (originalRequest as ProviderRequest).text : "请仅回复 OK。")) fail("invalid_argument");
       if (input.priorRunId !== undefined) { id(input.priorRunId); if (!this.row(input.priorRunId)) fail("invalid_argument"); }
-      const config = checked(providerConfigSchema, { providerRequest: { operationRef: input.operationRef, method: input.method, originalRequest }, selection: input.selection, policy: input.policy });
+      const config = checked(providerConfigSchema, { providerRequest: { operationRef: input.operationRef, method: input.method, originalRequest }, selection: input.selection, policy: input.policy,
+        ...(input.runtimeConfiguration ? { runtimeConfiguration: input.runtimeConfiguration } : {}) });
       const result = this.db.query(`INSERT INTO runs(
         session_id,input_id,kind,prior_run_id,instance_id,status,goal,input_text,output_text,config_json,
         scope_json,workspace_json,reference_date,timezone,error_json,created_at,started_at,

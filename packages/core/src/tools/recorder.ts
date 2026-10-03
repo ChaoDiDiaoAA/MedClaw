@@ -1,4 +1,5 @@
 import { AppErrorSchema, safeError, type AppError, type AppErrorCode } from "@medclaw/contracts/error";
+import { z } from 'zod';
 import type { ToolCallIdentity, ToolCallStore, ToolExecutionContext, ToolResult, ToolSdkDelivery } from "@medclaw/contracts/tool";
 import { isDeepStrictEqual } from 'node:util';
 import type { ToolControlObservation } from '@medclaw/contracts/model';
@@ -48,7 +49,7 @@ export class ToolRecorder {
     try { return action(); }
     catch (native) {
       const known = AppErrorSchema.safeParse(native);
-      const candidate = safeError(known.success ? known.data.code : native instanceof Error ? native.message : fallback);
+      const candidate = safeError(known.success ? known.data.code : native instanceof z.ZodError ? 'invalid_argument' : native instanceof Error ? native.message : fallback);
       const error = candidate.code === "internal_error" ? safeError(fallback) : candidate;
       if (context && error.category === "storage" && fallback === "storage_write_failed") throw this.failPersistence(context);
       throw error;
@@ -89,7 +90,7 @@ export class ToolRecorder {
     }
   }
   read(context: ToolExecutionContext) { return this.checked(() => this.store.readCall(context), "storage_read_failed"); }
-  readToolObservations(input: { cutoffAt: string; maxToolCallId?: number; limit?: number }) {
+  readToolObservations(input: { cutoffAt: string; maxToolCallId?: number; limit: number; windowDays: number }) {
     return this.store.readToolObservations?.(input) ?? { maxToolCallId: null, observations: [] };
   }
   mergeControl(context: ToolExecutionContext, control: Partial<ToolControlObservation>) {
