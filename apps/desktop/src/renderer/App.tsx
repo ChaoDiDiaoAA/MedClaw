@@ -189,7 +189,12 @@ export function App() {
   const readWorkspace = useCallback(async (confirm = true) => {
     const instance = hostRef.current.instanceId, result = await window.medclaw.request("workspace.read", {});
     if (instance !== hostRef.current.instanceId) return;
-    if (result.ok) applyWorkspace(result.data, instance, confirm); else { confirmedWorkspace.current = false; setWorkspaceConfirmed(false); setError(errorMessage(result.error)); }
+    if (result.ok) applyWorkspace(result.data, instance, confirm);
+    else {
+      confirmedWorkspace.current = false; setWorkspaceConfirmed(false);
+      setWorkspaceRecovery(unknownWorkspaceInstance.current === instance ? 'restart' : 'verify');
+      setError(errorMessage(result.error));
+    }
   }, [applyWorkspace]);
   const restoreWorkspace = useCallback(async () => {
     const instance = hostRef.current.instanceId;

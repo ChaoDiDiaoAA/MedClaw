@@ -454,6 +454,20 @@ test('A11 rejected selection receipt preserves the latest Session intent until e
   save('A11-rejected-receipt', { a, b, calls: await calls(), workspace: sql('SELECT * FROM workspace') });
 });
 
+test('A08 transient ordinary Workspace read failure offers same-instance verification', async () => {
+  await page.getByRole('button', { name: 'Chat', exact: true }).click(); await create(); await dataScope();
+  const host = await page.evaluate(() => window.medclaw.request('host.read', {})), before = sql('SELECT * FROM workspace')[0];
+  await rules([{ method: 'workspace.read', project: { ok: false, error: safeError('storage_read_failed') } }]); await notifyConfigChanged();
+  await page.getByRole('button', { name: 'Data Workspace', exact: true }).click();
+  await expect(page.getByText('Selection unconfirmed', { exact: true }).last()).toBeVisible();
+  const verify = page.getByRole('button', { name: 'Verify saved selection', exact: true }); await expect(verify).toBeEnabled();
+  await notifyConfigChanged(); await expect(page.getByRole('button', { name: 'Apply 2 selected batches', exact: true })).toBeDisabled();
+  await verify.click(); await expect(page.getByRole('button', { name: 'Apply 2 selected batches', exact: true })).toBeEnabled();
+  expect(await page.evaluate(() => window.medclaw.request('host.read', {}))).toEqual(host);
+  expect(sql('SELECT * FROM workspace')[0]).toEqual(before);
+  save('A08-ordinary-read-recovery', { host, before, workspace: sql('SELECT * FROM workspace'), calls: await calls() });
+});
+
 test('A10 truly slow restore stays locked after late commit and cannot be unlocked by old creation recovery', async () => {
   test.setTimeout(60000);
   await page.getByRole('button', { name: 'Chat', exact: true }).click(); await create(); await dataScope();
