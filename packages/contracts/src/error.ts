@@ -6,17 +6,22 @@ export const TimestampSchema = z.string().datetime({ offset: true }).max(64);
 export const ErrorCategorySchema = z.enum(["provider", "runtime", "tool", "session", "storage", "input", "extension", "internal"]);
 export const ErrorReasonSchema = z.enum(["runtime_busy", "workspace_revision_mismatch", "session_not_found", "message_cursor_invalid", "input_cursor_invalid", "host_interrupted"]);
 
+export const EventRangeErrorSchema = z.strictObject({ runId: PositiveIdSchema, firstSequence: PositiveIdSchema.nullable(), lastSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), resumeAfterSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable() }).refine(value => (value.firstSequence === null ? value.lastSequence === 0 : value.firstSequence <= value.lastSequence) && (value.resumeAfterSequence === null || value.resumeAfterSequence <= value.lastSequence));
+export type EventRangeError = z.infer<typeof EventRangeErrorSchema>;
+
 export const AppErrorSchema = z.strictObject({
   code: z.string().min(1).max(128).regex(/^[a-z][a-z0-9_]*$/),
   category: ErrorCategorySchema,
   message: z.string().min(1).max(2000),
   retryable: z.boolean(),
   reason: ErrorReasonSchema.optional(),
+  eventRange: EventRangeErrorSchema.optional(),
   operationRef: OpaqueIdSchema.optional(),
   runId: PositiveIdSchema.optional(),
   sessionId: PositiveIdSchema.optional(),
   toolCallId: PositiveIdSchema.optional(),
-});
+}).refine(error => !error.eventRange || error.code === "event_cursor_invalid" || error.code === "event_gap", "Range metadata requires an event range error");
+// Range metadata is reserved for cursor and gap failures.
 export type AppError = z.infer<typeof AppErrorSchema>;
 export type Result<T> = { ok: true; data: T } | { ok: false; error: AppError };
 export const resultSchema = <S extends z.ZodType>(data: S) => z.discriminatedUnion("ok", [
@@ -25,6 +30,10 @@ export const resultSchema = <S extends z.ZodType>(data: S) => z.discriminatedUni
 ]);
 
 const errorDefinitions = {
+  event_cursor_invalid: ["input", "The event cursor is outside the saved range.", false],
+  event_gap: ["storage", "The saved event range has a gap. Read the original facts before resuming.", false],
+  event_subscription_invalid: ["input", "The event subscription identity or parameters are invalid.", false],
+  event_subscription_limit: ["runtime", "The event subscription limit has been reached.", false],
   tool_not_found: ["tool", "Tool not found.", false],
   tool_input_invalid: ["tool", "The tool input is invalid.", false],
   tool_output_invalid: ["tool", "The tool output does not meet the contract and cannot be used as a valid result.", false],
@@ -104,7 +113,7 @@ const errorDefinitions = {
   internal_error: ["internal", "Operation failed. Check diagnostics.", false],
 } as const satisfies Record<string, readonly [AppError["category"], string, boolean]>;
 export type AppErrorCode = keyof typeof errorDefinitions;
-export type ErrorContext = Pick<AppError, "operationRef" | "runId" | "sessionId" | "toolCallId" | "reason">;
+export type ErrorContext = Pick<AppError, "operationRef" | "runId" | "sessionId" | "toolCallId" | "reason" | "eventRange">;
 
 /** Native errors are deliberately not copied: message/body/cause can contain credentials. */
 export function safeError(code: string, _native?: unknown, context: ErrorContext = {}): AppError {
@@ -115,6 +124,7 @@ export function safeError(code: string, _native?: unknown, context: ErrorContext
     const value = context[key];
     if (value !== undefined && AppErrorSchema.shape[key].safeParse(value).success) Object.assign(error, { [key]: value });
   }
+  if ((safeCode === "event_cursor_invalid" || safeCode === "event_gap") && context.eventRange) { const range = EventRangeErrorSchema.safeParse(context.eventRange); if (range.success) error.eventRange = range.data; }
   if (safeCode === "runtime_busy" || safeCode === "host_interrupted" || safeCode === "workspace_revision_mismatch" || safeCode === "session_not_found") error.reason = safeCode;
   if (safeCode === "state_conflict" && error.reason === "runtime_busy") error.message = errorDefinitions.runtime_busy[1];
   if (safeCode === "state_conflict" && error.reason === "workspace_revision_mismatch") error.message = errorDefinitions.workspace_revision_mismatch[1];
@@ -133,7 +143,9 @@ export async function serviceResult<T>(action: () => T | Promise<T>, fallback: A
   catch (native) {
     const known = AppErrorSchema.safeParse(native);
     let code = known.success ? known.data.code : native instanceof z.ZodError ? "invalid_argument" : native instanceof Error ? native.message : fallback;
-    const errorContext = { ...context, ...(known.success ? { reason: known.data.reason } : {}) };
+    const errorContext = { ...context, ...(known.success ? { reason: known.data.reason, eventRange: known.data.eventRange,
+      operationRef: known.data.operationRef ?? context.operationRef, runId: known.data.runId ?? context.runId,
+      sessionId: known.data.sessionId ?? context.sessionId, toolCallId: known.data.toolCallId ?? context.toolCallId } : {}) };
     if (code === "workspace_revision_mismatch") { code = "state_conflict"; errorContext.reason = "workspace_revision_mismatch"; }
     if (code === "session_not_found") { code = "input_invalid"; errorContext.reason = "session_not_found"; }
     if (code === "session_history_unavailable" || code === "native_state_invalid") code = "session_history_invalid";

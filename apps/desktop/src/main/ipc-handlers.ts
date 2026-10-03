@@ -8,6 +8,7 @@ import { HostController } from "./host-controller.ts";
 import { MainSettings, type PublishOptions } from "./settings.ts";
 import { MainCredentials, SecretInputs } from "./credentials.ts";
 import { FileTokens } from "./file-tokens.ts";
+import { EventSubscribeInputSchema, EventSubscribeResultSchema, type OpenEventSubscriptionInput } from '../../../../packages/contracts/src/event.ts';
 
 export async function privateCredentialRequest(credentials: MainCredentials, frame: PrivateCredentialFrame, fileTokens?: FileTokens, windowId?: number): Promise<Result<unknown>> {
   try {
@@ -30,7 +31,21 @@ export async function privateCredentialRequest(credentials: MainCredentials, fra
 export function registerIpc(options: { window: BrowserWindow; host: HostController; settings: MainSettings; credentials: MainCredentials; inputs: SecretInputs; fileTokens?: FileTokens; diagnostics(categories: string[]): Promise<DiagnosticsView>; report(error: ReturnType<typeof safeError>): void; notify(notice: RuntimeNotice): void }) {
   const { window, host, settings, credentials, inputs } = options;
   const operations = new Map<string, { method: PublicMethod; payload: unknown }>();
-  const trusted = (event: Electron.IpcMainInvokeEvent) => {
+  // Only display subscriptions are owned by a renderer. Pi/Recorder listeners
+  // belong to the Run and continue independently when this map is cleared.
+  type Owner = { instanceId: string; input: OpenEventSubscriptionInput; sessionId: number | null; ready: boolean };
+  const eventOwners = new Map<string, Owner>();
+  const closeCaptured = (owner: Owner) => {
+    void host.request('event.subscribe', { action: 'close', subscriptionId: owner.input.subscriptionId }, undefined, undefined, owner.instanceId).catch(() => {});
+  };
+  const clearEventOwners = (instanceId?: string, sendClose = true) => {
+    for (const [sid, owner] of eventOwners) {
+      if (instanceId && owner.instanceId !== instanceId) continue;
+      eventOwners.delete(sid);
+      if (sendClose) closeCaptured(owner);
+    }
+  };
+  const trusted = (event: Pick<Electron.IpcMainInvokeEvent, 'sender' | 'senderFrame'>) => {
     if (event.sender.id !== window.webContents.id || event.senderFrame !== event.sender.mainFrame || !event.senderFrame.url.startsWith("file:")) throw new Error("access_denied");
   };
   const requireHost = () => { if (host.read().state !== "ready") throw new Error("host_not_ready"); };
@@ -56,6 +71,36 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       case "host.start": return host.start();
       case "host.stop": return host.stop((raw as { expectedInstanceId: string }).expectedInstanceId);
       case "host.restart": return host.restart((raw as { expectedInstanceId: string }).expectedInstanceId);
+      case 'event.subscribe': {
+        const input = EventSubscribeInputSchema.parse(raw);
+        if (input.action === 'close') {
+          const owner = eventOwners.get(input.subscriptionId);
+          if (!owner) return { action: 'close', subscriptionId: input.subscriptionId, closed: true };
+          eventOwners.delete(input.subscriptionId);
+          return unwrap(await host.request(method, input, operationRef, undefined, owner.instanceId));
+        }
+        requireHost();
+        const instanceId = host.read().instanceId!;
+        const previous = eventOwners.get(input.subscriptionId);
+        if (previous && (previous.instanceId !== instanceId || !isDeepStrictEqual(previous.input, input))) throw new Error('state_conflict');
+        const owner = previous ?? { instanceId, input: structuredClone(input), sessionId: null, ready: false };
+        // Reserve before forwarding: notices can precede the open reply.
+        if (!previous) eventOwners.set(input.subscriptionId, owner);
+        try {
+          const result = EventSubscribeResultSchema.parse(unwrap(await host.request(method, input, operationRef, undefined, instanceId)));
+          if (result.action !== 'open' || result.subscriptionId !== input.subscriptionId || result.runId !== input.runId) throw new Error('host_protocol_mismatch');
+          if (eventOwners.get(input.subscriptionId) !== owner || host.read().instanceId !== instanceId) {
+            closeCaptured(owner); throw new Error('event_subscription_invalid');
+          }
+          owner.sessionId = result.sessionId; owner.ready = true;
+          return result;
+        } catch (error) {
+          // A failed refresh must retain a previously proven owner. A failed
+          // provisional open may have reached Host despite a lost reply.
+          if (!previous && !owner.ready && eventOwners.get(input.subscriptionId) === owner) { eventOwners.delete(input.subscriptionId); closeCaptured(owner); }
+          throw error;
+        }
+      }
       case "settings.ui.read": { const s = settings.read(); return { configVersion: s.configVersion, ui: s.ui }; }
       case "settings.ui.update": { const p = raw as { expectedConfigVersion: string; patch: PublishedSettings["ui"] }; const s = await publish(p.expectedConfigVersion, { ui: p.patch }, "ui"); if (host.read().state === "ready") await synchronize(); options.notify({ type: "config.changed", configVersion: s.configVersion }); return { configVersion: s.configVersion, ui: s.ui }; }
       case "model.config.read": { const s = settings.read(); return { configVersion: s.configVersion, previousConfigVersion: s.previous?.configVersion ?? null, rollbackFromVersion: s.rollbackFromVersion, policy: s.requestPolicy, agentPolicy: s.agentPolicy, runtimeConfiguration: s.runtimeConfiguration, toolConfiguration: s.toolConfiguration }; }
@@ -175,8 +220,22 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       return { ok: true, data: options.fileTokens.issue(window.id, instanceId, request.operationRef, selected.filePaths[0]!) };
     } catch (error) { return { ok: false, error: safeError(error instanceof Error ? error.message : "file_token_invalid") }; }
   });
-  window.on("closed", () => { inputs.closeWindow(window.id); options.fileTokens?.closeWindow(window.id); ["medclaw:request", "medclaw:secret-input", "medclaw:secret-discard", "medclaw:open-auth-link", "medclaw:import-directory"].forEach(channel => ipcMain.removeHandler(channel)); });
-  return { synchronize, publishCredentials: async () => {
+  const observerFailure = (event: Electron.IpcMainEvent) => { try { trusted(event); options.report(safeError('preview_delivery_failed')); } catch { /* Fixed diagnostics never cross into execution control. */ } };
+  ipcMain.on?.('medclaw:observer-error', observerFailure);
+  window.webContents.on?.('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => { if (isMainFrame) clearEventOwners(); });
+  window.webContents.on?.('render-process-gone', () => clearEventOwners());
+  window.webContents.on?.('destroyed', () => clearEventOwners());
+  window.on("closed", () => { clearEventOwners(); ipcMain.removeListener?.('medclaw:observer-error', observerFailure); inputs.closeWindow(window.id); options.fileTokens?.closeWindow(window.id); ["medclaw:request", "medclaw:secret-input", "medclaw:secret-discard", "medclaw:open-auth-link", "medclaw:import-directory"].forEach(channel => ipcMain.removeHandler(channel)); });
+  return { synchronize,
+    closeInstance: (instanceId: string) => clearEventOwners(instanceId, false),
+    acceptEventNotice: (notice: RuntimeNotice, instanceId: string | null): boolean => {
+      if (notice.type !== 'event.available' && notice.type !== 'event.stream') return true;
+      const owner = eventOwners.get(notice.subscriptionId);
+      if (!owner || owner.instanceId !== instanceId || host.read().instanceId !== instanceId) return false;
+      const identity = notice.type === 'event.available' ? notice : notice.snapshot;
+      return identity.runId === owner.input.runId && (owner.sessionId === null || identity.sessionId === owner.sessionId);
+    },
+    publishCredentials: async () => {
     const current = settings.read(), refs = credentials.captureRefs();
     if (isDeepStrictEqual(current.credentialRefs, refs)) return;
     await publish(current.configVersion, { credentialRefs: refs, customProviders: current.customProviders.map(p => ({ ...p, credentialRef: refs[p.definition.providerId] ?? null })) }, "model");

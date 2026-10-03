@@ -226,7 +226,7 @@ describe("P1 read and usage boundaries", () => {
 });
 
 describe("P1 public and private protocol", () => {
-  test("public dispatch retains P1 methods in the P5 whitelist", async () => {
+  test("public dispatch retains P1 methods in the P6 whitelist", async () => {
     const { publicMethodSchemas, parsePublicPayload } = await import("../../packages/contracts/src/protocol");
     expect(Object.keys(publicMethodSchemas).sort()).toEqual([
       "model.list", "model.read", "model.refresh", "operation.cancel", "model.auth.start", "model.auth.respond",
@@ -236,6 +236,7 @@ describe("P1 public and private protocol", () => {
       "settings.ui.read", "settings.ui.update", "diagnostics.read", "host.read", "host.start", "host.stop", "host.restart",
       "workspace.update", "data.read", "data.rows", "query.execute", "query.read", "query.list", "evidence.read", "tool.read",
       "import.preview", "import.commit", "import.read", "import.cancel", "import.recover", "evidence.readOperation", "evidence.readArtifact",
+      "event.read", "event.subscribe",
     ].sort());
     for (const method of ["credential.read", "credential.modify.begin", "file.resolve", "settings.prepare", "host.shutdown", "diagnostics.export", "executeShell", "__proto__"]) {
       expect(() => parsePublicPayload(method, {})).toThrow();

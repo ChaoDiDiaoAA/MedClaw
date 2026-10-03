@@ -1,5 +1,5 @@
 import { errorMessage, type Result } from "../../../../packages/contracts/src/error";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { HostView, ModelChoice, ModelDirectoryView } from "../../../../packages/contracts/src/model";
 import type { ActiveRunView, RunView, RuntimeControlView } from "../../../../packages/contracts/src/run";
 import type { InputMode, SessionDetail, SessionInput } from "../../../../packages/contracts/src/session";
@@ -9,29 +9,31 @@ import { ContextPanel } from "./context-panel";
 import type { SessionMessagePage, SessionMessageView } from "../../../../packages/contracts/src/messages";
 import type { PublicReturn } from "../../../../packages/contracts/src/protocol";
 import { InputQueue, type InputQueueSnapshot } from "./input-queue";
+import { finalDisplaySource, resolveReadingAnchor, shouldRecordScroll, type ReadingAnchor, type RunEventProjectionState } from './use-run-events';
 
 // Each public page stays bounded; the displayed collection is independent of that DTO.
-type MessageAvailability = { available: boolean; hasPage: boolean; hasHistory: boolean; hasMore: boolean; unavailable: boolean };
+type MessageAvailability = { available: boolean; hasPage: boolean; hasHistory: boolean; hasMore: boolean; unavailable: boolean; runCovered: boolean };
 export function NativeMessages(props: { host: HostView; sessionId: number | null; nativeSessionId?: string | null; visible: boolean;
-  context: string; revision?: string | null; testId: string; onChanged?: () => void; onAvailability?: (value: MessageAvailability) => void; onCreate?: () => void }) {
+  context: string; revision?: string | null; testId: string; requiredRunId?: number | null; excludeRunId?: number | null; onChanged?: () => void; onAvailability?: (value: MessageAvailability) => void; onCreate?: () => void }) {
   const key = JSON.stringify([props.host.instanceId, props.host.state, props.sessionId, props.nativeSessionId, props.visible, props.context, props.revision]);
   const target = useRef({ key, epoch: 0 }), generation = useRef(0), mounted = useRef(true);
   if (target.current.key !== key) { target.current = { key, epoch: target.current.epoch + 1 }; generation.current++; }
-  type View = { key: string; pages: SessionMessagePage[]; loading: boolean; error: string | null };
-  const [view, setView] = useState<View>({ key, pages: [], loading: false, error: null }), viewRef = useRef(view);
+  type View = { key: string; sessionId: number | null; pages: SessionMessagePage[]; loading: boolean; error: string | null };
+  const [view, setView] = useState<View>({ key, sessionId: props.sessionId, pages: [], loading: false, error: null }), viewRef = useRef(view);
   const [reference, setReference] = useState<string | null>(null), referenceOrder = useRef(0);
-  const current = view.key === key ? view : { key, pages: [], loading: false, error: null }, last = current.pages.at(-1);
+  const current = view.key === key ? view : view.sessionId === props.sessionId ? { ...view, loading: false } : { key, sessionId: props.sessionId, pages: [], loading: false, error: null }, last = current.pages.at(-1);
   const write = (value: View) => { viewRef.current = value; setView(value); };
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; generation.current++; referenceOrder.current++; }; }, []);
   useEffect(() => { referenceOrder.current++; setReference(null); if (props.visible && props.host.state === 'ready' && props.sessionId) void read(false); }, [key, props.revision]);
   async function read(append: boolean) {
     if (!props.visible || props.host.state !== 'ready' || !props.sessionId || !props.host.instanceId) return;
-    const old = viewRef.current.key === key ? viewRef.current : { key, pages: [], loading: false, error: null }, tail = old.pages.at(-1);
+    const old = viewRef.current.key === key ? viewRef.current : { key, sessionId: props.sessionId, pages: [], loading: false, error: null }, tail = old.pages.at(-1);
     if (append && (!tail?.hasMore || old.loading)) return;
     const leafId = append ? tail!.leafId : null, afterEntryId = append ? tail!.nextEntryId : null;
     const scope = { ...target.current, instanceId: props.host.instanceId, sessionId: props.sessionId, generation: ++generation.current, leafId, afterEntryId };
     const owns = () => mounted.current && target.current.key === scope.key && target.current.epoch === scope.epoch && generation.current === scope.generation;
-    const availability = (pages: SessionMessagePage[], available: boolean, unavailable = false) => props.onAvailability?.({ available, unavailable: unavailable && pages.length === 0, hasPage: pages.length > 0, hasHistory: pages.some(value => value.items.length > 0 || value.hasMore), hasMore: pages.at(-1)?.hasMore ?? false });
+    const availability = (pages: SessionMessagePage[], available: boolean, unavailable = false) => props.onAvailability?.({ available, unavailable: unavailable && pages.length === 0, hasPage: pages.length > 0, hasHistory: pages.some(value => value.items.length > 0 || value.hasMore), hasMore: pages.at(-1)?.hasMore ?? false,
+      runCovered: !!props.requiredRunId && pages.some(page => page.items.some(item => item.runId === props.requiredRunId || item.references.includes('run:' + props.requiredRunId))) });
     referenceOrder.current++; setReference(null);
     write({ ...old, loading: true, error: null });
     try {
@@ -47,7 +49,7 @@ export function NativeMessages(props: { host: HostView; sessionId: number | null
         write({ ...old, loading: true, error: 'Message history read failed. The reply did not match the original session and leaf.' }); availability(old.pages, false); return;
       }
       const pages = append ? [...old.pages, page] : [page];
-      write({ key: scope.key, pages, loading: true, error: null }); props.onChanged?.(); availability(pages, true);
+      write({ key: scope.key, sessionId: scope.sessionId, pages, loading: true, error: null }); props.onChanged?.(); availability(pages, true);
     } catch { if (owns()) { write({ ...old, loading: true, error: 'Message history read failed. Read the original session again.' }); availability(old.pages, false); } }
     finally { if (owns()) write({ ...viewRef.current, loading: false }); }
   }
@@ -91,16 +93,18 @@ export function NativeMessages(props: { host: HostView; sessionId: number | null
     } catch { /* An unavailable original reference remains visible without selecting another target. */ }
     if (owns()) setReference(available ? summary : 'Original reference ' + ref + ' unavailable. Keep its original Session and Run; read it again there.');
   }
-  const seen = new Set<string>(), items = current.pages.flatMap(page => page.items).filter(item => { if (seen.has(item.nativeEntryId)) return false; seen.add(item.nativeEntryId); return true; });
+  const seen = new Set<string>(), items = current.pages.flatMap(page => page.items).filter(item => { if (seen.has(item.nativeEntryId)) return false; seen.add(item.nativeEntryId); return !(props.excludeRunId && (item.runId === props.excludeRunId || item.references.includes('run:' + props.excludeRunId))); });
   return <section className="native-messages" data-testid={props.testId} aria-label="Native session messages">
     <div className="section-heading"><h3>Native memory · Session {props.sessionId ?? 'unavailable'}</h3><div className="actions"><button disabled={!props.visible || props.host.state !== 'ready' || !props.sessionId} onClick={() => void read(false)}>Refresh messages</button>{last?.hasMore && <button disabled={current.loading || !props.visible || props.host.state !== 'ready'} onClick={() => void read(true)}>Load more messages</button>}</div></div>
     <p className="tiny muted">Messages in this app session. Run and Answer saving are separate facts.</p>
+    {last?.hasMore && <p className="tiny evidence-gap">Native history page incomplete. Load more messages to read this leaf. Read the full saved output in Run details.</p>}
+    {current.pages.length > 0 && view.key !== key && <p className="tiny evidence-gap">Last verified message page from the prior display connection. Current native history is being rechecked.</p>}
     {last && <p className="tiny message-origin">Native session <code>{last.nativeSessionId}</code> · Leaf <code>{last.leafId ?? 'None'}</code> · {last.source === 'native_memory' ? 'Native memory' : 'Saved history'}</p>}
     {current.loading && <p role="status">Reading native messages…</p>}
     {current.error && <p className="error-text" role="alert">{current.error}{current.pages.length ? ' Showing the last read leaf.' : ''}</p>}
     {current.error && props.onCreate && <button onClick={props.onCreate}>Create new session</button>}
     {last && !items.length && !current.error && <p className="muted">{last.hasMore ? 'More native entries are available; this page has no visible messages.' : 'No native messages in this session.'}</p>}
-    {items.map(message => <article key={message.nativeEntryId} data-native-entry-id={message.nativeEntryId} className="native-message"><strong>{message.displayRole.replaceAll('_', ' ')}</strong>
+    {items.map(message => <article key={message.nativeEntryId} data-native-entry-id={message.nativeEntryId} data-run-id={message.runId ?? undefined} className="native-message"><strong>{message.displayRole.replaceAll('_', ' ')}</strong>
       <div className="answer-text">{message.text ?? 'Structured native entry; body omitted.'}</div>
       <p className="tiny muted">Native entry <code>{message.nativeEntryId}</code>{message.runId ? ' · Original Run ' + message.runId : ''}{message.toolCallRef ? ' · Tool call ' + message.toolCallRef : ''}</p>
       {message.textInfo.truncated && <p className="tiny muted">Native message display truncated · {message.text?.length ?? 0} / {message.textInfo.totalChars} characters</p>}
@@ -113,6 +117,7 @@ export function NativeMessages(props: { host: HostView; sessionId: number | null
 
 export function Chat(props: { visible: boolean; sessionId: number | null; onCreate: () => void; directory: ModelDirectoryView | null; directoryCurrent: boolean; host: HostView; active: ActiveRunView | null; control: RuntimeControlView | null;
   run: RunView | null; preview: { text: string; truncated: boolean } | null; session: SessionDetail | null; draft: SessionDraft | null;
+  events: RunEventProjectionState | null; onFinalSource: (source: 'native' | 'saved' | 'unavailable') => void;
   selecting: boolean; sending: boolean; runningTitle: string | null; onDraft: (patch: Partial<SessionDraft>) => void; onSend: () => void; onResend: () => void;
   onLookup: () => void; onStop: () => void; onModels: () => void; workspace: WorkspaceView | null; workspaceConfirmed: boolean; onWorkspace: (change: WorkspaceChange) => Promise<boolean>;
   dataDefaults: { batchCount: number; referenceDate: string | null; timezone: string | null } | null;
@@ -120,8 +125,13 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
   onRefreshInputs: () => void; onMoreInputs: () => void; onCancelInput: (input: SessionInput) => void;
   onUseForSession: (target: { instanceId: string; sessionId: number }, choice: ModelChoice) => void }) {
   const [following, setFollowing] = useState(true), input = useRef<HTMLTextAreaElement>(null), scroll = useRef<HTMLDivElement>(null);
+  const positions = useRef(new Map<string, { following: boolean; top: number; anchor: ReadingAnchor | null; offset: number }>()), followingRef = useRef(following);
+  const restoring = useRef(false), restorationFrame = useRef<number | null>(null), readingTarget = useRef<string | null>(null);
+  const scrollIntent = useRef<{ key: string; height: number; viewport: number; until: number } | null>(null);
+  const [contentUpdated, setContentUpdated] = useState<string | null>(null);
+  followingRef.current = following;
   const [messageRevision, setMessageRevision] = useState(0);
-  const availabilityKey = JSON.stringify([props.host.instanceId, props.host.state, props.sessionId, props.session?.session.nativeSessionId, props.visible, props.session?.session.leafId]);
+  const availabilityKey = JSON.stringify([props.host.instanceId, props.host.state, props.sessionId, props.session?.session.nativeSessionId, props.visible, props.session?.session.leafId, props.run?.id]);
   const availabilityTarget = useRef({ key: availabilityKey, epoch: 0 });
   if (availabilityTarget.current.key !== availabilityKey) availabilityTarget.current = { key: availabilityKey, epoch: availabilityTarget.current.epoch + 1 };
   const availabilityEpoch = availabilityTarget.current.epoch;
@@ -135,6 +145,7 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
   const selectedModel = models.find(model => model.provider === choice?.provider && model.id === choice?.modelId);
   const choiceValue = selectedModel ? JSON.stringify([selectedModel.provider, selectedModel.id]) : "";
   const run = props.run?.kind === "agent" && props.run.sessionId !== props.session?.session.id ? null : props.run;
+  const readingKey = props.sessionId === null ? null : `${props.sessionId}:${run?.id ?? 'history'}:chat`;
   const inputControl = props.session?.session.inputControl, queueRun = props.queueRun, original = props.queueRootInput?.workspaceContext;
   const mode: InputMode = inputControl ? draft?.mode ?? 'send' : 'send';
   const label = mode === 'follow_up' ? 'Follow Up' : mode === 'steer' ? 'Steer' : 'Send';
@@ -157,21 +168,77 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
     : props.active && props.active.runId === run?.id && props.active.persistencePending ? "Waiting to save"
     : run?.status === "completed" ? "Saved" : run?.status === "cancelled" ? "Cancelled and saved"
     : run?.status === "failed" ? props.active?.runId === run.id ? "Failed; cleanup unconfirmed" : "Failure saved" : run ? "Generating; not saved" : null;
-  const temporary = !!props.preview || run?.status === 'running' || run?.status === 'created';
+  const events = props.events && props.events.runId === run?.id && props.events.sessionId === props.sessionId ? props.events : null;
+  const savedFinal = !!run && ['completed', 'failed', 'cancelled'].includes(run.status) && run.cleanup?.requiredPersistenceComplete === true;
+  const temporary = run?.kind === 'agent' ? events?.finalSource === 'temporary' : !!props.preview || run?.status === 'running' || run?.status === 'created';
   const historyUnavailable = !currentAvailability?.hasPage && (currentAvailability?.unavailable || props.session?.history.available === false);
-  const showRunBody = temporary || historyUnavailable || run?.kind === 'provider';
+  const showRunBody = run?.kind === 'agent' ? events?.finalSource === 'saved' : temporary || historyUnavailable || run?.kind === 'provider';
+  useEffect(() => {
+    if (!run || !events) return;
+    const source = finalDisplaySource(run, { available: currentAvailability?.available ?? false, runCovered: currentAvailability?.runCovered ?? false, unavailable: historyUnavailable });
+    if (source) props.onFinalSource(source);
+  }, [savedFinal, events?.runId, currentAvailability?.available, currentAvailability?.runCovered, historyUnavailable]);
+  const streamKey = JSON.stringify(events?.snapshots.map(value => [value.type, value.revision, value.streamConnection]));
+  const readingElementKey = (element: HTMLElement) => element.dataset.nativeEntryId ? 'native:' + element.dataset.nativeEntryId : 'message:' + element.dataset.streamConnection + '/' + element.dataset.messageId;
+  useLayoutEffect(() => {
+    const container = scroll.current; if (!container || !readingKey || !props.visible) return;
+    readingTarget.current = readingKey; restoring.current = true;
+    if (restorationFrame.current !== null) cancelAnimationFrame(restorationFrame.current);
+    restorationFrame.current = requestAnimationFrame(() => { restoring.current = false; restorationFrame.current = null; });
+    const position = positions.current.get(readingKey);
+    if (position?.following === false) {
+      followingRef.current = false; setFollowing(false);
+      const elements = Array.from(container.querySelectorAll<HTMLElement>('[data-native-entry-id], [data-message-id]')).filter(element => element.offsetParent !== null);
+      const resolved = position.anchor ? resolveReadingAnchor(position.anchor, elements.map(readingElementKey), events?.nativeEntries ?? {}) : null;
+      const anchor = resolved?.key ? elements.find(element => readingElementKey(element) === resolved.key) : null;
+      if (anchor) container.scrollTop += anchor.getBoundingClientRect().top - container.getBoundingClientRect().top - position.offset;
+      else container.scrollTop = position.top;
+      if (resolved?.contentUpdated && elements.length > 0) setContentUpdated(readingKey);
+    } else { followingRef.current = true; setFollowing(true); container.scrollTop = container.scrollHeight; }
+  }, [readingKey, props.visible, messageRevision, streamKey, events?.finalSource, run?.output.text]);
+  useEffect(() => () => { if (restorationFrame.current !== null) cancelAnimationFrame(restorationFrame.current); }, []);
+  function markScrollIntent() {
+    const container = scroll.current; if (!container || !readingKey) return;
+    restoring.current = false;
+    scrollIntent.current = { key: readingKey, height: container.scrollHeight, viewport: container.clientHeight, until: performance.now() + 500 };
+  }
+  function rememberPosition(event: React.UIEvent<HTMLDivElement>) {
+    const container = scroll.current; if (!container || !props.visible || !readingKey || readingTarget.current !== readingKey || restoring.current && event.nativeEvent.isTrusted) return;
+    const intent = scrollIntent.current;
+    // Layout can clamp an up-scrolled position to the bottom of a shorter intermediate
+    // DOM. Only explicit input in this same region and geometry may change its intent.
+    const userInitiated = !event.nativeEvent.isTrusted || !!intent && intent.key === readingKey && intent.height === container.scrollHeight && intent.viewport === container.clientHeight && intent.until >= performance.now();
+    if (!shouldRecordScroll(positions.current.get(readingKey), container.scrollHeight, container.clientHeight, userInitiated)) return;
+    const follows = container.scrollHeight - container.scrollTop - container.clientHeight < 64;
+    const top = container.getBoundingClientRect().top;
+    const elements = Array.from(container.querySelectorAll<HTMLElement>('[data-native-entry-id], [data-message-id]')).filter(element => element.offsetParent !== null);
+    const index = elements.findIndex(element => element.getBoundingClientRect().bottom > top), anchor = elements[index];
+    const anchorKey = anchor ? readingElementKey(anchor) : null, mapped = anchorKey ? events?.nativeEntries[anchorKey] : null;
+    positions.current.set(readingKey, { following: follows, top: container.scrollTop, anchor: anchor && anchorKey ? { key: anchorKey, nativeEntryId: anchor.dataset.nativeEntryId ?? (mapped?.startsWith('native:') ? mapped.slice(7) : null), neighbors: [elements[index + 1], elements[index - 1]].filter((element): element is HTMLElement => !!element).map(readingElementKey) } : null, offset: anchor ? anchor.getBoundingClientRect().top - top : 0 });
+    if (positions.current.size > 50) positions.current.delete(positions.current.keys().next().value!);
+    followingRef.current = follows; setFollowing(follows);
+  }
   useEffect(() => { if (input.current) { input.current.style.height = "auto"; input.current.style.height = Math.min(160, input.current.scrollHeight + input.current.offsetHeight - input.current.clientHeight) + "px"; } }, [draft?.text, props.session?.session.id]);
-  useEffect(() => { if (props.visible && following && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }, [props.preview?.text, run?.output.text, following, props.sessionId, props.visible, messageRevision]);
   return <div className="chat-layout">
     <div className="session-heading"><strong data-testid="current-session">{props.session ? "Viewing: " + sessionDisplayTitle(props.session.session) : "No session selected"}</strong>
       {props.active && <span data-testid="running-session" className="status-chip">Running: {props.runningTitle ?? "Provider"} · Run {props.active.runId}</span>}</div>
-    <div className="messages" ref={scroll} onScroll={() => { if (!props.visible) return; const element = scroll.current!; setFollowing(element.scrollHeight - element.scrollTop - element.clientHeight < 64); }}>
+    <div className="messages" data-testid="chat-scroll" ref={scroll} onScroll={rememberPosition} onWheel={markScrollIntent} onPointerDown={markScrollIntent} onPointerMove={event => { if (event.buttons) markScrollIntent(); }} onKeyDown={event => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) markScrollIntent(); }}>
       <div className="reading-width">
         {!run && !currentAvailability?.hasHistory && currentAvailability?.available !== false && props.session?.history.available !== false && <div className="chat-empty"><span className="eyebrow">Session chat</span><h2>{props.session ? "Start a conversation" : "Create a session"}</h2><p>Each session keeps its context during this app session. Review the saved run for each message.</p><button className="primary" onClick={props.onModels}>Configure models</button></div>}
-        {props.sessionId && <NativeMessages host={props.host} sessionId={props.sessionId} nativeSessionId={props.session?.session.nativeSessionId} visible={props.visible} context="chat" revision={props.session?.session.leafId} testId="chat-native-messages" onCreate={props.onCreate} onChanged={() => setMessageRevision(value => value + 1)} onAvailability={value => setMessageAvailability({ ...value, epoch: availabilityEpoch })} />}
+        {props.sessionId && <NativeMessages host={props.host} sessionId={props.sessionId} nativeSessionId={props.session?.session.nativeSessionId} visible={props.visible} context="chat" revision={props.session?.session.leafId} testId="chat-native-messages" requiredRunId={run?.id} excludeRunId={run?.kind === 'agent' && events?.finalSource !== 'native' ? run.id : null} onCreate={props.onCreate} onChanged={() => setMessageRevision(value => value + 1)} onAvailability={value => setMessageAvailability({ ...value, epoch: availabilityEpoch })} />}
+        {events && <div className="stream-display-status" data-testid="event-display-status" data-run-id={events.runId} data-cursor={events.cursor}><p className="tiny muted">Run {events.runId} display · {events.phase} · committed cursor {events.cursor}</p>{(events.finalSource === 'native' || events.finalSource === 'temporary') && <span className="status-chip" data-testid="run-save-status">{status}</span>}{events.error && <p role="alert" className="error-text">{events.error}</p>}{events.phase === 'disconnected' && <p role="status">Disconnected. Retaining verified facts; reconnect restores display.</p>}{events.snapshotsIncomplete && <p className="evidence-gap">Some temporary content is unavailable. Temporary text is not a saved history.</p>}</div>}
+        {events?.finalSource === 'temporary' && <section data-testid="temporary-run-area" data-run-id={events.runId} aria-label="Temporary Run display">
+          <div className="user-message"><span className="message-label">User</span><div>{run?.inputText}</div></div>
+          <p className="tiny muted">Temporary output · Run and Answer saving unconfirmed</p>
+          {events.snapshots.filter(value => value.type === 'message.snapshot').map(value => value.type === 'message.snapshot' && <article className="model-answer" key={value.streamConnection + ':' + value.messageId} data-message-id={value.messageId} data-stream-connection={value.streamConnection} data-native-entry-ref={value.nativeEntryId ?? undefined} data-run-id={value.runId} data-testid="temporary-message"><div className="answer-heading"><strong>Assistant</strong><span className="status-chip">{value.phase}</span></div><div className="answer-text">{value.blocks.map(block => <span key={block.contentIndex}>{block.text}</span>)}</div>{value.truncated && <p className="tiny muted">Temporary display truncated. Read saved facts after completion.</p>}</article>)}
+          {!events.snapshots.some(value => value.type === 'message.snapshot') && <p className="muted">Waiting for temporary model output.</p>}
+          {events.snapshots.filter(value => value.type === 'tool.snapshot').map(value => value.type === 'tool.snapshot' && <p className="tiny tool-progress" key={value.nativeToolCallId} data-testid="temporary-tool" data-native-tool-call-id={value.nativeToolCallId}>Tool {value.nativeToolCallId} · {value.phase} · temporary observation{value.toolCallId ? ' · saved call ' + value.toolCallId : ' · saved call not yet identified'}</p>)}
+          {savedFinal && !currentAvailability?.runCovered && <p className="evidence-gap">Final Run facts are saved. Reading authoritative messages for this Run.</p>}
+        </section>}
+        {events?.finalSource === 'unavailable' && <p className="evidence-gap" data-testid="final-content-unavailable">Final content is unavailable. Run and Answer saving remains unconfirmed; read the original facts again.</p>}
         {props.session && !props.session.history.available && <button onClick={props.onCreate}>Create new session</button>}
-        {run && <>{run.kind === "provider" && <p className="muted">Provider diagnostic · Run {run.id}</p>}{showRunBody && <div className="user-message"><span className="message-label">User</span><div>{run.inputText}</div></div>}
-          <article className="model-answer"><div className="answer-heading"><strong>Assistant</strong><span className="status-chip">{status}</span></div>
+        {run && (run.kind === 'provider' || showRunBody || !events) && <>{run.kind === "provider" && <p className="muted">Provider diagnostic · Run {run.id}</p>}{showRunBody && <div className="user-message"><span className="message-label">User</span><div>{run.inputText}</div></div>}
+          <article className="model-answer" data-testid={showRunBody && savedFinal ? 'saved-final-area' : undefined} data-run-id={run.id}><div className="answer-heading"><strong>Assistant</strong><span className="status-chip">{status}</span></div>
             <p className="tiny muted">{temporary ? 'Temporary output · Run and Answer saving unconfirmed' : historyUnavailable ? 'Saved run output; native history unavailable' : run.kind === 'provider' ? 'Saved diagnostic output · Review Run details' : currentAvailability?.hasMore ? 'Native history page incomplete. Load more messages to read this leaf. Read the full saved output in Run details.' : currentAvailability?.hasPage ? 'Native history: in memory. Read the full saved output in Run details.' : 'Native history coverage unconfirmed. Read the full saved output in Run details.'}</p>
             {showRunBody && <div className="answer-text" data-testid="run-output">{props.preview?.text ?? (run.output.text || "Waiting for model output")}</div>}
             {props.preview?.truncated && <p className="muted">The live preview was truncated. Read the full saved output in Run details.</p>}
@@ -179,7 +246,8 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
             {run.error && <p role="alert" className="error-text">{errorMessage(run.error)}</p>}</article></>}
       </div>
     </div>
-    {!following && <button className="new-content" onClick={() => setFollowing(true)}>New content · Back to latest</button>}
+    {contentUpdated === readingKey && !following && <p className="tiny evidence-gap reading-update" data-testid="reading-content-updated">Content updated. Kept the nearest available message.</p>}
+    {!following && <button className="new-content" data-testid="back-to-latest" onClick={() => { if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; if (readingKey) positions.current.set(readingKey, { following: true, top: scroll.current?.scrollTop ?? 0, anchor: null, offset: 0 }); followingRef.current = true; setFollowing(true); setContentUpdated(null); }}>New content · Back to latest</button>}
     {props.sessionId && <div className="reading-width input-queue-wrap"><InputQueue snapshot={props.inputs} sessionId={props.sessionId} ready={props.host.state === 'ready' && props.visible} cancelling={props.cancellingInputs} onRefresh={props.onRefreshInputs} onMore={props.onMoreInputs} onCancel={props.onCancelInput} /></div>}
     <div className="composer-wrap"><div className="composer reading-width">
       <div className="composer-model"><span aria-hidden="true">◇</span><div className="composer-model-choice">

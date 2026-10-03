@@ -35,7 +35,7 @@ async function until(predicate: () => boolean) { const end = Date.now() + 4000; 
 test("Core imports only contracts and platform libraries", async () => {
   const source = await Bun.file(new URL("../../packages/core/src/application.ts", import.meta.url)).text();
   const imports = [...source.matchAll(/\b(?:from|import)\s*["']([^"']+)["']/g)].map(match => match[1]!);
-  expect(imports.filter(specifier => !specifier.startsWith("node:") && !specifier.includes("/contracts/") && !specifier.startsWith("@medclaw/contracts/") && !specifier.startsWith("./runtime/"))).toEqual([]);
+  expect(imports.filter(specifier => !specifier.startsWith("node:") && !specifier.includes("/contracts/") && !specifier.startsWith("@medclaw/contracts/") && !specifier.startsWith("./runtime/") && !specifier.startsWith("./events/"))).toEqual([]);
   expect(source.includes("CredentialSynchronizationError")).toBe(false);
 });
 test("operation identity returns original and terminals persist before notice", async () => {

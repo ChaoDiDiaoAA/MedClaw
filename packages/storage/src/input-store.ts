@@ -4,13 +4,24 @@ import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, safe
 import { InputContentSchema, SessionInputSchema, ReadInputRequestSchema, ListInputsRequestSchema, SessionInputPageSchema, MAX_INPUT_PAGE_BYTES,
  type InputContent, type SessionInput, type SessionInputPage, type ReadInputRequest, type ListInputsRequest, type InputStore, type InputCancelProof, type InputSettlementProof } from '../../contracts/src/session';
 import { canonicalRequest, safePreview } from '../../contracts/src/run';
+import type { EventWriter, RegisteredEventPayload } from '../../contracts/src/event';
 export type InputRow={id:number;session_id:number;client_sequence:number;operation_ref:string;mode:SessionInput['mode'];status:SessionInput['status'];processing_status:SessionInput['processingStatus'];content_json:string;target_run_id:number|null;run_id:number|null;native_entry_id:string|null;created_at:string;updated_at:string;delivered_at:string|null;processed_at:string|null;error_json:string|null};
 function fail(code:string):never {throw new Error(code);}
 function check<T>(schema:z.ZodType<T>,value:unknown,code='invalid_argument'):T {const r=schema.safeParse(value);return r.success?r.data:fail(code);}
 function readJson(text:string):unknown {try{return JSON.parse(text);}catch{return fail('storage_read_failed');}}
 /** Synchronous primitives on the Repositories connection; callers own acceptance/finalization transactions. */
 export class SqliteInputStore {
- constructor(private readonly db:Database){}
+ constructor(private readonly db:Database,private readonly events?:EventWriter){}
+ private event(row:InputRow,fact:RegisteredEventPayload,at:string):void {
+  if(!this.events)return;const runId=row.run_id??row.target_run_id;if(runId===null)fail('storage_write_failed');
+  this.events.appendInTransaction({...fact,runId,sessionId:row.session_id,source:'application',sourceConnection:null,sourceSequence:null,toolCallId:null,occurredAt:at,receivedAt:at});
+ }
+ private fields(row:InputRow){return {contract:'medclaw.event/v1' as const,inputId:row.id,targetRunId:row.target_run_id,runId:row.run_id,status:row.status,processingStatus:row.processing_status,errorCode:row.error_json===null?null:check(AppErrorSchema,readJson(row.error_json),'storage_read_failed').code};}
+ accepted(inputId:number,at:string):void {
+  const row=this.required(inputId);if(row.status!=='queued'||row.processing_status!=='pending'||row.run_id!==null||row.error_json!==null)fail('state_conflict');
+  const payload={...this.fields(row),runId:null,status:'queued' as const,processingStatus:'pending' as const,errorCode:null};
+  this.event(row,{type:'input_accepted',payload},at);if(row.mode!=='send')this.event(row,{type:'input_queued',payload},at);
+ }
  row(inputId:number):InputRow|null {check(PositiveIdSchema,inputId);return this.db.query<InputRow,[number]>('SELECT * FROM session_inputs WHERE id=?').get(inputId);}
  required(inputId:number):InputRow {return this.row(inputId)??fail('input_not_found');}
  content(row:InputRow):InputContent {const content=check(InputContentSchema,readJson(row.content_json),'storage_read_failed'); if(content.originalSubmitInput.sessionId!==row.session_id||content.originalSubmitInput.clientSequence!==row.client_sequence||content.originalSubmitInput.mode!==row.mode)fail('storage_read_failed');return content;}
@@ -25,6 +36,11 @@ export class SqliteInputStore {
   check(TimestampSchema,at);
   const changed=this.db.query(`UPDATE session_inputs SET status=?,processing_status=?,processed_at=?,updated_at=?,error_json=?,run_id=?,native_entry_id=? WHERE id=? AND status=? AND processing_status=? AND run_id IS ? AND native_entry_id IS ?`).run(status,processing,processing==='pending'?null:row.processed_at??at,at,error,runId,entry,row.id,row.status,row.processing_status,row.run_id,row.native_entry_id);
   if(changed.changes!==1)fail('state_conflict');
+  const next=this.required(row.id),payload=this.fields(next);
+  if(status==='consumed'&&row.status!=='consumed')this.event(next,{type:'input_delivered',payload:{...payload,phase:'native_consumed'}},at);
+  else if(processing==='completed')this.event(next,{type:'input_processed',payload:{...payload,processingStatus:'completed'}},at);
+  else if(processing==='cancelled')this.event(next,{type:'input_cancelled',payload:{...payload,processingStatus:'cancelled'}},at);
+  else if(status==='failed'||status==='delivery_unknown'||processing==='failed')this.event(next,{type:'input_failed',payload:{...payload,processingStatus:processing==='failed'?'failed':'pending'}},at);
  }
  beginInputDelivery(inputId:number,instanceId:string,at:string):void {
   check(OpaqueIdSchema,instanceId);check(TimestampSchema,at);const row=this.required(inputId),c=this.content(row);
@@ -37,6 +53,7 @@ export class SqliteInputStore {
   if(row.delivered_at!==null){if(row.delivered_at===at)return;fail('state_conflict');}
   if(row.status==='cancelled'||row.status==='failed')fail('native_state_invalid');
   this.db.query('UPDATE session_inputs SET delivered_at=?,updated_at=? WHERE id=? AND delivered_at IS NULL').run(at,at,inputId);
+  this.event(this.required(inputId),{type:'input_delivered',payload:{...this.fields(this.required(inputId)),phase:'sdk_received'}},at);
  }
  recordInputConsumption(inputId:number,fact:Parameters<InputStore['recordInputConsumption']>[1]):void {
   check(PositiveIdSchema,fact.sessionId);check(PositiveIdSchema,fact.runId);check(OpaqueIdSchema,fact.nativeEntryId);check(TimestampSchema,fact.at);

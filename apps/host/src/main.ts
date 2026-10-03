@@ -32,6 +32,9 @@ import { AbsolutePathSchema } from '../../../packages/contracts/src/protocol.ts'
 import { ErrorLog } from "../../../packages/logging/src/error-log.ts";
 import { RuntimeLog } from "../../../packages/logging/src/runtime-log.ts";
 import { PromptTrace } from "../../../packages/logging/src/prompt-trace.ts";
+import { SqliteWriteTransactions } from '../../../packages/storage/src/write-transactions.ts';
+import { SqliteEventStore } from '../../../packages/storage/src/event-store.ts';
+import { EventService } from '../../../packages/core/src/events/event-service.ts';
 
 const errorLog = new ErrorLog("host"), runtimeLog = new RuntimeLog("host"), promptTrace = new PromptTrace();
 
@@ -39,6 +42,7 @@ let hello: HostHello | null = null, application: Application<ResolvedModel> | nu
 let sessions: SessionService | null = null, workspace: WorkspaceService | null = null;
 let repositories: Repositories, catalog: SqliteCatalogStore, toolStore: SqliteToolStore, queries: QueryService, evidence: EvidenceReader, imports: ImportService, artifacts: ArtifactStore;
 let database: ReturnType<typeof openDatabase> | null = null;
+let events: EventService | null = null;
 let locked = false, closing = false, controlCount = 0;
 let terminating = false, shutdownTask: Promise<void> | null = null, fatalTask: Promise<void> | null = null;
 let startupPhase = "hello";
@@ -46,6 +50,9 @@ let writes: Promise<unknown> = Promise.resolve();
 const pending = new Map<string, { method: PrivateCredentialMethod; resolve(value: unknown): void; reject(error: unknown): void; timer: ReturnType<typeof setTimeout> }>();
 const previews = new Map<number, Extract<RuntimeNotice, { type: "provider.preview" | "agent.preview" }>>();
 let previewTimer: ReturnType<typeof setTimeout> | null = null;
+const streams = new Map<string, Extract<RuntimeNotice, { type: 'event.stream' }>>();
+const streamRevisions = new Map<string, number>();
+let streamTimer: ReturnType<typeof setTimeout> | null = null;
 function sendRaw(line: string): Promise<void> {
   if (Buffer.byteLength(line.trimEnd(), "utf8") > MAX_FRAME_BYTES) throw new Error("frame_too_large");
   if (++controlCount > 256) { controlCount--; throw new Error("runtime_busy"); }
@@ -54,12 +61,22 @@ function sendRaw(line: string): Promise<void> {
   return next;
 }
 function notice(notice: RuntimeNotice) {
-  if (!hello || (closing && (notice.type === "provider.preview" || notice.type === "agent.preview"))) return;
+  if (!hello || (closing && (notice.type === "provider.preview" || notice.type === "agent.preview" || notice.type === 'event.stream'))) return;
   if (notice.type === "provider.preview") promptTrace.add(notice.runId, "provider.preview");
   if (notice.type === "provider.settled" || notice.type === "agent.settled") { promptTrace.add(notice.runId, "run_saved"); promptTrace.finish(notice.runId); }
   if (notice.type === "provider.persistence_failed" || notice.type === "agent.persistence_failed") { errorLog.add(notice.error, { runId: notice.runId }); promptTrace.add(notice.runId, notice.type); }
   if (notice.type === "auth.finished") runtimeLog.add("auth_finished");
-  if (notice.type === "provider.preview" || notice.type === "agent.preview") {
+  if (notice.type === 'event.stream') {
+    const snapshot = notice.snapshot, objectId = snapshot.type === 'message.snapshot' ? snapshot.messageId : snapshot.nativeToolCallId;
+    const key = JSON.stringify([notice.subscriptionId, snapshot.runId, snapshot.streamConnection, snapshot.type, objectId]);
+    if (snapshot.revision <= (streamRevisions.get(key) ?? 0)) return;
+    streamRevisions.delete(key); streamRevisions.set(key, snapshot.revision);
+    if (streamRevisions.size > 512) streamRevisions.delete(streamRevisions.keys().next().value!);
+    if (snapshot.phase === 'ended') { streams.delete(key); void sendNotice(notice).catch(() => {}); return; }
+    streams.set(key, structuredClone(notice));
+    if (streams.size > 256) streams.delete(streams.keys().next().value!);
+    if (!streamTimer) streamTimer = setTimeout(() => { streamTimer = null; const latest = [...streams.values()]; streams.clear(); latest.forEach(n => void sendNotice(n).catch(() => {})); }, 32);
+  } else if (notice.type === "provider.preview" || notice.type === "agent.preview") {
     previews.set(notice.runId, notice);
     if (!previewTimer) previewTimer = setTimeout(() => { previewTimer = null; const latest = [...previews.values()]; previews.clear(); latest.forEach(n => void sendNotice(n).catch(() => {})); }, 32);
   } else {
@@ -124,6 +141,8 @@ function shutdownHost(): Promise<void> {
   closing = true;
   if (previewTimer) clearTimeout(previewTimer);
   previewTimer = null; previews.clear();
+  if (streamTimer) clearTimeout(streamTimer);
+  streamTimer = null; streams.clear(); streamRevisions.clear(); events?.closeAll();
   return shutdownTask = (async () => {
     const stopped = await Promise.allSettled([application?.shutdown(), imports?.shutdown()]);
     for (const result of stopped) if (result.status === 'rejected') throw result.reason;
@@ -141,7 +160,12 @@ async function initialize(raw: unknown) {
   startupPhase = "settings_read";
   const settings = PublishedSettingsSchema.parse(JSON.parse(await readFile(config.paths.settingsPath, "utf8")));
   startupPhase = "database_open"; database = openDatabase(config.paths.databasePath);
-  repositories = new Repositories(database);
+  const transactions = SqliteWriteTransactions.forDatabase(database);
+  let agent: PiAgentRuntime | null = null;
+  events = new EventService(new SqliteEventStore(database, transactions), transactions, () => new Date().toISOString(), notice,
+    { readSnapshots: runId => agent?.readSnapshots(runId) ?? { streamConnection: null, snapshots: [], incomplete: false } },
+    error => errorLog.add(error, { ...(error.runId ? { runId: error.runId } : {}) }), notice);
+  repositories = new Repositories(database, undefined, events, transactions);
   try { repositories.recoverInterrupted(config.instanceId, new Date().toISOString()); }
   catch { errorLog.add(safeError("storage_write_failed")); }
   const credentialStore = new BridgeCredentialStore(credentials);
@@ -149,7 +173,7 @@ async function initialize(raw: unknown) {
   const runtime = await PiModelRuntime.create({ credentials: credentialStore, modelsStore: await CatalogStore.open(config.paths.cachePath, error => errorLog.add(error)) });
   startupPhase = "custom_registration";
   await runtime.installCustom(settings.customProviders.map(p => p.definition));
-  catalog = new SqliteCatalogStore(database); toolStore = new SqliteToolStore(database);
+  catalog = new SqliteCatalogStore(database); toolStore = new SqliteToolStore(database, events, transactions);
   const catalogService = new CatalogService(catalog);
   queries = new QueryService(catalogService, toolStore); evidence = new EvidenceReader(catalogService, queries, toolStore);
   const recorder = new ToolRecorder(toolStore, (error, context) => application?.runs.failToolPersistence(context.runId, error));
@@ -164,14 +188,14 @@ async function initialize(raw: unknown) {
     });
     return { registry, executor };
   };
-  const agent = new PiAgentRuntime(runtime, config.paths.dataRoot, { ...configure(), recorder, configure });
+  agent = new PiAgentRuntime(runtime, config.paths.dataRoot, { ...configure(), recorder, configure });
   artifacts = new ArtifactStore(database, join(config.paths.dataRoot, 'artifacts'));
   imports = new ImportService({ store: new SqliteImportStore(database), artifacts, instanceId: config.instanceId,
     resolveToken: async (fileToken, operationRef) => AbsolutePathSchema.parse(await credentials('file.resolve', { fileToken, operationRef })) });
   application = new Application(config.instanceId, settings, runtime, repositories,
     (context, action) => credentialStore.withContext(context, action),
     (runId, kind, time) => new ModelCallRecorder(repositories, runId, kind, time),
-    notice, error => errorLog.add(error), agent);
+    notice, error => errorLog.add(error), agent, events);
   application.runs.recoverInterrupted(true); // The writer lock proves that the previous owning process exited.
   sessions = new SessionService(config.instanceId, repositories, agent, (input, context) => application!.runs.submitAgent(input, context),
     () => application!.runs.activeHandle, sessionId => application!.runs.readInputControl(sessionId),
@@ -231,6 +255,14 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case "model.request": return app.submitProvider(request, "main");
     case "model.diagnose": return app.submitProvider(request, "diagnostic");
     case "run.read": return unwrap(await app.runs.read(request.payload));
+    case 'event.read': return unwrap(events!.read(request.payload));
+    case 'event.subscribe': {
+      const input = request.payload;
+      if (input.action === 'open') return events!.subscribe(input);
+      for (const key of streams.keys()) if (JSON.parse(key)[0] === input.subscriptionId) streams.delete(key);
+      for (const key of streamRevisions.keys()) if (JSON.parse(key)[0] === input.subscriptionId) streamRevisions.delete(key);
+      return events!.close(input.subscriptionId);
+    }
     case "run.active": return unwrap(await app.runs.active());
     case "run.control.read": return unwrap(await app.runs.readControl());
     case "run.cancel": return unwrap(await app.runs.cancel(request.payload.runId));
@@ -333,7 +365,9 @@ async function request(raw: unknown) {
     const schema = frame.method in hostPrivateMethodSchemas ? hostPrivateMethodSchemas[frame.method as keyof typeof hostPrivateMethodSchemas].output : publicMethodSchemas[frame.method as keyof typeof publicMethodSchemas].output;
     try { result = { ok: true, data: schema.parse(data) }; }
     catch { throw safeError(isReadOnlyMethod(frame.method) ? "host_protocol_mismatch" : "operation_result_unknown", undefined, { operationRef: frame.operationRef }); }
-  } catch (error) { const known = AppErrorSchema.safeParse(error); const safe = known.success ? { ...known.data, operationRef: frame.operationRef }
+  } catch (error) { const known = AppErrorSchema.safeParse(error), wrapped = AppErrorSchema.safeParse(error && typeof error === 'object' && 'appError' in error ? error.appError : undefined);
+    const proved = known.success ? known.data : wrapped.success ? wrapped.data : null;
+    const safe = proved ? { ...proved, operationRef: frame.operationRef }
     : safeError(error instanceof Error && error.name === 'ZodError' ? 'invalid_argument' : error instanceof Error ? error.message : "internal_error", error, { operationRef: frame.operationRef }); errorLog.add(safe); result = { ok: false, error: safe }; }
   if (terminating) return;
   await sendRaw(encodeHostFrame({ protocolVersion: HOST_PROTOCOL_VERSION, kind: "reply", instanceId: frame.instanceId, requestId: frame.requestId, result } as never));

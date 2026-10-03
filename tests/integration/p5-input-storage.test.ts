@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { openDatabase, SCHEMA_VERSION } from '../../packages/storage/src/database';
 import { Repositories } from '../../packages/storage/src/repositories';
 const at='2026-10-03T00:00:00.000Z';
-test('schema3 upgrades all original columns and checksums to schema4 without rewriting legacy facts',()=>{
+test('schema3 upgrades all original columns and checksums to latest schema without rewriting legacy facts',()=>{
  const root=mkdtempSync(join(tmpdir(),'p5-storage-')), path=join(root,'app.sqlite');
  let db=new Database(path);
  try {
@@ -33,7 +33,7 @@ test('schema3 upgrades all original columns and checksums to schema4 without rew
   `);
   const names=db.query<{name:string},[]>("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(x=>x.name);
   const before=Object.fromEntries(names.map(n=>[n,db.query(`SELECT * FROM ${n}`).all()])); db.close(); db=openDatabase(path);
-  expect(Object.values(before).every(rows=>rows.length>0)).toBe(true);expect(SCHEMA_VERSION).toBe(4); expect(db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'").all()).toHaveLength(18);
+  expect(Object.values(before).every(rows=>rows.length>0)).toBe(true);expect(SCHEMA_VERSION).toBe(5); expect(db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'").all()).toHaveLength(19);
   for(const n of names) expect(db.query(`SELECT * FROM ${n}`).all().slice(0,before[n]!.length)).toEqual(before[n]);
   expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]); expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
   expect(new Repositories(db).readInput({inputId:999})).toBeNull();
@@ -125,7 +125,7 @@ test('schema4 copy, rename and marker faults roll back to reopenable schema3 wit
   const schema=db.query('SELECT name,sql FROM sqlite_schema ORDER BY name').all();db.close();
   let failed=false;try{openDatabase(path,(point?:string)=>{if(point===phase)throw new Error(phase);}).close();}catch(error){failed=(error as Error).message==='storage_migration_failed';}expect(failed).toBe(true);
   db=new Database(path);expect(db.query('SELECT name,sql FROM sqlite_schema ORDER BY name').all()).toEqual(schema);expect(db.query('SELECT COUNT(*) AS n FROM schema_migrations').get()).toEqual({n:3});db.close();
-  db=openDatabase(path);expect(db.query('SELECT COUNT(*) AS n FROM schema_migrations').get()).toEqual({n:4});
+  db=openDatabase(path);expect(db.query('SELECT COUNT(*) AS n FROM schema_migrations').get()).toEqual({n:5});
  }finally{db.close();rmSync(root,{recursive:true,force:true});}
  }
 });
@@ -179,7 +179,7 @@ test('formal Query SQL and read projection persist the original root Input',()=>
  expect(()=>f.repos.acceptInput(badPlan)).toThrow('invalid_argument');expect(f.db.query('SELECT * FROM session_inputs').all()).toEqual([]);
  const r=f.repos.acceptInput(plan);f.repos.startCall(r.runId!,'query-call','main',at);
  const context={sessionId:1,runId:r.runId!,inputId:r.inputId!,source:'user_form' as const,callRef:'q',scope,referenceDate:request.referenceDate,timezone:request.timezone,signal:new AbortController().signal};
- const query={sessionId:1,runId:r.runId!,inputId:r.inputId!,callRef:'q',source:'user_form' as const,kind:'current' as const,params:CurrentQuerySchema.parse({batchIds:[1]}),batchIds:[1],scopeDeviceIds:null,rows:[],snapshotIds:[],eventIds:[],warnings:[],calculationVersion:'query/v1',resultHash:'h',createdAt:at};
+ const query={sessionId:1,runId:r.runId!,inputId:r.inputId!,callRef:'q',source:'user_form' as const,kind:'current' as const,params:CurrentQuerySchema.parse({batchIds:[1]}),batchIds:[1],scopeDeviceIds:null,rows:[],snapshotIds:[],eventIds:[],warnings:[],calculationVersion:'query/v1',resultHash:'a'.repeat(64),createdAt:at};
  const saved=new SqliteToolStore(f.db).commitQuery(query,[],context);expect(saved.inputId).toBe(r.inputId);expect(f.db.query('SELECT input_id FROM queries').get()).toEqual({input_id:r.inputId});
  }finally{f.dispose();}
 });

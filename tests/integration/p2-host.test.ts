@@ -89,8 +89,10 @@ test("actual slow Host streams to A while viewing B; busy Send and Stop keep the
     expect(await c.workspace()).toEqual(browsing); expect(c.service.requests).toHaveLength(1);
     expect(RuntimeControlViewSchema.parse(unwrap(await c.host.request("run.control.read", {})))).toMatchObject({ activeRootRun: { runId: accepted.runId, sessionId: a.session.id }, acceptingNewRuns: false });
     expect(await c.host.request("session.submit", await c.input(b.session.id, "B-draft"), "busy-b")).toMatchObject({ ok: false, error: { code: "state_conflict", reason: "runtime_busy" } });
-    await until(() => c.notices.some(n => n.type === "agent.preview"));
-    expect(c.notices.filter(n => n.type === "agent.preview").every(n => n.sessionId === a.session.id && n.runId === accepted.runId)).toBe(true);
+    const opened = unwrap(await c.host.request('event.subscribe', { action:'open', subscriptionId:'p2-slow-a', runId:accepted.runId, afterSequence:0, limit:50 })) as {snapshots:{runId:number;sessionId:number}[]};
+    await until(() => opened.snapshots.length > 0 || c.notices.some(n => n.type === 'event.stream'));
+    expect(opened.snapshots.every(n=>n.sessionId===a.session.id&&n.runId===accepted.runId)).toBe(true);
+    expect(c.notices.filter(n=>n.type==='event.stream').every(n=>n.snapshot.sessionId===a.session.id&&n.snapshot.runId===accepted.runId)).toBe(true);
     expect(await c.host.request("run.cancel", { runId: accepted.runId })).toMatchObject({ ok: true, data: { stopped: true } }); await c.idle();
     expect(ReadRunResultSchema.parse(unwrap(await c.host.request("run.read", { runId: accepted.runId })))).toMatchObject({ kind: "one", run: { status: "cancelled", sessionId: a.session.id } });
     expect(c.service.requests).toHaveLength(1);

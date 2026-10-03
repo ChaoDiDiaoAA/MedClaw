@@ -29,6 +29,7 @@ mkdirSync(join(dataRoot, "data"), { recursive: true }); mkdirSync(join(dataRoot,
 const credentials = new MainCredentials(join(dataRoot, "data", "credentials.enc.json"), safeStorage);
 const fileTokens = new FileTokens();
 const notify = (notice: DesktopNotice) => {
+  if ((notice.type === 'event.available' || notice.type === 'event.stream') && !ipc?.acceptEventNotice(notice, host.read().instanceId)) return;
   const frame = { ...notice, instanceId: host.read().instanceId };
   if (notice.type === "provider.preview") lastPreview = frame;
   if (notice.type === "provider.settled" || notice.type === "provider.persistence_failed") lastPreview = null;
@@ -39,7 +40,7 @@ const hostEntry = process.env.MEDCLAW_HOST_ENTRY ?? resolve(desktopEntryDir, "..
 if (!isAbsolute(hostEntry)) throw new Error("Controlled Host entry must be absolute");
 const host = new HostController({ dataRoot, hostEntry, bunExecutable: process.env.MEDCLAW_BUN_EXECUTABLE,
   onStarting: instanceId => credentials.attachInstance(instanceId),
-  onExit: instanceId => { credentials.confirmHostExit(instanceId); if (shuttingDown) app.exit(0); },
+  onExit: instanceId => { ipc?.closeInstance(instanceId); credentials.confirmHostExit(instanceId); if (shuttingDown) app.exit(0); },
   onCredentialRequest: frame => privateCredentialRequest(credentials, frame, fileTokens, window && !window.isDestroyed() ? window.id : undefined),
   onError: error => errors.add(error),
   onNotice: notice => {

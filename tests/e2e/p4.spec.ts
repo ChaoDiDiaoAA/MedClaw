@@ -10,21 +10,42 @@ import type { SessionMessagePage, SessionMessageView } from '../../packages/cont
 import { canonicalRequest } from '../../packages/contracts/src/run';
 import type { SubmitResult } from '../../packages/contracts/src/session';
 import { safeError } from '../../packages/contracts/src/error';
+import type { MessageStreamSnapshot, OpenEventSubscriptionInput } from '../../packages/contracts/src/event';
 
 const root = resolve(import.meta.dirname, '../..'), bun = process.env.MEDCLAW_BUN_EXECUTABLE ?? 'bun';
 let app: ElectronApplication, page: Page, temporary: string, server: Server, httpCount = 0;
 test.describe.configure({ mode: 'serial' });
-type Rule = { method?: string; sessionId?: number; runId?: number; page?: number; leafId?: string | null; hold?: string; project?: unknown };
-type Gate = { rules: Rule[]; entered: string[]; pending: Record<string, () => void>; calls: { method: string; sessionId?: number; runId?: number; page?: number; pageSize?: number; leafId?: string | null; afterEntryId?: string | null; clientSequence?: number; operationRef?: string }[]; toolProjection: string | null; accepted: (SubmitResult & { operationRef: string; batchIds: number[]; referenceDate: string; timezone: string })[] };
+type Rule = { method?: string; sessionId?: number; runId?: number; page?: number; leafId?: string | null; hold?: string; group?: string; persistent?: boolean; project?: unknown };
+type Gate = { rules: Rule[]; entered: string[]; pending: Record<string, () => void>; held: { group: string; operationRef: string; runId: number | undefined }[]; holdCounter: number; calls: { method: string; sessionId?: number; runId?: number; page?: number; pageSize?: number; leafId?: string | null; afterEntryId?: string | null; clientSequence?: number; operationRef?: string; action?: 'open' | 'close'; subscriptionId?: string; afterSequence?: number; limit?: number }[]; toolProjection: string | null; accepted: (SubmitResult & { operationRef: string; batchIds: number[]; referenceDate: string; timezone: string })[] };
 type MainGlobal = typeof globalThis & { __p4Gate: Gate };
 const entry = (id: string, text: string, extra: Partial<SessionMessageView> = {}): SessionMessageView => ({ nativeEntryId: id, parentEntryId: null, entryType: 'message', displayRole: 'assistant', text, references: [], inputId: null, runId: null, toolCallRef: null, textInfo: { totalChars: text.length, truncated: false, redacted: false }, ...extra });
 const projection = (sessionId: number, nativeSessionId: string, leafId: string, items: SessionMessageView[], cursor: string | null = null): { ok: true; data: SessionMessagePage } => ({ ok: true, data: { sessionId, nativeSessionId, leafId, source: 'native_memory', items, nextEntryId: cursor, hasMore: cursor !== null } });
 const region = () => page.getByTestId('chat-native-messages');
 const input = () => page.getByLabel('Message text', { exact: true });
+const temporaryAnswer = () => page.getByTestId('temporary-message').last().locator('.answer-text');
+async function nativeReadingAnchor() {
+  return page.locator('.messages').evaluate(container => {
+    const viewport = container.getBoundingClientRect(), native = Array.from(container.querySelectorAll<HTMLElement>('[data-native-entry-id]'));
+    const anchor = native.find(element => element.getBoundingClientRect().bottom > viewport.top && element.getBoundingClientRect().top < viewport.bottom);
+    if (!anchor) throw new Error('No real visible native reading anchor');
+    return { nativeEntryId: anchor.dataset.nativeEntryId!, offset: anchor.getBoundingClientRect().top - viewport.top, scrollTop: container.scrollTop, bottomGap: container.scrollHeight - container.scrollTop - container.clientHeight };
+  });
+}
 async function rules(values: Rule[]) { await app.evaluate((_, values) => { (globalThis as MainGlobal).__p4Gate.rules.push(...values); }, values); }
 async function entered(id: string) { await expect.poll(() => app.evaluate((_, id) => (globalThis as MainGlobal).__p4Gate.entered.includes(id), id)).toBe(true); }
-async function release(id: string) { await app.evaluate((_, id) => { (globalThis as MainGlobal).__p4Gate.pending[id]?.(); }, id); await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))); }
+async function release(id: string) { await app.evaluate((_, id) => { const state = (globalThis as MainGlobal).__p4Gate; state.rules = state.rules.filter(rule => !(rule.persistent && (rule.hold === id || rule.group === id))); for (const [key, resolve] of Object.entries(state.pending)) if (key === id || key.startsWith(id + ':')) resolve(); }, id); await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))); }
 async function calls() { return app.evaluate(() => (globalThis as MainGlobal).__p4Gate.calls); }
+async function streamTarget(runId: number) {
+  const requests = await calls(), original = requests.findLast(call => call.method === 'event.subscribe' && call.action === 'open' && call.runId === runId);
+  if (!original?.subscriptionId || original.afterSequence === undefined || original.limit === undefined) throw new Error('Missing actual display subscription');
+  const input: OpenEventSubscriptionInput = { action: 'open', subscriptionId: original.subscriptionId, runId, afterSequence: original.afterSequence, limit: original.limit };
+  const result = await page.evaluate(input => window.medclaw.request('event.subscribe', input), input);
+  if (!result.ok || result.data.action !== 'open') throw new Error('Missing actual current stream snapshot');
+  const snapshot = result.data.snapshots.findLast((value): value is MessageStreamSnapshot => value.type === 'message.snapshot' && value.blocks.some(block => block.text.includes('P4 temporary reply')));
+  if (!snapshot || snapshot.runId !== runId || snapshot.streamConnection !== result.data.streamConnection) throw new Error('Actual assistant stream identity was not proved');
+  const host = await page.evaluate(() => window.medclaw.request('host.read', {})); if (!host.ok) throw new Error('Missing current Host');
+  return { instanceId: host.data.instanceId, subscriptionId: original.subscriptionId, snapshot };
+}
 async function create() { await page.getByRole('button', { name: 'New Session', exact: true }).click(); const w = await page.evaluate(() => window.medclaw.request('workspace.read', {})); if (!w.ok || !w.data.sessionId) throw new Error('No selected session'); await expect(page.getByTestId('current-session')).toContainText(`New Session ${w.data.sessionId}`); const s = await page.evaluate(id => window.medclaw.request('session.read', { sessionId: id }), w.data.sessionId); if (!s.ok || !s.data) throw new Error('No session'); return s.data.session; }
 async function select(id: number) { await page.getByRole('button', { name: `New Session ${id}`, exact: true }).click(); await expect(page.getByTestId('current-session')).toContainText(`New Session ${id}`); }
 async function refresh() { await region().getByRole('button', { name: 'Refresh messages', exact: true }).click(); }
@@ -132,16 +153,17 @@ test.beforeAll(async () => {
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const seam = join(temporary, 'public-gates.cjs');
   writeFileSync(seam, `const {ipcMain}=require('electron'); const original=ipcMain.handle.bind(ipcMain);
-    const state=globalThis.__p4Gate={rules:[],entered:[],pending:{},calls:[],toolProjection:null,accepted:[]};
+    const state=globalThis.__p4Gate={rules:[],entered:[],pending:{},held:[],holdCounter:0,calls:[],toolProjection:null,accepted:[]};
     ipcMain.handle=(channel,listener)=>original(channel,async(event,envelope)=>{
       if(channel!=='medclaw:request')return listener(event,envelope);
-      const p=envelope.payload; state.calls.push({method:envelope.method,sessionId:p.sessionId,runId:p.runId,page:p.page,pageSize:p.pageSize,leafId:p.leafId,afterEntryId:p.afterEntryId,clientSequence:p.clientSequence,...(envelope.method==='session.submit'?{operationRef:envelope.operationRef}:{})});
+      const p=envelope.payload; state.calls.push({method:envelope.method,sessionId:p.sessionId,runId:p.runId,page:p.page,pageSize:p.pageSize,leafId:p.leafId,afterEntryId:p.afterEntryId,clientSequence:p.clientSequence,...(envelope.method==='event.subscribe'?{action:p.action,subscriptionId:p.subscriptionId,afterSequence:p.afterSequence,limit:p.limit}:{}),...(envelope.method==='session.submit'?{operationRef:envelope.operationRef}:{})});
       const index=state.rules.findIndex(r=>(!r.method||r.method===envelope.method)&&(r.sessionId===undefined||r.sessionId===p.sessionId)&&(r.runId===undefined||r.runId===p.runId)&&(r.page===undefined||r.page===p.page)&&(!Object.hasOwn(r,'leafId')||r.leafId===p.leafId));
-      const rule=index<0?null:state.rules.splice(index,1)[0]; let result=await listener(event,envelope);
+      const rule=index<0?null:state.rules[index].persistent?state.rules[index]:state.rules.splice(index,1)[0]; let result=await listener(event,envelope);
       if(envelope.method==='session.submit'&&result.ok)state.accepted.push({...result.data,operationRef:envelope.operationRef,batchIds:p.expectedBatchIds,referenceDate:p.referenceDate,timezone:p.timezone});
-      if(rule?.project)result=rule.project;
+      if(rule?.project&&(!rule.persistent||state.rules.includes(rule)))result=rule.project;
       if(envelope.method==='tool.read'&&result.ok&&state.toolProjection) result={...result,data:{...result.data,items:result.data.items.map(c=>({...c,name:'bash',version:'INTERNAL-WRAPPER-VERSION',sdkReturned:state.toolProjection!=='unconfirmed',sdkResultIsError:false,nativeOutputTruncated:state.toolProjection==='truncated'?true:state.toolProjection==='verified'?false:undefined,nextModelCallId:'old-call',consumedAt:'old-time',consumptionEvidence:state.toolProjection==='verified'?'provider_input_verified':undefined,truncated:true}))}};
-      if(rule?.hold){state.entered.push(rule.hold);await new Promise(resolve=>state.pending[rule.hold]=resolve);delete state.pending[rule.hold];}
+      if(rule?.hold&&(!rule.persistent||state.rules.includes(rule))){state.entered.push(rule.hold);const key=rule.persistent?rule.hold+':'+(++state.holdCounter):rule.hold;
+        state.held.push({group:rule.hold,operationRef:envelope.operationRef,runId:p.runId});await new Promise(resolve=>state.pending[key]=resolve);delete state.pending[key];}
       return result;
     });`);
   const hostEntry = join(temporary, 't06-host.ts');
@@ -188,7 +210,7 @@ test.beforeAll(async () => {
 });
 test.afterAll(async () => {
   httpReleases.forEach(release => release());
-  await app?.evaluate(() => Object.values((globalThis as MainGlobal).__p4Gate.pending).forEach(release => release())).catch(() => {});
+  await app?.evaluate(() => { const state = (globalThis as MainGlobal).__p4Gate; state.rules = []; Object.values(state.pending).forEach(release => release()); }).catch(() => {});
   await app?.close(); if (server) await new Promise<void>(resolve => server.close(() => resolve()));
   if (temporary) { const path = resolve(temporary), inside = relative(resolve(tmpdir()), path); if (inside && !inside.startsWith('..') && !inside.includes(':')) rmSync(path, { recursive: true, force: true }); }
 });
@@ -217,8 +239,14 @@ test('RunDetails rejects held historical and output replies across A2 to B to A2
   await rules([{ method: 'run.read', runId: a1.run.id, hold: 'final-fix-error', project: { ok: false, error: safeError('storage_read_failed') } }]);
   await details.getByRole('button', { name: `View Run ${a1.run.id}`, exact: true }).click(); await entered('final-fix-error');
   await select(b.id); await select(a.id);
-  await rules([{ method: 'run.read', runId: a2.run.id, hold: 'final-fix-current-loading' }]);
+  // P6 may issue another read of this same Run while the button starts its
+  // request. Hold the whole current-Run read group, with unique pending keys,
+  // after each real listener returns. No observer is disabled or result faked.
+  await rules([{ method: 'run.read', runId: a2.run.id, persistent: true, hold: 'final-fix-current-loading' }]);
   await details.getByRole('button', { name: 'Read this run again', exact: true }).click(); await entered('final-fix-current-loading');
+  const heldCurrent = await app.evaluate(() => (globalThis as MainGlobal).__p4Gate.held.filter(value => value.group === 'final-fix-current-loading'));
+  expect(heldCurrent.length).toBeGreaterThan(0); expect(heldCurrent.every(value => value.runId === a2.run.id && !!value.operationRef)).toBe(true);
+  await expect(details.getByRole('button', { name: 'Read this run again', exact: true })).toBeDisabled();
   await release('final-fix-error'); await expect(details.getByRole('alert')).toHaveCount(0);
   await expect(details.getByRole('button', { name: 'Read this run again', exact: true })).toBeDisabled();
   await release('final-fix-current-loading'); await expect(details.getByRole('button', { name: 'Read this run again', exact: true })).toBeEnabled();
@@ -306,10 +334,10 @@ test('chat message pages reject late session, host and leaf replies', async () =
 // Binding Stop and tool reads to the displayed B instead of the original active A breaks this test.
 test('viewing B while A runs preserves B draft and keeps Stop and tool results on A', async () => {
   const a = await create(), b = await create(); await input().fill('B previously saved message'); await page.getByRole('button', { name: 'Send', exact: true }).click(); await expect(page.getByText('Saved', { exact: true })).toBeVisible(); await select(a.id); const before = httpCount;
-  await input().fill('slow A tool'); await page.getByRole('button', { name: 'Send', exact: true }).click(); await expect.poll(() => httpCount).toBe(before + 2); await expect(page.getByTestId('run-output')).toHaveText('P4 temporary reply');
+  await input().fill('slow A tool'); await page.getByRole('button', { name: 'Send', exact: true }).click(); await expect.poll(() => httpCount).toBe(before + 2); await expect(temporaryAnswer()).toHaveText('P4 temporary reply');
   const active = await page.evaluate(() => window.medclaw.request('run.active', {})); if (!active.ok || !active.data) throw new Error('No active run'); const runId = active.data.runId;
   const original = await page.evaluate(runId => window.medclaw.request('run.read', { runId }), runId); if (!original.ok || original.data.kind !== 'one' || !original.data.run || original.data.run.kind !== 'agent') throw new Error('No original run');
-  await select(b.id); await input().fill('B independent unsent draft'); const bHistory = await messages(b.id), bAnswer = bHistory.items.find(item => item.displayRole === 'assistant')!; await expect(region().locator(`[data-native-entry-id="${bAnswer.nativeEntryId}"] .answer-text`)).toHaveText('P4 temporary reply saved'); await expect(page.getByTestId('run-output')).toHaveCount(0); await expect(region()).not.toContainText('slow A tool');
+  await select(b.id); await input().fill('B independent unsent draft'); const bHistory = await messages(b.id), bAnswer = bHistory.items.find(item => item.displayRole === 'assistant')!; await expect(region().locator(`[data-native-entry-id="${bAnswer.nativeEntryId}"] .answer-text`)).toHaveText('P4 temporary reply saved'); await expect(page.getByTestId('run-output')).toHaveCount(0); await expect(page.getByTestId('temporary-run-area')).toHaveCount(0); await expect(region()).not.toContainText('slow A tool');
   await page.getByRole('button', { name: 'View run details', exact: true }).click(); await page.getByRole('tab', { name: 'Run details', exact: true }).click(); await page.getByRole('button', { name: `View Run ${runId}`, exact: true }).click();
   const details = page.getByTestId('run-native-messages'); await expect(details).toContainText('Session ' + a.id); await expect(details).toContainText('tool result'); await expect(page.getByTestId('tool-call-details')).toContainText('read_data_scope'); await expect(input()).toHaveValue('B independent unsent draft');
   const host = await page.evaluate(() => window.medclaw.request('host.read', {})); if (!host.ok) throw new Error('No host'); await rules([{ method: 'run.read', sessionId: b.id, hold: 'B-refresh-original-details' }]);
@@ -359,21 +387,31 @@ test('temporary output and saved messages remain separate while scrolling', asyn
   await input().fill('short saved message'); await page.getByRole('button', { name: 'Send', exact: true }).click(); await expect(page.getByText('Saved', { exact: true })).toBeVisible();
   const native = await page.evaluate(id => window.medclaw.request('session.messages.read', { sessionId: id, leafId: null, afterEntryId: null, limit: 50 }), a.id); if (!native.ok) throw new Error('No native messages');
   const rows = Array.from({ length: 50 }, (_, index) => { const text = 'Historical native text ' + index + '\n' + 'Synthetic line\n'.repeat(8); return entry('history-' + index, text, index === 0 ? { textInfo: { totalChars: text.length + 100, truncated: true, redacted: true } } : {}); });
-  await rules([{ method: 'session.messages.read', sessionId: a.id, project: projection(a.id, a.nativeSessionId, 'scroll-leaf', rows, 'scroll-cursor') }]); await refresh(); await expect(region().locator('[data-native-entry-id]')).toHaveCount(50); await expect(region()).toContainText('Native memory'); await expect(region()).not.toContainText('Saved'); await expect(page.getByTestId('run-output')).toHaveCount(0); await expect(page.locator('.model-answer')).toContainText('Native history page incomplete');
+  await rules([{ method: 'session.messages.read', sessionId: a.id, project: projection(a.id, a.nativeSessionId, 'scroll-leaf', rows, 'scroll-cursor') }]); await refresh(); await expect(region().locator('[data-native-entry-id]')).toHaveCount(50); await expect(region()).toContainText('Native memory'); await expect(region()).not.toContainText('Saved'); await expect(page.getByTestId('run-output')).toHaveCount(0); await expect(page.locator('.messages')).toContainText('Native history page incomplete');
   await expect(region()).toContainText('Native message display truncated'); await expect(region()).toContainText('Unsafe native fields omitted');
   await page.locator('.messages').evaluate(element => { element.scrollTop = 200; element.dispatchEvent(new Event('scroll')); }); await expect(page.getByRole('button', { name: 'New content · Back to latest', exact: true })).toBeVisible();
-  await rules([{ method: 'session.messages.read', sessionId: a.id, leafId: 'scroll-leaf', project: projection(a.id, a.nativeSessionId, 'scroll-leaf', [entry('tail', 'Native tail')]) }]); await region().getByRole('button', { name: 'Load more messages' }).click(); await expect(region().locator('[data-native-entry-id]')).toHaveCount(51); expect(await page.locator('.messages').evaluate(element => element.scrollTop)).toBeCloseTo(200, 0);
+  const beforePagination = await nativeReadingAnchor();
+  await rules([{ method: 'session.messages.read', sessionId: a.id, leafId: 'scroll-leaf', project: projection(a.id, a.nativeSessionId, 'scroll-leaf', [entry('tail', 'Native tail')]) }]); await region().getByRole('button', { name: 'Load more messages' }).click(); await expect(region().locator('[data-native-entry-id]')).toHaveCount(51);
+  const afterPagination = await nativeReadingAnchor();
+  saveEvidence('p6-adapted-p4-pagination-anchor', { before: beforePagination, after: afterPagination, reason: 'hasMore banner removed above the same visible native entry' });
+  expect(afterPagination.nativeEntryId).toBe(beforePagination.nativeEntryId); expect(Math.abs(afterPagination.offset - beforePagination.offset)).toBeLessThan(0.5); expect(afterPagination.bottomGap).toBeGreaterThan(64); await expect(page.getByRole('button', { name: 'New content · Back to latest', exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Models', exact: true }).click(); const hiddenTop = await page.locator('.messages').evaluate(element => element.scrollTop); const messageReads = (await calls()).filter(call => call.method === 'session.messages.read').length;
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))); expect(await page.locator('.messages').evaluate(element => element.scrollTop)).toBe(hiddenTop); expect((await calls()).filter(call => call.method === 'session.messages.read').length).toBe(messageReads);
   await page.getByRole('button', { name: 'Chat', exact: true }).click(); await page.getByRole('button', { name: 'New content · Back to latest', exact: true }).click(); await expect.poll(() => page.locator('.messages').evaluate(element => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(2);
-  await input().fill('slow A scroll'); await page.getByRole('button', { name: 'Send', exact: true }).click(); await expect.poll(() => httpCount).toBe(before + 3); await expect(page.getByTestId('run-output')).toHaveText('P4 temporary reply'); await expect(page.locator('.model-answer')).toContainText('Temporary output'); await expect(page.locator('.model-answer')).not.toContainText('Saved');
-  await rules([{ method: 'session.messages.read', sessionId: a.id, project: projection(a.id, a.nativeSessionId, 'preview-scroll-leaf', rows) }]); await refresh(); await expect(region().locator('[data-native-entry-id]')).toHaveCount(50);
+  await input().fill('slow A scroll'); await page.getByRole('button', { name: 'Send', exact: true }).click(); await expect.poll(() => httpCount).toBe(before + 3); await expect(temporaryAnswer()).toHaveText('P4 temporary reply'); await expect(page.getByTestId('temporary-run-area')).toContainText('Temporary output'); await expect(page.getByTestId('temporary-run-area')).not.toContainText('Saved');
+  const previewReadsBefore = (await calls()).length;
+  // P6 may refresh the native page while reconnecting its display subscription. Keep
+  // this scroll-only safe page projection stable until this scenario releases it.
+  await rules([{ method: 'session.messages.read', sessionId: a.id, persistent: true, group: 'scroll-preview-page', project: projection(a.id, a.nativeSessionId, 'preview-scroll-leaf', rows) }]); await refresh(); await expect(region().locator('[data-native-entry-id]')).toHaveCount(50);
   await page.locator('.messages').evaluate(element => { element.scrollTop = 200; element.dispatchEvent(new Event('scroll')); }); await expect(page.getByRole('button', { name: 'New content · Back to latest', exact: true })).toBeVisible();
   const facts = await page.evaluate(async () => ({ host: await window.medclaw.request('host.read', {}), active: await window.medclaw.request('run.active', {}) })); if (!facts.host.ok || !facts.active.ok || !facts.active.data) throw new Error('Missing original preview target');
-  const previewTarget = { instanceId: facts.host.data.instanceId, sessionId: a.id, runId: facts.active.data.runId };
-  await app.evaluate(({ BrowserWindow }, ids) => BrowserWindow.getAllWindows()[0]!.webContents.send('medclaw:notice', { type: 'agent.preview', ...ids, noticeSequence: 999, text: 'New temporary preview while reading', truncated: true }), previewTarget); await expect(page.getByTestId('run-output')).toHaveText('New temporary preview while reading'); expect(await page.locator('.messages').evaluate(element => element.scrollTop)).toBeCloseTo(200, 0); await expect(region()).not.toContainText('New temporary preview');
+  const previewTarget = await streamTarget(facts.active.data.runId); expect(previewTarget.snapshot.sessionId).toBe(a.id);
+  const currentSnapshot = { ...previewTarget.snapshot, revision: previewTarget.snapshot.revision + 100, phase: 'streaming' as const, blocks: [{ contentIndex: 0, text: 'New temporary preview while reading' }], totalChars: 'New temporary preview while reading'.length + 1, truncated: true };
+  await app.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0]!.webContents.send('medclaw:notice', { type: 'event.stream', instanceId: value.instanceId, subscriptionId: value.subscriptionId, snapshot: value.snapshot }), { ...previewTarget, snapshot: currentSnapshot }); await expect(temporaryAnswer()).toHaveText('New temporary preview while reading'); expect(await page.locator('.messages').evaluate(element => element.scrollTop)).toBeCloseTo(200, 0); await expect(region()).not.toContainText('New temporary preview');
   await page.getByRole('button', { name: 'Models', exact: true }).click(); const previewHiddenTop = await page.locator('.messages').evaluate(element => element.scrollTop), previewHiddenReads = (await calls()).filter(call => call.method === 'session.messages.read').length;
-  await app.evaluate(({ BrowserWindow }, ids) => BrowserWindow.getAllWindows()[0]!.webContents.send('medclaw:notice', { type: 'agent.preview', ...ids, noticeSequence: 1000, text: 'Hidden temporary preview', truncated: false }), previewTarget); await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))); expect(await page.locator('.messages').evaluate(element => element.scrollTop)).toBe(previewHiddenTop); expect((await calls()).filter(call => call.method === 'session.messages.read').length).toBe(previewHiddenReads); await page.getByRole('button', { name: 'Chat', exact: true }).click();
+  await app.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0]!.webContents.send('medclaw:notice', { type: 'event.stream', instanceId: value.instanceId, subscriptionId: value.subscriptionId, snapshot: value.snapshot }), { ...previewTarget, snapshot: { ...currentSnapshot, revision: currentSnapshot.revision + 1, blocks: [{ contentIndex: 0, text: 'Hidden temporary preview' }], totalChars: 'Hidden temporary preview'.length, truncated: false } }); await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))); expect(await page.locator('.messages').evaluate(element => element.scrollTop)).toBe(previewHiddenTop); expect((await calls()).filter(call => call.method === 'session.messages.read').length).toBe(previewHiddenReads); await page.getByRole('button', { name: 'Chat', exact: true }).click();
+  saveEvidence('p6-adapted-p4-scroll-projection', { sessionId: a.id, originalNativeSessionId: native.data.nativeSessionId, fixtureLeafId: 'preview-scroll-leaf', fixtureCount: rows.length, reads: (await calls()).slice(previewReadsBefore).filter(call => call.method === 'session.messages.read'), hiddenReads: previewHiddenReads, afterHiddenReads: (await calls()).filter(call => call.method === 'session.messages.read').length });
+  await release('scroll-preview-page');
   await page.getByRole('button', { name: 'View run details', exact: true }).click(); await page.getByRole('tab', { name: 'Run details', exact: true }).click(); await app.evaluate(() => { (globalThis as MainGlobal).__p4Gate.toolProjection = 'unconfirmed'; }); await page.getByRole('button', { name: 'Refresh tools', exact: true }).click();
   const tool = page.getByTestId('tool-call-details'); await expect(tool.locator('dt:has-text("SDK result status") + dd')).toHaveText('Unknown; SDK receipt unconfirmed'); await expect(tool).toContainText('Model consumption: Unknown'); await expect(tool.locator('dt:has-text("Native output truncated") + dd')).toHaveText('Unknown'); await expect(tool).toContainText('Command exit code: Unknown'); await expect(tool).not.toContainText('INTERNAL-WRAPPER-VERSION');
   await app.evaluate(() => { (globalThis as MainGlobal).__p4Gate.toolProjection = 'truncated'; }); await page.getByRole('button', { name: 'Refresh tools', exact: true }).click(); await expect(tool.locator('dt:has-text("Native output truncated") + dd')).toHaveText('Yes'); await expect(tool).toContainText('Model consumption: Unknown');
@@ -460,7 +498,7 @@ test('lost submission reply is looked up before reading the original messages wi
   await select(b.id); await input().fill('P4-B-UNSENT-DRAFT'); const mutations = (await calls()).filter(call => ['session.select', 'workspace.update'].includes(call.method)).length; await release('original-lookup');
   await expect.poll(async () => (await calls()).some(call => call.method === 'run.read' && call.runId === original.runId)).toBe(true); await expect(input()).toHaveValue('P4-B-UNSENT-DRAFT'); await expect(region()).not.toContainText('P4-LOST-ORIGINAL');
   expect((await calls()).filter(call => ['session.select', 'workspace.update'].includes(call.method)).length).toBe(mutations); expect((await accepted()).length).toBe(acceptedBefore + 1); expect(httpCount).toBe(before + 1);
-  await select(a.id); await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toHaveCount(0); await refresh(); await expect(region()).toContainText('P4-LOST-ORIGINAL'); await shot('lost-reply-original-lookup');
+  await select(a.id); await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toHaveCount(0); await refresh(); await expect(page.getByTestId('temporary-run-area')).toContainText('P4-LOST-ORIGINAL'); await expect(page.locator('.messages').getByText('P4-LOST-ORIGINAL', { exact: true })).toHaveCount(1); await shot('lost-reply-original-lookup');
   const bridge = (await calls()).slice(callsBefore), submit = bridge.filter(call => call.method === 'session.submit'), lookups = bridge.filter(call => call.method === 'session.readSubmission'); expect(submit).toHaveLength(1); expect(lookups).toHaveLength(2); expect(lookups.every(call => call.sessionId === a.id && call.clientSequence === original.clientSequence)).toBe(true);
   expect(bridge.findIndex(call => call.method === 'session.readSubmission')).toBeGreaterThan(bridge.findIndex(call => call.method === 'session.submit'));
   expect(bridge.findIndex(call => call.method === 'run.read' && call.runId === original.runId)).toBeGreaterThan(bridge.findIndex(call => call.method === 'session.readSubmission'));
@@ -483,7 +521,9 @@ test('tool success survives failed delivery without a falsely consumed message o
   const unsaved = await readTools(); if (!unsaved.ok) throw new Error(unsaved.error.code); const target = unsaved.data.items.find(tool => tool.nativeToolCallId === 'p4-fault-query'); expect(target).toMatchObject({ id: fault.toolId, sessionId: a.id, runId: origin.runId, status: 'succeeded', sdkReturned: false, nativeEntryId: null, sdkResultIsError: null }); expect(target?.nextModelCallId ?? null).toBeNull(); expect(target?.consumedAt ?? null).toBeNull(); expect(target?.consumptionEvidence).toBeUndefined();
   const fact = await queryFact(fault.queryId, origin.runId, a.id, 'p4-fault-query', 2), native = await messages(a.id); expect(fact.query.resultHash).toBe(fault.resultHash); expect(native.items.find(item => item.toolCallRef === 'p4-fault-query')).toMatchObject({ nativeEntryId: fault.nativeEntryId, displayRole: 'tool_result', runId: null });
   await showRun(origin.runId); const details = page.getByTestId('tool-call-details').locator('article').filter({ hasText: 'p4-fault-query' }); await expect(details).toContainText('succeeded'); await expect(details).toContainText('SDK return not confirmed'); await expect(details).toContainText('Model consumption: Unknown'); await expect(page.getByRole('button', { name: 'Retry save', exact: true })).toBeEnabled(); await details.getByText('SDK return not confirmed', { exact: true }).scrollIntoViewIfNeeded(); await shot('delivery-save-failed-tool'); await shot('delivery-save-failed');
-  await expect(page.locator('.model-answer')).toContainText('Waiting to save'); await expect(page.locator('.model-answer').getByRole('alert')).toContainText('Run facts have not been confirmed saved');
+  await expect(page.getByTestId('run-save-status')).toHaveText('Waiting to save');
+  await expect(page.locator('#runtime-panel').getByRole('alert')).toContainText('Run facts have not been confirmed saved');
+  await expect(page.locator('.persistence-notice')).toContainText(`Required facts for Run ${origin.runId} have not been saved`);
   await rules([{ method: 'run.retrySave', runId: origin.runId, hold: 'final-fix-retry-error' }]);
   await page.getByRole('button', { name: 'Retry save', exact: true }).click(); await entered('final-fix-retry-error');
   const b = await create(); await select(a.id); await expect(page.locator('.detail-run')).toContainText(`Run ${origin.runId}`);

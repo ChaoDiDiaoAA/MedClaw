@@ -5,9 +5,13 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createServer, type Server } from "node:http";
+import type { MessageStreamSnapshot, OpenEventSubscriptionInput, OpenEventSubscriptionResult } from '../../packages/contracts/src/event';
 
 const root = resolve(import.meta.dirname, "../.."), bun = process.env.MEDCLAW_BUN_EXECUTABLE ?? "bun";
 let app: ElectronApplication, page: Page, dataRoot: string, server: Server;
+type EventGate = { active: Record<string, OpenEventSubscriptionInput>; replies: OpenEventSubscriptionResult[] };
+type EventMain = typeof globalThis & { __p2EventGate: EventGate };
+let terminalStream: MessageStreamSnapshot | null = null;
 const requests: { model: string; messages: { role: string; content: unknown }[] }[] = [];
 test.describe.configure({ mode: "serial" });
 test.beforeAll(async () => {
@@ -34,7 +38,14 @@ test.beforeAll(async () => {
   const playwright = createRequire(createRequire(import.meta.url).resolve("@playwright/test/package.json")), core = createRequire(playwright.resolve("playwright/package.json")).resolve("playwright-core/package.json");
   const env: Record<string, string> = { ...Object.fromEntries(Object.entries(process.env).flatMap(([key, value]) => value === undefined ? [] : [[key, value]])), MEDCLAW_HOST_ENTRY: join(root, "apps/host/src/main.ts"), MEDCLAW_BUN_EXECUTABLE: execFileSync(bun, ["-e", "process.stdout.write(process.execPath)"], { encoding: "utf8" }).trim() };
   delete env.ELECTRON_RUN_AS_NODE;
-  app = await electron.launch({ executablePath: electronPath, args: ["-r", join(dirname(core), "lib/server/electron/loader.js"), join(root, ".build/desktop/main/index.cjs"), "--medclaw-data-root", dataRoot], env, timeout: 30000 });
+  const eventSeam = join(dataRoot, 'event-observation.cjs');
+  writeFileSync(eventSeam, `const {ipcMain}=require('electron'),original=ipcMain.handle.bind(ipcMain);const state=globalThis.__p2EventGate={active:{},replies:[]};
+    ipcMain.handle=(channel,listener)=>original(channel,async(event,envelope)=>{const result=await listener(event,envelope);
+      if(channel==='medclaw:request'&&envelope.method==='event.subscribe'&&result.ok){const p=envelope.payload;
+        if(p.action==='open'){state.active[p.subscriptionId]=structuredClone(p);state.replies.push(structuredClone(result.data));if(state.replies.length>200)state.replies.shift();}
+        else delete state.active[p.subscriptionId];}
+      return result;});`);
+  app = await electron.launch({ executablePath: electronPath, args: ["-r", join(dirname(core), "lib/server/electron/loader.js"), '-r', eventSeam, join(root, ".build/desktop/main/index.cjs"), "--medclaw-data-root", dataRoot], env, timeout: 30000 });
   page = await app.firstWindow(); await expect(page.getByText("Host ready", { exact: true }).first()).toBeVisible({ timeout: 30000 });
   const configured = await page.evaluate(async baseUrl => {
     const directory = await window.medclaw.request("model.read", {}); if (!directory.ok) throw new Error("setup directory: " + directory.error.code);
@@ -162,10 +173,16 @@ test("running A can be browsed from B without losing B draft or retargeting Stop
   await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p2-ui", "second"]));
   const running = await page.evaluate(() => window.medclaw.request("run.read", { recent: true, sessionId: 1, limit: 1 }));
   expect(running).toMatchObject({ ok: true, data: { kind: "recent", runs: [{ model: { modelId: "first" } }] } });
+  if (!running.ok || running.data.kind !== 'recent') throw new Error('Missing actual running A');
+  const originalRunId = running.data.runs[0]!.id;
+  await expect(page.getByTestId('temporary-message').last().locator('.answer-text')).toHaveText('P2 reply');
+  await expect.poll(async () => app.evaluate((_, runId) => (globalThis as EventMain).__p2EventGate.replies.some(reply => reply.runId === runId && reply.snapshots.some(snapshot => snapshot.type === 'message.snapshot' && snapshot.blocks.some(block => block.text === 'P2 reply'))), originalRunId)).toBe(true);
+  terminalStream = await app.evaluate((_, runId) => (globalThis as EventMain).__p2EventGate.replies.findLast(reply => reply.runId === runId && reply.snapshots.some(snapshot => snapshot.type === 'message.snapshot' && snapshot.blocks.some(block => block.text === 'P2 reply')))!.snapshots.findLast((snapshot): snapshot is MessageStreamSnapshot => snapshot.type === 'message.snapshot' && snapshot.blocks.some(block => block.text === 'P2 reply'))!, originalRunId);
+  expect(terminalStream).toMatchObject({ runId: originalRunId, sessionId: 1, phase: 'streaming' });
   expect(requests.at(-1)!.model).toBe("first");
   await select(2); await input().fill("B remains unsent");
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled(); await expect(page.getByTestId("running-session")).toContainText("New Session 1");
-  await expect(page.getByTestId("run-output")).toHaveCount(0); await expect(page.getByTestId("chat-native-messages")).not.toContainText("slow A"); await page.getByRole("button", { name: "Stop generating", exact: true }).click();
+  await expect(page.getByTestId("run-output")).toHaveCount(0); await expect(page.getByTestId('temporary-run-area')).toHaveCount(0); await expect(page.getByTestId("chat-native-messages")).not.toContainText("slow A"); await page.getByRole("button", { name: "Stop generating", exact: true }).click();
   await expect(input()).toHaveValue("B remains unsent"); await expect(page.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
   await select(1); await expect(page.getByText("Cancelled and saved", { exact: true })).toBeVisible(); expect(requests).toHaveLength(before + 1);
 });
@@ -177,13 +194,19 @@ test("terminal and old-instance Agent notices cannot replace saved text; Host re
   await page.getByRole("button", { name: "View run details", exact: true }).click(); await page.getByRole("tab", { name: "Run details", exact: true }).click();
   await page.getByRole("button", { name: `View Run ${run.data.runs[0]!.id}`, exact: true }).click();
   const text = await page.getByTestId("saved-output").innerText();
+  if (!terminalStream || terminalStream.runId !== run.data.runs[0]!.id) throw new Error('Missing original observed stream identity');
+  const current = await app.evaluate((_, runId) => Object.values((globalThis as EventMain).__p2EventGate.active).find(input => input.runId === runId), run.data.runs[0]!.id);
+  if (!current) throw new Error('Missing actual current display sid');
   await app.evaluate(({ BrowserWindow }, ids) => { const contents = BrowserWindow.getAllWindows()[0]!.webContents;
     // A bounded notification cache may evict this older known terminal Run.
     for (let runId = 1000; runId < 1052; runId++) contents.send("medclaw:notice", { type: "agent.settled", instanceId: ids.instanceId, runId, sessionId: 2, noticeSequence: 1, status: "completed" });
-    for (const instanceId of [ids.instanceId, "old-host"]) contents.send("medclaw:notice", { type: "agent.preview", instanceId, runId: ids.runId, sessionId: 1, noticeSequence: 999, text: "late text", truncated: false });
-  }, { instanceId: result.h.data.instanceId!, runId: run.data.runs[0]!.id });
+    // Inject display faults using a proved original SDK object and the real
+    // current sid. Neither packet creates or repeats a domain operation.
+    for (const instanceId of [ids.instanceId, "old-host"]) contents.send("medclaw:notice", { type: 'event.stream', instanceId, subscriptionId: ids.subscriptionId,
+      snapshot: { ...ids.snapshot, phase: 'streaming', revision: ids.snapshot.revision + 999, blocks: [{ contentIndex: 0, text: 'late text' }], totalChars: 'late text'.length, truncated: false } });
+  }, { instanceId: result.h.data.instanceId!, runId: run.data.runs[0]!.id, subscriptionId: current.subscriptionId, snapshot: terminalStream });
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-  await expect(page.getByTestId("saved-output")).toHaveText(text); await expect(page.getByTestId("run-output")).toHaveCount(0);
+  await expect(page.getByTestId("saved-output")).toHaveText(text); await expect(page.getByTestId("run-output")).toHaveCount(0); await expect(page.getByTestId('temporary-run-area')).toHaveCount(0); await expect(page.getByTestId('chat-native-messages')).not.toContainText('late text');
   const restarted = await page.evaluate(instanceId => window.medclaw.request("host.restart", { expectedInstanceId: instanceId }), result.h.data.instanceId!); expect(restarted.ok).toBe(true);
   await expect(page.getByText("This session cannot continue after a restart. Create a new session.", { exact: true })).toBeVisible(); await expect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
   await page.getByRole("button", { name: "Close run details", exact: true }).click();
