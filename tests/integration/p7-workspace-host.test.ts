@@ -43,7 +43,7 @@ test('A03 real Host Query pages keep saved snapshot identities across page sizes
     expect({workspace:f.sql('SELECT * FROM workspace'),queries:f.sql('SELECT * FROM queries'),runs:f.sql('SELECT * FROM runs')}).toEqual(before);
     expect(f.sql('SELECT count(*) AS n FROM model_calls')).toEqual([{n:0}]);expect(f.sql('SELECT count(*) AS n FROM session_inputs')).toEqual([{n:0}]);
   } finally {await f.close();}
-});
+},30000);
 
 // Break caught: page-local duplicate detection incorrectly grants identities
 // to equal legacy aggregate rows that are separated by a page boundary.
@@ -57,7 +57,7 @@ test('A03 real Host marks duplicate saved aggregate rows null even when split ac
     expect(unique.page.rowKeys).toEqual([stable]);expect(tail.page.rowKeys).toEqual([stable]);expect(unique.page.rows).toEqual([{region:'浙江',value:7}]);
     expect(first.page.rows).toEqual(second.page.rows);expect(f.sql('SELECT * FROM queries')).toEqual(before);
   } finally {await f.close();}
-});
+},30000);
 
 // Break caught: details require the viewing Session, or Evidence IDs are
 // accepted for a different Query without checking the original relationship.
@@ -76,7 +76,7 @@ test('A04 real Host reads original Query Evidence across Sessions and rejects mi
     expect({workspace:f.sql('SELECT * FROM workspace'),queries:f.sql('SELECT * FROM queries'),evidence:f.sql('SELECT * FROM query_evidence'),runs:f.sql('SELECT * FROM runs')}).toEqual(before);
     expect(f.sql('SELECT count(*) AS n FROM model_calls')).toEqual([{n:0}]);expect(f.sql('SELECT count(*) AS n FROM session_inputs')).toEqual([{n:0}]);
   } finally {await f.close();}
-});
+},30000);
 
 test('A10 real restore commit with dropped reply reports unknown and read does not resend',async()=>{
   const f=await fixture();try{

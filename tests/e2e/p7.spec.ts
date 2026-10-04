@@ -497,6 +497,7 @@ test('A10 truly slow restore stays locked after late commit and cannot be unlock
 test('A14 minimum window, keyboard row selection and 200 percent zoom keep tables and details accessible', async () => {
   await page.getByRole('button', { name: 'Chat', exact: true }).click(); const query = await savedQuery();
   const view = await page.evaluate(queryId => window.medclaw.request('query.read', { queryId }), query.queryId); if (!view.ok) throw Error(view.error.code);
+  if (await page.getByRole('button', { name: 'Close run details', exact: true }).count()) await page.getByRole('button', { name: 'Close run details', exact: true }).click();
   await app.evaluate(({ BrowserWindow }) => { const win = BrowserWindow.getAllWindows()[0]; win.setSize(1100, 720); win.webContents.setZoomFactor(2); });
   await page.setViewportSize({ width: 1100, height: 720 });
   expect(await page.evaluate(() => window.innerWidth)).toBe(550);
@@ -511,7 +512,6 @@ test('A14 minimum window, keyboard row selection and 200 percent zoom keep table
   const table = page.getByTestId('query-results').locator('..');
   const geometry = await table.evaluate(element => ({ overflowX: getComputedStyle(element).overflowX, width: element.clientWidth, scrollWidth: element.scrollWidth }));
   expect(geometry.overflowX).toBe('auto'); expect(geometry.scrollWidth).toBeGreaterThan(geometry.width);
-  if (await page.getByRole('button', { name: 'Close run details', exact: true }).count()) await page.getByRole('button', { name: 'Close run details', exact: true }).click();
   await page.getByRole('button', { name: 'View run details', exact: true }).focus(); await page.keyboard.press('Enter');
   const close = page.getByRole('button', { name: 'Close run details', exact: true }); await expect(close).toBeVisible(); await close.focus(); await page.keyboard.press('Escape');
   await expect(close).toHaveCount(0); await expect(page.getByRole('button', { name: 'View run details', exact: true })).toBeFocused();
