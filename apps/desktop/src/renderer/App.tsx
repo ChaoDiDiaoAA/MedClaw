@@ -41,7 +41,7 @@ export function App() {
   const [run, setRun] = useState<RunView | null>(null), [preview, setPreview] = useState<{ text: string; truncated: boolean } | null>(null);
   const [workspace, setWorkspace] = useState<WorkspaceView | null>(null), [workspaceConfirmed, setWorkspaceConfirmed] = useState(false), [selecting, setSelecting] = useState(false);
   const [catalog, setCatalog] = useState<PublicReturn<"data.read"> | null>(null), catalogRead = useRef(0);
-  const [requestedQuery, setRequestedQuery] = useState<number | null>(null);
+  const [requestedQuery, setRequestedQuery] = useState<{ queryId: number; ownerSessionId: number } | null>(null);
   const [sessions, setSessions] = useState<SessionView[]>([]), [nextSession, setNextSession] = useState<number | null>(null);
   const [details, setDetails] = useState<Record<number, SessionDetail>>({}), [drafts, setDrafts] = useState<Record<number, SessionDraft>>({});
   const [creating, setCreating] = useState(false), [creationUnknown, setCreationUnknown] = useState(false), [sending, setSending] = useState<number | null>(null);
@@ -57,6 +57,14 @@ export function App() {
   const creation = useRef<{ operationRef: string; input: NewSessionInput; model: ModelChoice | null } | null>(null);
   const directoryRead = useRef(0), activeRead = useRef(0), detailsButton = useRef<HTMLButtonElement>(null);
   const workspaceChangeBusy = useRef(false);
+  const workspaceMutation = useRef<{ instance: string | null; kind: 'create' | 'select' | 'update' | 'restore' } | null>(null);
+  const confirmedWorkspace = useRef(false), unknownWorkspaceInstance = useRef<string | null>(null), restoredInstance = useRef<string | null>(null);
+  const successfulRestoreInstance = useRef<string | null>(null);
+  const [workspaceRecovery, setWorkspaceRecovery] = useState<'verify' | 'restart' | null>(null);
+  const workspaceAuthority = useRef<string | null>(null);
+  const inconsistentRead = useRef<string | null>(null);
+  const desiredSessionNeedsConfirmation = useRef(false);
+  const [pendingSessionChoice, setPendingSessionChoice] = useState<number | null>(null);
   const sessionReadOrder = useRef(new Map<number, number>()), mounted = useRef(true);
   const sessionReads = useRef(new Map<number, Promise<void>>());
   const sessionReadAgain = useRef(new Set<number>());
@@ -145,11 +153,27 @@ export function App() {
       sessionsRef.current = next; return next; });
     setNextSession(result.data.nextBeforeSessionId);
   }, []);
-  const applyWorkspace = useCallback((value: WorkspaceView, instance: string | null) => {
-    if (instance !== hostRef.current.instanceId || value.revision < (workspaceRef.current?.revision ?? 0)) return;
+  const applyWorkspace = useCallback((value: WorkspaceView, instance: string | null, confirm = true) => {
+    if (instance !== hostRef.current.instanceId || value.revision < (workspaceRef.current?.revision ?? 0)) return false;
+    const state = (view: WorkspaceView) => JSON.stringify([view.revision, view.sessionId, view.materialVersion, view.batchRefs, view.deviceIds, view.queryId, view.activeView, view.selection]);
+    if (workspaceAuthority.current === instance && workspaceRef.current?.revision === value.revision && state(workspaceRef.current) !== state(value)) {
+      confirmedWorkspace.current = false; setWorkspaceConfirmed(false); setWorkspaceRecovery('verify');
+      setError('The selection reply is inconsistent. Verify the saved selection before continuing.');
+      const identity = `${instance}:${value.revision}`;
+      if (inconsistentRead.current !== identity) {
+        inconsistentRead.current = identity;
+        void window.medclaw.request('workspace.read', {}).then(result => {
+          if (instance === hostRef.current.instanceId && result.ok) applyWorkspace(result.data, instance, false);
+        });
+      }
+      return false;
+    }
     const selectionChanged = value.sessionId !== workspaceRef.current?.sessionId;
     if (selectionChanged) inspectedRun.current = null;
-    workspaceRef.current = value; setWorkspace(value); setWorkspaceConfirmed(true);
+    workspaceRef.current = value; workspaceAuthority.current = instance; setWorkspace(value);
+    const confirmed = confirm && successfulRestoreInstance.current === instance && unknownWorkspaceInstance.current !== instance;
+    confirmedWorkspace.current = confirmed; setWorkspaceConfirmed(confirmed);
+    if (confirmed) { inconsistentRead.current = null; setWorkspaceRecovery(null); }
     if (selectionChanged || !runRef.current) {
       const cached = value.sessionId ? selectedRuns.current.get(value.sessionId) ?? null : null;
       runRef.current = cached; setRun(cached); setPreview(cached ? previews.current.get(cached.id) ?? null : null);
@@ -160,26 +184,55 @@ export function App() {
         if (instance === hostRef.current.instanceId && result.ok && result.data.kind === "recent" && result.data.runs[0]) void readRun(result.data.runs[0].id);
       });
     }
+    return true;
   }, [readRun, readSession]);
-  const readWorkspace = useCallback(async () => {
+  const readWorkspace = useCallback(async (confirm = true) => {
     const instance = hostRef.current.instanceId, result = await window.medclaw.request("workspace.read", {});
     if (instance !== hostRef.current.instanceId) return;
-    if (result.ok) applyWorkspace(result.data, instance); else { setWorkspaceConfirmed(false); setError(errorMessage(result.error)); }
+    if (result.ok) applyWorkspace(result.data, instance, confirm);
+    else {
+      confirmedWorkspace.current = false; setWorkspaceConfirmed(false);
+      setWorkspaceRecovery(unknownWorkspaceInstance.current === instance ? 'restart' : 'verify');
+      setError(errorMessage(result.error));
+    }
   }, [applyWorkspace]);
+  const restoreWorkspace = useCallback(async () => {
+    const instance = hostRef.current.instanceId;
+    if (!instance || hostRef.current.state !== 'ready' || workspaceMutation.current || unknownWorkspaceInstance.current === instance) return;
+    workspaceMutation.current = { instance, kind: 'restore' }; restoredInstance.current = instance;
+    confirmedWorkspace.current = false; setWorkspaceConfirmed(false); setSelecting(true);
+    try {
+      const result = await window.medclaw.request('workspace.restore', {});
+      if (instance !== hostRef.current.instanceId) return;
+      if (result.ok) { successfulRestoreInstance.current = instance; applyWorkspace(result.data, instance); }
+      else {
+        if (result.error.code === 'operation_result_unknown') { unknownWorkspaceInstance.current = instance; setWorkspaceRecovery('restart'); setError('Verify status in Settings and restart the Host.'); }
+        else { setWorkspaceRecovery('verify'); setError(errorMessage(result.error)); }
+        await readWorkspace(false);
+      }
+    } finally { if (workspaceMutation.current?.instance === instance && workspaceMutation.current.kind === 'restore') { workspaceMutation.current = null; setSelecting(false); } }
+  }, [applyWorkspace, readWorkspace]);
   const changed = useCallback(async () => {
     await readUi(); if (hostRef.current.state !== "ready") return;
     const instance = hostRef.current.instanceId;
     await Promise.all([readDirectory(), readActive(), readSessions(), (async () => {
       await readCatalog();
-      if (instance === hostRef.current.instanceId && hostRef.current.state === "ready") await readWorkspace();
+      if (instance === hostRef.current.instanceId && hostRef.current.state === "ready") {
+        if (restoredInstance.current !== instance) await restoreWorkspace();
+        else if (!workspaceMutation.current) await readWorkspace(confirmedWorkspace.current);
+      }
     })()]);
-  }, [readUi, readDirectory, readActive, readSessions, readWorkspace, readCatalog]);
+  }, [readUi, readDirectory, readActive, readSessions, readWorkspace, readCatalog, restoreWorkspace]);
 
   useEffect(() => window.medclaw.subscribe(notice => {
     if (notice.type === "host.status") {
       const prior = hostRef.current.instanceId; hostRef.current = notice.host; setHost(notice.host);
-      if (notice.host.state !== "ready") { setDirectoryCurrent(false); setControl(null); setWorkspaceConfirmed(false); }
+      if (notice.host.state !== "ready") { setDirectoryCurrent(false); setControl(null); confirmedWorkspace.current = false; setWorkspaceConfirmed(false); }
       if (notice.host.instanceId !== prior) {
+        workspaceMutation.current = null; unknownWorkspaceInstance.current = null; setWorkspaceRecovery(null);
+        selectBusy.current = false; workspaceChangeBusy.current = false; createBusy.current = false;
+        if (desiredSession.current !== null) { desiredSessionNeedsConfirmation.current = true; setPendingSessionChoice(desiredSession.current); }
+        setSelecting(false); setCreating(false);
         setPrompt(null); setAuthNotify(null); setAuthAttempt(null);
         // Keep read-only, previously verified facts visible during reconnection.
         // Admission still requires fresh Host/control/workspace confirmation.
@@ -226,7 +279,11 @@ export function App() {
   useEffect(() => { if (host.state === 'ready' && page === 'chat' && workspace?.sessionId) void refreshInputs(workspace.sessionId, true); }, [host.instanceId, host.state, page, workspace?.sessionId, refreshInputs]);
 
   async function selectSession(sessionId: number) {
-    setRequestedQuery(null); desiredSession.current = sessionId; if (selectBusy.current || workspaceChangeBusy.current) return;
+    setRequestedQuery(null); desiredSession.current = sessionId;
+    if (!confirmedWorkspace.current) { desiredSessionNeedsConfirmation.current = true; setPendingSessionChoice(sessionId); return; }
+    desiredSessionNeedsConfirmation.current = false; setPendingSessionChoice(null);
+    if (workspaceMutation.current || unknownWorkspaceInstance.current === hostRef.current.instanceId || hostRef.current.state !== 'ready') return;
+    workspaceMutation.current = { instance: hostRef.current.instanceId, kind: 'select' };
     selectBusy.current = true; setSelecting(true); const instance = hostRef.current.instanceId;
     try {
       while (desiredSession.current !== null && instance === hostRef.current.instanceId) {
@@ -234,35 +291,52 @@ export function App() {
         const current = workspaceRef.current; if (!current) { setWorkspaceConfirmed(false); await readWorkspace(); break; }
         const result = await window.medclaw.request("session.select", { sessionId: target, expectedWorkspaceRevision: current.revision });
         if (instance !== hostRef.current.instanceId) break;
-        if (result.ok) applyWorkspace(result.data, instance);
-        else { setWorkspaceConfirmed(false); setError(errorMessage(result.error)); await readWorkspace(); }
+        if (result.ok) {
+          if (!applyWorkspace(result.data, instance)) {
+            confirmedWorkspace.current = false; setWorkspaceConfirmed(false); setWorkspaceRecovery('verify');
+            desiredSession.current ??= target; desiredSessionNeedsConfirmation.current = true; setPendingSessionChoice(desiredSession.current); break;
+          }
+        }
+        else {
+          confirmedWorkspace.current = false; setWorkspaceConfirmed(false); desiredSession.current ??= target;
+          desiredSessionNeedsConfirmation.current = true; setPendingSessionChoice(desiredSession.current);
+          if (result.error.code === 'operation_result_unknown') { unknownWorkspaceInstance.current = instance; setWorkspaceRecovery('restart'); setError('Verify status in Settings and restart the Host.'); }
+          else { setWorkspaceRecovery('verify'); setError(errorMessage(result.error)); }
+          await readWorkspace(false); break;
+        }
       }
-    } finally { selectBusy.current = false; setSelecting(false); }
+    } finally { if (workspaceMutation.current?.instance === instance && workspaceMutation.current.kind === 'select') { workspaceMutation.current = null; selectBusy.current = false; setSelecting(false); } }
   }
   async function updateWorkspace(change: WorkspaceChange) {
     const original = workspaceRef.current, instance = hostRef.current.instanceId;
-    if (!original || !workspaceConfirmed || workspaceChangeBusy.current || selectBusy.current || hostRef.current.state !== "ready") return false;
+    if (!original || !confirmedWorkspace.current || workspaceMutation.current || hostRef.current.state !== "ready") return false;
+    workspaceMutation.current = { instance, kind: 'update' };
     workspaceChangeBusy.current = true; setSelecting(true); setError(null);
     try {
       const result = await window.medclaw.request("workspace.update", { change, expectedRevision: original.revision }, crypto.randomUUID());
       if (instance !== hostRef.current.instanceId) return false;
-      if (result.ok) { applyWorkspace(result.data, instance); return true; }
-      setWorkspaceConfirmed(false); setError(errorMessage(result.error)); await readWorkspace(); return false;
-    } finally { workspaceChangeBusy.current = false; setSelecting(false); if (desiredSession.current !== null) void selectSession(desiredSession.current); }
+      if (result.ok) return applyWorkspace(result.data, instance);
+      confirmedWorkspace.current = false; setWorkspaceConfirmed(false);
+      if (desiredSession.current !== null) { desiredSessionNeedsConfirmation.current = true; setPendingSessionChoice(desiredSession.current); }
+      if (result.error.code === 'operation_result_unknown') { unknownWorkspaceInstance.current = instance; setWorkspaceRecovery('restart'); setError('Verify status in Settings and restart the Host.'); }
+      else { setWorkspaceRecovery('verify'); setError(errorMessage(result.error)); }
+      await readWorkspace(false); return false;
+    } finally { if (workspaceMutation.current?.instance === instance && workspaceMutation.current.kind === 'update') { workspaceMutation.current = null; workspaceChangeBusy.current = false; setSelecting(false); if (confirmedWorkspace.current && desiredSession.current !== null && !desiredSessionNeedsConfirmation.current) void selectSession(desiredSession.current); } }
   }
   async function createSession(retry = false) {
-    if (createBusy.current || selectBusy.current || workspaceChangeBusy.current || !workspaceRef.current || !workspaceConfirmed) return;
+    if (workspaceMutation.current || !workspaceRef.current || hostRef.current.state !== 'ready' || successfulRestoreInstance.current !== hostRef.current.instanceId
+      || unknownWorkspaceInstance.current === hostRef.current.instanceId || !retry && !confirmedWorkspace.current) return;
     if (!retry && creation.current) { setError("Recover the original creation first."); return; }
     creation.current ??= { operationRef: crypto.randomUUID(), input: { expectedWorkspaceRevision: workspaceRef.current.revision, selectOnCreate: true }, model: defaultModel() };
-    const original = creation.current, instance = hostRef.current.instanceId; createBusy.current = true; setCreating(true); setError(null);
+    setRequestedQuery(null); const original = creation.current, instance = hostRef.current.instanceId; workspaceMutation.current = { instance, kind: 'create' }; createBusy.current = true; setCreating(true); setSelecting(true); setError(null);
     try {
       const result = await window.medclaw.request("session.create", original.input, original.operationRef);
       if (instance !== hostRef.current.instanceId) { setCreationUnknown(true); return; }
       if (result.ok) {
         ensureDraft(result.data.session.id, original.model); applyWorkspace(result.data.workspace, instance);
         creation.current = null; setCreationUnknown(false); await Promise.all([readSessions(), readWorkspace(), readSession(result.data.session.id)]); setPage("chat");
-      } else { setError(errorMessage(result.error)); if (result.error.code === "operation_result_unknown") setCreationUnknown(true); else { creation.current = null; setCreationUnknown(false); } }
-    } finally { createBusy.current = false; setCreating(false); }
+      } else { setError(errorMessage(result.error)); if (result.error.code === "operation_result_unknown") { setCreationUnknown(true); confirmedWorkspace.current = false; setWorkspaceConfirmed(false); } else { creation.current = null; setCreationUnknown(false); } }
+    } finally { if (workspaceMutation.current?.instance === instance && workspaceMutation.current.kind === 'create') { workspaceMutation.current = null; createBusy.current = false; setCreating(false); setSelecting(false); if (confirmedWorkspace.current && desiredSession.current !== null && !desiredSessionNeedsConfirmation.current) void selectSession(desiredSession.current); } }
   }
   async function acceptedAgent(value: SubmitResult, pending: NonNullable<SessionDraft["pending"]>) {
     if (value.sessionId !== pending.input.sessionId || value.clientSequence !== pending.input.clientSequence) { setError("The acceptance reply does not match the original submission. Keep it and read its result."); return; }
@@ -291,7 +365,7 @@ export function App() {
   }
   async function sendSession(retry = false) {
     const sessionId = workspaceRef.current?.sessionId, draft = sessionId ? draftsRef.current[sessionId] : null, instance = hostRef.current.instanceId;
-    if (!sessionId || !draft || !instance || sendBusy.current || selecting || !workspaceConfirmed) return;
+    if (!sessionId || !draft || !instance || hostRef.current.state !== 'ready' || sendBusy.current || workspaceMutation.current || !confirmedWorkspace.current) return;
     const originalControl = detailsRef.current[sessionId]?.session.inputControl, root = selectedRuns.current.get(sessionId);
     const mode = originalControl ? draft.mode ?? 'send' : 'send';
     if (retry && !draft.resendConfirmed) return;
@@ -372,29 +446,32 @@ export function App() {
   const runningSession = sessions.find(s => s.id === active?.sessionId);
   const queueRun = current && currentDetail?.session.inputControl ? selectedRuns.current.get(current) ?? null : null;
   const queueRootInput = queueRun?.inputId && current ? inputQueue.snapshots[current]?.items.find(value => value.id === queueRun.inputId) ?? null : null;
+  const frozenRun = active?.kind === 'agent' && active.sessionId ? selectedRuns.current.get(active.sessionId) : run?.kind === 'agent' ? run : null;
+  const frozenInput = frozenRun?.inputId ? inputQueue.snapshots[frozenRun.sessionId]?.items.find(value => value.id === frozenRun.inputId) ?? null : null;
   return <div className={"desktop " + (ui.navCollapsed ? "nav-collapsed " : "") + (ui.detailOpen ? "has-details" : "")}>
     <Sidebar page={page} onPage={page => { setRequestedQuery(null); setPage(page); }} collapsed={ui.navCollapsed} onCollapse={() => void updateUi({ navCollapsed: true })} host={host}>
-      <SessionList sessions={sessions} current={current} running={active?.sessionId ?? null} creating={creating} canCreate={host.state === "ready" && workspaceConfirmed && !selecting}
+      <SessionList sessions={sessions} current={current} running={active?.sessionId ?? null} creating={creating} canCreate={host.state === "ready" && workspaceConfirmed && !selecting} canSelect={host.state === 'ready' && workspaceConfirmed} canRecoverCreate={host.state === 'ready' && !selecting && workspaceRecovery !== 'restart' && successfulRestoreInstance.current === host.instanceId}
         creationUnknown={creationUnknown} nextBefore={nextSession} onCreate={() => void createSession()} onRecoverCreate={() => void createSession(true)} onSelect={id => void selectSession(id)} onMore={() => void readSessions(nextSession!)} />
+      {pendingSessionChoice !== null && <p role="status">Session {pendingSessionChoice} is still your requested selection. <button disabled={!workspaceConfirmed || selecting} onClick={() => void selectSession(pendingSessionChoice)}>Confirm Session {pendingSessionChoice}</button></p>}
     </Sidebar>
     <main className="workspace">
       <header className="page-header"><div className="header-title">{ui.navCollapsed && <button className="quiet" onClick={() => void updateUi({ navCollapsed: false })}>Expand navigation</button>}<h1>{{ chat: "Chat", data: "Data Workspace", queries: "Query History", models: "Models", settings: "Settings" }[page]}</h1></div><button ref={detailsButton} className="quiet" onClick={() => void updateUi({ detailOpen: !ui.detailOpen })}>View run details</button></header>
       {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="Dismiss notice" onClick={() => setError(null)}>×</button></div>}
       <section className="page-content chat-page" hidden={page !== "chat"}><Chat visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} directory={directory} directoryCurrent={directoryCurrent} host={host} active={active} control={control} run={run} preview={preview} events={runEvents.state} onFinalSource={runEvents.setFinalSource}
-        workspace={workspace} workspaceConfirmed={workspaceConfirmed} onWorkspace={updateWorkspace} dataDefaults={catalog}
+        workspace={workspace} workspaceConfirmed={workspaceConfirmed} workspacePending={selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} onWorkspace={updateWorkspace} dataDefaults={catalog}
         session={currentDetail} draft={draft} selecting={selecting || !workspaceConfirmed} sending={sending === current} runningTitle={runningSession ? sessionDisplayTitle(runningSession) : null}
-        queueRun={queueRun} queueRootInput={queueRootInput} inputs={current ? inputQueue.snapshots[current] ?? null : null} cancellingInputs={cancellingInputs}
+        queueRun={queueRun} queueRootInput={queueRootInput} frozenInput={frozenInput} frozenRunId={frozenRun?.id} inputs={current ? inputQueue.snapshots[current] ?? null : null} cancellingInputs={cancellingInputs}
         onRefreshInputs={() => { if (current) void refreshInputs(current, true); }} onMoreInputs={() => { if (current) void readInputPage(current, 'more'); }} onCancelInput={original => void cancelInput(original)}
         onDraft={patch => { if (current) editDraft(current, patch); }} onUseForSession={useForSession} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} /></section>
-      <section className="page-content" hidden={page !== "data"}><DataWorkspace host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} catalog={catalog} batches={catalog?.batches ?? []} onRefresh={page => void readCatalog(page)} onUpdate={updateWorkspace} onError={setError} /></section>
-      <section className="page-content" hidden={page !== "queries"}><QueryHistory visible={page === "queries"} requestedQueryId={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} active={active} onUpdate={updateWorkspace} onError={setError} /></section>
+      <section className="page-content" hidden={page !== "data"}><DataWorkspace host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} catalog={catalog} batches={catalog?.batches ?? []} onRefresh={page => void readCatalog(page)} onUpdate={updateWorkspace} onError={setError} /></section>
+      <section className="page-content" hidden={page !== "queries"}><QueryHistory visible={page === "queries"} requestedQuery={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} active={active} onUpdate={updateWorkspace} onError={setError} /></section>
       <section className="page-content" hidden={page !== "models"}><ModelsPage directory={directory} directoryCurrent={directoryCurrent} host={host} active={active} control={control}
         sessionTarget={workspaceConfirmed && !selecting && current && currentDetail && host.instanceId ? { instanceId: host.instanceId, sessionId: current } : null} onUseForSession={useForSession}
         prompt={prompt} notification={authNotify} attempt={authAttempt} onChanged={changed} onAccepted={acceptedProvider} onError={setError} /></section>
       <section className="page-content" hidden={page !== "settings"}><SettingsPage ui={ui} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost} /></section>
     </main>
     {ui.detailOpen && <RunDetails run={run} host={host} viewSessionId={current} tab={ui.detailTab} active={active} control={control} events={runEvents.state} onResumeGap={runEvents.resumeGap} onTab={tab => void updateUi({ detailTab: tab })} onClose={() => void closeDetails()} onError={setError}
-      onQuery={(queryId, sessionId) => { if (workspaceRef.current?.sessionId !== sessionId) void selectSession(sessionId); setRequestedQuery(queryId); setPage("queries"); }}
+      onQuery={(queryId, sessionId) => { setRequestedQuery({ queryId, ownerSessionId: sessionId }); setPage("queries"); }}
       onRun={value => { inspectedRun.current = value.id; runRef.current = value; setRun(value); setPreview(null); }} onRetrySaved={() => { void readActive(); if (activeRef.current?.sessionId) { void readSession(activeRef.current.sessionId); void refreshInputs(activeRef.current.sessionId); } }} />}
   </div>;
 }

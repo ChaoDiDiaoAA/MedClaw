@@ -10,8 +10,10 @@ import { SqliteWriteTransactions } from './write-transactions';
 import type { EventWriter } from '../../contracts/src/event';
 import { StoredToolConfigurationSchema } from '../../contracts/src/tool-config';
 import { createToolControlObservation, MeasurementContextSchema, ToolControlObservationSchema, type ToolControlObservation } from '../../contracts/src/model';
-import { ToolCallRecordSchema, ToolContextIdentitySchema, ToolExecutionModeSchema, ToolSdkDeliverySchema, type ToolCallIdentity, type ToolCallRecord,
+import { ToolCallRecordSchema, ToolContextIdentitySchema, ToolContextFieldsSchema, ToolExecutionModeSchema, ToolSdkDeliverySchema, type ToolCallIdentity, type ToolCallRecord,
   ToolObservationSchema, type ToolObservation, type ToolCallStore, type ToolExecutionContext, type ToolResult, type ToolSdkDelivery } from "../../contracts/src/tool";
+import { InputContentSchema } from '../../contracts/src/session';
+import { WorkspaceContextSchema } from '../../contracts/src/workspace';
 
 const knownErrors = new Set(["invalid_argument", "access_denied", "state_conflict", "operation_not_found", "runtime_interrupted", "storage_read_failed", "storage_write_failed"]);
 function fail(code: string): never { throw new Error(code); }
@@ -108,14 +110,31 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
 
   private identity(context: QueryContext, active: boolean): void {
     const { signal: _signal, ...identity } = context;
-    if (!("nativeToolCallId" in identity ? ToolContextIdentitySchema : ToolContextIdentitySchema.omit({ nativeToolCallId: true })).safeParse(identity).success) fail("invalid_argument");
+    if (!("nativeToolCallId" in identity ? ToolContextIdentitySchema : ToolContextFieldsSchema.omit({ nativeToolCallId: true })).safeParse(identity).success) fail("invalid_argument");
     if ("source" in context && (!["agent_tool", "intent", "user_form"].includes(context.source) || !context.callRef)) fail("invalid_argument");
-    const run = this.db.query<{ input_id?:number|null; session_id: number; status: string; scope_json: string; reference_date: string; timezone: string }, [number]>(
+    const run = this.db.query<{ input_id?:number|null; workspace_json: string | null; session_id: number; status: string; scope_json: string; reference_date: string; timezone: string }, [number]>(
       "SELECT * FROM runs WHERE id=?").get(context.runId);
     if (!run || run.session_id !== context.sessionId || run.reference_date !== context.referenceDate || run.timezone !== context.timezone) fail("access_denied");
     if('inputId' in context && context.inputId !== (run.input_id ?? null)) fail('access_denied');
     const scope = RunScopeSchema.safeParse(decode(run.scope_json));
     if (!scope.success || !isDeepStrictEqual(scope.data, context.scope)) fail("access_denied");
+    if ('nativeToolCallId' in context && context.workspaceContext !== undefined) {
+      if (context.workspaceInputId != null) {
+        const input = this.db.query<{ session_id: number; target_run_id: number | null; run_id: number | null; status: string;
+          native_entry_id: string | null; content_json: string }, [number]>('SELECT * FROM session_inputs WHERE id=?').get(context.workspaceInputId);
+        if (!input || input.session_id !== context.sessionId || input.target_run_id !== context.runId || input.run_id !== context.runId
+          || input.status !== 'consumed' || !input.native_entry_id) fail('state_conflict');
+        const content = InputContentSchema.safeParse(decode(input.content_json));
+        if (!content.success) fail('storage_read_failed');
+        if (!isDeepStrictEqual(content.data.workspaceContext, context.workspaceContext)
+          || !isDeepStrictEqual(content.data.scope, context.scope) || content.data.referenceDate !== context.referenceDate
+          || content.data.timezone !== context.timezone) fail('access_denied');
+      } else {
+        if (run.input_id != null || run.workspace_json == null) fail('state_conflict');
+        const workspace = WorkspaceContextSchema.safeParse(decode(run.workspace_json));
+        if (!workspace.success || !isDeepStrictEqual(workspace.data, context.workspaceContext)) fail('access_denied');
+      }
+    }
     if (active && run.status !== "running") fail("state_conflict");
   }
 

@@ -14,6 +14,7 @@ import type { RunScope } from '../../../contracts/src/run';
 import { normalizeToolConfiguration } from '../../../contracts/src/tool-config';
 import { normalizeRuntimeConfiguration, projectRuntimePolicies } from '../../../contracts/src/runtime-config';
 import type { StreamSnapshot } from '../../../contracts/src/event';
+import { toWorkspaceContext } from '../../../contracts/src/workspace';
 
 type Execution = { handle: RunHandle; operationRef: string; abort: AbortController; nativeTerminal: boolean; cause: "user" | "deadline" | "shutdown" | null;
   cancelAt: string | null; stopped: boolean; executionStarted: boolean | null; fact: FinalProviderFact | FinalAgentFact | null;
@@ -129,11 +130,11 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         let profiles: ReturnType<NonNullable<AgentRuntimePort<Resolved>['captureToolProfiles']>> | undefined;
         try { profiles = this.agent.captureToolProfiles?.(scope); } catch { /* Missing statistics use the frozen configured timeout. */ }
         const fields = { sessionId: request.sessionId, text: request.text, model: resolved.selection, policy: resolved.policy, goal: "answer" as const,
-          workspace, scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: resolved.policy.timeoutMs,
+          workspace: toWorkspaceContext(workspace), scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: resolved.policy.timeoutMs,
           agentPolicy, runtimeConfiguration, toolConfiguration, ...(profiles ? structuredClone(profiles) : {}),
           agentOptions: this.agent.describe(resolved) };
         const createdAt = now(), content: InputContent = { contract: 'medclaw.session-input/v1', originalSubmitInput: request, text: request.text,
-          workspaceContext: structuredClone(workspace), scope: structuredClone(scope), model: structuredClone(resolved.selection),
+          workspaceContext: toWorkspaceContext(workspace), scope: structuredClone(scope), model: structuredClone(resolved.selection),
           referenceDate: request.referenceDate, timezone: request.timezone, deliveryAttempt: null };
         const accepted = this.store.acceptInput({ operationRef: context.operationRef, originalSubmitInput: request, content, createdAt,
           execution: { mode: 'send', run: { ...fields, instanceId: this.instanceId, createdAt } } });
@@ -187,7 +188,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       || fields.scope.deviceIds !== null && (!workspace.deviceIds.length || workspace.deviceIds.some(id => !fields.scope.deviceIds!.includes(id))))
       throw new Error('state_conflict');
     const content: InputContent = { contract: 'medclaw.session-input/v1', originalSubmitInput: request, text: request.text,
-      workspaceContext: structuredClone(workspace), scope: structuredClone(fields.scope), model: structuredClone(fields.model),
+      workspaceContext: toWorkspaceContext(workspace), scope: structuredClone(fields.scope), model: structuredClone(fields.model),
       referenceDate: fields.referenceDate, timezone: fields.timezone, deliveryAttempt: null };
     const accepted = this.store.acceptInput({ operationRef: context.operationRef, originalSubmitInput: request, content, createdAt: now(),
       execution: { mode: request.mode, targetRunId: request.targetRunId } });
@@ -198,7 +199,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       this.store.beginInputDelivery(accepted.inputId, this.instanceId, now());
       dispatched = true;
       await this.agent.inputAdapter.deliver({ inputId: accepted.inputId, sessionId: request.sessionId, targetRunId: request.targetRunId,
-        mode: request.mode, text: request.text, stopEpoch: execution.stopEpoch });
+        mode: request.mode, text: request.text, stopEpoch: execution.stopEpoch, workspaceContext: content.workspaceContext });
     } catch (native) {
       execution.acceptingInputs = false;
       const error = safeError(dispatched ? 'input_delivery_unknown' : 'storage_write_failed', native);
@@ -333,7 +334,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         entered = true;
         return this.agent!.execute({
         runId: execution.handle.runId, sessionId: input.sessionId, inputId: input.inputId, text: input.text, resolved: input.resolved, agentOptions: input.agentOptions,
-        scope: input.scope, referenceDate: input.referenceDate, timezone: input.timezone, signal: execution.abort.signal, deadlineAt,
+        scope: input.scope, workspaceContext: toWorkspaceContext(input.workspace), referenceDate: input.referenceDate, timezone: input.timezone, signal: execution.abort.signal, deadlineAt,
         agentPolicy: input.agentPolicy, runtimeConfiguration: input.runtimeConfiguration, toolConfiguration: input.toolConfiguration, measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot }, {
         startCall: time => this.startCall(execution.handle.runId, "main", time), preview: text => this.preview(execution, text),
         stream: snapshot => { if (snapshot.runId !== execution.handle.runId || snapshot.sessionId !== execution.handle.sessionId) return;

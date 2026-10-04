@@ -44,7 +44,7 @@ test('P5 safe UTF16 preview and UTF8 page budget', () => {
  expect(contracts.SessionInputPageSchema.safeParse({ sessionId: 1, items: Array.from({ length: 100 }, (_, index) => ({ ...item, id: index + 1, clientSequence: index + 1 })), nextClientSequence: null, hasMore: false }).success).toBe(false);
 });
 test('P5 protocol constants and explicit read classification', () => {
- expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p6-v1'); expect(DATABASE_SCHEMA_VERSION).toBe(5);
+ expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p7-v1'); expect(DATABASE_SCHEMA_VERSION).toBe(5);
  for (const method of ['session.readInput', 'session.listInputs']) expect(isReadOnlyMethod(method)).toBe(true);
  expect(isReadOnlyMethod('session.cancelInput')).toBe(false);
  expect(publicMethodSchemas['session.cancelInput']).toBeDefined();
@@ -69,7 +69,7 @@ test('P5 handshake requires exact protocol, schema and pinned SDK', () => {
  const hello = { protocolVersion: HOST_PROTOCOL_VERSION, instanceId: 'host-1', startupToken: 'token-1', sdkVersion: '0.87.1', expectedSchemaVersion: DATABASE_SCHEMA_VERSION,
  paths: { dataRoot: 'C:/fixture', databasePath: 'C:/fixture/db', settingsPath: 'C:/fixture/settings', cachePath: 'C:/fixture/cache', lockPath: 'C:/fixture/lock' } };
  expect(HostReadySchema.safeParse(ready).success).toBe(true); expect(HostHelloSchema.safeParse(hello).success).toBe(true);
- for (const protocolVersion of ['medclaw.host/p5-v1', 'medclaw.host/p4-v1', 'medclaw.host/p3-v1']) { expect(HostReadySchema.safeParse({ ...ready, protocolVersion }).success).toBe(false); expect(HostHelloSchema.safeParse({ ...hello, protocolVersion }).success).toBe(false); }
+ for (const protocolVersion of ['medclaw.host/p6-v1', 'medclaw.host/p5-v1', 'medclaw.host/p4-v1', 'medclaw.host/p3-v1']) { expect(HostReadySchema.safeParse({ ...ready, protocolVersion }).success).toBe(false); expect(HostHelloSchema.safeParse({ ...hello, protocolVersion }).success).toBe(false); }
  expect(HostReadySchema.safeParse({ ...ready, schemaVersion: 3 }).success).toBe(false);
  expect(HostHelloSchema.safeParse({ ...hello, sdkVersion: '0.87.2' }).success).toBe(false);
 });

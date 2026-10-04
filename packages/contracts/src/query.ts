@@ -4,6 +4,7 @@ import { ReferenceDateSchema, TimezoneSchema } from "./model";
 import type { ToolExecutionContext } from "./tool";
 import type { RunScope } from "./run";
 import { StoredToolConfigurationSchema } from './tool-config';
+import { WorkspaceRowKeySchema, WorkspaceTargetVersionSchema } from './workspace';
 
 export const BusinessDateSchema = ReferenceDateSchema;
 export const BUSINESS_RULES = Object.freeze({
@@ -200,6 +201,9 @@ export type QuerySummary = z.infer<typeof QuerySummarySchema>;
 export const QueryPageSchema = z.strictObject({ queryId: PositiveIdSchema, rows: z.array(QueryRowSchema), totalRows: z.number().int().nonnegative(),
   page: PositiveIdSchema, pageSize: PositiveIdSchema, warnings: z.array(z.string()), calculationVersion: z.string(), evidenceIds: z.array(PositiveIdSchema),
   interpretation: QueryInterpretationSchema.optional() });
+export const DesktopQueryPageSchema = QueryPageSchema.extend({ targetVersion: WorkspaceTargetVersionSchema,
+  rowKeys: z.array(WorkspaceRowKeySchema.nullable()) }).refine(page => page.rowKeys.length === page.rows.length, 'Row identities must align with rows');
+export type DesktopQueryPage = z.infer<typeof DesktopQueryPageSchema>;
 export const EvidenceSchema = z.strictObject({ id: PositiveIdSchema, queryId: PositiveIdSchema, batchIds: BatchIdsSchema,
   snapshotIds: z.array(PositiveIdSchema), eventIds: z.array(PositiveIdSchema), sourceRowRefs: z.array(z.string()),
   calculationVersion: z.string(), materialVersion: z.string(), sourceBundleId: z.string(), sourceLockHash: z.string(), resultHash: z.string(),
@@ -213,16 +217,19 @@ export const EvidenceSummarySchema = EvidenceSchema.omit({ snapshotIds: true, ev
 export type EvidenceSummary = z.infer<typeof EvidenceSummarySchema>;
 export const QueryViewSchema = z.strictObject({
   query: QuerySummarySchema,
-  page: QueryPageSchema,
+  page: DesktopQueryPageSchema,
   evidence: z.array(EvidenceSummarySchema),
 });
 export const EvidenceViewSchema = z.strictObject({
   evidence: EvidenceSummarySchema,
   items: z.array(SnapshotSchema),
+  targetVersion: WorkspaceTargetVersionSchema,
+  rowKeys: z.array(WorkspaceRowKeySchema.nullable()),
   totalRows: z.number().int().nonnegative(),
   page: PositiveIdSchema,
   pageSize: PositiveIdSchema,
-});
+}).refine(page => page.rowKeys.length === page.items.length && page.rowKeys.every(key => key === null || key.startsWith('snapshot:')),
+  'Evidence identities must align with snapshot rows');
 export type SnapshotReference = Pick<Snapshot, 'id' | 'batchId' | 'deviceId' | 'sourceRowRef'>;
 export type CatalogSummary = { rows: QueryRecord['rows']; snapshotIds: number[]; eventIds: number[] };
 export interface CatalogStore {

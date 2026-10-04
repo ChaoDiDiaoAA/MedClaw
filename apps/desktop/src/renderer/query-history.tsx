@@ -7,18 +7,18 @@ import type { QueryParams } from '../../../../packages/contracts/src/query';
 import type { WorkspaceChange, WorkspaceView } from '../../../../packages/contracts/src/workspace';
 import { QueryPanel, queryBasisLabel, queryDataDatesLabel, queryQuantityLabel } from './query-panel';
 
-export function QueryHistory(props: { visible: boolean; requestedQueryId: number | null; host: HostView; workspace: WorkspaceView | null; confirmed: boolean; active: ActiveRunView | null; onUpdate: (change: WorkspaceChange) => Promise<boolean>; onError: (message: string | null) => void }) {
+export function QueryHistory(props: { visible: boolean; requestedQuery: { queryId: number; ownerSessionId: number } | null; host: HostView; workspace: WorkspaceView | null; confirmed: boolean; active: ActiveRunView | null; onUpdate: (change: WorkspaceChange) => Promise<boolean>; onError: (message: string | null) => void }) {
   const [history, setHistory] = useState<PublicReturn<'query.list'> | null>(null), [view, setView] = useState<PublicReturn<'query.read'> | null>(null), [evidence, setEvidence] = useState<PublicReturn<'evidence.read'> | null>(null), [loading, setLoading] = useState(false);
   const [pending, setPending] = useState<{ sessionId: number; runId: number; operationRef: string; uncertain: boolean; payload: { params: QueryParams; expectedRevision: number } } | null>(null);
-  const target = useRef<{ instanceId: string | null; sessionId: number | null; queryId: number | null }>({ instanceId: props.host.instanceId, sessionId: props.workspace?.sessionId ?? null, queryId: null }), order = useRef(0), listOrder = useRef(0), mounted = useRef(true);
+  const target = useRef<{ instanceId: string | null; sessionId: number | null; queryId: number | null; ownerSessionId: number | null }>({ instanceId: props.host.instanceId, sessionId: props.workspace?.sessionId ?? null, queryId: null, ownerSessionId: null }), order = useRef(0), listOrder = useRef(0), mounted = useRef(true);
   target.current.instanceId = props.host.instanceId; target.current.sessionId = props.workspace?.sessionId ?? null;
   const capture = () => ({ ...target.current, order: ++order.current });
-  const owns = (scope: ReturnType<typeof capture>) => mounted.current && scope.order === order.current && scope.instanceId === target.current.instanceId && scope.sessionId === target.current.sessionId && scope.queryId === target.current.queryId;
+  const owns = (scope: ReturnType<typeof capture>) => mounted.current && scope.order === order.current && scope.instanceId === target.current.instanceId && scope.ownerSessionId === target.current.ownerSessionId && scope.queryId === target.current.queryId;
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => { order.current++; listOrder.current++; target.current.queryId = null; setHistory(null); setView(null); setEvidence(null); setLoading(false); }, [props.host.instanceId, props.workspace?.sessionId]);
   useEffect(() => { setPending(value => value ? { ...value, uncertain: true } : null); }, [props.host.instanceId]);
   useEffect(() => { if (props.visible && props.host.state === 'ready') void readHistory(); }, [props.visible, props.host.state, props.host.instanceId, props.workspace?.sessionId, props.active?.runId]);
-  useEffect(() => { if (props.visible && props.confirmed && props.requestedQueryId && props.host.state === 'ready') void readQuery(props.requestedQueryId); }, [props.visible, props.confirmed, props.requestedQueryId, props.host.instanceId, props.workspace?.sessionId]);
+  useEffect(() => { if (props.visible && props.requestedQuery && props.host.state === 'ready') void readQuery(props.requestedQuery.queryId, undefined, props.requestedQuery.ownerSessionId); }, [props.visible, props.requestedQuery, props.host.state, props.host.instanceId, props.workspace?.sessionId]);
   async function readHistory(beforeQueryId?: number) {
     const instanceId = target.current.instanceId, sessionId = target.current.sessionId, token = ++listOrder.current;
     if (!sessionId) return;
@@ -27,12 +27,13 @@ export function QueryHistory(props: { visible: boolean; requestedQueryId: number
     if (result.ok) setHistory(old => beforeQueryId && old ? { items: [...old.items, ...result.data.items.filter(query => !old.items.some(known => known.id === query.id))], nextBeforeQueryId: result.data.nextBeforeQueryId } : result.data);
     else props.onError(errorMessage(result.error));
   }
-  async function readQuery(queryId: number, page?: number) {
+  async function readQuery(queryId: number, page?: number, ownerSessionId = view?.query.id === queryId ? view.query.sessionId : props.workspace?.sessionId ?? null) {
     if (target.current.queryId !== queryId) { target.current.queryId = queryId; setView(null); setEvidence(null); }
+    target.current.ownerSessionId = ownerSessionId;
     const scope = capture(); setLoading(true);
     const result = await window.medclaw.request('query.read', { queryId, page });
     if (!owns(scope)) return;
-    if (result.ok && result.data.query.id === queryId && result.data.query.sessionId === scope.sessionId) setView(result.data);
+    if (result.ok && result.data.query.id === queryId && result.data.query.sessionId === scope.ownerSessionId) setView(result.data);
     else props.onError(result.ok ? 'The saved query belongs to another session.' : errorMessage(result.error));
     setLoading(false);
   }
@@ -61,7 +62,7 @@ export function QueryHistory(props: { visible: boolean; requestedQueryId: number
     } else {
       const matchesOriginal = result.data.query.sessionId === original.sessionId && result.data.query.runId === original.runId;
       if (matchesOriginal) setPending(value => value?.operationRef === original.operationRef ? null : value);
-      if (owns(scope) && matchesOriginal) {
+      if (owns(scope) && scope.sessionId === target.current.sessionId && matchesOriginal) {
         target.current.queryId = result.data.query.id; setView(result.data); setEvidence(null); await readHistory();
       } else if (owns(scope)) props.onError('The query reply does not match the original Run and Session. Read its saved identity before continuing.');
     }
@@ -83,9 +84,9 @@ export function QueryHistory(props: { visible: boolean; requestedQueryId: number
     <section className="panel"><div className="section-heading"><div><span className="eyebrow">Saved facts for this Session</span><h2>Query history</h2></div><button disabled={props.host.state !== 'ready' || !props.workspace?.sessionId} onClick={() => void readHistory()}>Refresh query history</button></div>
       {!props.workspace?.sessionId ? <p className="muted">Select a Session to read its saved queries.</p> : history && !history.items.length ? <p className="muted">No saved queries yet. Ask the Agent to query the selected batches.</p> : !history ? <p className="muted">Query history has not been read yet.</p> : <div className="query-history-list">{history.items.map(query => <button key={query.id} aria-label={`Read Query ${query.id} from Run ${query.runId}`} className={view?.query.id === query.id ? 'selected' : ''} onClick={() => void readQuery(query.id)}><strong>Query {query.id} · {query.kind}</strong><span>{query.interpretation ? `${queryQuantityLabel(query.interpretation)} · ${queryBasisLabel[query.interpretation.basis]}` : `${query.totalRows} result rows`} · Run {query.runId}</span>{query.interpretation && <span className="tiny muted">Requested {query.interpretation.requestedDate ?? (query.interpretation.requestedTime ? `${query.interpretation.requestedTime.start} – ${query.interpretation.requestedTime.endExclusive} (exclusive)` : 'Not recorded')} · Data {queryDataDatesLabel(query.interpretation.dataDates)}{query.interpretation.status ? ` · ${query.interpretation.status}` : ''}</span>}<span className="tiny muted">{query.createdAt}</span></button>)}</div>}
       {history?.nextBeforeQueryId && <button disabled={loading} onClick={() => void readHistory(history.nextBeforeQueryId!)}>Read earlier queries</button>}
-      {view && <button disabled={!props.confirmed || loading} onClick={() => void props.onUpdate({ batchIds: view.query.batchIds, deviceIds: view.query.scopeDeviceIds ?? [], queryId: view.query.id, activeView: 'query' })}>Use Query {view.query.id} for next message</button>}
+      {view && <p role="status">Viewing Query {view.query.id} from Session {view.query.sessionId}</p>}{view && <button disabled={!props.confirmed || loading || view.query.sessionId !== props.workspace?.sessionId} onClick={() => void props.onUpdate({ batchIds: view.query.batchIds, deviceIds: view.query.scopeDeviceIds ?? [], queryId: view.query.id, activeView: 'query' })}>Use Query {view.query.id} for next message</button>}
       {pending && <div className="persistence-notice" role="status"><p>Original query · Session {pending.sessionId} · Run {pending.runId}</p><p className="tiny"><code>{pending.operationRef}</code></p><div className="actions"><button disabled={props.host.state !== 'ready' || loading} onClick={() => void findOriginal()}>Read original query result</button><button disabled={props.host.state !== 'ready' || loading} onClick={() => void submit(pending)}>Resend original query</button></div></div>}
     </section>
-    <QueryPanel workspace={props.workspace} query={view?.query ?? null} page={view?.page ?? null} evidence={evidence} loading={loading} executeReason={executeReason} onPage={page => { if (view) void readQuery(view.query.id, page); }} onEvidence={id => void readEvidence(id)} onEvidencePage={page => { if (evidence) void readEvidence(evidence.evidence.id, page); }} onExecute={execute} />
+    <QueryPanel workspace={props.workspace} query={view?.query ?? null} page={view?.page ?? null} evidence={evidence} loading={loading} canSelect={props.confirmed && view?.query.sessionId === props.workspace?.sessionId} onSelect={selection => view ? props.onUpdate({ queryId: view.query.id, activeView: selection.kind === "evidence" ? "evidence" : "query", selection }) : Promise.resolve(false)} executeReason={executeReason} onPage={page => { if (view) void readQuery(view.query.id, page); }} onEvidence={id => void readEvidence(id)} onEvidencePage={page => { if (evidence) void readEvidence(evidence.evidence.id, page); }} onExecute={execute} />
   </div>;
 }

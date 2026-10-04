@@ -12,6 +12,7 @@ import type { ToolExecutionContext } from '../../packages/contracts/src/tool';
 import { PositiveIdSchema } from '../../packages/contracts/src/error';
 import { createBusinessToolSchemas } from '../../packages/contracts/src/business-tools';
 import { RunScopeSchema } from '../../packages/contracts/src/run';
+import { WorkspaceContextSchema } from '../../packages/contracts/src/workspace';
 import { PiAgentRuntime } from '../../packages/runtime-pi/src/agent-runtime';
 import { PiModelRuntime } from '../../packages/runtime-pi/src/model-runtime';
 import { ToolRegistry } from '../../packages/core/src/tools/registry';
@@ -23,7 +24,7 @@ test('Pi session freezes result limits and rebuilds only for actual tool Schema 
   const root = await mkdtemp(join(tmpdir(), 'medclaw-session-config-')), db = new Database(':memory:');
   db.exec(`PRAGMA foreign_keys=ON;
     CREATE TABLE sessions(id INTEGER PRIMARY KEY);
-    CREATE TABLE runs(id INTEGER PRIMARY KEY,session_id INTEGER REFERENCES sessions(id),status TEXT,scope_json TEXT,reference_date TEXT,timezone TEXT,UNIQUE(id,session_id));
+    CREATE TABLE runs(id INTEGER PRIMARY KEY,session_id INTEGER REFERENCES sessions(id),status TEXT,scope_json TEXT,workspace_json TEXT,reference_date TEXT,timezone TEXT,UNIQUE(id,session_id));
     INSERT INTO sessions VALUES(1);`);
   initializeToolStorage(db);
   const requests: Record<string, unknown>[] = [], observed: { ceiling: number; pageSize: number; contextCeiling: number }[] = [];
@@ -55,11 +56,13 @@ test('Pi session freezes result limits and rebuilds only for actual tool Schema 
     const native = agent.allocate(); native.bind(1);
     const nativeSessionId = native.nativeSessionId;
     const scope = RunScopeSchema.parse({ batchIds: [], deviceIds: null, allowedToolNames: agent.toolNames, allowedResourceRefs: [], artifactIds: [], readOnly: true });
+    const workspaceContext = WorkspaceContextSchema.parse({ revision: 1, sessionId: 1, materialVersion: null,
+      batchRefs: [], deviceIds: [], queryId: null, activeView: 'data', selection: null });
     const resolved = await runtime.resolve({ provider: 'session-config', modelId: 'fixture', expectedConfigVersion: '1' }, '1', null, { timeoutMs: 10000, maxRetries: 0, maxRetryDelayMs: 2000 });
     let runId = 0;
     const execute = async (configuration: ToolConfiguration, controller = new AbortController()) => {
-      db.query("INSERT INTO runs VALUES(?,1,'running',?,'2026-01-01','Asia/Shanghai')").run(++runId, JSON.stringify(scope));
-      return agent!.execute({ runId, sessionId: 1, text: `run-${runId}`, resolved, agentOptions: agent!.describe(resolved), scope, referenceDate: '2026-01-01', timezone: 'Asia/Shanghai', toolConfiguration: configuration,
+      db.query("INSERT INTO runs VALUES(?,1,'running',?,?,'2026-01-01','Asia/Shanghai')").run(++runId, JSON.stringify(scope), JSON.stringify(workspaceContext));
+      return agent!.execute({ runId, sessionId: 1, text: `run-${runId}`, resolved, agentOptions: agent!.describe(resolved), scope, workspaceContext, referenceDate: '2026-01-01', timezone: 'Asia/Shanghai', toolConfiguration: configuration,
         signal: controller.signal, deadlineAt: performance.now() + 10000 }, { startCall: () => ({ finish: (outcome, endedAt) => ({ callId: `run-${runId}-call`, state: outcome.callState, responseModel: outcome.responseModel, sdkStopReason: outcome.sdkStopReason === 'pending' ? null : outcome.sdkStopReason, endedAt, durationMs: 1, inputTokens: outcome.usage.inputTokens, outputTokens: outcome.usage.outputTokens, cost: outcome.usage.cost, costCurrency: outcome.usage.costCurrency, usageSource: outcome.usage.source, unavailableReason: outcome.usage.unavailableReason, error: outcome.error }) }), preview: () => {}, nativeTerminal: () => {} });
     };
     const binding = () => (Reflect.get(agent!, 'sessions') as Map<number, { session: AgentSession; manager: { getSessionId(): string } }>).get(1)!;

@@ -1,3 +1,4 @@
+import { toWorkspaceContext } from '../../packages/contracts/src/workspace';
 import { test, expect } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -56,7 +57,7 @@ function fixture() {
  const s=repos.createSession({expectedWorkspaceRevision:0},'create','n',at); const workspace=s.workspace;
  const scope={batchIds:[],deviceIds:null,allowedToolNames:[],allowedResourceRefs:[],artifactIds:[],readOnly:true};
  const request={sessionId:s.session.id,clientSequence:1,text:'same',mode:'send' as const,expectedRevision:workspace.revision,expectedBatchIds:[],expectedQueryId:null,model:{provider:'p',modelId:'m',expectedConfigVersion:'1'},referenceDate:'2026-10-03',timezone:'Asia/Shanghai'};
- const content={contract:'medclaw.session-input/v1' as const,originalSubmitInput:request,text:request.text,workspaceContext:workspace,scope,model,referenceDate:request.referenceDate,timezone:request.timezone,deliveryAttempt:null};
+ const content={contract:'medclaw.session-input/v1' as const,originalSubmitInput:request,text:request.text,workspaceContext:toWorkspaceContext(workspace),scope,model,referenceDate:request.referenceDate,timezone:request.timezone,deliveryAttempt:null};
  const run={sessionId:s.session.id,goal:'answer' as const,text:request.text,model,policy:DEFAULT_REQUEST_POLICY,workspace,scope,referenceDate:request.referenceDate,timezone:request.timezone,timeoutMs:DEFAULT_REQUEST_POLICY.timeoutMs,agentOptions:{requestedThinkingLevel:'off' as const,effectiveThinkingLevel:'off' as const},instanceId:'host',createdAt:at};
  const plan={operationRef:'send',originalSubmitInput:request,content,createdAt:at,execution:{mode:'send' as const,run}};
  return {db,repos,plan,dispose(){db.close();rmSync(root,{recursive:true,force:true});}};
@@ -174,7 +175,7 @@ test('formal Query SQL and read projection persist the original root Input',()=>
  f.db.exec(`INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_hash,preview_request_json,created_at,updated_at) VALUES(1,'imp','h','imported','h','{}','${at}','${at}');
  INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,catalog_revision,created_at) VALUES(1,1,'s','2026-10-03','浙江','v','b','l','h','full','c',0,0,'[]','{"referenceDate":"2026-10-03","timezone":"Asia/Shanghai"}',1,1,'${at}');`);
  const workspace=f.repos.updateWorkspace({batchIds:[1]},1,at),scope={...f.plan.content.scope,batchIds:[1],allowedToolNames:['query_current_devices']};
- const request={...f.plan.originalSubmitInput,expectedRevision:workspace.revision,expectedBatchIds:[1]};const plan={...f.plan,originalSubmitInput:request,content:{...f.plan.content,originalSubmitInput:request,scope,workspaceContext:workspace},execution:{mode:'send' as const,run:{...f.plan.execution.run,workspace,scope}}};const badRequest={...request,timezone:'UTC'};
+ const request={...f.plan.originalSubmitInput,expectedRevision:workspace.revision,expectedBatchIds:[1]};const plan={...f.plan,originalSubmitInput:request,content:{...f.plan.content,originalSubmitInput:request,scope,workspaceContext:toWorkspaceContext(workspace)},execution:{mode:'send' as const,run:{...f.plan.execution.run,workspace,scope}}};const badRequest={...request,timezone:'UTC'};
  const badPlan={...plan,operationRef:'wrong-timezone',originalSubmitInput:badRequest,content:{...plan.content,timezone:'UTC',originalSubmitInput:badRequest},execution:{mode:'send' as const,run:{...plan.execution.run,timezone:'UTC'}}};
  expect(()=>f.repos.acceptInput(badPlan)).toThrow('invalid_argument');expect(f.db.query('SELECT * FROM session_inputs').all()).toEqual([]);
  const r=f.repos.acceptInput(plan);f.repos.startCall(r.runId!,'query-call','main',at);

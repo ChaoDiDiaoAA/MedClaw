@@ -205,7 +205,9 @@ test('manual Query and native Steer Follow Up retain the original P3 Run and fro
     expect(QueryViewSchema.parse(unwrap(await f.host.request('query.read', { queryId: manual.query.id }))).query.resultHash).toBe(manual.query.resultHash);
     const next = NewSessionResultSchema.parse(unwrap(await f.host.request('session.create', { expectedWorkspaceRevision: (await f.workspace()).revision }, 'session-b')));
     expect(next.workspace.queryId).toBeNull();
-    expect(await f.host.request('query.read', { queryId: manual.query.id })).toMatchObject({ ok: false, error: { code: 'access_denied' } });
+    expect(QueryViewSchema.parse(unwrap(await f.host.request('query.read', { queryId: manual.query.id }))).query).toEqual(manual.query);
+    expect(await f.host.request('workspace.update', { expectedRevision: next.workspace.revision, change: { queryId: manual.query.id } })).toMatchObject({ ok: false, error: { code: 'access_denied' } });
+    expect(await f.workspace()).toEqual(next.workspace);
     expect(await f.host.request('tool.read', { runId: accepted.runId })).toMatchObject({ ok: true, data: { runId: accepted.runId, scope: { batchIds: [1] }, items: [{ name: 'query_current_devices', status: 'succeeded' }] } });
     expect(f.requests).toHaveLength(settledRequestCount);
   } finally { await f.close(); }

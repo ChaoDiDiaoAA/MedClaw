@@ -1,8 +1,8 @@
 import { z } from "zod";
 import { AppErrorSchema, TimestampSchema, OpaqueIdSchema, PositiveIdSchema } from "./error";
 import { ModelChoiceSchema, ModelSelectionSchema, ReferenceDateSchema, TimezoneSchema } from "./model";
-import { RevisionSchema, WorkspaceViewSchema } from "./workspace";
-import type { WorkspaceView, WorkspaceChange } from "./workspace";
+import { RevisionSchema, WorkspaceViewSchema, WorkspaceContextSchema } from "./workspace";
+import type { WorkspaceView, WorkspaceChange, WorkspaceContext } from "./workspace";
 import { RunScopeSchema } from "./run";
 import type { AppError } from "./error";
 import type { StoredOperation, RunHandle, RegisterAgentInput } from "./run";
@@ -53,7 +53,7 @@ export const MAX_INPUT_TEXT_CHARS = 8192;
 export const MAX_INPUT_PAGE_BYTES = 3 * 1024 * 1024;
 export const SessionInputSchema = z.strictObject({
   id: PositiveIdSchema, sessionId: PositiveIdSchema, clientSequence: PositiveIdSchema, mode: InputModeSchema,
-  text: z.string().max(MAX_INPUT_TEXT_CHARS), textInfo: z.strictObject({ totalChars: RevisionSchema, truncated: z.boolean() }), workspaceContext: WorkspaceViewSchema.nullable(),
+  text: z.string().max(MAX_INPUT_TEXT_CHARS), textInfo: z.strictObject({ totalChars: RevisionSchema, truncated: z.boolean() }), workspaceContext: WorkspaceContextSchema.nullable(),
   status: InputStatusSchema, processingStatus: InputProcessingStatusSchema, targetRunId: PositiveIdSchema.nullable(), runId: PositiveIdSchema.nullable(), nativeEntryId: OpaqueIdSchema.nullable(),
   deliveredAt: TimestampSchema.nullable(), processedAt: TimestampSchema.nullable(), createdAt: TimestampSchema, updatedAt: TimestampSchema, error: AppErrorSchema.nullable(),
 }).superRefine((input, ctx) => {
@@ -71,7 +71,7 @@ export const SessionInputPageSchema = z.strictObject({ sessionId: PositiveIdSche
   .refine(page => page.items.every((item, index) => item.sessionId === page.sessionId && (!index || item.clientSequence > page.items[index - 1]!.clientSequence))
     && (page.hasMore ? page.items.length > 0 && page.nextClientSequence === page.items.at(-1)!.clientSequence : page.nextClientSequence === null), "Inconsistent input page cursor or ownership");
 export const InputContentSchema = z.strictObject({ contract: z.literal("medclaw.session-input/v1"), originalSubmitInput: SubmitInputSchema,
-  text: z.string(), workspaceContext: WorkspaceViewSchema, scope: RunScopeSchema, model: ModelSelectionSchema, referenceDate: ReferenceDateSchema, timezone: TimezoneSchema,
+  text: z.string(), workspaceContext: WorkspaceContextSchema, scope: RunScopeSchema, model: ModelSelectionSchema, referenceDate: ReferenceDateSchema, timezone: TimezoneSchema,
   deliveryAttempt: z.strictObject({ instanceId: OpaqueIdSchema, startedAt: TimestampSchema }).nullable() });
 export type InputContent = z.infer<typeof InputContentSchema>;
 export type InputMode = z.infer<typeof InputModeSchema>;
@@ -82,13 +82,15 @@ export type SessionInputPage = z.infer<typeof SessionInputPageSchema>;
 export type ReadInputRequest = z.infer<typeof ReadInputRequestSchema>;
 export type ListInputsRequest = z.input<typeof ListInputsRequestSchema>;
 export type CancelInputRequest = z.infer<typeof CancelInputRequestSchema>;
-export interface InputBinding { inputId: number; sessionId: number; targetRunId: number; mode: InputMode; text: string; stopEpoch: number }
+export interface InputBinding { inputId: number; sessionId: number; targetRunId: number; mode: InputMode; text: string; stopEpoch: number; workspaceContext?: WorkspaceContext }
+export type ConsumedWorkspace = { inputId: number; nativeEntryId: string; workspaceContext: WorkspaceContext };
 export type InputCancelProof = { kind: "removed"; inputId: number; runId: number; at: string }
   | { kind: "consumed"; inputId: number; runId: number; nativeEntryId: string } | { kind: "unknown"; inputId: number; error: AppError };
 export interface InputSettlementProof { runId: number; admissionClosed: boolean; preflightSettled: boolean; nativeIdle: boolean; nativeQueuesEmpty: boolean; pendingPersistence: boolean;
   removals: Extract<InputCancelProof, { kind: "removed" }>[]; unconfirmedInputIds: number[] }
 export interface InputAdapterPort { deliver(input: InputBinding): Promise<void>; cancel(inputId: number): Promise<InputCancelProof>;
-  close(runId: number, outcome: "completed" | "failed" | "cancelled"): Promise<InputSettlementProof>; persistencePending(runId: number): boolean; retryPersistence(runId: number): void }
+  close(runId: number, outcome: "completed" | "failed" | "cancelled"): Promise<InputSettlementProof>; persistencePending(runId: number): boolean; retryPersistence(runId: number): void;
+  readConsumedWorkspace?(runId: number): ConsumedWorkspace | null }
 export type PreparedInput = { operationRef: string; originalSubmitInput: SubmitInput; content: InputContent; createdAt: string;
   execution: { mode: "send"; run: Omit<RegisterAgentInput, "inputId" | "submission"> } | { mode: "steer" | "follow_up"; targetRunId: number } };
 export interface InputStore {

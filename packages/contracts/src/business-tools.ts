@@ -3,6 +3,7 @@ import { PositiveIdSchema } from './error';
 import { BUSINESS_RULES, createQuerySchemas, BatchSchema, BusinessDateSchema, DeviceViewSchema, EvidenceSchema, FieldOriginsSchema, QueryPageSchema, QueryRecordSchema, SnapshotSchema, SourceRefSchema } from './query';
 import { RunScopeSchema } from './run';
 import { ReferenceDateSchema, TimezoneSchema } from './model';
+import { WorkspaceContextSchema } from './workspace';
 
 
 function buildBusinessToolSchemas() {
@@ -165,7 +166,10 @@ function buildBusinessToolSchemas() {
   } as const;
 }
 
-export const businessToolSchemas = buildBusinessToolSchemas();
+/** Persisted v1.0.0 results retain their original output contract. */
+export const legacyBusinessToolSchemas = buildBusinessToolSchemas();
+export const businessToolSchemas = { ...legacyBusinessToolSchemas, read_data_scope: { ...legacyBusinessToolSchemas.read_data_scope,
+  output: legacyBusinessToolSchemas.read_data_scope.output.extend({ workspaceContext: WorkspaceContextSchema.nullable(), workspaceInputId: PositiveIdSchema.nullable() }) } };
 export function createBusinessToolSchemas() { return businessToolSchemas; }
 
 export type BusinessToolName = keyof typeof businessToolSchemas;
