@@ -150,3 +150,137 @@ test('management operation identity conflicts with real Input, legacy Run and Pr
  const renamed=f.repos.renameSession({sessionId:s.session.id,title:'running rename allowed',expectedMetadataRevision:0},'rename',later);expect(renamed.session.metadataRevision).toBe(1);expect(f.db.query('SELECT COUNT(*) AS n FROM runs').get()).toEqual({n:1});
  }finally{f.dispose();}}
 });
+
+// These expectations describe display numbering independently of durable Session IDs.
+function removeNumberedSession(f: ReturnType<typeof fixture>, sessionId: number, operationRef: string) {
+ const current = f.repos.readSession(sessionId)!;
+ return f.repos.deleteSession({sessionId, expectedMetadataRevision:current.metadataRevision,
+  expectedWorkspaceRevision:f.repos.readWorkspace().revision}, operationRef, later);
+}
+function renameNumberedSession(f: ReturnType<typeof fixture>, sessionId: number, title: string, operationRef: string) {
+ const current = f.repos.readSession(sessionId)!;
+ return f.repos.renameSession({sessionId, title, expectedMetadataRevision:current.metadataRevision}, operationRef, later);
+}
+
+test('default numbering reuses a deleted display gap without renumbering durable identities or old receipts', () => {
+ const f=fixture();try{
+  const first=create(f,'number-first'),second=create(f,'number-second'),third=create(f,'number-third');
+  const oldRows=f.db.query<{id:number;creation_result_json:string},[]>('SELECT id,creation_result_json FROM sessions ORDER BY id').all();
+  removeNumberedSession(f,second.session.id,'number-delete-second');
+  const fourth=create(f,'number-fourth');
+  expect(fourth.session).toMatchObject({id:4,title:'New Session 2'});
+  expect(f.repos.readSession(first.session.id)?.title).toBe('New Session 1');
+  expect(f.repos.readSession(third.session.id)?.title).toBe('New Session 3');
+  expect(f.db.query('SELECT id,creation_result_json FROM sessions WHERE id<=3 ORDER BY id').all()).toEqual(oldRows);
+  expect(f.repos.findOperation('number-second')).toMatchObject({result:{session:{id:2,title:'New Session 2',status:'active'}}});
+  expect(f.db.query('SELECT metadata_json FROM sessions WHERE id=4').get()).toEqual({metadata_json:'{"titleOrigin":"default"}'});
+  expect(f.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+  expect(f.db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
+ }finally{f.dispose();}
+});
+
+test('default numbering starts at one after every user Session is deleted while durable IDs keep increasing', () => {
+ const f=fixture();try{
+  const first=create(f,'clear-first'),second=create(f,'clear-second');
+  removeNumberedSession(f,first.session.id,'clear-delete-first');removeNumberedSession(f,second.session.id,'clear-delete-second');
+  expect(f.repos.listSessions({})).toEqual({sessions:[],nextBeforeSessionId:null});
+  const next=create(f,'clear-new');expect(next.session).toMatchObject({id:3,title:'New Session 1',metadataRevision:0});
+  expect(f.db.query('SELECT id,status,title FROM sessions ORDER BY id').all()).toEqual([
+   {id:1,status:'deleted',title:'New Session 1'},{id:2,status:'deleted',title:'New Session 2'},{id:3,status:'active',title:'New Session 1'},
+  ]);
+ }finally{f.dispose();}
+});
+
+test('default numbering counts literal user default-shaped names and releases numbers after renaming away', () => {
+ const f=fixture();try{
+  const first=create(f,'rename-first'),second=create(f,'rename-second');
+  renameNumberedSession(f,first.session.id,'我的分析','rename-first-custom');
+  renameNumberedSession(f,second.session.id,'New Session 1','rename-second-user');
+  const third=create(f,'rename-third');expect(third.session).toMatchObject({id:3,title:'New Session 2'});
+  expect(f.db.query('SELECT metadata_json FROM sessions WHERE id=2').get()).toEqual({metadata_json:'{"titleOrigin":"user"}'});
+  renameNumberedSession(f,second.session.id,'后续分析','rename-second-custom');
+  const fourth=create(f,'rename-fourth');expect(fourth.session).toMatchObject({id:4,title:'New Session 1'});
+  expect(f.repos.readSession(first.session.id)?.title).toBe('我的分析');expect(f.repos.readSession(second.session.id)?.title).toBe('后续分析');
+ }finally{f.dispose();}
+});
+
+test('default numbering scans active names beyond the first sidebar page', () => {
+ const f=fixture();try{
+  for(let index=1;index<=105;index++)create(f,`page-${index}`);
+  const visible=f.repos.listSessions({limit:50});expect(visible.sessions).toHaveLength(50);
+  expect(visible.sessions.some(session=>session.id===1)).toBe(false);
+  removeNumberedSession(f,2,'page-delete-two');
+  const next=create(f,'page-new');expect(next.session).toMatchObject({id:106,title:'New Session 2'});
+  expect(f.repos.readSession(1)?.title).toBe('New Session 1');
+ }finally{f.dispose();}
+});
+
+test('default numbering matches only exact positive safe integer names and leaves user language unchanged', () => {
+ const f=fixture();try{
+  const titles=['New Session 01','New Session 0','New Session +1','New Session 1 extra','New Session 9007199254740992','新会话 1'];
+  for(const [index,title] of titles.entries()){
+   const made=create(f,`exact-${index}`);renameNumberedSession(f,made.session.id,title,`exact-rename-${index}`);
+  }
+  const next=create(f,'exact-new');expect(next.session).toMatchObject({id:7,title:'New Session 1'});
+  expect(f.repos.listSessions({limit:50}).sessions.slice(1).map(session=>session.title)).toEqual([...titles].reverse());
+ }finally{f.dispose();}
+});
+
+test('default numbering uses the public legacy Chinese default projection without rewriting its stored title or creation JSON', () => {
+ const f=fixture();try{
+  const first=create(f,'legacy-default'),second=create(f,'legacy-user'),third=create(f,'legacy-delete');
+  f.db.query("UPDATE sessions SET title='新会话 1',metadata_json=json_set(metadata_json,'$.titleOrigin','default','$.other','保留') WHERE id=?").run(first.session.id);
+  renameNumberedSession(f,second.session.id,'新会话 2','legacy-user-rename');removeNumberedSession(f,third.session.id,'legacy-delete-three');
+  const original=f.db.query('SELECT id,title,metadata_json,creation_result_json FROM sessions WHERE id<=3 ORDER BY id').all();
+  expect(f.repos.readSession(first.session.id)?.title).toBe('New Session 1');expect(f.repos.readSession(second.session.id)?.title).toBe('新会话 2');
+  const next=create(f,'legacy-new');expect(next.session).toMatchObject({id:4,title:'New Session 2'});
+  expect(f.db.query('SELECT id,title,metadata_json,creation_result_json FROM sessions WHERE id<=3 ORDER BY id').all()).toEqual(original);
+ }finally{f.dispose();}
+});
+
+test('default numbering rolls back an unpublished allocation and reopens with immutable original creation receipts', () => {
+ const f=fixture();let reopened:Database|null=null;try{
+  const first=create(f,'recover-first');renameNumberedSession(f,first.session.id,'分析历史','recover-custom');
+  const before=f.db.query('SELECT * FROM sessions ORDER BY id').all(),workspace=f.repos.readWorkspace();
+  const faulty=new Repositories(f.db,()=>{throw new Error('numbering-commit-fault');});
+  expect(()=>faulty.createSession({expectedWorkspaceRevision:workspace.revision},'recover-new','native-recover-new',later)).toThrow('numbering-commit-fault');
+  expect(f.db.query('SELECT * FROM sessions ORDER BY id').all()).toEqual(before);expect(f.repos.readWorkspace()).toEqual(workspace);
+  expect(f.repos.findOperation('recover-new')).toBeNull();
+  const request={expectedWorkspaceRevision:workspace.revision};const accepted=f.repos.createSession(request,'recover-new','native-recover-new',later);
+  expect(accepted.session).toMatchObject({id:2,title:'New Session 1'});
+  const originalJson=f.db.query('SELECT creation_result_json FROM sessions WHERE id=2').get();
+  renameNumberedSession(f,accepted.session.id,'New Session 7','recover-rename');
+  const current=create(f,'recover-current');expect(current.session).toMatchObject({id:3,title:'New Session 1'});
+  f.db.close();reopened=openDatabase(f.path);const repos=new Repositories(reopened);
+  expect(repos.createSession(request,'recover-new','another-native',at)).toEqual(accepted);
+  expect(repos.readSession(2)?.title).toBe('New Session 7');expect(repos.readWorkspace().sessionId).toBe(3);
+  expect(reopened.query('SELECT creation_result_json FROM sessions WHERE id=2').get()).toEqual(originalJson);
+  expect(reopened.query('PRAGMA foreign_key_check').all()).toEqual([]);expect(reopened.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
+ }finally{reopened?.close();f.db.close();rmSync(f.root,{recursive:true,force:true});}
+});
+
+test('default numbering explicitly persists default origin before schema6 migration and preserves it on same-name rename', () => {
+ const root=mkdtempSync(join(tmpdir(),'numbering-old-schema-')),path=join(root,'db.sqlite');let db=new Database(path);
+ try{
+  for(const [index,name] of migrations.slice(0,2).entries()){
+   db.exec('PRAGMA foreign_keys=OFF');
+   const sql=readFileSync(new URL(`../../packages/storage/src/migrations/${name}`,import.meta.url));db.exec(sql.toString());
+   db.query('INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(?,?,?)').run(index+1,createHash('sha256').update(sql).digest('hex'),at);
+  }
+  const repos=new Repositories(db);repos.createSession({expectedWorkspaceRevision:0},'origin-first','native-origin-first',at);
+  db.query("UPDATE sessions SET title='保留历史' WHERE id=1").run();
+  const made=repos.createSession({expectedWorkspaceRevision:1},'origin-second','native-origin-second',later);
+  expect(made.session).toMatchObject({id:2,title:'New Session 1'});
+  expect(db.query('SELECT metadata_json FROM sessions WHERE id=2').get()).toEqual({metadata_json:'{"titleOrigin":"default"}'});
+  const originalJson=db.query('SELECT creation_result_json FROM sessions WHERE id=2').get();
+  db.close();db=openDatabase(path);const migrated=new Repositories(db);
+  expect(db.query('SELECT metadata_json FROM sessions WHERE id=2').get()).toEqual({metadata_json:'{"titleOrigin":"default"}'});
+  migrated.renameSession({sessionId:2,title:'New Session 1',expectedMetadataRevision:0},'origin-noop',later);
+  expect(db.query('SELECT metadata_revision,metadata_json FROM sessions WHERE id=2').get()).toEqual({metadata_revision:0,metadata_json:'{"titleOrigin":"default"}'});
+  migrated.renameSession({sessionId:2,title:'用户命名',expectedMetadataRevision:0},'origin-user',later);
+  expect(db.query('SELECT metadata_revision,metadata_json FROM sessions WHERE id=2').get()).toEqual({metadata_revision:1,metadata_json:'{"titleOrigin":"user"}'});
+  expect(db.query('SELECT creation_result_json FROM sessions WHERE id=2').get()).toEqual(originalJson);
+  expect(migrated.findOperation('origin-second')).toMatchObject({result:{session:{id:2,title:'New Session 1'}}});
+  expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
+ }finally{db.close();rmSync(root,{recursive:true,force:true});}
+});

@@ -31,12 +31,13 @@ async function entered(id: string) { await expect.poll(() => app.evaluate((_, id
 async function release(id: string) { await app.evaluate((_, id) => { (globalThis as MainGlobal).__p7Gate.pending[id]?.(); }, id); }
 async function calls() { return app.evaluate(() => (globalThis as MainGlobal).__p7Gate.calls); }
 async function accepted() { return app.evaluate(() => (globalThis as MainGlobal).__p7Gate.accepted); }
-async function create() { await page.getByRole('button', { name: 'New Session', exact: true }).click(); const w = await page.evaluate(() => window.medclaw.request('workspace.read', {})); if (!w.ok || !w.data.sessionId) throw new Error('Missing Session'); await expect(page.getByTestId('current-session')).toContainText(`New Session ${w.data.sessionId}`); return w.data.sessionId; }
-async function select(id: number) { await page.getByRole('button', { name: `New Session ${id}`, exact: true }).click(); await expect(page.getByTestId('current-session')).toContainText(`New Session ${id}`); }
+async function create() { await page.getByRole('button', { name: 'New Session', exact: true }).click(); const w = await page.evaluate(() => window.medclaw.request('workspace.read', {})); if (!w.ok || !w.data.sessionId) throw new Error('Missing Session'); await expect(page.getByTestId('current-session')).toContainText(await sessionTitle(w.data.sessionId)); return w.data.sessionId; }
+async function sessionTitle(id: number) { const value = await page.evaluate(sessionId => window.medclaw.request('session.read', { sessionId }), id); if (!value.ok || !value.data) throw new Error('Missing Session title'); return value.data.session.title; }
+async function select(id: number) { await page.locator(`.session-row[data-session-id="${id}"]`).locator('button[aria-pressed]').click(); await expect(page.getByTestId('current-session')).toContainText(await sessionTitle(id)); }
 async function idle() { await expect.poll(async () => { const value = await page.evaluate(() => window.medclaw.request('run.control.read', {})); return value.ok && value.data.acceptingNewRuns && value.data.activeRootRun === null; }).toBe(true); }
 async function readInput(id: number) { const value = await page.evaluate(inputId => window.medclaw.request('session.readInput', { inputId }), id); if (!value.ok || !value.data) throw new Error('Missing original Input'); return value.data; }
 async function readRun(id: number) { const value = await page.evaluate(runId => window.medclaw.request('run.read', { runId }), id); if (!value.ok || value.data.kind !== 'one' || !value.data.run) throw new Error('Missing original Run'); return value.data.run; }
-async function clickSubmit(text: string, mode: 'send' | 'steer' | 'follow_up' = 'send') { const before = (await accepted()).length; await page.getByLabel('Input mode', { exact: true }).selectOption(mode); await input().fill(text); await page.getByRole('button', { name: mode === 'follow_up' ? 'Follow Up' : mode === 'steer' ? 'Steer' : 'Send', exact: true }).click(); await expect.poll(async () => (await accepted()).length).toBe(before + 1); return (await accepted())[before]!; }
+async function clickSubmit(text: string, mode: 'send' | 'steer' | 'follow_up' = 'send') { const before = (await accepted()).length; const actions = page.getByRole('button', { name: 'Message actions', exact: true }); if (mode !== 'send') { await actions.click(); await page.getByRole('menuitem', { name: mode === 'follow_up' ? 'Follow Up' : mode === 'steer' ? 'Steer' : 'Send', exact: true }).click(); } await input().fill(text); await page.getByRole('button', { name: mode === 'follow_up' ? 'Follow Up' : mode === 'steer' ? 'Steer' : 'Send', exact: true }).click(); await expect.poll(async () => (await accepted()).length).toBe(before + 1); return (await accepted())[before]!; }
 function sql(query: string) { return JSON.parse(execFileSync(bun, ['-e', 'import {Database} from "bun:sqlite"; const db=new Database(process.argv[1],{readonly:true}); console.log(JSON.stringify(db.query(process.argv[2]).all())); db.close();', join(temporary, 'data', 'data', 'app.sqlite'), query], { encoding: 'utf8', cwd: root })); }
 function save(name: string, data: unknown) { mkdirSync(evidence, { recursive: true }); writeFileSync(join(evidence, name + '.json'), JSON.stringify(data, null, 2)); }
 
@@ -83,7 +84,8 @@ test.beforeAll(async () => {
   const seam = join(temporary, 'public-gates.cjs');
   writeFileSync(seam, `const {ipcMain,app}=require('electron'); const original=ipcMain.handle.bind(ipcMain);
     const state=globalThis.__p7Gate={rules:[],entered:[],pending:{},calls:[],accepted:[],drop:[],notices:[]};
-    app.on('browser-window-created',(_,win)=>{const send=win.webContents.send.bind(win.webContents);win.webContents.send=(channel,...args)=>{if(channel==='medclaw:notice'){state.notices.push(structuredClone(args[0]));if(state.drop.includes(args[0].type))return;}return send(channel,...args);};});
+    // Keep Playwright's frame-based actionability checks independent of Windows occlusion.
+    app.on('browser-window-created',(_,win)=>{win.webContents.setBackgroundThrottling(false);const send=win.webContents.send.bind(win.webContents);win.webContents.send=(channel,...args)=>{if(channel==='medclaw:notice'){state.notices.push(structuredClone(args[0]));if(state.drop.includes(args[0].type))return;}return send(channel,...args);};});
     ipcMain.handle=(channel,listener)=>original(channel,async(event,envelope)=>{
       if(channel!=='medclaw:request')return listener(event,envelope);
       const p=envelope.payload; state.calls.push({method:envelope.method,payload:p,operationRef:envelope.operationRef});
@@ -163,7 +165,7 @@ test('A08 definite restore failure can be explicitly verified in the same Host i
   await page.reload(); await page.getByRole('button', { name: 'Data Workspace', exact: true }).click(); await expect(page.getByText('Selection unconfirmed', { exact: true }).last()).toBeVisible();
   const before = (await calls()).filter(call => call.method === 'workspace.restore').length;
   const host = await page.evaluate(() => window.medclaw.request('host.read', {}));
-  await expect(page.getByRole('button', { name: `New Session ${existing}`, exact: true })).toBeDisabled();
+  await expect(page.locator(`.session-row[data-session-id="${existing}"]`).locator('button[aria-pressed]')).toBeDisabled();
   await page.evaluate(() => window.medclaw.request('workspace.read', {}));
   await expect(page.getByRole('button', { name: 'Apply 0 selected batches', exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Chat', exact: true }).click();
@@ -186,7 +188,7 @@ test('A05 a lost creation receipt can recover its original identity without crea
   expect(sql('SELECT count(*) AS n FROM sessions WHERE kind=\'user\'')[0].n).toBe(before + 1);
   const created = sql('SELECT active_session_id FROM workspace')[0].active_session_id;
   await recover.click(); await expect(recover).toHaveCount(0);
-  await expect(page.getByTestId('current-session')).toContainText(`New Session ${created}`);
+  await expect(page.getByTestId('current-session')).toContainText(await sessionTitle(created));
   expect(sql('SELECT count(*) AS n FROM sessions WHERE kind=\'user\'')[0].n).toBe(before + 1);
   const requests = (await calls()).filter(call => call.method === 'session.create').slice(-2);
   expect(requests[0]).toEqual(requests[1]);
@@ -246,7 +248,7 @@ test('A12 viewing B keeps the running A ownership, frozen Input and Stop target'
   const held = gate(); steps = [() => ({ text: 'A owns this live answer.', endGate: held })];
   await page.getByRole('button', { name: 'Chat', exact: true }).click();
   const acceptedA = await clickSubmit('Keep running A'); await held.entered;
-  await expect(page.getByTestId('running-session')).toContainText(`New Session ${original.sessionId}`);
+  await expect(page.getByTestId('running-session')).toContainText(await sessionTitle(original.sessionId));
   const b = await create(); await input().fill('B draft remains unsent');
   await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
   await expect(page.getByTestId('running-session')).toContainText(`Run ${acceptedA.runId}`);
@@ -404,9 +406,9 @@ test('A11 fast Session choices confirm the latest target without replaying inter
   await page.getByRole('button',{name:'Chat',exact:true}).click();
   const a=await create(),b=await create(),c=await create(),before=(await calls()).length,runCount=sql('SELECT count(*) AS n FROM runs')[0].n,modelCount=physical;
   await rules([{method:'session.select',sessionId:a,hold:'first-session-choice',before:true}]);
-  await page.getByRole('button',{name:`New Session ${a}`,exact:true}).click();await entered('first-session-choice');
-  await page.getByRole('button',{name:`New Session ${b}`,exact:true}).click();await page.getByRole('button',{name:`New Session ${c}`,exact:true}).click();await release('first-session-choice');
-  await expect(page.getByTestId('current-session')).toContainText(`New Session ${c}`);
+  await page.locator(`.session-row[data-session-id="${a}"]`).locator('button[aria-pressed]').click();await entered('first-session-choice');
+  await page.locator(`.session-row[data-session-id="${b}"]`).locator('button[aria-pressed]').click();await page.locator(`.session-row[data-session-id="${c}"]`).locator('button[aria-pressed]').click();await release('first-session-choice');
+  await expect(page.getByTestId('current-session')).toContainText(await sessionTitle(c));
   await expect.poll(()=>sql('SELECT active_session_id FROM workspace')[0].active_session_id).toBe(c);
   const selected=(await calls()).slice(before).filter(call=>call.method==='session.select').map(call=>call.payload.sessionId);expect(selected).toEqual([a,c]);
   expect(sql('SELECT count(*) AS n FROM runs')[0].n).toBe(runCount);expect(physical).toBe(modelCount);
@@ -442,8 +444,8 @@ test('A11 rejected selection receipt preserves the latest Session intent until e
   const saved = await page.evaluate(() => window.medclaw.request('workspace.read', {})); if (!saved.ok) throw Error(saved.error.code);
   await rules([{ method: 'session.select', sessionId: a, hold: 'inconsistent-session', project: { ok: true, data: { ...saved.data, activeView: 'query' } } }]);
   const before = (await calls()).filter(call => call.method === 'session.select').length;
-  await page.getByRole('button', { name: `New Session ${a}`, exact: true }).click(); await entered('inconsistent-session');
-  await page.getByRole('button', { name: `New Session ${b}`, exact: true }).click(); await release('inconsistent-session');
+  await page.locator(`.session-row[data-session-id="${a}"]`).locator('button[aria-pressed]').click(); await entered('inconsistent-session');
+  await page.locator(`.session-row[data-session-id="${b}"]`).locator('button[aria-pressed]').click(); await release('inconsistent-session');
   await expect(page.getByRole('button', { name: `Confirm Session ${b}`, exact: true })).toBeDisabled();
   expect((await calls()).filter(call => call.method === 'session.select')).toHaveLength(before + 1);
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click(); await page.getByRole('button', { name: 'Verify saved selection', exact: true }).click();
