@@ -63,7 +63,8 @@ test.beforeAll(async () => {
 });
 test.afterAll(async () => { await app?.close(); if (server) await new Promise<void>(resolve => server.close(() => resolve())); if (dataRoot) rmSync(dataRoot, { recursive: true, force: true }); });
 const input = () => page.getByLabel("Message text", { exact: true });
-async function select(id: number) { await page.getByRole("button", { name: `New Session ${id}`, exact: true }).click(); await expect(page.getByTestId("current-session")).toContainText(`New Session ${id}`); }
+async function sessionTitle(id: number) { const value = await page.evaluate(sessionId => window.medclaw.request('session.read', { sessionId }), id); if (!value.ok || !value.data) throw new Error('Missing Session title'); return value.data.session.title; }
+async function select(id: number) { await page.locator(`.session-row[data-session-id="${id}"]`).locator('button[aria-pressed]').click(); await expect(page.getByTestId("current-session")).toContainText(await sessionTitle(id)); }
 async function send(text: string) {
   const original = await page.evaluate(async () => {
     const workspace = await window.medclaw.request("workspace.read", {}); if (!workspace.ok || !workspace.data.sessionId) throw Error("Missing selected Session");
@@ -217,7 +218,7 @@ test("a late directory read initializes the empty Session model without overwrit
   await page.getByRole("button", { name: "New Session", exact: true }).click();
   const current = await page.evaluate(() => window.medclaw.request("workspace.read", {}));
   if (!current.ok || !current.data.sessionId) throw new Error("session unavailable");
-  await expect(page.getByTestId("current-session")).toContainText(`New Session ${current.data.sessionId}`);
+  await expect(page.getByTestId("current-session")).toContainText(await sessionTitle(current.data.sessionId));
   await page.addInitScript(() => {
     const bridge = window.medclaw;
     let release!: () => void;
@@ -230,7 +231,7 @@ test("a late directory read initializes the empty Session model without overwrit
     } } });
   });
   await page.reload();
-  await expect(page.getByTestId("current-session")).toContainText(`New Session ${current.data.sessionId}`);
+  await expect(page.getByTestId("current-session")).toContainText(await sessionTitle(current.data.sessionId));
   await input().fill("draft typed before model directory");
   await page.evaluate(() => window.modelReadGate.release());
   const directory = await page.evaluate(() => window.medclaw.request("model.read", {}));

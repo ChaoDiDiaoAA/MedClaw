@@ -7,7 +7,7 @@ export function sessionDisplayTitle(session: Pick<SessionView, "id" | "title">):
 }
 
 export type SessionDraft = { text: string; referenceDate: string; timezone: string; model: ModelChoice | null; mode?: InputMode;
-  resendConfirmed?: boolean; pending: { operationRef: string; input: SubmitInput } | null };
+  resendConfirmed?: boolean; confirmedFailure?: boolean; pending: { operationRef: string; input: SubmitInput } | null };
 export function newSessionDraft(model: ModelChoice | null, dataDefaults?: { batchCount: number; referenceDate: string | null; timezone: string | null } | null): SessionDraft {
   return { text: "", referenceDate: dataDefaults && dataDefaults.batchCount > 0 ? dataDefaults.referenceDate ?? "" : new Date().toLocaleDateString("sv-SE"), timezone: dataDefaults && dataDefaults.batchCount > 0 ? dataDefaults.timezone ?? "" : (Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"), model, mode: "send", pending: null, resendConfirmed: false };
 }
@@ -20,7 +20,7 @@ export function selectSessionModelDraft(draft: SessionDraft | undefined, context
 export function acceptSubmissionDraft(draft: SessionDraft, original: NonNullable<SessionDraft["pending"]>): SessionDraft {
   if (draft.pending?.operationRef !== original.operationRef || draft.pending.input.sessionId !== original.input.sessionId
     || draft.pending.input.clientSequence !== original.input.clientSequence) return draft;
-  return { ...draft, pending: null, resendConfirmed: false, text: draft.text === original.input.text ? "" : draft.text };
+  return { ...draft, mode: 'send', pending: null, resendConfirmed: false, confirmedFailure: false, text: draft.text === original.input.text ? "" : draft.text };
 }
 export type SessionManagementEditor = { action: 'rename' | 'delete'; target: SessionView; title: string; visible: boolean; busy: boolean; unknown: boolean; error: string | null };
 export function SessionList(props: { sessions: SessionView[]; current: number | null; running: number | null; creating: boolean; canCreate: boolean; canRecoverCreate?: boolean; canSelect?: boolean;

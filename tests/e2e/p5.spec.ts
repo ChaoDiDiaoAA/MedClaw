@@ -28,12 +28,16 @@ async function entered(id: string) { await expect.poll(() => app.evaluate((_, id
 async function release(id: string) { await app.evaluate((_, id) => { (globalThis as MainGlobal).__p5Gate.pending[id]?.(); }, id); }
 async function calls() { return app.evaluate(() => (globalThis as MainGlobal).__p5Gate.calls); }
 async function accepted() { return app.evaluate(() => (globalThis as MainGlobal).__p5Gate.accepted); }
-async function create() { await page.getByRole('button', { name: 'New Session', exact: true }).click(); const w = await page.evaluate(() => window.medclaw.request('workspace.read', {})); if (!w.ok || !w.data.sessionId) throw new Error('Missing Session'); await expect(page.getByTestId('current-session')).toContainText(`New Session ${w.data.sessionId}`); return w.data.sessionId; }
-async function select(id: number) { await page.getByRole('button', { name: `New Session ${id}`, exact: true }).click(); await expect(page.getByTestId('current-session')).toContainText(`New Session ${id}`); }
+const row = (id: number) => page.locator(`.session-row[data-session-id="${id}"]`);
+async function title(id: number) { const result = await page.evaluate(sessionId => window.medclaw.request('session.read', { sessionId }), id); if (!result.ok || !result.data) throw new Error('Missing Session'); return result.data.session.title; }
+async function create() { const before = await page.evaluate(() => window.medclaw.request('workspace.read', {})); await page.getByRole('button', { name: 'New Session', exact: true }).click(); await expect.poll(async () => { const result = await page.evaluate(() => window.medclaw.request('workspace.read', {})); return result.ok ? result.data.sessionId : null; }).not.toBe(before.ok ? before.data.sessionId : null); const w = await page.evaluate(() => window.medclaw.request('workspace.read', {})); if (!w.ok || !w.data.sessionId) throw new Error('Missing Session'); await expect(page.getByTestId('current-session')).toContainText(await title(w.data.sessionId)); return w.data.sessionId; }
+async function select(id: number) { await row(id).locator('button[aria-pressed]').click(); await expect(page.getByTestId('current-session')).toContainText(await title(id)); }
 async function idle() { await expect.poll(async () => { const value = await page.evaluate(() => window.medclaw.request('run.control.read', {})); return value.ok && value.data.acceptingNewRuns && value.data.activeRootRun === null; }).toBe(true); }
 async function readInput(id: number) { const value = await page.evaluate(inputId => window.medclaw.request('session.readInput', { inputId }), id); if (!value.ok || !value.data) throw new Error('Missing original Input'); return value.data; }
 async function readRun(id: number) { const value = await page.evaluate(runId => window.medclaw.request('run.read', { runId }), id); if (!value.ok || value.data.kind !== 'one' || !value.data.run) throw new Error('Missing original Run'); return value.data.run; }
-async function clickSubmit(text: string, mode: 'send' | 'steer' | 'follow_up' = 'send') { const before = (await accepted()).length; await page.getByLabel('Input mode', { exact: true }).selectOption(mode); await input().fill(text); await page.getByRole('button', { name: mode === 'follow_up' ? 'Follow Up' : mode === 'steer' ? 'Steer' : 'Send', exact: true }).click(); await expect.poll(async () => (await accepted()).length).toBe(before + 1); return (await accepted())[before]!; }
+const modeName = (mode: 'send' | 'steer' | 'follow_up') => mode === 'follow_up' ? 'Follow Up' : mode === 'steer' ? 'Steer' : 'Send';
+async function chooseMode(mode: 'send' | 'steer' | 'follow_up') { await page.getByRole('button', { name: 'Message actions', exact: true }).click(); await page.getByRole('menuitem', { name: modeName(mode), exact: true }).click(); await expect(page.getByRole('menu', { name: 'Message actions', exact: true })).toHaveCount(0); }
+async function clickSubmit(text: string, mode: 'send' | 'steer' | 'follow_up' = 'send') { const before = (await accepted()).length; if (mode !== 'send') await chooseMode(mode); await input().fill(text); await page.getByRole('button', { name: modeName(mode), exact: true }).click(); await expect.poll(async () => (await accepted()).length).toBe(before + 1); return (await accepted())[before]!; }
 function sql(query: string) { return JSON.parse(execFileSync(bun, ['-e', 'import {Database} from "bun:sqlite"; const db=new Database(process.argv[1],{readonly:true}); console.log(JSON.stringify(db.query(process.argv[2]).all())); db.close();', join(temporary, 'data', 'data', 'app.sqlite'), query], { encoding: 'utf8', cwd: root })); }
 function save(name: string, data: unknown) { mkdirSync(evidence, { recursive: true }); writeFileSync(join(evidence, name + '.json'), JSON.stringify(data, null, 2)); }
 
@@ -89,12 +93,27 @@ test.afterEach(async ({}, info) => {
 });
 
 test('Send, Steer and Follow Up expose real Input identities and cancel only the original queued object', async () => {
-  const a = await create(); await expect(page.getByLabel('Input mode', { exact: true })).toHaveValue('send');
-  await expect(page.getByLabel('Input mode', { exact: true }).locator('option[value="steer"]')).toHaveAttribute('disabled', '');
+  const a = await create(); await expect(page.getByLabel('Input mode', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Message actions', exact: true })).toHaveCount(0);
+  await page.screenshot({ path: join(root, '.superpowers/input-menu-numbering/desktop-send-idle.png') });
   const first = gate(); steps = [async wire => { expect(JSON.stringify(wire)).toContain('P5-root'); first.enter(); await first.response; return 'P5 first turn'; }, wire => { expect(JSON.stringify(wire)).toContain('P5-correction'); expect(JSON.stringify(wire)).not.toContain('P5-cancel-me'); return 'P5 final'; }];
   const before = physical, rootInput = await clickSubmit('P5-root'); await first.entered; if (!rootInput.runId || !rootInput.inputId) throw new Error('Send must return both IDs');
   await expect(item(rootInput.inputId)).toContainText('Consumed'); await expect(item(rootInput.inputId)).toContainText('Pending');
-  const correction = await clickSubmit('P5-correction', 'steer'), cancelled = await clickSubmit('P5-cancel-me', 'follow_up');
+  const arrow = page.getByRole('button', { name: 'Message actions', exact: true }), menu = page.getByRole('menu', { name: 'Message actions', exact: true });
+  await expect(arrow).toBeVisible(); const beforeChoice = (await calls()).filter(call => call.method === 'session.submit').length;
+  await arrow.focus(); await arrow.press('ArrowDown'); await expect(menu.getByRole('menuitem', { name: 'Steer', exact: true })).toBeFocused();
+  await page.screenshot({ path: join(root, '.superpowers/input-menu-numbering/desktop-message-actions.png') });
+  await page.keyboard.press('ArrowDown'); await expect(menu.getByRole('menuitem', { name: 'Follow Up', exact: true })).toBeFocused(); await page.keyboard.press('Enter');
+  await expect(menu).toHaveCount(0); await expect(page.getByRole('button', { name: 'Follow Up', exact: true })).toBeVisible();
+  expect((await calls()).filter(call => call.method === 'session.submit')).toHaveLength(beforeChoice); expect(physical).toBe(before + 1);
+  await arrow.click(); await page.keyboard.press('Escape'); await expect(menu).toHaveCount(0); await expect(arrow).toBeFocused();
+  await arrow.click(); await page.keyboard.press('Tab'); await expect(menu).toHaveCount(0);
+  await arrow.click(); await input().click(); await expect(menu).toHaveCount(0);
+  await chooseMode('steer'); await input().fill('P5-correction'); await input().press('Shift+Enter'); await expect(input()).toHaveValue('P5-correction\n');
+  expect((await calls()).filter(call => call.method === 'session.submit')).toHaveLength(beforeChoice);
+  await input().fill('P5-correction'); await input().press('Enter'); await expect.poll(async () => (await accepted()).length).toBe(2);
+  const correction = (await accepted())[1]!; await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible();
+  const cancelled = await clickSubmit('P5-cancel-me', 'follow_up');
   expect(correction.runId).toBeNull(); expect(cancelled.runId).toBeNull(); if (!correction.inputId || !cancelled.inputId) throw new Error('Queued inputs need IDs');
   await expect(item(cancelled.inputId)).toContainText('Queued'); await item(cancelled.inputId).getByRole('button', { name: 'Cancel input', exact: true }).click();
   await expect(item(cancelled.inputId)).toContainText('Cancelling'); first.release(); await idle();
@@ -103,6 +122,7 @@ test('Send, Steer and Follow Up expose real Input identities and cancel only the
   expect(facts[1]!.runId).toBe(rootInput.runId); expect(facts[2]!.runId).toBeNull(); expect(facts[2]!.nativeEntryId).toBeNull(); expect(physical - before).toBe(2);
   expect((await calls()).some(call => call.method === 'run.read' && call.payload.runId === null)).toBe(false);
   const run = await readRun(rootInput.runId); expect(run.inputId).toBe(rootInput.inputId); expect(run.cleanup?.inputsSettled).toBe(true);
+  await expect(arrow).toHaveCount(0);
   save('three-modes', { sessionId: a, rootInput, correction, cancelled, facts, runId: run.id, physicalCalls: physical - before, sql: sql(`SELECT id,session_id,target_run_id,run_id,status,processing_status,native_entry_id FROM session_inputs WHERE session_id=${a} ORDER BY client_sequence`) });
 });
 
@@ -112,10 +132,13 @@ test('an executed queued reply lost in IPC is read back under A while B and newe
   await rules([{ method: 'session.submit', sessionId: a, project: { ok: false, error: safeError('operation_result_unknown') } }]);
   const lost = await clickSubmit('P5-lost-follow-up', 'follow_up'); if (!lost.inputId) throw new Error('Missing queued ID');
   await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Message actions', exact: true })).toBeDisabled(); await expect(page.getByRole('button', { name: 'Follow Up', exact: true })).toBeDisabled();
+  const originalCall = (await calls()).filter(call => call.method === 'session.submit' && call.payload.sessionId === a && call.payload.clientSequence === lost.clientSequence)[0]!;
+  expect(originalCall.payload).toMatchObject({ mode: 'follow_up', targetRunId: rootInput.runId, text: 'P5-lost-follow-up' }); expect(originalCall.operationRef).toBe(lost.operationRef);
   await input().fill('P5-A-newer-draft'); await rules([{ method: 'session.readSubmission', sessionId: a, hold: 'lost-query' }]);
   await page.getByRole('button', { name: 'Read original submission', exact: true }).click(); await entered('lost-query'); await select(b); await input().fill('P5-B-draft'); const before = physical;
   await release('lost-query'); await expect.poll(async () => (await calls()).some(call => call.method === 'session.readInput' && call.payload.inputId === lost.inputId)).toBe(true);
-  await expect(input()).toHaveValue('P5-B-draft'); await expect(page.getByTestId('current-session')).toContainText(`New Session ${b}`); await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
+  await expect(input()).toHaveValue('P5-B-draft'); await expect(page.getByTestId('current-session')).toContainText(await title(b)); await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled(); await expect(page.getByRole('button', { name: 'Message actions', exact: true })).toHaveCount(0);
   await select(a); await expect(input()).toHaveValue('P5-A-newer-draft'); await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toHaveCount(0);
   expect(physical).toBe(before); expect((await calls()).filter(call => call.method === 'session.submit' && call.payload.clientSequence === lost.clientSequence && call.payload.sessionId === a)).toHaveLength(1);
   first.release(); await idle(); expect((await readInput(lost.inputId)).processingStatus).toBe('completed'); save('lost-response', { a, b, rootInput, lost, physicalCalls: physical - before, calls: await calls() });
@@ -134,16 +157,23 @@ test('read failures preserve proven Input states and late queued responses canno
 test('frozen model and time changes close queue controls and a Host rejection keeps the edited draft', async () => {
   const a = await create(), first = gate(); steps = [async () => { first.enter(); await first.response; return 'P5 frozen first'; }, () => 'P5 frozen final'];
   const original = await clickSubmit('P5-frozen-root'); await first.entered; if (!original.runId) throw new Error('Missing root Run'); const rootRun = await readRun(original.runId);
-  await expect(page.getByLabel('Input mode').locator('option[value="steer"]')).not.toHaveAttribute('disabled', ''); await page.getByLabel('Input mode').selectOption('steer'); await input().fill('P5-preserve-on-rejection');
+  await chooseMode('steer'); await input().fill('P5-preserve-on-rejection');
   await page.locator('.reference-fields summary').click(); await page.getByLabel('Reference date', { exact: true }).fill('2026-01-01');
   await expect(page.getByRole('button', { name: 'Steer', exact: true })).toBeDisabled(); await expect(page.locator('.composer-reason')).toContainText('Restore the original Run reference date');
   await page.getByLabel('Reference date', { exact: true }).fill(rootRun.referenceDate); await page.getByLabel('Session model', { exact: true }).selectOption(JSON.stringify(['p5-fixture', 'second']));
   await expect(page.getByRole('button', { name: 'Steer', exact: true })).toBeDisabled(); await expect(page.locator('.composer-reason')).toContainText('Restore its model');
+  await page.getByRole('button', { name: 'Message actions', exact: true }).click(); await expect(page.getByRole('menuitem', { name: 'Steer', exact: true })).toBeDisabled(); await expect(page.getByRole('menuitem', { name: 'Steer', exact: true })).toHaveAttribute('title', /Restore its model/); await page.keyboard.press('Escape'); await expect(page.getByRole('button', { name: 'Message actions', exact: true })).toBeFocused();
   await page.getByLabel('Session model', { exact: true }).selectOption(JSON.stringify(['p5-fixture', 'first'])); await expect(page.getByRole('button', { name: 'Steer', exact: true })).toBeEnabled();
   await rules([{ method: 'session.submit', sessionId: a, requestPatch: { expectedRevision: 999999 } }]); await page.getByRole('button', { name: 'Steer', exact: true }).click();
-  await expect(page.locator('.error-banner')).toBeVisible(); await expect(input()).toHaveValue('P5-preserve-on-rejection'); await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toHaveCount(0);
+  await expect(page.locator('.error-banner')).toBeVisible(); await expect(input()).toHaveValue('P5-preserve-on-rejection'); await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Steer', exact: true })).toBeDisabled(); await expect(page.getByRole('button', { name: 'Message actions', exact: true })).toBeDisabled();
+  const rejected = (await calls()).filter(call => call.method === 'session.submit' && call.payload.text === 'P5-preserve-on-rejection').at(-1)!;
+  await input().fill('P5-frozen-correction'); const count = (await calls()).filter(call => call.method === 'session.submit').length;
+  await page.getByRole('button', { name: 'Start a new attempt', exact: true }).click(); await expect(input()).toHaveValue('P5-frozen-correction'); await expect(page.getByRole('button', { name: 'Steer', exact: true })).toBeEnabled();
+  expect((await calls()).filter(call => call.method === 'session.submit')).toHaveLength(count); await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toHaveCount(0);
   const queued = await clickSubmit('P5-frozen-correction', 'steer'); const call = (await calls()).filter(call => call.method === 'session.submit' && call.payload.clientSequence === queued.clientSequence && call.payload.text === 'P5-frozen-correction').at(-1)!;
   expect(call.payload).toMatchObject({ targetRunId: original.runId, model: { provider: rootRun.model.provider, modelId: rootRun.model.modelId, expectedConfigVersion: rootRun.model.configVersion }, referenceDate: rootRun.referenceDate, timezone: rootRun.timezone });
+  expect(call.operationRef).not.toBe(rejected.operationRef);
   first.release(); await idle(); save('frozen-context-and-draft', { a, original, queued, frozenConfigVersion: rootRun.model.configVersion, call });
 });
 
@@ -174,18 +204,95 @@ test('accepted inputs reported failed or delivery unknown keep original drafts a
   const a = await create(), first = gate(); steps = [async () => { first.enter(); await first.response; return 'P5 outcome root'; }, () => 'P5 outcome final'];
   await clickSubmit('P5-outcome-root'); await first.entered;
   for (const [outcome, text] of [['failed', 'P5-keep-failed-draft'], ['delivery_unknown', 'P5-keep-unknown-draft']] as const) {
-    await page.getByLabel('Input mode').selectOption('follow_up'); await input().fill(text); const before = (await accepted()).length;
+    await chooseMode('follow_up'); await input().fill(text); const before = (await accepted()).length;
     await rules([{ method: 'session.submit', sessionId: a, hold: 'accepted-' + outcome }]); await page.getByRole('button', { name: 'Follow Up', exact: true }).click(); await entered('accepted-' + outcome);
     const original = (await accepted())[before]!; if (!original.inputId) throw new Error('Missing actual accepted Input'); const actual = await readInput(original.inputId);
     const projected: SessionInput = { ...actual, status: outcome, processingStatus: outcome === 'failed' ? 'failed' : 'pending', processedAt: outcome === 'failed' ? new Date().toISOString() : null, runId: null, nativeEntryId: null, error: safeError(outcome === 'failed' ? 'input_hook_handled' : 'input_delivery_unknown') };
     await rules([{ method: 'session.readInput', inputId: original.inputId, project: { ok: true, data: projected } }]); await release('accepted-' + outcome);
     await expect(input()).toHaveValue(text); await expect(page.getByRole('button', { name: 'Follow Up', exact: true })).toHaveCount(1);
-    if (outcome === 'failed') { await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toHaveCount(0); await expect(page.locator('.error-banner')).toContainText('input'); }
-    else { await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toBeVisible(); await expect(page.getByRole('button', { name: 'Resend original submission', exact: true })).toBeDisabled(); await expect(page.getByRole('button', { name: 'Follow Up', exact: true })).toBeDisabled(); }
+    await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toBeVisible(); await expect(page.getByRole('button', { name: 'Follow Up', exact: true })).toBeDisabled();
+    if (outcome === 'failed') { await expect(page.getByRole('button', { name: 'Start a new attempt', exact: true })).toBeVisible(); await expect(page.locator('.error-banner')).toContainText('input'); }
+    else { await expect(page.getByRole('button', { name: 'Start a new attempt', exact: true })).toHaveCount(0); await expect(page.getByRole('button', { name: 'Resend original submission', exact: true })).toBeDisabled(); }
     expect((await calls()).filter(call => call.method === 'session.submit' && call.payload.sessionId === a && call.payload.clientSequence === original.clientSequence)).toHaveLength(1);
     save('accepted-' + outcome, { actualHostAcceptance: original, projectedReadPresentationOnly: projected, draftPreserved: text, submits: 1 });
+    if (outcome === 'failed') { const count = (await calls()).filter(call => call.method === 'session.submit').length; await page.getByRole('button', { name: 'Start a new attempt', exact: true }).click(); await expect(input()).toHaveValue(text); expect((await calls()).filter(call => call.method === 'session.submit')).toHaveLength(count); }
   }
   await page.getByRole('button', { name: 'Stop generating', exact: true }).click(); first.release(); await idle();
+});
+
+test('an accepted input with an unavailable confirmation read retains its frozen mode until original lookup succeeds', async () => {
+  const a = await create(), first = gate(); steps = [async () => { first.enter(); await first.response; return 'Read failure root'; }, () => 'Original confirmed follow up'];
+  const rootInput = await clickSubmit('P5-confirm-read-root'); await first.entered; await chooseMode('follow_up'); await input().fill('Preserve this unconfirmed follow up');
+  const before = (await accepted()).length, physicalBefore = physical;
+  await rules([{ method: 'session.submit', sessionId: a, hold: 'confirmation-read-failure' }]); await page.getByRole('button', { name: 'Follow Up', exact: true }).click(); await entered('confirmation-read-failure');
+  const original = (await accepted())[before]!; if (!original.inputId) throw new Error('Missing actual accepted Input');
+  await rules([{ method: 'session.readInput', inputId: original.inputId, project: { ok: false, error: safeError('storage_read_failed') } }]); await release('confirmation-read-failure');
+  await expect(page.locator('.error-banner')).toContainText('The original Input is unavailable'); await expect(input()).toHaveValue('Preserve this unconfirmed follow up');
+  await expect(page.getByRole('button', { name: 'Start a new attempt', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toBeEnabled(); await expect(page.getByRole('button', { name: 'Follow Up', exact: true })).toBeDisabled(); await expect(page.getByRole('button', { name: 'Message actions', exact: true })).toBeDisabled();
+  const originalCall = (await calls()).filter(call => call.method === 'session.submit' && call.payload.sessionId === a && call.payload.clientSequence === original.clientSequence)[0]!;
+  expect(originalCall).toMatchObject({ operationRef: original.operationRef, payload: { sessionId: a, clientSequence: original.clientSequence, mode: 'follow_up', targetRunId: rootInput.runId, text: 'Preserve this unconfirmed follow up' } });
+  const prior = (await calls()).length; await page.getByRole('button', { name: 'Read original submission', exact: true }).click(); await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible(); await expect(input()).toHaveValue('');
+  expect((await calls()).slice(prior).filter(call => call.method === 'session.readSubmission')).toHaveLength(1);
+  expect((await calls()).slice(prior).find(call => call.method === 'session.readSubmission')?.payload).toEqual({ sessionId: a, clientSequence: original.clientSequence });
+  expect((await calls()).filter(call => call.method === 'session.submit' && call.operationRef === original.operationRef)).toHaveLength(1); expect(physical).toBe(physicalBefore); const physicalAfterRead = physical;
+  const verified = await readInput(original.inputId); expect(verified.mode).toBe('follow_up'); expect(verified.targetRunId).toBe(rootInput.runId); expect(verified.status).toBe('queued');
+  first.release(); await idle(); expect((await readInput(original.inputId)).processingStatus).toBe('completed');
+  save('accepted-confirmation-read-error', { a, rootInput, original, originalCall, verified, calls: (await calls()).slice(prior), physicalReadDelta: physicalAfterRead - physicalBefore, physicalAfterOriginalCompletion: physical });
+});
+
+test('a late null lookup cannot authorize replay of a different new pending attempt', async () => {
+  const a = await create(), b = await create(); await select(a); const first = gate();
+  steps = [async () => { first.enter(); await first.response; return 'Original race root'; }, () => 'Actual replacement input'];
+  await clickSubmit('P5-old-lookup-root'); await first.entered; await chooseMode('follow_up'); await input().fill('Original rejected follow up');
+  await rules([{ method: 'session.submit', sessionId: a, requestPatch: { expectedRevision: 999999 } }]); await page.getByRole('button', { name: 'Follow Up', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Start a new attempt', exact: true })).toBeVisible();
+  const rejected = (await calls()).filter(call => call.method === 'session.submit' && call.payload.text === 'Original rejected follow up').at(-1)!;
+  await rules([{ method: 'session.readSubmission', sessionId: a, hold: 'old-null-lookup' }]); await page.getByRole('button', { name: 'Read original submission', exact: true }).click(); await entered('old-null-lookup');
+  await select(b); await input().fill('B independent race draft'); await expect(page.getByRole('button', { name: 'Start a new attempt', exact: true })).toHaveCount(0); await select(a);
+  await page.getByRole('button', { name: 'Start a new attempt', exact: true }).click(); await input().fill('Replacement unconfirmed follow up');
+  await rules([{ method: 'session.submit', sessionId: a, project: { ok: false, error: safeError('operation_result_unknown') } }]); const replacement = await clickSubmit('Replacement unconfirmed follow up', 'follow_up');
+  expect(replacement.operationRef).not.toBe(rejected.operationRef); expect(replacement.clientSequence).toBe(rejected.payload.clientSequence);
+  await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toBeVisible(); await expect(page.getByRole('button', { name: 'Start a new attempt', exact: true })).toHaveCount(0);
+  await release('old-null-lookup'); await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(page.getByRole('button', { name: 'Resend original submission', exact: true })).toBeDisabled(); await expect(input()).toHaveValue('Replacement unconfirmed follow up');
+  await expect(page.getByRole('button', { name: 'Follow Up', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Read original submission', exact: true }).click(); await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toHaveCount(0); await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible();
+  expect((await calls()).filter(call => call.method === 'session.submit' && call.operationRef === replacement.operationRef)).toHaveLength(1);
+  first.release(); await idle(); await select(b); await expect(input()).toHaveValue('B independent race draft');
+  save('new-attempt-late-null-lookup', { a, b, rejected, replacement, calls: await calls() });
+});
+
+test('a confirmed identity conflict cannot treat another operation at the same sequence as its own successful input', async () => {
+  const a = await create(), first = gate(); steps = [async () => { first.enter(); await first.response; return 'Conflict owner root'; }, () => 'Actual other operation'];
+  const rootInput = await clickSubmit('P5-conflict-root'); await first.entered; await chooseMode('follow_up'); await input().fill('Same sequence and mode with another identity');
+  await rules([{ method: 'session.submit', sessionId: a, hold: 'conflict-before-host', before: true }]); await page.getByRole('button', { name: 'Follow Up', exact: true }).click(); await entered('conflict-before-host');
+  const rejected = (await calls()).filter(call => call.method === 'session.submit' && call.payload.text === 'Same sequence and mode with another identity').at(-1)!;
+  const acceptedOther = await page.evaluate(async original => window.medclaw.request('session.submit', original.payload as unknown as import('../../packages/contracts/src/session').SubmitInput, crypto.randomUUID()), rejected);
+  expect(acceptedOther.ok).toBe(true); if (!acceptedOther.ok || !acceptedOther.data.inputId) throw new Error('Missing real conflicting Input');
+  await release('conflict-before-host'); await expect(page.getByRole('button', { name: 'Start a new attempt', exact: true })).toBeVisible(); await expect(page.getByRole('button', { name: 'Follow Up', exact: true })).toBeDisabled();
+  const other = await readInput(acceptedOther.data.inputId); expect(other.clientSequence).toBe(rejected.payload.clientSequence); expect(other.mode).toBe('follow_up'); expect(other.status).toBe('queued'); expect(other.targetRunId).toBe(rootInput.runId);
+  const before = (await calls()).filter(call => call.method === 'session.submit').length; await page.getByRole('button', { name: 'Read original submission', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Start a new attempt', exact: true })).toBeVisible(); await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toBeVisible(); await expect(input()).toHaveValue('Same sequence and mode with another identity');
+  await expect(page.getByRole('button', { name: 'Follow Up', exact: true })).toBeDisabled(); expect((await calls()).filter(call => call.method === 'session.submit')).toHaveLength(before);
+  await page.getByRole('button', { name: 'Start a new attempt', exact: true }).click(); await expect(input()).toHaveValue('Same sequence and mode with another identity'); expect((await calls()).filter(call => call.method === 'session.submit')).toHaveLength(before);
+  first.release(); await idle(); save('failure-same-sequence-foreign-operation', { a, rootInput, rejected, acceptedOther, other, calls: await calls() });
+});
+
+test('a retry that becomes unknown revokes a prior confirmed failure and resends only its frozen original request', async () => {
+  const a = await create(), first = gate(); steps = [async () => { first.enter(); await first.response; return 'Retry root only'; }];
+  await clickSubmit('P5-retry-failure-root'); await first.entered; await chooseMode('follow_up'); await input().fill('Frozen rejected request');
+  await rules([{ method: 'session.submit', sessionId: a, requestPatch: { expectedRevision: 999999 } }]); await page.getByRole('button', { name: 'Follow Up', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Start a new attempt', exact: true })).toBeVisible();
+  const original = (await calls()).filter(call => call.method === 'session.submit' && call.payload.text === 'Frozen rejected request').at(-1)!;
+  await input().fill('Edited text belongs to a future attempt'); await page.getByRole('button', { name: 'Read original submission', exact: true }).click(); await expect(page.getByRole('button', { name: 'Resend original submission', exact: true })).toBeEnabled();
+  await rules([{ method: 'session.submit', sessionId: a, requestPatch: { expectedRevision: 999999 }, project: { ok: false, error: safeError('operation_result_unknown') }, hold: 'retry-becomes-unknown' }]);
+  await page.getByRole('button', { name: 'Resend original submission', exact: true }).click(); await entered('retry-becomes-unknown'); await expect(page.getByRole('button', { name: 'Start a new attempt', exact: true })).toHaveCount(0);
+  await release('retry-becomes-unknown'); await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toBeEnabled(); await expect(page.getByRole('button', { name: 'Start a new attempt', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Resend original submission', exact: true })).toBeDisabled(); await expect(input()).toHaveValue('Edited text belongs to a future attempt'); await expect(page.getByRole('button', { name: 'Follow Up', exact: true })).toBeDisabled();
+  const submits = (await calls()).filter(call => call.method === 'session.submit' && call.operationRef === original.operationRef); expect(submits).toHaveLength(2); expect(submits[1]!.payload).toEqual(original.payload);
+  await page.getByRole('button', { name: 'Stop generating', exact: true }).click(); first.release(); await idle(); save('retry-failure-becomes-unknown', { a, original, submits, calls: await calls() });
 });
 
 test('terminal unknown Input history remains readable without permanent automatic per-input polling', async () => {
@@ -219,4 +326,26 @@ test('legacy acceptance reads only its Run and an old Host input reply is ignore
   await release('old-host-list'); await expect(queue()).not.toContainText('Delivery unknown'); await expect(item(original.inputId)).toContainText('Completed');
   expect((await calls()).some(call => call.method === 'session.readInput' && call.payload.inputId === null || call.method === 'run.read' && call.payload.runId === null)).toBe(false);
   save('old-instance', { a, original, oldInstanceId: old.data.instanceId, newInstanceId: restarted.data.instanceId, beforePhysical: physical, afterPhysical: physical });
+});
+
+test('message action menus close on Session, original Run and Host changes without submitting a draft', async () => {
+  const a = await create(), b = await create(); await select(a); const first = gate();
+  steps = [async () => { first.enter(); await first.response; return 'Original Run finishes without correction'; }];
+  const original = await clickSubmit('P5-menu-boundary-root'); await first.entered; await chooseMode('steer'); await input().fill('Still an unsent correction');
+  const arrow = page.getByRole('button', { name: 'Message actions', exact: true }), menu = page.getByRole('menu', { name: 'Message actions', exact: true });
+  const before = (await calls()).filter(call => call.method === 'session.submit').length;
+  await arrow.click(); await expect(menu).toBeVisible(); await select(b); await expect(menu).toHaveCount(0); await expect(arrow).toHaveCount(0);
+  await select(a); await expect(input()).toHaveValue('Still an unsent correction'); await expect(page.getByRole('button', { name: 'Steer', exact: true })).toBeVisible();
+  await arrow.click(); await expect(menu).toBeVisible(); first.release(); await idle(); await expect(menu).toHaveCount(0); await expect(arrow).toHaveCount(0); await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible();
+  expect((await calls()).filter(call => call.method === 'session.submit')).toHaveLength(before);
+
+  const second = gate(); steps = [async () => { second.enter(); await second.response; return 'Restarted original Run'; }];
+  const next = await clickSubmit('P5-menu-host-boundary'); await second.entered; await chooseMode('follow_up'); await input().fill('Unsent follow up across Host'); await arrow.click(); await expect(menu).toBeVisible();
+  const host = await page.evaluate(() => window.medclaw.request('host.read', {})); if (!host.ok || !host.data.instanceId) throw new Error('Missing Host');
+  const restart = page.evaluate(expectedInstanceId => window.medclaw.request('host.restart', { expectedInstanceId }), host.data.instanceId);
+  await expect(menu).toHaveCount(0); second.release(); const restarted = await restart; expect(restarted.ok).toBe(true);
+  await expect.poll(async () => { const result = await page.evaluate(() => window.medclaw.request('host.read', {})); return result.ok && result.data.state === 'ready' && result.data.instanceId !== host.data.instanceId; }).toBe(true);
+  await expect(arrow).toHaveCount(0); await expect(input()).toHaveValue('Unsent follow up across Host');
+  expect((await calls()).filter(call => call.method === 'session.submit' && call.payload.sessionId === a)).toHaveLength(2);
+  save('menu-target-boundaries', { a, b, original, next, oldInstance: host.data.instanceId, restarted, calls: (await calls()).filter(call => call.method === 'session.submit' && call.payload.sessionId === a) });
 });

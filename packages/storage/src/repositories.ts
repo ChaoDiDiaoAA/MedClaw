@@ -676,12 +676,21 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const sessionId = (this.db.query<{ n: number | null }, []>("SELECT MAX(id) AS n FROM sessions").get()?.n ?? 0) + 1;
       checked(PositiveIdSchema, sessionId);
       if (workspace.revision === Number.MAX_SAFE_INTEGER) fail('state_conflict');
+      const occupiedNumbers = new Set<number>();
+      const activeTitles = this.db.query<{id:number;title:string;metadata_json:string},[]>(
+        "SELECT id,title,metadata_json FROM sessions WHERE kind='user' AND status='active'").all();
+      for (const row of activeTitles) {
+        const match = /^New Session ([1-9]\d*)$/.exec(this.sessionTitle(row));
+        if (match && Number.isSafeInteger(Number(match[1]))) occupiedNumbers.add(Number(match[1]));
+      }
+      let displayNumber = 1;
+      while (occupiedNumbers.has(displayNumber)) displayNumber++;
       const next = this.sessionWorkspace(workspace,sessionId);
-      const result = checked(NewSessionResultSchema, { session: { id: sessionId, title: `New Session ${sessionId}`, nativeSessionId,
+      const result = checked(NewSessionResultSchema, { session: { id: sessionId, title: `New Session ${displayNumber}`, nativeSessionId,
         kind: "user", status: "active", metadataRevision:0, deletedAt:null, inputControl: null, storageVersion: 0, leafId: null, nextSubmissionSequence: 1 },
         workspace: { ...next, revision: workspace.revision + 1 } });
-      this.db.query(`INSERT INTO sessions(id,native_session_id,creation_operation_ref,creation_request_json,creation_result_json,title,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?)`).run(sessionId, nativeSessionId, operationRef, canonicalRequest(request), JSON.stringify(result), result.session.title, time, time);
+      this.db.query(`INSERT INTO sessions(id,native_session_id,creation_operation_ref,creation_request_json,creation_result_json,title,metadata_json,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?)`).run(sessionId, nativeSessionId, operationRef, canonicalRequest(request), JSON.stringify(result), result.session.title, '{"titleOrigin":"default"}', time, time);
       this.saveWorkspace(workspace,next,time);
       this.beforeCommit?.();
       return result;

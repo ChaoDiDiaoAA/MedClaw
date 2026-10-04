@@ -120,6 +120,7 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
   run: RunView | null; preview: { text: string; truncated: boolean } | null; session: SessionDetail | null; draft: SessionDraft | null;
   events: RunEventProjectionState | null; onFinalSource: (source: 'native' | 'saved' | 'unavailable') => void;
   selecting: boolean; sending: boolean; runningTitle: string | null; onDraft: (patch: Partial<SessionDraft>) => void; onSend: () => void; onResend: () => void;
+  onNewAttempt: (pending: NonNullable<SessionDraft['pending']>) => void;
   onLookup: () => void; onStop: () => void; onModels: () => void; workspace: WorkspaceView | null; workspaceConfirmed: boolean; workspacePending?: boolean; workspaceRecovery?: 'verify' | 'restart' | null; onVerifyWorkspace?: () => void; onWorkspace: (change: WorkspaceChange) => Promise<boolean>;
   dataDefaults: { batchCount: number; referenceDate: string | null; timezone: string | null } | null;
   queueRun: RunView | null; queueRootInput: SessionInput | null; frozenInput?: SessionInput | null; frozenRunId?: number; inputs: InputQueueSnapshot | null; cancellingInputs: number[];
@@ -157,14 +158,35 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
     : !props.workspace || props.workspace.sessionId !== props.sessionId || props.workspace.batchRefs.some(batch => !original.batchRefs.some(known => known.id === batch.id))
       || original.deviceIds.length > 0 && (!props.workspace.deviceIds.length || props.workspace.deviceIds.some(id => !original.deviceIds.includes(id))) ? 'The selected data exceeds the original Run scope. Wait and Send a new message.'
     : props.inputs?.items.some(input => input.targetRunId === queueRun.id && input.status === 'delivery_unknown') ? 'Input consumption is unconfirmed. Read the original Input or Stop its original Run.' : null;
-  const reason = props.host.state !== "ready" ? "Waiting for Host to be ready" : props.selecting ? "Session selection is unconfirmed" : !props.session ? "Create or select a session"
+  const commonReason = props.host.state !== "ready" ? "Waiting for Host to be ready" : props.selecting ? "Session selection is unconfirmed" : !props.session ? "Create or select a session"
     : !props.session.history.available ? "This session cannot continue after a restart. Create a new session." : draft?.pending ? "Read the original submission first"
     : currentAvailability?.available === false ? currentAvailability.unavailable ? 'Native message history is unavailable. Refresh messages or create a new session.' : 'Native message history read failed. Refresh messages before sending.'
-    : !draft?.referenceDate ? "Enter a reference date in Message time context" : !draft.timezone.trim() ? "Enter a time zone in Message time context"
-    : mode !== 'send' ? queueReason
-    : !props.directoryCurrent ? "Reload the model directory in Models" : !choice ? "Select a session model" : !model || !model.input.includes("text") ? "The session model is unavailable. Select another model."
+    : !draft?.referenceDate ? "Enter a reference date in Message time context" : !draft.timezone.trim() ? "Enter a time zone in Message time context" : null;
+  const sendReason = !props.directoryCurrent ? "Reload the model directory in Models" : !choice ? "Select a session model" : !model || !model.input.includes("text") ? "The session model is unavailable. Select another model."
     : !model.maxTokens ? "Confirm the model output limit" : provider?.auth.state !== "available" ? "Authenticate the provider first" : !props.control ? "Run availability is unconfirmed"
     : !props.control.acceptingNewRuns ? (props.control.blockReasons[0] ? errorMessage(props.control.blockReasons[0]) : "Wait for the original run to stop and be saved") : null;
+  const reason = commonReason ?? (mode === 'send' ? sendReason : queueReason);
+  const showActions = !!inputControl && props.active?.kind === 'agent' && props.active.sessionId === props.sessionId && props.active.runId === inputControl.runId;
+  const menuBlocked = !draft || props.selecting || props.sending || !!draft.pending || props.host.state !== 'ready';
+  const actionKey = JSON.stringify([props.host.instanceId, props.host.state, props.sessionId, inputControl?.runId, props.active?.runId, props.visible]);
+  const [actionMenu, setActionMenu] = useState<string | null>(null), actionGroup = useRef<HTMLDivElement>(null), actionTrigger = useRef<HTMLButtonElement>(null);
+  const menuEdge = useRef<'first' | 'last'>('first'), menuOpen = actionMenu === actionKey && showActions && !menuBlocked;
+  useEffect(() => { setActionMenu(null); }, [actionKey, menuBlocked]);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const items = actionGroup.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)');
+    if (items?.length) items[menuEdge.current === 'last' ? items.length - 1 : 0]?.focus();
+    else actionGroup.current?.querySelector<HTMLElement>('[role="menu"]')?.focus();
+    const outside = (event: PointerEvent) => { if (!actionGroup.current?.contains(event.target as Node)) setActionMenu(null); };
+    document.addEventListener('pointerdown', outside);
+    return () => document.removeEventListener('pointerdown', outside);
+  }, [menuOpen]);
+  const closeActions = () => { setActionMenu(null); actionTrigger.current?.focus(); };
+  const openActions = (edge: 'first' | 'last') => { if (!showActions || menuBlocked) return; menuEdge.current = edge; setActionMenu(actionKey); };
+  function chooseAction(next: InputMode) {
+    if (!menuOpen || menuBlocked || commonReason || (next === 'send' ? sendReason : queueReason)) return;
+    props.onDraft({ mode: next }); closeActions();
+  }
   const status = props.active && props.active.runId === run?.id && props.active.stopPending ? "Stopping; waiting for confirmation"
     : props.active && props.active.runId === run?.id && props.active.persistencePending ? "Waiting to save"
     : run?.status === "completed" ? "Saved" : run?.status === "cancelled" ? "Cancelled and saved"
@@ -263,17 +285,32 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
         {!selectedModel && <span className="tiny" data-testid="session-model">{choice ? "The selected model is unavailable. Select a configured model." : "No session model selected"}</span>}
       </div><button className="quiet" onClick={props.onModels}>Manage models</button></div>
       {props.active && <p className="tiny muted">Model changes apply to the next message. The current run uses its frozen configuration.</p>}
-      <label className="input-mode">Input mode<select aria-label="Input mode" value={mode} disabled={!draft || props.selecting || props.sending || !!draft.pending} onChange={event => props.onDraft({ mode: event.target.value as InputMode })}>
-        <option value="send">Send</option><option value="steer" disabled={!!queueReason}>Steer</option><option value="follow_up" disabled={!!queueReason}>Follow Up</option>
-      </select></label>
       {mode !== 'send' && queueRun && <p className="tiny muted">Queueing for original Run {queueRun.id} · {queueRun.model.provider} / {queueRun.model.modelId} · {queueRun.referenceDate} · {queueRun.timezone}</p>}
       <label className="sr-only" htmlFor="message-text">Message text</label><textarea id="message-text" ref={input} value={draft?.text ?? ""} disabled={!draft} placeholder="Type a message…" onChange={event => props.onDraft({ text: event.target.value })} onKeyDown={event => {
         if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); if (!reason && !props.sending && draft?.text.trim()) props.onSend(); }
       }} />
       <div className="composer-bottom"><span className="tiny muted">Shift+Enter for a new line</span><div className="actions">
-        {draft?.pending && <><button disabled={props.sending} onClick={props.onLookup}>Read original submission</button><button disabled={props.sending || !draft.resendConfirmed || !props.workspaceConfirmed || props.selecting || (draft.pending.input.mode === 'send' ? !props.control?.acceptingNewRuns : !inputControl?.acceptingInputs || inputControl.runId !== draft.pending.input.targetRunId)} onClick={props.onResend}>Resend original submission</button></>}
+        {draft?.pending && <><button disabled={props.sending} onClick={props.onLookup}>Read original submission</button><button disabled={props.sending || !draft.resendConfirmed || !props.workspaceConfirmed || props.selecting || (draft.pending.input.mode === 'send' ? !props.control?.acceptingNewRuns : !inputControl?.acceptingInputs || inputControl.runId !== draft.pending.input.targetRunId)} onClick={props.onResend}>Resend original submission</button>{draft.confirmedFailure && <button disabled={props.sending || props.selecting || props.host.state !== 'ready' || !props.workspaceConfirmed} onClick={() => props.onNewAttempt(draft.pending!)}>Start a new attempt</button>}</>}
         {props.active && <><button className="danger" disabled={props.host.state !== "ready"} onClick={props.onStop}>Stop generating</button><span className="tiny" data-testid="stop-target">Stops {props.active.sessionId ? `Session ${props.active.sessionId}` : 'Provider'} · Run {props.active.runId}</span></>}
-        <button className="primary" disabled={!!reason || props.sending || !draft?.text.trim()} title={reason ?? undefined} onClick={props.onSend}>{props.sending ? "Submitting…" : label}</button>
+        <div className="message-actions" ref={actionGroup}>
+          <button className="primary" disabled={!!reason || props.sending || !draft?.text.trim()} title={reason ?? undefined} onClick={props.onSend}>{props.sending ? "Submitting…" : label}</button>
+          {showActions && <button ref={actionTrigger} className="primary message-action-trigger" aria-label="Message actions" aria-haspopup="menu" aria-expanded={menuOpen} disabled={menuBlocked} onClick={() => menuOpen ? closeActions() : openActions('first')} onKeyDown={event => {
+            if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); openActions(event.key === 'ArrowUp' ? 'last' : 'first'); }
+          }}><span aria-hidden="true">▾</span></button>}
+          {menuOpen && <div role="menu" tabIndex={-1} aria-label="Message actions" className="message-action-menu" onKeyDown={event => {
+            if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeActions(); }
+            else if (event.key === 'Tab') setActionMenu(null);
+            else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+              event.preventDefault(); const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)'));
+              if (!items.length) return; const current = items.indexOf(document.activeElement as HTMLButtonElement);
+              const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+              items[next]?.focus();
+            }
+          }}>{(['send', 'steer', 'follow_up'] as const).map(value => {
+            const disabledReason = commonReason ?? (value === 'send' ? sendReason : queueReason);
+            return <button key={value} role="menuitem" aria-current={value === mode ? 'true' : undefined} disabled={!!disabledReason} title={disabledReason ?? undefined} onClick={() => chooseAction(value)}>{value === 'follow_up' ? 'Follow Up' : value === 'steer' ? 'Steer' : 'Send'}</button>;
+          })}</div>}
+        </div>
       </div></div>{reason && <p className="composer-reason" role="status">{reason}</p>}
     </div><details className="chat-data-context reading-width"><summary>Data for next message · {props.workspace?.batchRefs.length ?? 0} batches</summary><ContextPanel frozenInput={props.frozenInput} frozenRunId={props.frozenRunId} workspace={props.workspace} confirmed={props.workspaceConfirmed} disabled={props.workspacePending ?? props.selecting} recovery={props.workspaceRecovery} onVerify={props.onVerifyWorkspace} onUpdate={props.onWorkspace} /></details><details className="reference-fields reading-width"><summary>Message time context</summary><label>Reference date<input type="date" value={draft?.referenceDate ?? ""} disabled={!draft} onChange={event => props.onDraft({ referenceDate: event.target.value })} /></label><label>Time zone<input value={draft?.timezone ?? ""} disabled={!draft} onChange={event => props.onDraft({ timezone: event.target.value })} /></label>{props.dataDefaults && props.dataDefaults.batchCount > 0 && (!props.dataDefaults.referenceDate || !props.dataDefaults.timezone) && <p className="tiny muted" data-testid="data-time-defaults-missing">Imported data has no common default date or time zone. Choose the reference date and time zone for the next message.</p>}{props.dataDefaults?.referenceDate && props.dataDefaults.timezone && <div className="actions"><span className="tiny muted" data-testid="data-time-defaults">Data defaults: {props.dataDefaults.referenceDate} · {props.dataDefaults.timezone}</span><button disabled={!draft || !!draft.pending} onClick={() => props.onDraft({ referenceDate: props.dataDefaults!.referenceDate!, timezone: props.dataDefaults!.timezone! })}>Use data defaults</button></div>}</details></div>
   </div>;

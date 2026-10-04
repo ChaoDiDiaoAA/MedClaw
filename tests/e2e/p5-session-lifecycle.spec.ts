@@ -33,7 +33,7 @@ async function create() {
   const prior = (await workspace()).sessionId;
   await page.getByRole('button', { name: 'New Session', exact: true }).click();
   await expect.poll(async () => (await workspace()).sessionId).not.toBe(prior);
-  const id = (await workspace()).sessionId!; await expect(page.getByRole('button', { name: `New Session ${id}`, exact: true })).toBeVisible(); await expect(page.getByTestId('current-session')).toContainText(`New Session ${id}`); return id;
+  const id = (await workspace()).sessionId!, title = (await session(id)).title; await expect(row(id).locator('button[aria-pressed]')).toHaveText(title); await expect(page.getByTestId('current-session')).toContainText(title); return id;
 }
 async function select(id: number) { await row(id).locator('button[aria-pressed]').click(); await expect(page.getByTestId('current-session')).toContainText((await session(id)).title); }
 async function action(id: number, name: 'Rename' | 'Delete') { await row(id).getByRole('button', { name: /^Session actions for / }).click(); await row(id).getByRole('menuitem', { name, exact: true }).click(); await expect(editor()).toBeVisible(); }
@@ -122,7 +122,7 @@ test.afterEach(async ({}, info) => { if (page) { const name = info.title.replace
 
 test('session menus and rename keyboard editing preserve selection and literal user titles', async () => {
   const a = await create(); await composer().fill('A independent draft'); const b = await create(); await composer().fill('B independent draft');
-  const before = await workspace(), menu = page.getByRole('button', { name: `Session actions for New Session ${a}`, exact: true });
+  const before = await workspace(), menu = row(a).getByRole('button', { name: /^Session actions for / });
   await expect(menu).toBeVisible();
   await menu.focus(); await page.keyboard.press('Enter'); await expect(row(a).getByRole('menu')).toBeVisible(); await page.keyboard.press('Escape'); await expect(menu).toBeFocused();
   expect(await workspace()).toEqual(before); await expect(composer()).toHaveValue('B independent draft');
@@ -322,4 +322,18 @@ test('SQL pagination and deleting the last visible Session preserve history with
   expect((await calls()).filter(call => call.method === 'session.create')).toHaveLength(before); expect(sql('SELECT COUNT(*) AS n FROM sessions')[0].n).toBe(count); expect(physicalCalls).toBe(4);
   await rules([{ method: 'session.list', project: { ok: false, error: safeError('storage_read_failed') } }]); await page.getByRole('button', { name: 'Refresh sessions', exact: true }).click(); await expect(page.locator('.error-banner')).toBeVisible();
   save('pagination-and-last-delete', { ids, count, workspace: await workspace(), sql: sql('SELECT id,status,metadata_revision,deleted_at FROM sessions ORDER BY id') });
+});
+
+test('a fresh default title reuses the smallest free display number while deleted identities remain distinct', async () => {
+  const before = sql('SELECT MAX(id) AS id,COUNT(*) AS n FROM sessions')[0], physical = physicalCalls;
+  await expect(page.locator('.session-row')).toHaveCount(0);
+  const first = await create(); expect(first).toBe(before.id + 1); expect((await session(first)).title).toBe('New Session 1');
+  await composer().fill('First fresh Session draft'); const second = await create(); expect(second).toBe(first + 1); expect((await session(second)).title).toBe('New Session 2');
+  await composer().fill('Second fresh Session draft'); await remove(first); await expect(composer()).toHaveValue('Second fresh Session draft');
+  const third = await create(); expect(third).toBe(second + 1); expect((await session(third)).title).toBe('New Session 1');
+  await expect(row(third).locator('button[aria-pressed]')).toHaveText('New Session 1'); await expect(row(first)).toHaveCount(0);
+  expect((await session(first)).status).toBe('deleted'); expect((await session(first)).title).toBe('New Session 1');
+  await rename(third, '用户会话'); const fourth = await create(); expect(fourth).toBe(third + 1); expect((await session(fourth)).title).toBe('New Session 1');
+  expect((await session(third)).title).toBe('用户会话'); expect(sql('SELECT COUNT(*) AS n FROM sessions')[0].n).toBe(before.n + 4); expect(physicalCalls).toBe(physical);
+  save('default-number-vs-identity', { before, first, second, third, fourth, sessions: await Promise.all([session(first), session(second), session(third), session(fourth)]), sql: sql(`SELECT id,title,status,metadata_revision FROM sessions WHERE id>=${first} ORDER BY id`), physical });
 });

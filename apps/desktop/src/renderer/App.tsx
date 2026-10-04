@@ -495,25 +495,40 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       showManagement({ ...editor, busy: false, unknown: true, error: result.ok ? 'The original operation is not recorded yet. Keep its identity and read it again.' : errorMessage(result.error) });
     } catch { if (instance === hostRef.current.instanceId) showManagement({ ...editor, busy: false, unknown: true, error: 'The original operation could not be read. Keep its identity and read it again.' }); }
   }
+  function ownsPending(sessionId: number, pending: NonNullable<SessionDraft['pending']>) {
+    const current = draftsRef.current[sessionId]?.pending;
+    return current?.operationRef === pending.operationRef && current.input.sessionId === pending.input.sessionId && current.input.clientSequence === pending.input.clientSequence;
+  }
+  function startNewAttempt(target: { instanceId: string | null; sessionId: number; pending: NonNullable<SessionDraft['pending']> }) {
+    if (target.instanceId !== hostRef.current.instanceId || hostRef.current.state !== 'ready' || workspaceRef.current?.sessionId !== target.sessionId
+      || !confirmedWorkspace.current || workspaceMutation.current || selectBusy.current || sendBusy.current || deletedSessions.current.has(target.sessionId)
+      || detailsRef.current[target.sessionId]?.session.status !== 'active' || !ownsPending(target.sessionId, target.pending) || !draftsRef.current[target.sessionId]?.confirmedFailure) return;
+    editDraft(target.sessionId, { pending: null, confirmedFailure: false, resendConfirmed: false }); setError(null);
+  }
   async function acceptedAgent(value: SubmitResult, pending: NonNullable<SessionDraft["pending"]>) {
+    if (!ownsPending(pending.input.sessionId, pending)) return;
+    // Sequence lookup cannot prove operationRef ownership after an identity conflict.
+    if (draftsRef.current[pending.input.sessionId]?.confirmedFailure) {
+      setError('The original submission has a confirmed failure. Its original identity is retained. Start a new attempt to submit the current draft.'); return;
+    }
     if (value.sessionId !== pending.input.sessionId || value.clientSequence !== pending.input.clientSequence) { setError("The acceptance reply does not match the original submission. Keep it and read its result."); return; }
     const instance = hostRef.current.instanceId;
     let healthy = false;
     if (value.inputId !== null) {
       const original = await readInput(value.inputId, value.sessionId);
-      if (instance !== hostRef.current.instanceId) return;
+      if (instance !== hostRef.current.instanceId || !ownsPending(pending.input.sessionId, pending)) return;
       if (!original || original.clientSequence !== value.clientSequence || original.mode !== pending.input.mode) {
+        editDraft(value.sessionId, { confirmedFailure: false, resendConfirmed: false });
         setError('The original Input is unavailable. Keep the original draft and read its submission again.');
       } else if (original.status === 'failed' || original.status === 'cancelled' || original.processingStatus === 'failed' || original.status === 'delivery_unknown') {
-        const draft = draftsRef.current[value.sessionId];
-        if (original.status !== 'delivery_unknown' && draft?.pending?.operationRef === pending.operationRef) editDraft(value.sessionId, { pending: null, resendConfirmed: false });
+        editDraft(value.sessionId, { confirmedFailure: original.status !== 'delivery_unknown', resendConfirmed: false });
         setError(original.error ? errorMessage(original.error) : `Input ${original.id} ${original.status === 'delivery_unknown' ? 'consumption is unconfirmed' : 'failed or was cancelled'}. The original draft is retained.`);
       } else healthy = original.status === 'queued' || original.status === 'consumed';
     } else if (value.runId !== null) {
       const original = await readRun(value.runId);
-      if (instance !== hostRef.current.instanceId) return;
+      if (instance !== hostRef.current.instanceId || !ownsPending(pending.input.sessionId, pending)) return;
       healthy = original?.kind === 'agent' && original.sessionId === value.sessionId && original.clientSequence === value.clientSequence;
-      if (!healthy) setError('The original Run is unavailable. Keep the original draft and read its submission again.');
+      if (!healthy) { editDraft(value.sessionId, { confirmedFailure: false, resendConfirmed: false }); setError('The original Run is unavailable. Keep the original draft and read its submission again.'); }
     }
     if (workspaceRef.current?.sessionId === value.sessionId) inspectedRun.current = null;
     const draft = draftsRef.current[value.sessionId];
@@ -535,25 +550,25 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       referenceDate: mode === 'send' ? draft.referenceDate : root!.referenceDate, timezone: mode === 'send' ? draft.timezone : root!.timezone };
     const pending = retry ? draft.pending : { operationRef: crypto.randomUUID(), input: mode === 'send' ? { ...fields, mode } : { ...fields, mode, targetRunId: originalControl!.runId } satisfies SubmitInput };
     if (!pending) return;
-    editDraft(sessionId, { pending, mode: pending.input.mode, resendConfirmed: false }); sendBusy.current = sessionId; setSending(sessionId); setError(null);
+    editDraft(sessionId, { pending, mode: pending.input.mode, resendConfirmed: false, confirmedFailure: false }); sendBusy.current = sessionId; setSending(sessionId); setError(null);
     try {
       const result = await window.medclaw.request("session.submit", pending.input, pending.operationRef);
-      if (instance !== hostRef.current.instanceId) return;
+      if (instance !== hostRef.current.instanceId || !ownsPending(sessionId, pending)) return;
       if (result.ok) await acceptedAgent(result.data, pending);
-      else { setError(errorMessage(result.error)); if (result.error.code !== "operation_result_unknown") editDraft(sessionId, { pending: null }); await Promise.all([readSession(sessionId), readActive(), refreshInputs(sessionId)]); }
+      else { setError(errorMessage(result.error)); editDraft(sessionId, { confirmedFailure: result.error.code !== 'operation_result_unknown', resendConfirmed: false }); await Promise.all([readSession(sessionId), readActive(), refreshInputs(sessionId)]); }
     } finally { sendBusy.current = null; setSending(null); }
   }
   async function lookupSubmission() {
     const sessionId = workspaceRef.current?.sessionId, pending = sessionId ? draftsRef.current[sessionId]?.pending : null, instance = hostRef.current.instanceId;
     if (!pending || !sessionId) return;
     const result = await window.medclaw.request("session.readSubmission", { sessionId: pending.input.sessionId, clientSequence: pending.input.clientSequence });
-    if (instance !== hostRef.current.instanceId) return;
+    if (instance !== hostRef.current.instanceId || !ownsPending(sessionId, pending)) return;
     if (result.ok && result.data) await acceptedAgent(result.data, pending);
     else {
       editDraft(sessionId, { resendConfirmed: false });
       if (!result.ok) { setError(errorMessage(result.error)); return; }
       const [gate, original] = await Promise.all([window.medclaw.request('run.control.read', {}), window.medclaw.request('session.read', { sessionId: pending.input.sessionId })]);
-      if (instance !== hostRef.current.instanceId) return;
+      if (instance !== hostRef.current.instanceId || !ownsPending(sessionId, pending)) return;
       const canRetry = gate.ok && original.ok && original.data?.session.status === 'active' && original.data.history.available && (pending.input.mode === 'send' ? gate.data.acceptingNewRuns && gate.data.activeRootRun === null
         : original.data.session.inputControl?.runId === pending.input.targetRunId && original.data.session.inputControl.acceptingInputs);
       editDraft(sessionId, { resendConfirmed: !!canRetry });
@@ -622,7 +637,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
         session={currentDetail} draft={draft} selecting={selecting || !workspaceConfirmed} sending={sending !== null && sending === current} runningTitle={runningSession ? sessionDisplayTitle(runningSession) : null}
         queueRun={queueRun} queueRootInput={queueRootInput} frozenInput={frozenInput} frozenRunId={frozenRun?.id} inputs={current ? inputQueue.snapshots[current] ?? null : null} cancellingInputs={cancellingInputs}
         onRefreshInputs={() => { if (current) void refreshInputs(current, true); }} onMoreInputs={() => { if (current) void readInputPage(current, 'more'); }} onCancelInput={original => void cancelInput(original)}
-        onDraft={patch => { if (current) editDraft(current, patch); }} onUseForSession={useForSession} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} /></section>
+        onDraft={patch => { if (current) editDraft(current, patch); }} onUseForSession={useForSession} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onNewAttempt={pending => { if (current) startNewAttempt({ instanceId: host.instanceId, sessionId: current, pending }); }} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} /></section>
       <section className="page-content" hidden={page !== "data"}><DataWorkspace host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} catalog={catalog} batches={catalog?.batches ?? []} onRefresh={page => void readCatalog(page)} onUpdate={updateWorkspace} onError={setError} /></section>
       <section className="page-content" hidden={page !== "queries"}><QueryHistory visible={page === "queries"} requestedQuery={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} active={active} onUpdate={updateWorkspace} onError={setError} /></section>
       <section className="page-content" hidden={page !== "models"}><ModelsPage directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control}

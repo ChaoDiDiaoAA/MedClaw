@@ -46,8 +46,9 @@ async function streamTarget(runId: number) {
   const host = await page.evaluate(() => window.medclaw.request('host.read', {})); if (!host.ok) throw new Error('Missing current Host');
   return { instanceId: host.data.instanceId, subscriptionId: original.subscriptionId, snapshot };
 }
-async function create() { await page.getByRole('button', { name: 'New Session', exact: true }).click(); const w = await page.evaluate(() => window.medclaw.request('workspace.read', {})); if (!w.ok || !w.data.sessionId) throw new Error('No selected session'); await expect(page.getByTestId('current-session')).toContainText(`New Session ${w.data.sessionId}`); const s = await page.evaluate(id => window.medclaw.request('session.read', { sessionId: id }), w.data.sessionId); if (!s.ok || !s.data) throw new Error('No session'); return s.data.session; }
-async function select(id: number) { await page.getByRole('button', { name: `New Session ${id}`, exact: true }).click(); await expect(page.getByTestId('current-session')).toContainText(`New Session ${id}`); }
+async function create() { await page.getByRole('button', { name: 'New Session', exact: true }).click(); const w = await page.evaluate(() => window.medclaw.request('workspace.read', {})); if (!w.ok || !w.data.sessionId) throw new Error('No selected session'); await expect(page.getByTestId('current-session')).toContainText(await sessionTitle(w.data.sessionId)); const s = await page.evaluate(id => window.medclaw.request('session.read', { sessionId: id }), w.data.sessionId); if (!s.ok || !s.data) throw new Error('No session'); return s.data.session; }
+async function sessionTitle(id: number) { const value = await page.evaluate(sessionId => window.medclaw.request('session.read', { sessionId }), id); if (!value.ok || !value.data) throw new Error('Missing Session title'); return value.data.session.title; }
+async function select(id: number) { await page.locator(`.session-row[data-session-id="${id}"]`).locator('button[aria-pressed]').click(); await expect(page.getByTestId('current-session')).toContainText(await sessionTitle(id)); }
 async function refresh() { await region().getByRole('button', { name: 'Refresh messages', exact: true }).click(); }
 
 // T06 scripts observe the actual loopback wire. Raw requests are never persisted.
