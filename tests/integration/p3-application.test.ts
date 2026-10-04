@@ -46,9 +46,13 @@ test('workspace selection uses trusted batch identities and compare-and-swap whi
     const repo = new Repositories(db);
     const initial = repo.readWorkspace();
     const selected = repo.updateWorkspace({ batchIds: [1, 2], deviceIds: [11] }, initial.revision, '2026-10-02T00:00:00.000Z');
+    expect(selected.sessionId).toBeNull();
     expect(selected.batchRefs.map(batch => batch.contentHash)).toEqual(['hash-1', 'hash-2']);
     const frozen = repo.freezeAgentScope(selected, ['read_data_scope', 'write']);
     expect(frozen).toMatchObject({ batchIds: [1, 2], deviceIds: [11], artifactIds: [5], allowedToolNames: ['read_data_scope', 'write'], readOnly: false });
+    expect(repo.freezeAgentScope({ ...selected, notices: [{ code: 'reference_cleared', kind: 'session', targetId: '1' }] }, ['read_data_scope', 'write'])).toEqual(frozen);
+    expect(() => repo.freezeAgentScope(selected, ['read_data_scope', 'read_data_scope'])).toThrow('invalid_argument');
+    expect(() => repo.freezeAgentScope(selected, ['invented_tool'])).toThrow('invalid_argument');
     expect(() => repo.updateWorkspace({ batchIds: [2] }, initial.revision, '2026-10-02T00:00:01.000Z')).toThrow('workspace_revision_mismatch');
     expect(() => repo.updateWorkspace({ deviceIds: [99] }, selected.revision, '2026-10-02T00:00:01.000Z')).toThrow('access_denied');
     const narrowed = repo.updateWorkspace({ batchIds: [2], deviceIds: [] }, selected.revision, '2026-10-02T00:00:01.000Z');

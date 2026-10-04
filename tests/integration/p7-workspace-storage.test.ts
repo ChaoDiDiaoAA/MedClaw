@@ -77,6 +77,24 @@ function prepared(f: ReturnType<typeof fixture>, sequence = 1) {
     execution:{mode:'send' as const,run:{sessionId:workspace.sessionId!,goal:'answer' as const,text:request.text,model,policy:DEFAULT_REQUEST_POLICY,workspace,scope,referenceDate:request.referenceDate,timezone:request.timezone,timeoutMs:DEFAULT_REQUEST_POLICY.timeoutMs,agentOptions:{requestedThinkingLevel:'off' as const,effectiveThinkingLevel:'off' as const},instanceId:'host',createdAt:at}}};
 }
 
+test('scope freezes a valid selection without a selected Session while input admission still requires that Session', () => {
+  const f=fixture(); f.repos.updateWorkspace({selection:deviceSelection},2,at); const plan=prepared(f);
+  f.db.query('UPDATE workspace SET active_session_id=NULL').run();
+  const workspace=f.repos.readWorkspace(),before=allWorkspace(f);
+  expect(workspace.sessionId).toBeNull();
+  expect(f.repos.freezeAgentScope({...workspace,notices:[{code:'reference_cleared',kind:'session',targetId:'1'}]},['read_data_scope'])).toEqual({
+    batchIds:[1,2],deviceIds:[1],allowedToolNames:['read_data_scope'],allowedResourceRefs:[],artifactIds:[],readOnly:true,
+  });
+  expect(()=>f.repos.freezeAgentScope({...workspace,selection:{...deviceSelection,targetVersion:hash1}},[])).toThrow('access_denied');
+  expect(()=>f.repos.freezeAgentScope({...workspace,selection:{...deviceSelection,field:'price_cents'}},[])).toThrow('invalid_argument');
+  expect(()=>toWorkspaceContext(workspace)).toThrow();
+  expect(()=>f.repos.acceptInput(plan)).toThrow('workspace_revision_mismatch');
+  expect(allWorkspace(f)).toEqual(before);
+  expect(f.db.query('SELECT COUNT(*) AS n FROM session_inputs').get()).toEqual({n:0});
+  expect(f.db.query('SELECT COUNT(*) AS n FROM runs').get()).toEqual({n:0});
+  expect(f.db.query('SELECT COUNT(*) AS n FROM model_calls').get()).toEqual({n:0});
+});
+
 test('same normalized scope preserves adopted Query and leaves every SQL column unchanged on no-op', () => {
   const f=fixture(),q=savedQuery(f);
   const adopted=f.repos.updateWorkspace({queryId:q.record.id,activeView:'query'},2,at),before=allWorkspace(f);

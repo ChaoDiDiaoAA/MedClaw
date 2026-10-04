@@ -517,7 +517,9 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   }
 
   freezeAgentScope(workspace: WorkspaceView, toolNames: readonly string[]): RunScope {
-    const selected = toWorkspaceContext(workspace), ids = selected.batchRefs.map(batch => batch.id);
+    const selected = checked(WorkspaceStateSchema, { revision: workspace.revision, sessionId: workspace.sessionId, materialVersion: workspace.materialVersion,
+      batchRefs: workspace.batchRefs, deviceIds: workspace.deviceIds, queryId: workspace.queryId, activeView: workspace.activeView, selection: workspace.selection });
+    const ids = selected.batchRefs.map(batch => batch.id);
     const batches = this.batchReferences(ids);
     if (!isDeepStrictEqual(batches.refs, selected.batchRefs) || batches.materialVersion !== selected.materialVersion) fail("access_denied");
     const names = [...toolNames], supported = new Set([...Object.keys(businessToolSchemas), "read", "grep", "find", "ls", "edit", "write", "bash", "powershell"]);

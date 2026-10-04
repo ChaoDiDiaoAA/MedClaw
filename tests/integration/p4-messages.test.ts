@@ -28,6 +28,7 @@ import { ToolRegistry } from "../../packages/core/src/tools/registry";
 import { ToolRecorder } from "../../packages/core/src/tools/recorder";
 import { ToolExecutor } from "../../packages/core/src/tools/executor";
 import { RunScopeSchema } from "../../packages/contracts/src/run";
+import { toWorkspaceContext } from "../../packages/contracts/src/workspace";
 import { projectToolCall } from "../../packages/runtime-pi/src/messages";
 import type { ToolExecutionContext } from "../../packages/contracts/src/tool";
 import { CatalogService } from "../../packages/core/src/data/catalog-service";
@@ -100,7 +101,7 @@ async function deliveryFixture(config: DeliveryFixtureOptions = {}) {
   try { native = agent.allocate(); } finally { allocation.mockRestore(); }
   const session = repo.createSession({ expectedWorkspaceRevision: 0 }, "create", native.nativeSessionId, new Date().toISOString()).session; native.bind(session.id);
   if (config.query) repo.updateWorkspace({ batchIds: [1] }, repo.readWorkspace().revision, new Date().toISOString());
-  const workspace = repo.readWorkspace(), scope = repo.freezeAgentScope(workspace, agent.toolNames ?? []);
+  const workspace = repo.readWorkspace(), workspaceContext = toWorkspaceContext(workspace), scope = repo.freezeAgentScope(workspace, agent.toolNames ?? []);
   const policy = { timeoutMs: 10000, maxRetries: config.retry ? 1 as const : 0 as const, maxRetryDelayMs: 2000 };
   const model = { provider: "p4-delivery", modelId: "fixture", expectedConfigVersion: "1" };
   const resolved = await runtime.resolve(model, "1", null, policy), agentOptions = agent.describe(resolved);
@@ -111,6 +112,7 @@ async function deliveryFixture(config: DeliveryFixtureOptions = {}) {
     referenceDate: input.referenceDate, timezone: input.timezone, timeoutMs: policy.timeoutMs, agentOptions, agentPolicy,
     submission: { operationRef: "send", originalSubmitInput: input }, instanceId: "p4-fixture", createdAt: new Date().toISOString() });
   const context = (nativeToolCallId = config.api === "openai-responses" ? `${tools[0]!.id}|fc1` : tools[0]!.id): ToolExecutionContext => ({ runId, sessionId: session.id, nativeToolCallId, scope,
+    workspaceContext, workspaceInputId: null, basedOnQueryId: workspaceContext.queryId, workspaceRevision: workspaceContext.revision,
     referenceDate: input.referenceDate, timezone: input.timezone, signal: abort.signal, checkActive: () => abort.signal.throwIfAborted() });
   const originalCreate = PiSdk.createAgentSession;
   let actualSession: PiSdk.AgentSession | undefined;
@@ -139,7 +141,7 @@ async function deliveryFixture(config: DeliveryFixtureOptions = {}) {
     return typeof args[0] === "string" ? originalAuth(args[0], args[1]) : originalAuth(args[0], args[1]);
   };
   let observed: Awaited<ReturnType<typeof agent.execute>>;
-  try { observed = await agent.execute({ runId, sessionId: session.id, text: input.text, resolved, agentOptions, scope,
+  try { observed = await agent.execute({ runId, sessionId: session.id, text: input.text, resolved, agentOptions, scope, workspaceContext,
     referenceDate: input.referenceDate, timezone: input.timezone, agentPolicy, signal: abort.signal, deadlineAt: performance.now() + policy.timeoutMs }, {
     startCall: time => new ModelCallRecorder(repo, runId, "main", time), preview: () => {}, nativeTerminal: () => {},
   }); } finally { factory.mockRestore(); actualSession?.dispose(); }
@@ -351,7 +353,7 @@ test("consumption store rejects missing delivery, nonexistent calls and cross-Ru
   const c = await deliveryFixture({ prepare: "no-callbacks" }), json = c.receiptJson();
   expect(() => c.store.recordConsumption(c.context(), "nonexistent", "provider_input_verified")).toThrow("state_conflict");
   expect(() => c.store.recordConsumption({ ...c.context(), runId: 999 }, c.observed.calls[1]!.callId, "provider_input_verified")).toThrow("access_denied");
-  expect(() => c.store.recordConsumption({ ...c.context(), sessionId: 999 }, c.observed.calls[1]!.callId, "provider_input_verified")).toThrow("access_denied");
+  expect(() => c.store.recordConsumption({ ...c.context(), sessionId: 999, workspaceContext: { ...c.context().workspaceContext!, sessionId: 999 } }, c.observed.calls[1]!.callId, "provider_input_verified")).toThrow("access_denied");
   expect(() => c.store.recordConsumption(c.context(), c.observed.calls[0]!.callId, "provider_input_verified")).toThrow("state_conflict");
   expect(() => Reflect.apply(c.store.recordConsumption, c.store, [c.context(), c.observed.calls[1]!.callId, "invalid"])).toThrow("invalid_argument");
   c.db.query("UPDATE tool_calls SET delivery_json=? WHERE id=1").run(JSON.stringify({ ...JSON.parse(json), sdkReturned: false }));
