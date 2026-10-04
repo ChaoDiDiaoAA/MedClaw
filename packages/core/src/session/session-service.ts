@@ -1,10 +1,12 @@
 import { canonicalRequest } from "../../../contracts/src/run";
 import type { RunHandle } from "../../../contracts/src/run";
-import { NewSessionInputSchema, SessionDetailSchema, SubmitInputSchema, ReadInputRequestSchema, ListInputsRequestSchema, ReadSubmissionRequestSchema } from "../../../contracts/src/session";
+import { NewSessionInputSchema, SessionDetailSchema, SubmitInputSchema, ReadInputRequestSchema, ListInputsRequestSchema, ReadSubmissionRequestSchema,
+  RenameSessionInputSchema, DeleteSessionInputSchema, ReadManagementOperationInputSchema } from "../../../contracts/src/session";
 import type { NativeSessionBindings, NewSessionInput, NewSessionResult, SelectSessionInput, SessionStore, SubmitInput, SubmitResult, ReadSubmissionRequest,
-  ReadInputRequest, ListInputsRequest, SessionInput, SessionInputPage, InputControl } from "../../../contracts/src/session";
+  ReadInputRequest, ListInputsRequest, SessionInput, SessionInputPage, InputControl, RenameSessionInput, DeleteSessionInput,
+  ReadManagementOperationInput, SessionManagementReceipt } from "../../../contracts/src/session";
 import type { CommandContext } from "../../../contracts/src/protocol";
-import { OpaqueIdSchema, PositiveIdSchema, safeError, serviceResult, type Result } from "../../../contracts/src/error";
+import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, safeError, serviceResult, type Result } from "../../../contracts/src/error";
 import { ReadSessionMessagesInputSchema, SessionMessagePageSchema, type ReadSessionMessagesInput, type SessionMessagePage } from "../../../contracts/src/messages";
 
 export class SessionService {
@@ -12,7 +14,8 @@ export class SessionService {
     private readonly submitAgent: (input: SubmitInput, context: CommandContext) => Promise<Result<SubmitResult>>,
     private readonly active: () => RunHandle | null,
     private readonly inputControl: (sessionId: number) => InputControl | null = () => null,
-    private readonly cancelAgentInput?: (inputId: number, context: CommandContext) => Promise<Result<SessionInput>>) {}
+    private readonly cancelAgentInput?: (inputId: number, context: CommandContext) => Promise<Result<SessionInput>>,
+    private readonly runtime?: { assertOperationAvailable(operationRef: string): void; withSessionDeletion<T>(sessionId: number, write: () => T): T }) {}
 
   create(input: NewSessionInput, context: CommandContext): Promise<Result<NewSessionResult>> {
     return serviceResult(() => {
@@ -35,6 +38,36 @@ export class SessionService {
   }
 
   select(input: SelectSessionInput) { return serviceResult(() => this.store.selectSession(input, new Date().toISOString()), "storage_write_failed", { sessionId: input.sessionId }); }
+  rename(input: RenameSessionInput, context: CommandContext): Promise<Result<SessionManagementReceipt>> {
+    return serviceResult(() => {
+      this.validateContext(context);
+      const request = RenameSessionInputSchema.parse(input), original = this.findManagementOperation(context.operationRef);
+      if (original) {
+        if (original.method !== 'session.rename' || canonicalRequest(original.originalRequest) !== canonicalRequest(request)) throw new Error('state_conflict');
+        return original.result;
+      }
+      if (!this.runtime) throw safeError('state_conflict', undefined, { reason: 'runtime_busy' });
+      this.runtime.assertOperationAvailable(context.operationRef);
+      return this.store.renameSession(request, context.operationRef, new Date().toISOString());
+    }, 'storage_write_failed', { operationRef: context.operationRef, sessionId: input.sessionId });
+  }
+  delete(input: DeleteSessionInput, context: CommandContext): Promise<Result<SessionManagementReceipt>> {
+    return serviceResult(() => {
+      this.validateContext(context);
+      const request = DeleteSessionInputSchema.parse(input), original = this.findManagementOperation(context.operationRef);
+      if (original) {
+        if (original.method !== 'session.delete' || canonicalRequest(original.originalRequest) !== canonicalRequest(request)) throw new Error('state_conflict');
+        return original.result;
+      }
+      if (!this.runtime) throw safeError('state_conflict', undefined, { reason: 'runtime_busy' });
+      this.runtime.assertOperationAvailable(context.operationRef);
+      this.requireActiveSession(request.sessionId);
+      return this.runtime.withSessionDeletion(request.sessionId, () => this.store.deleteSession(request, context.operationRef, new Date().toISOString()));
+    }, 'storage_write_failed', { operationRef: context.operationRef, sessionId: input.sessionId });
+  }
+  readManagementOperation(input: ReadManagementOperationInput): Promise<Result<SessionManagementReceipt | null>> {
+    return serviceResult(() => this.store.readManagementOperation(ReadManagementOperationInputSchema.parse(input)), 'storage_read_failed');
+  }
   list(input: { beforeSessionId?: number; limit?: number }) { return serviceResult(() => {
     const page = this.store.listSessions(input);
     return { ...page, sessions: page.sessions.map(session => ({ ...session, inputControl: this.inputControl(session.id) })) };
@@ -57,6 +90,7 @@ export class SessionService {
           || canonicalRequest(operation.originalRequest) !== canonicalRequest(request)) throw new Error("state_conflict");
         return sequence;
       }
+      this.requireActiveSession(request.sessionId);
       return null;
     }, "storage_read_failed", { operationRef: context.operationRef, sessionId: input.sessionId });
     if (!existing.ok) return existing;
@@ -124,6 +158,18 @@ export class SessionService {
   private validateContext(context: CommandContext) {
     if (context.instanceId !== this.instanceId) throw new Error("host_protocol_mismatch");
     OpaqueIdSchema.parse(context.operationRef);
+  }
+  private requireActiveSession(sessionId: number) {
+    const session = this.store.readSession(sessionId);
+    if (!session) throw new Error('session_not_found');
+    if (session.status === 'deleted') throw safeError('state_conflict', undefined, { reason: 'session_deleted' });
+  }
+  private findManagementOperation(operationRef: string) {
+    try { return this.store.findOperation(operationRef); }
+    catch (error) {
+      if (AppErrorSchema.safeParse(error).success || error instanceof Error && safeError(error.message).code !== 'internal_error') throw error;
+      throw safeError('storage_read_failed');
+    }
   }
 }
 

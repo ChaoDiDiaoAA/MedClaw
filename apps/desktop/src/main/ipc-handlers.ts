@@ -193,7 +193,7 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       const parsed = JSON.parse(JSON.stringify(schema.parse(payload))) as unknown;
       parsingPayload = false;
       if ((method === "import.preview" || method === "import.commit") && (parsed as { operationRef: string }).operationRef !== operationRef) throw new Error("state_conflict");
-      if (method === "model.request" || method === "model.diagnose" || method === "session.submit" || method === "session.create") {
+      if (method === "model.request" || method === "model.diagnose" || method === "session.submit" || method === "session.create" || method === "session.rename" || method === "session.delete") {
         const old = operations.get(operationRef);
         if (old && (old.method !== method || !isDeepStrictEqual(old.payload, parsed))) throw new Error("state_conflict");
         operations.set(operationRef, { method, payload: parsed });

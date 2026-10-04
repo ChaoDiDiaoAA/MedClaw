@@ -200,7 +200,7 @@ async function initialize(raw: unknown) {
   application.runs.recoverInterrupted(true); // The writer lock proves that the previous owning process exited.
   sessions = new SessionService(config.instanceId, repositories, agent, (input, context) => application!.runs.submitAgent(input, context),
     () => application!.runs.activeHandle, sessionId => application!.runs.readInputControl(sessionId),
-    (inputId, context) => application!.runs.cancelInput(inputId, context));
+    (inputId, context) => application!.runs.cancelInput(inputId, context), application.runs);
   workspace = new WorkspaceService(repositories, artifacts);
   await sendRaw(`${JSON.stringify({ protocolVersion: HOST_PROTOCOL_VERSION, instanceId: config.instanceId, sdkVersion: actualVersion, schemaVersion: SCHEMA_VERSION, configVersion: settings.configVersion, dataRoot: config.paths.dataRoot })}\n`);
   runtimeLog.add("host_ready");
@@ -271,6 +271,9 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case "run.retrySave": return unwrap(await app.runs.retrySave(request.payload.runId));
     case "session.create": return unwrap(await sessions!.create(request.payload, request));
     case "session.select": return unwrap(await sessions!.select(request.payload));
+    case "session.rename": return unwrap(await sessions!.rename(request.payload, request));
+    case "session.delete": return unwrap(await sessions!.delete(request.payload, request));
+    case "session.readManagementOperation": return unwrap(await sessions!.readManagementOperation(request.payload));
     case "session.list": return unwrap(await sessions!.list(request.payload));
     case "session.read": return unwrap(await sessions!.read(request.payload.sessionId));
     case "session.submit": return unwrap(await sessions!.submit(request.payload, request));

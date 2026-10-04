@@ -17,7 +17,7 @@ function legacy(path:string) {
  db.query("INSERT INTO runs(id,session_id,kind,instance_id,status,goal,input_text,config_json,scope_json,workspace_json,submission_operation_ref,submission_client_sequence,submission_request_json,reference_date,timezone,created_at) VALUES(1,1,'agent','old','failed','answer','原文😀',json_object('agent',json_object('nativeSessionId','n'),'unknown',NULL),'{}','{}','legacy',1,json_object('sessionId',1,'clientSequence',1),'2026-10-03','Asia/Shanghai',?)").run(at);
  return db;
 }
-test('schema4_to_5_preserves_all_old_rows_and_migration_checksums',()=>{
+test('schema4_to_latest_preserves_old_rows_and_checksums_with_only_lifecycle_metadata_added',()=>{
  const root=mkdtempSync(join(tmpdir(),'p6-storage-')),path=join(root,'app.sqlite');let db=legacy(path);
  try {
   // Populate every old domain table, including schema4 inputs, rather than proving empty-table equality.
@@ -39,8 +39,11 @@ test('schema4_to_5_preserves_all_old_rows_and_migration_checksums',()=>{
   const names=db.query<{name:string},[]>("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations' ORDER BY name").all().map(r=>r.name);
   const before=names.map(n=>db.query(`SELECT * FROM ${n} ORDER BY id`).all());expect(names).toHaveLength(17);expect(before.every(rows=>rows.length>0)).toBe(true);const markers=db.query('SELECT * FROM schema_migrations ORDER BY version').all();db.close();db=openDatabase(path);
   expect(db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations'").all()).toHaveLength(18);
-  names.forEach((n,i)=>expect(db.query(`SELECT * FROM ${n} ORDER BY id`).all()).toEqual(before[i]));
+  names.forEach((n,i)=>expect(db.query(`SELECT * FROM ${n} ORDER BY id`).all()).toEqual(n==='sessions'
+   ? before[i]!.map(row=>({...row as Record<string,unknown>,metadata_json:'{"titleOrigin":"user"}',metadata_revision:0,deleted_at:null}))
+   : before[i]));
   expect(db.query('SELECT * FROM schema_migrations ORDER BY version').all().slice(0,4)).toEqual(markers);
+  expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([1,2,3,4,5,6].map(version=>({version})));
   expect(db.query('SELECT * FROM runtime_events').all()).toEqual([]);
   expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
  }finally{db.close();rmSync(root,{recursive:true,force:true});}

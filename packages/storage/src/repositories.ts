@@ -14,7 +14,9 @@ import { SqliteToolStore } from "./tool-store";
 import { SqliteCatalogStore } from './catalog-store';
 import { assertSelectionField, describeDataSelection, resolveQueryRow } from './workspace-selection';
 import type { QueryRecord } from '../../contracts/src/query';
-import { NewSessionInputSchema, NewSessionResultSchema, SelectSessionInputSchema, SessionViewSchema, ListSessionsRequestSchema, SubmitInputSchema, ReadSubmissionRequestSchema,
+import { RenameSessionInputSchema, DeleteSessionInputSchema, ReadManagementOperationInputSchema, SessionManagementDetailsSchema, SessionManagementReceiptSchema,
+  type RenameSessionInput, type DeleteSessionInput, type ReadManagementOperationInput, type SessionManagementReceipt, type SessionManagementDetails,
+  NewSessionInputSchema, NewSessionResultSchema, SelectSessionInputSchema, SessionViewSchema, ListSessionsRequestSchema, SubmitInputSchema, ReadSubmissionRequestSchema,
   type NewSessionInput, type NewSessionResult, type SelectSessionInput, type SessionView, type SessionPage, type ReadSubmissionRequest, type SubmitResult, type SessionStore } from "../../contracts/src/session";
 import { WorkspaceStateSchema, WorkspaceViewSchema, WorkspaceChangeSchema, RevisionSchema, toWorkspaceContext, type WorkspaceState, type WorkspaceSelection, type WorkspaceView, type WorkspaceChange, type BatchRef, type WorkspaceStore, type WorkspaceInspection, type WorkspaceNotice } from "../../contracts/src/workspace";
 import { businessToolSchemas } from "../../contracts/src/business-tools";
@@ -139,7 +141,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
 
   private creationReceipt(text: string): NewSessionResult {
     const value = decoded(text) as NewSessionResult;
-    return checked(NewSessionResultSchema, {...value, session: {...value.session, inputControl: value.session.inputControl ?? null}}, "storage_read_failed");
+    return checked(NewSessionResultSchema, {...value, session: {...value.session, inputControl: value.session.inputControl ?? null, metadataRevision:value.session.metadataRevision ?? 0, deletedAt:value.session.deletedAt ?? null}}, "storage_read_failed");
   }
   private inputRead<T>(action:()=>T):T {try{return action();}catch(error){if(error instanceof Error&&error.name==='SQLiteError')fail('storage_read_failed');throw error;}}
   private inputWrite<T>(action:()=>T):T {try{return this.transactions.immediate(()=>{const result=action();this.beforeCommit?.();return result;});}catch(error){if(error instanceof Error&&error.name==='SQLiteError')fail('storage_write_failed');throw error;}}
@@ -166,7 +168,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if(operation||sequence){if(!operation||operation.method!=='session.submit'||!sequence||operation.result.inputId!==sequence.inputId||operation.result.runId!==sequence.runId||operation.result.sessionId!==sequence.sessionId||operation.result.clientSequence!==sequence.clientSequence||canonicalRequest(operation.originalRequest)!==canonicalRequest(request))fail('state_conflict');return sequence;}
       const content=checked(InputContentSchema,plan.content);timestamp(plan.createdAt);
       if(canonicalRequest(content.originalSubmitInput)!==canonicalRequest(request)||content.deliveryAttempt!==null||content.text!==request.text||content.referenceDate!==request.referenceDate||content.timezone!==request.timezone||content.model.provider!==request.model.provider||content.model.modelId!==request.model.modelId||content.model.configVersion!==request.model.expectedConfigVersion||plan.execution.mode!==request.mode)fail('invalid_argument');
-      const session=this.readSession(request.sessionId);if(!session)fail('session_not_found');
+      const session=this.readSession(request.sessionId);if(!session)fail('session_not_found');this.assertSessionActive(session);
       if(request.clientSequence<session.nextSubmissionSequence||request.clientSequence===Number.MAX_SAFE_INTEGER)fail('state_conflict');
       const workspace=this.readWorkspace();if(workspace.sessionId!==session.id||workspace.revision!==request.expectedRevision||!isDeepStrictEqual(toWorkspaceContext(workspace),content.workspaceContext)||!isDeepStrictEqual(workspace.batchRefs.map(b=>b.id),request.expectedBatchIds)||workspace.queryId!==request.expectedQueryId)fail('workspace_revision_mismatch');
       const frozenWorkspace=toWorkspaceContext(workspace);
@@ -267,7 +269,16 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
 
   findOperation(operationRef: string): StoredOperation | null {
     checked(OpaqueIdSchema, operationRef);
-    if(this.p5){const count=this.db.query<{n:number},[string]>("SELECT COUNT(*) AS n FROM (SELECT id FROM sessions WHERE creation_operation_ref=?1 UNION ALL SELECT id FROM runs WHERE submission_operation_ref=?1 OR (kind='provider' AND json_extract(config_json,'$.providerRequest.operationRef')=?1) UNION ALL SELECT id FROM session_inputs WHERE operation_ref=?1)").get(operationRef)!.n;if(count>1)fail('state_conflict');}
+    const sources=["SELECT id FROM sessions WHERE creation_operation_ref=?1","SELECT id FROM runs WHERE submission_operation_ref=?1 OR (kind='provider' AND json_extract(config_json,'$.providerRequest.operationRef')=?1)"];
+    if(this.p5)sources.push("SELECT id FROM session_inputs WHERE operation_ref=?1");
+    if(this.p3)sources.push("SELECT id FROM business_events WHERE operation_ref=?1 AND type IN ('session_renamed','session_deleted')");
+    const count=this.db.query<{n:number},[string]>(`SELECT COUNT(*) AS n FROM (${sources.join(' UNION ALL ')})`).get(operationRef)!.n;
+    if(count>1)fail('state_conflict');
+    if(this.p3){const management=this.managementDetails(operationRef);if(management){const {receipt,originalRequest}=management;
+      if(receipt.method==='session.rename'&&'title' in originalRequest)return {method:receipt.method,operationRef,originalRequest,result:receipt};
+      if(receipt.method==='session.delete'&&'expectedWorkspaceRevision' in originalRequest)return {method:receipt.method,operationRef,originalRequest,result:receipt};
+      fail('storage_read_failed');
+    }}
     const created = this.db.query<{ creation_request_json: string; creation_result_json: string }, [string]>(
       "SELECT creation_request_json,creation_result_json FROM sessions WHERE creation_operation_ref=?").get(operationRef);
     if (created) return { method: "session.create", operationRef,
@@ -317,7 +328,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     const ids=(value:unknown):number[]=>checked(z.array(PositiveIdSchema),value,'storage_read_failed');
     const load=(kind:Kind,target:number):Record<string,unknown>|null=>{
       const key=`${kind}:${target}`,known=dependencies.get(key);if(known)return known.record;
-      const row=this.db.query<Record<string,unknown>,[number]>(kind==='session'?'SELECT id,kind,status FROM sessions WHERE id=?':`SELECT * FROM ${tables[kind]} WHERE id=?`).get(target);
+      const row=this.db.query<Record<string,unknown>,[number]>(kind==='session'?'SELECT id,kind,status,title,metadata_revision,deleted_at,metadata_json FROM sessions WHERE id=?':`SELECT * FROM ${tables[kind]} WHERE id=?`).get(target);
       dependencies.set(key,{kind,id:target,record:row});
       if(!row)return null;
       for(const [field,value] of Object.entries(row))if(field.endsWith('_json')&&typeof value==='string') {
@@ -539,14 +550,98 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
 
   readSession(sessionId: number): SessionView | null {
     id(sessionId);
-    const row = this.db.query<{ id: number; native_session_id: string; title: string; kind: string; status: string; storage_version: number }, [number]>("SELECT * FROM sessions WHERE id=?").get(sessionId);
+    const row = this.db.query<{ id: number; native_session_id: string; title: string; kind: string; status: string; storage_version: number; metadata_json:string; metadata_revision?:number; deleted_at?:string|null }, [number]>("SELECT * FROM sessions WHERE id=?").get(sessionId);
     if (!row) return null;
     const sequence = this.db.query<{ n: number | null }, [number]>(this.p5 ? "SELECT MAX(n) AS n FROM (SELECT submission_client_sequence AS n FROM runs WHERE session_id=?1 UNION ALL SELECT client_sequence AS n FROM session_inputs WHERE session_id=?1)" : "SELECT MAX(submission_client_sequence) AS n FROM runs WHERE session_id=?").get(sessionId)?.n ?? 0;
-    return checked(SessionViewSchema, { id: row.id, title: row.title, nativeSessionId: row.native_session_id, kind: row.kind, status: row.status,
+    return checked(SessionViewSchema, { id: row.id, title: this.sessionTitle(row), metadataRevision:row.metadata_revision??0, deletedAt:row.deleted_at??null, nativeSessionId: row.native_session_id, kind: row.kind, status: row.status,
       inputControl: null, storageVersion: row.storage_version, leafId: null, nextSubmissionSequence: sequence + 1 }, "storage_read_failed");
   }
 
-  private sessionWorkspace(workspace: WorkspaceState, sessionId: number): WorkspaceState {
+  private sessionTitle(row:{id:number;title:string;metadata_json:string}):string {
+    let metadata:unknown;try{metadata=JSON.parse(row.metadata_json);}catch{fail('storage_read_failed');}
+    const parsed=checked(z.object({titleOrigin:z.enum(['default','user']).optional()}).passthrough(),metadata,'storage_read_failed');
+    return parsed.titleOrigin==='default'&&row.title===`新会话 ${row.id}` ? `New Session ${row.id}` : row.title;
+  }
+  private assertSessionActive(session:SessionView):void {
+    if(session.status==='deleted')throw safeError('state_conflict',undefined,{reason:'session_deleted'});
+    if(session.kind!=='user')fail('access_denied');
+  }
+  private managementDetails(operationRef:string):SessionManagementDetails|null {
+    const rows=this.db.query<{operation_ref:string;type:string;actor:string;session_id:number|null;run_id:number|null;import_id:number|null;query_id:number|null;artifact_id:number|null;details_json:string;occurred_at:string},[string]>(
+      "SELECT * FROM business_events WHERE operation_ref=? AND type IN ('session_renamed','session_deleted')").all(operationRef);
+    if(rows.length>1)fail('state_conflict');const row=rows[0];if(!row)return null;
+    let value:unknown;try{value=JSON.parse(row.details_json);}catch{fail('storage_read_failed');}
+    const details=checked(SessionManagementDetailsSchema,value,'storage_read_failed'),receipt=details.receipt;
+    if(row.operation_ref!==receipt.operationRef||row.type!==(receipt.method==='session.rename'?'session_renamed':'session_deleted')
+      ||row.actor!=='user'||row.session_id!==receipt.session.id||row.occurred_at!==receipt.committedAt
+      ||row.run_id!==null||row.import_id!==null||row.query_id!==null||row.artifact_id!==null)fail('storage_read_failed');
+    return details;
+  }
+  readManagementOperation(input:ReadManagementOperationInput):SessionManagementReceipt|null {
+    const request=checked(ReadManagementOperationInputSchema,input);
+    try {
+      const operation=this.findOperation(request.operationRef);
+      return operation?.method==='session.rename'||operation?.method==='session.delete'?operation.result:null;
+    } catch { return fail('storage_read_failed'); }
+  }
+  private managementSession(sessionId:number,expectedRevision:number):SessionView {
+    const session=this.readSession(sessionId);if(!session)throw safeError('input_invalid',undefined,{reason:'session_not_found'});
+    this.assertSessionActive(session);
+    if(session.metadataRevision!==expectedRevision)throw safeError('state_conflict',undefined,{reason:'session_metadata_revision_mismatch'});
+    return session;
+  }
+  private managementReplay(method:'session.rename'|'session.delete',request:RenameSessionInput|DeleteSessionInput,operationRef:string):SessionManagementReceipt|null {
+    const operation=this.findOperation(operationRef);if(!operation)return null;
+    if(operation.method!==method||canonicalRequest(operation.originalRequest)!==canonicalRequest(request))fail('state_conflict');
+    if(operation.method==='session.rename'||operation.method==='session.delete')return operation.result;
+    return fail('state_conflict');
+  }
+  private saveManagement(request:RenameSessionInput|DeleteSessionInput,receipt:SessionManagementReceipt):void {
+    const details=checked(SessionManagementDetailsSchema,{format:'medclaw.session-management/v1',originalRequest:request,receipt});
+    this.db.query("INSERT INTO business_events(operation_ref,type,actor,session_id,details_json,occurred_at) VALUES(?,?,'user',?,?,?)")
+      .run(receipt.operationRef,receipt.method==='session.rename'?'session_renamed':'session_deleted',receipt.session.id,canonicalRequest(details),receipt.committedAt);
+  }
+  renameSession(input:RenameSessionInput,operationRef:string,time:string):SessionManagementReceipt {
+    const request=checked(RenameSessionInputSchema,input);checked(OpaqueIdSchema,operationRef);checked(TimestampSchema,time);
+    return this.inputWrite(()=>{
+      const prior=this.managementReplay('session.rename',request,operationRef);if(prior)return prior;
+      const session=this.managementSession(request.sessionId,request.expectedMetadataRevision);
+      if(request.title!==session.title){
+        if(session.metadataRevision===Number.MAX_SAFE_INTEGER)fail('state_conflict');
+        this.db.query("UPDATE sessions SET title=?,metadata_json=json_set(metadata_json,'$.titleOrigin','user'),metadata_revision=metadata_revision+1,updated_at=? WHERE id=? AND status='active' AND metadata_revision=?")
+          .run(request.title,time,session.id,session.metadataRevision);
+      }
+      const receipt=checked(SessionManagementReceiptSchema,{operationRef,method:'session.rename',session:this.metadataView(this.readSession(session.id)!),workspace:null,committedAt:time});
+      this.saveManagement(request,receipt);return receipt;
+    });
+  }
+  private metadataView(session:SessionView) {return {id:session.id,title:session.title,status:session.status,metadataRevision:session.metadataRevision,deletedAt:session.deletedAt};}
+  private assertSessionPersistedClosed(sessionId:number):void {
+    if(this.p5&&this.db.query("SELECT id FROM session_inputs WHERE session_id=? AND (processing_status='pending' OR status='delivery_unknown') LIMIT 1").get(sessionId))fail('runtime_busy');
+    for(const row of this.db.query<RunRow,[number]>('SELECT * FROM runs WHERE session_id=?').all(sessionId)){
+      const cleanup=RunCleanupRecordSchema.safeParse(decoded(row.cleanup_json));
+      if(row.status==='created'||row.status==='running'||!cleanup.success
+        ||!(cleanup.data.executionStarted===false||cleanup.data.stopConfirmed===true)||cleanup.data.requiredPersistenceComplete!==true
+        ||cleanup.data.inputsSettled!==true||cleanup.data.resourcesReleased!==true||cleanup.data.unconfirmedItems.length)fail('runtime_busy');
+      if(this.p3&&this.db.query("SELECT id FROM tool_calls WHERE run_id=? AND (status IN ('requested','running') OR (effect='LOCAL_WRITE' AND json_extract(result_json,'$.outcomeUnknown')=1)) LIMIT 1").get(row.id))fail('runtime_busy');
+    }
+  }
+  deleteSession(input:DeleteSessionInput,operationRef:string,time:string):SessionManagementReceipt {
+    const request=checked(DeleteSessionInputSchema,input);checked(OpaqueIdSchema,operationRef);checked(TimestampSchema,time);
+    return this.inputWrite(()=>{
+      const prior=this.managementReplay('session.delete',request,operationRef);if(prior)return prior;
+      const session=this.managementSession(request.sessionId,request.expectedMetadataRevision),workspace=this.readWorkspace();
+      if(workspace.revision!==request.expectedWorkspaceRevision)throw safeError('state_conflict',undefined,{reason:'workspace_revision_mismatch'});
+      if(session.metadataRevision===Number.MAX_SAFE_INTEGER)fail('state_conflict');this.assertSessionPersistedClosed(session.id);
+      this.db.query("UPDATE sessions SET status='deleted',deleted_at=?,metadata_revision=metadata_revision+1,updated_at=? WHERE id=? AND status='active' AND metadata_revision=?")
+        .run(time,time,session.id,session.metadataRevision);
+      const finalWorkspace=workspace.sessionId===session.id?this.saveWorkspace(workspace,this.sessionWorkspace(workspace,null),time):workspace;
+      const receipt=checked(SessionManagementReceiptSchema,{operationRef,method:'session.delete',session:this.metadataView(this.readSession(session.id)!),workspace:finalWorkspace,committedAt:time});
+      this.saveManagement(request,receipt);return receipt;
+    });
+  }
+
+  private sessionWorkspace(workspace: WorkspaceState, sessionId: number | null): WorkspaceState {
     const next: WorkspaceState = {...workspace,sessionId,queryId:null,selection:null,
       activeView:['query','evidence'].includes(workspace.activeView) ? 'data' : workspace.activeView};
     if (this.p3) {
@@ -563,7 +658,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
 
   listSessions(input: { beforeSessionId?: number; limit?: number }): SessionPage {
     const request = checked(ListSessionsRequestSchema, input);
-    const rows = this.db.query<{ id: number }, [number, number]>("SELECT id FROM sessions WHERE id<? ORDER BY id DESC LIMIT ?")
+    const rows = this.db.query<{ id: number }, [number, number]>("SELECT id FROM sessions WHERE kind='user' AND status='active' AND id<? ORDER BY id DESC LIMIT ?")
       .all(request.beforeSessionId ?? Number.MAX_SAFE_INTEGER, request.limit + 1), page = rows.slice(0, request.limit);
     return { sessions: page.map(row => this.readSession(row.id)!), nextBeforeSessionId: rows.length > request.limit ? page.at(-1)!.id : null };
   }
@@ -583,7 +678,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if (workspace.revision === Number.MAX_SAFE_INTEGER) fail('state_conflict');
       const next = this.sessionWorkspace(workspace,sessionId);
       const result = checked(NewSessionResultSchema, { session: { id: sessionId, title: `New Session ${sessionId}`, nativeSessionId,
-        kind: "user", status: "active", inputControl: null, storageVersion: 0, leafId: null, nextSubmissionSequence: 1 },
+        kind: "user", status: "active", metadataRevision:0, deletedAt:null, inputControl: null, storageVersion: 0, leafId: null, nextSubmissionSequence: 1 },
         workspace: { ...next, revision: workspace.revision + 1 } });
       this.db.query(`INSERT INTO sessions(id,native_session_id,creation_operation_ref,creation_request_json,creation_result_json,title,created_at,updated_at)
         VALUES(?,?,?,?,?,?,?,?)`).run(sessionId, nativeSessionId, operationRef, canonicalRequest(request), JSON.stringify(result), result.session.title, time, time);
@@ -600,6 +695,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if (workspace.revision !== request.expectedWorkspaceRevision) fail("workspace_revision_mismatch");
       const session = this.readSession(request.sessionId);
       if (!session) fail("session_not_found");
+      this.assertSessionActive(session);
       if (session.kind !== 'user' || session.status !== 'active') fail('access_denied');
       if (workspace.sessionId === request.sessionId) return workspace;
       const selected = this.saveWorkspace(workspace,this.sessionWorkspace(workspace,request.sessionId),time);
@@ -681,6 +777,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       }
       const session = this.readSession(request.sessionId);
       if (!session) fail("session_not_found");
+      this.assertSessionActive(session);
       if (request.clientSequence < session.nextSubmissionSequence || request.clientSequence === Number.MAX_SAFE_INTEGER) fail("state_conflict");
       const workspace = this.readWorkspace();
       if (workspace.sessionId !== session.id || workspace.revision !== request.expectedRevision || !isDeepStrictEqual(toWorkspaceContext(workspace), toWorkspaceContext(input.workspace))) fail("workspace_revision_mismatch");

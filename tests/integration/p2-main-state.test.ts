@@ -86,7 +86,7 @@ test("Main rejects injected native scope and untrusted frames before any Host re
 });
 test("Session create replay forwards its original identity and revision without configuration synchronization or injected dates", async () => {
   const c = await setup(false);
-  const created = { session: { id: 1, title: "", nativeSessionId: "native-a", kind: "user", status: "active", inputControl: null, storageVersion: 0, leafId: null, nextSubmissionSequence: 1 },
+  const created = { session: { id: 1, title: "", nativeSessionId: "native-a", kind: "user", status: "active", metadataRevision: 0, deletedAt: null, inputControl: null, storageVersion: 0, leafId: null, nextSubmissionSequence: 1 },
     workspace: { revision: 1, sessionId: 1, materialVersion: null, batchRefs: [], deviceIds: [], queryId: null, activeView: "data", selection: null } };
   c.host.request = async (method, payload, op) => { c.calls.push({ method, payload, op }); return { ok: true, data: created }; };
   expect(await c.request("session.create", { expectedWorkspaceRevision: 0 }, "create-original")).toEqual({ ok: true, data: created });

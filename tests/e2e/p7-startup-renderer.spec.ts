@@ -10,7 +10,7 @@ import { DataCatalogSchema } from '../../packages/contracts/src/data';
 // Only the external desktop bridge is substituted. These tests run the actual
 // renderer and assert user-visible admission and results, not fixture call counts.
 const root = resolve(import.meta.dirname, '../..'), bun = process.env.MEDCLAW_BUN_EXECUTABLE ?? 'bun';
-const ready = { instanceId: 'startup-renderer-instance', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion: 5, error: null };
+const ready = { instanceId: 'startup-renderer-instance', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion: 6, error: null };
 const directory = ModelDirectoryViewSchema.parse({ configVersion: '0', selection: null, customApis: [],
   providers: [{ id: 'offline-provider', name: 'Offline provider', source: 'pi_builtin', loginTypes: ['api_key'],
     auth: { providerId: 'offline-provider', state: 'unavailable', type: null, source: null, checkKind: 'snapshot', checkedAt: '2026-10-04T00:00:00Z' } }],
@@ -47,7 +47,7 @@ async function launch(config: Fixture = {}) {
       discardSecret:async()=>{},secretInput:async()=>({ok:false,error:${JSON.stringify(failure.error)}}),openAuthLink:async()=>({ok:true,data:null}),pickImportDirectory:async()=>({ok:true,data:null})});`);
   writeFileSync(main, `const {app,BrowserWindow,ipcMain}=require('electron');
     const state=globalThis.__startupRenderer={modelResult:${JSON.stringify(config.modelResult ?? { ok: true, data: directory })},catalogResult:${JSON.stringify(config.catalogResult ?? { ok: true, data: emptyCatalog })},host:${JSON.stringify(config.host ?? ready)},holds:${JSON.stringify(config.holds ?? [])},pending:{},entered:[],completed:[]};
-    const session=id=>({id,title:'New Session '+id,nativeSessionId:'native-'+id,kind:'user',status:'active',inputControl:null,storageVersion:0,leafId:null,nextSubmissionSequence:1});
+    const session=id=>({id,title:'New Session '+id,nativeSessionId:'native-'+id,kind:'user',status:'active',metadataRevision:0,deletedAt:null,inputControl:null,storageVersion:0,leafId:null,nextSubmissionSequence:1});
     const sessions=${config.restoredSession ? '[session(1)]' : '[]'},inputs=[];let workspace={revision:${config.restoredSession ? '1' : '0'},sessionId:${config.restoredSession ? '1' : 'null'},materialVersion:null,batchRefs:[],deviceIds:[],queryId:null,activeView:'data',selection:null};
     const ok=data=>({ok:true,data});const failed=${JSON.stringify(failure)};
     ipcMain.handle('test:request',async(_, {method,payload})=>{
@@ -75,7 +75,7 @@ async function launch(config: Fixture = {}) {
       return failed;
     });
     app.whenReady().then(()=>{const window=new BrowserWindow({show:false,width:1440,height:1000,webPreferences:{preload:${JSON.stringify(preload)},contextIsolation:true,sandbox:true,nodeIntegration:false}});window.loadFile(${JSON.stringify(join(temporary, 'renderer/index.html'))});});`);
-  const require = createRequire(import.meta.url), executablePath: string = require('electron');
+  const require = createRequire(join(root, 'apps/desktop/package.json')), executablePath: string = require('electron');
   const playwright = createRequire(require.resolve('@playwright/test/package.json')), core = createRequire(playwright.resolve('playwright/package.json')).resolve('playwright-core/package.json');
   const env: Record<string, string> = Object.fromEntries(Object.entries(process.env).flatMap(([key, value]) => value === undefined ? [] : [[key, value]])); delete env.ELECTRON_RUN_AS_NODE;
   app = await electron.launch({ executablePath, args: ['-r', join(dirname(core), 'lib/server/electron/loader.js'), main], env, timeout: 30000 });

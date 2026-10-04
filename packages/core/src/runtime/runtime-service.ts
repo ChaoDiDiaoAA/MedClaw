@@ -1,6 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import { performance } from "node:perf_hooks";
-import { safeError, serviceResult, type AppError, type Result } from "../../../contracts/src/error";
+import { PositiveIdSchema, safeError, serviceResult, type AppError, type Result } from "../../../contracts/src/error";
 import type { Command, CommandContext, RuntimeNotice } from "../../../contracts/src/protocol";
 import { type BudgetSummary, type CredentialScope, type DiagnoseRequest, type ModelRuntimePort, type ProviderAccepted, type ProviderRequest, type PublishedSettings, type ResolvedProviderSelection } from "../../../contracts/src/model";
 import { canonicalRequest, RuntimeControlViewSchema, safePreview, type AgentRuntimePort, type CancelRunResult, type FinalAgentFact,
@@ -30,7 +30,7 @@ const now = () => new Date().toISOString();
 /** The one owner of root admission and lifecycle, shared by Provider and Agent. */
 export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   private execution: Execution | null = null;
-  private reservation: { operationRef: string; request: string; kind: "provider" | "agent" } | null = null;
+  private reservation: { operationRef: string; request: string; kind: "provider" | "agent"; sessionId: number | null } | null = null;
   private readonly recoveries = new Map<number, Recovery>();
   private recoveryError: AppError | null = null;
   private closing = false;
@@ -42,6 +42,36 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   get activeHandle(): RunHandle | null { return this.execution?.handle ?? null; }
   get persistencePending() { return this.execution?.pendingSave ?? this.recoveries.size > 0; }
   get stopPending() { return !!this.execution?.cause && !this.execution.stopped; }
+  /** A pending resolve owns its operation identity before any durable receipt exists. */
+  assertOperationAvailable(operationRef: string): void {
+    if (this.reservation?.operationRef === operationRef) throw safeError('state_conflict', undefined, { operationRef });
+  }
+  /** The check and the repository transaction run in one synchronous turn. */
+  withSessionDeletion<T>(sessionId: number, write: () => T): T {
+    PositiveIdSchema.parse(sessionId);
+    if (this.closing) throw safeError('state_conflict', undefined, { reason: 'runtime_busy' });
+    if (this.recoveryError) throw this.recoveryError;
+    if (this.reservation?.sessionId === sessionId) throw safeError('state_conflict', undefined, { reason: 'runtime_busy' });
+    const execution = this.execution;
+    if (execution && (execution.handle.sessionId === sessionId || execution.handle.sessionId === null && (execution.cause || execution.pendingSave))) {
+      const context = { runId: execution.handle.runId };
+      if (execution.cause && !execution.stopped) throw safeError('stop_unconfirmed', undefined, context);
+      if (execution.pendingSave || execution.toolGap || this.agent?.inputPersistencePending?.(execution.handle.runId)) throw safeError('storage_write_failed', undefined, context);
+      throw safeError('state_conflict', undefined, { ...context, reason: 'runtime_busy' });
+    }
+    let active: RunHandle | null, gaps: RunView[];
+    try { active = this.store.active(); gaps = this.store.recoveryCandidates(this.instanceId); }
+    catch (error) { throw safeError('storage_read_failed', error); }
+    if (active?.sessionId === sessionId) throw safeError('state_conflict', undefined, { runId: active.runId, reason: 'runtime_busy' });
+    const blocked = (run: RunView) => run.sessionId === sessionId || run.sessionId === null;
+    for (const gap of gaps) if (blocked(gap)) {
+      const recovery = this.recoveries.get(gap.id);
+      throw safeError(!recovery?.verified ? 'stop_unconfirmed' : recovery.cleanup.requiredPersistenceComplete !== true ? 'run_save_unavailable' : 'storage_write_failed', undefined, { runId: gap.id });
+    }
+    for (const recovery of this.recoveries.values()) if (blocked(recovery.run))
+      throw safeError(!recovery.verified ? 'stop_unconfirmed' : recovery.cleanup.requiredPersistenceComplete !== true ? 'run_save_unavailable' : 'storage_write_failed', undefined, { runId: recovery.run.id });
+    return write();
+  }
   failToolPersistence(runId: number, error: AppError): void {
     const execution = this.execution;
     if (!execution || execution.handle.runId !== runId || execution.stopped) return;
@@ -92,13 +122,13 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       return RuntimeControlViewSchema.parse({ instanceId: this.instanceId, activeRootRun: this.activeHandle, acceptingNewRuns: reasons.length === 0, blockReasons: reasons, budget });
     }, "storage_read_failed");
   }
-  private reserve(operationRef: string, original: unknown, kind: "provider" | "agent") {
+  private reserve(operationRef: string, original: unknown, kind: "provider" | "agent", sessionId: number | null) {
     if (this.reservation?.operationRef === operationRef && this.reservation.request === canonicalRequest(original)) throw new Error("operation_result_unknown");
     if (this.busy) {
       if (kind === "agent") throw safeError("state_conflict", undefined, { reason: "runtime_busy" });
       throw new Error("runtime_busy");
     }
-    this.reservation = { operationRef, request: canonicalRequest(original), kind };
+    this.reservation = { operationRef, request: canonicalRequest(original), kind, sessionId };
   }
   private recheck(operationRef: string, configVersion: string) {
     if (this.reservation?.operationRef !== operationRef || this.execution || this.closing || this.modelControlBusy()
@@ -114,11 +144,12 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
           || canonicalRequest(original.originalRequest) !== canonicalRequest(request)) throw new Error("state_conflict");
         return previous;
       }
+      const session = this.store.readSession(request.sessionId);
+      if (!session) throw new Error('session_not_found');
+      if (session.status === 'deleted') throw safeError('state_conflict', undefined, { reason: 'session_deleted' });
       if (request.mode !== 'send') return this.submitQueuedInput(request, context);
-      this.reserve(context.operationRef, request, "agent");
+      this.reserve(context.operationRef, request, "agent", request.sessionId);
       try {
-        const session = this.store.readSession(request.sessionId);
-        if (!session) throw new Error("session_not_found");
         if (!this.agent || !this.agent.read(request.sessionId).available) throw new Error("session_history_invalid");
         const config = this.settings(), resolved = await this.modelRuntime.resolve(request.model, config.configVersion,
           config.credentialRefs[request.model.provider] ?? null, config.requestPolicy, true);
@@ -235,7 +266,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       if (original.method !== method || !("runId" in original) || canonicalRequest(original.originalRequest) !== canonicalRequest(command.payload)) throw new Error("state_conflict");
       return { runId: original.runId, operationRef: command.operationRef, reused: true };
     }
-    this.reserve(command.operationRef, command.payload, "provider");
+    this.reserve(command.operationRef, command.payload, "provider", null);
     try {
       const payload = command.payload, config = this.settings(), resolved = await this.modelRuntime.resolve(payload.model, config.configVersion,
         config.credentialRefs[payload.model.provider] ?? null, config.requestPolicy);

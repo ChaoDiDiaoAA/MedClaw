@@ -226,13 +226,14 @@ describe("P1 read and usage boundaries", () => {
 });
 
 describe("P1 public and private protocol", () => {
-  test("public dispatch retains P1 methods in the P6 whitelist", async () => {
+  test("public dispatch retains P1 methods and the current Session management whitelist", async () => {
     const { publicMethodSchemas, parsePublicPayload } = await import("../../packages/contracts/src/protocol");
     expect(Object.keys(publicMethodSchemas).sort()).toEqual([
       "model.list", "model.read", "model.refresh", "operation.cancel", "model.auth.start", "model.auth.respond",
       "model.auth.cancel", "model.auth.status", "model.custom.read", "model.custom.save", "model.configure", "model.policy.update",
       "model.config.read", "model.config.rollback", "model.request", "model.diagnose", "run.active", "run.read", "run.cancel", "run.retrySave",
       "session.create", "session.select", "session.list", "session.read", "session.messages.read", "session.submit", "session.readSubmission", "session.readInput", "session.listInputs", "session.cancelInput", "workspace.read", "workspace.restore", "run.control.read",
+      "session.rename", "session.delete", "session.readManagementOperation",
       "settings.ui.read", "settings.ui.update", "diagnostics.read", "host.read", "host.start", "host.stop", "host.restart",
       "workspace.update", "data.read", "data.rows", "query.execute", "query.read", "query.list", "evidence.read", "tool.read",
       "import.preview", "import.commit", "import.read", "import.cancel", "import.recover", "evidence.readOperation", "evidence.readArtifact",
