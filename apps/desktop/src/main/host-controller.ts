@@ -4,6 +4,7 @@ import { mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { OpaqueIdSchema, safeError, type AppError, type Result } from "@medclaw/contracts/error";
 import { SDK_VERSION, type HostView } from "@medclaw/contracts/model";
+import { HostStartupFailureReader, type HostStartupFailure } from '../../../../packages/logging/src/host-startup-failure';
 import {
   DATABASE_SCHEMA_VERSION, HOST_PROTOCOL_VERSION, MAX_FRAME_BYTES,
   HostHelloSchema, HostReadySchema, HostRequestSchema, PrivateCredentialFrameSchema, PrivateCredentialReplySchema,
@@ -19,6 +20,7 @@ export interface HostControllerOptions {
   onCredentialRequest?: (frame: PrivateCredentialFrame) => Promise<Result<unknown>>;
   onNotice?: (notice: DesktopNotice) => void;
   onError?: (error: AppError) => void;
+  onStartupFailure?: (failure: HostStartupFailure) => void;
   onStarting?: (instanceId: string) => void;
   onExit?: (instanceId: string) => void;
 }
@@ -218,13 +220,16 @@ export class HostController {
     const ready = new Promise<HostReady>((resolve, reject) => { this.handshake = { resolve, reject }; });
     void ready.catch(() => {});
     const child = spawn(this.options.bunExecutable ?? "bun", ["--no-env-file", resolve(this.options.hostEntry)], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, AWS_MAX_ATTEMPTS: "1", MEDCLAW_INSTANCE_ID: instanceId, MEDCLAW_STARTUP_TOKEN: startupToken } });
+    const startupFailure: { value: HostStartupFailure | null } = { value: null };
+    const failureReader = new HostStartupFailureReader();
     this.child = child;
     this.exited = new Promise<void>(done => child.once("close", () => {
       if (this.child === child) {
         this.child = null; this.preview = null; this.clearStreams();
         const stopped = this.view.state === "stopping" && (!this.view.error || this.view.error.code === "host_stop_unconfirmed");
         const failed = this.view.error !== null;
-        const error = this.view.error ?? safeError("host_interrupted");
+        const error = this.view.error ?? startupFailure.value?.error ?? safeError("host_interrupted");
+        if (startupFailure.value) { try { this.options.onStartupFailure?.(startupFailure.value); } catch { /* Diagnostics cannot alter Host control. */ } }
         this.handshake?.reject(error); this.handshake = null;
         this.interrupt(error);
         this.view = { ...this.view, state: stopped ? "stopped" : "failed", canStart: true, error: stopped ? null : error };
@@ -242,8 +247,11 @@ export class HostController {
       catch (error) { this.fail(error instanceof Error && error.message === "frame_too_large" ? "frame_too_large" : this.view.state === "handshaking" ? "host_protocol_mismatch" : "invalid_frame"); }
     });
     child.stdout.on("end", () => { if (this.child === child && this.buffer.length) this.fail("invalid_frame"); });
-    // Never forward raw stderr, which can contain provider secrets.
-    child.stderr.on("data", () => {});
+    // Never forward raw stderr, which can contain provider secrets. A fatal
+    // startup line is useful only after its phase/code are validated and exit is confirmed.
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (this.child === child && this.handshake) failureReader.push(chunk, failure => { startupFailure.value = failure; });
+    });
     this.options.onStarting?.(instanceId);
     this.view.state = "handshaking"; this.status();
     const timer = setTimeout(() => { if (this.child === child && this.handshake) this.fail("host_start_failed"); }, 10000);

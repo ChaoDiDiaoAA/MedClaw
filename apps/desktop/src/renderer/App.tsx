@@ -10,7 +10,7 @@ import { Sidebar } from "./sidebar";
 import { SessionList, sessionDisplayTitle, newSessionDraft, selectSessionModelDraft, acceptSubmissionDraft, type SessionDraft } from "./session-list";
 import { Chat } from "./chat";
 import { useInputQueue } from "./input-queue";
-import { ModelsPage } from "./models-page";
+import { ModelsPage, type DirectoryReadStatus } from "./models-page";
 import { SettingsPage } from "./settings-page";
 import { RunDetails } from "./run-details";
 import { DataWorkspace } from "./data-workspace";
@@ -34,9 +34,19 @@ const released = (run: RunView) => ["completed", "failed", "cancelled"].includes
   && (run.cleanup.executionStarted === false || run.cleanup.stopConfirmed === true) && run.cleanup.requiredPersistenceComplete === true
   && run.cleanup.resourcesReleased === true && run.cleanup.inputsSettled === true && run.cleanup.unconfirmedItems.length === 0;
 
+function StartupFailure() {
+  return <main className="page-content"><h1>Desktop startup failed</h1><p role="alert">The desktop connection could not be established. Restart the desktop application.</p><p>Sending is unavailable until the desktop connection and saved selection are confirmed.</p><button onClick={() => window.location.reload()}>Reload desktop page</button></main>;
+}
 export function App() {
+  const [failed, setFailed] = useState(false), fail = useCallback(() => setFailed(true), []);
+  const bridge = window.medclaw;
+  if (failed || !bridge || ['request', 'subscribe', 'secretInput', 'discardSecret', 'openAuthLink', 'pickImportDirectory'].some(key => typeof bridge[key as keyof DesktopBridge] !== 'function')) return <StartupFailure />;
+  return <ConnectedApp onBridgeFailure={fail} />;
+}
+function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   const [page, setPage] = useState<ViewPage>("chat"), [ui, setUi] = useState(initialUi), [uiVersion, setUiVersion] = useState("0");
   const [host, setHost] = useState(initialHost), [directory, setDirectory] = useState<ModelDirectoryView | null>(null), [directoryCurrent, setDirectoryCurrent] = useState(false);
+  const [directoryStatus, setDirectoryStatus] = useState<DirectoryReadStatus>({ state: 'unread', error: null });
   const [error, setError] = useState<string | null>(null), [active, setActive] = useState<ActiveRunView | null>(null), [control, setControl] = useState<RuntimeControlView | null>(null);
   const [run, setRun] = useState<RunView | null>(null), [preview, setPreview] = useState<{ text: string; truncated: boolean } | null>(null);
   const [workspace, setWorkspace] = useState<WorkspaceView | null>(null), [workspaceConfirmed, setWorkspaceConfirmed] = useState(false), [selecting, setSelecting] = useState(false);
@@ -68,32 +78,53 @@ export function App() {
   const sessionReadOrder = useRef(new Map<number, number>()), mounted = useRef(true);
   const sessionReads = useRef(new Map<number, Promise<void>>());
   const sessionReadAgain = useRef(new Set<number>());
+  const pendingDraftTime = useRef(new Map<number, Set<'referenceDate' | 'timezone'>>());
+  const hostNoticeEpoch = useRef(0);
+  const bridgeFailed = useRef(false);
+  const failBridge = useCallback(() => { bridgeFailed.current = true; onBridgeFailure(); }, [onBridgeFailure]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   hostRef.current = host; runRef.current = run; workspaceRef.current = workspace; sessionsRef.current = sessions; draftsRef.current = drafts; directoryRef.current = directory; catalogRef.current = catalog;
   activeRef.current = active; controlRef.current = control; detailsRef.current = details; pageRef.current = page;
 
   const editDraft = useCallback((sessionId: number, patch: Partial<SessionDraft>) => {
+    const pending = pendingDraftTime.current.get(sessionId), prior = draftsRef.current[sessionId];
+    for (const field of ['referenceDate', 'timezone'] as const) if (patch[field] !== undefined && patch[field] !== prior?.[field]) pending?.delete(field);
+    if (pending?.size === 0) pendingDraftTime.current.delete(sessionId);
     setDrafts(old => { const next = { ...old, [sessionId]: { ...(old[sessionId] ?? newSessionDraft(null, catalogRef.current)), ...patch } }; draftsRef.current = next; return next; });
   }, []);
   const defaultModel = () => directoryRef.current?.selection ? { provider: directoryRef.current.selection.provider, modelId: directoryRef.current.selection.modelId, expectedConfigVersion: directoryRef.current.configVersion } : null;
   const ensureDraft = useCallback((sessionId: number, model?: ModelChoice | null) => {
-    if (!draftsRef.current[sessionId]) editDraft(sessionId, newSessionDraft(model ?? defaultModel(), catalogRef.current));
+    if (!draftsRef.current[sessionId]) {
+      const draft = newSessionDraft(model ?? defaultModel(), catalogRef.current);
+      // Unknown imported facts cannot be treated as an empty catalog. Only the
+      // first confirmed catalog may initialize fields the user has not edited.
+      if (!catalogRef.current) { draft.referenceDate = ''; draft.timezone = ''; }
+      editDraft(sessionId, draft);
+      if (!catalogRef.current) pendingDraftTime.current.set(sessionId, new Set(['referenceDate', 'timezone']));
+    }
   }, [editDraft]);
   const readUi = useCallback(async () => {
-    const result = await window.medclaw.request("settings.ui.read", {});
-    if (result.ok) { setUi(result.data.ui); setUiVersion(result.data.configVersion); } else setError(errorMessage(result.error));
-  }, []);
+    try {
+      const result = await window.medclaw.request("settings.ui.read", {});
+      if (result.ok) { setUi(result.data.ui); setUiVersion(result.data.configVersion); } else setError(errorMessage(result.error));
+    } catch { failBridge(); }
+  }, [failBridge]);
   const readDirectory = useCallback(async () => {
+    if (hostRef.current.state !== 'ready') return;
     const instance = hostRef.current.instanceId, order = ++directoryRead.current;
-    const result = await window.medclaw.request("model.read", {});
-    if (instance !== hostRef.current.instanceId || order !== directoryRead.current) return;
-    if (result.ok) {
-      directoryRef.current = result.data; setDirectory(result.data); setDirectoryCurrent(true);
+    const owns = () => mounted.current && instance === hostRef.current.instanceId && hostRef.current.state === 'ready' && order === directoryRead.current;
+    setDirectoryCurrent(false); setDirectoryStatus({ state: 'loading', error: null });
+    try {
+      const result = await window.medclaw.request("model.read", {});
+      if (!owns()) return;
+      if (result.ok) {
+      directoryRef.current = result.data; setDirectory(result.data); setDirectoryCurrent(true); setDirectoryStatus({ state: 'ready', error: null });
       setDrafts(old => { const next = Object.fromEntries(Object.entries(old).map(([id, draft]) => {
         const model = draft.model ?? result.data.selection;
         return [id, { ...draft, model: model ? { provider: model.provider, modelId: model.modelId, expectedConfigVersion: result.data.configVersion } : null }];
       })); draftsRef.current = next; return next; });
-    } else { setDirectoryCurrent(false); setError(errorMessage(result.error)); }
+      } else { const message = errorMessage(result.error); setDirectoryStatus({ state: 'error', error: message }); setError(message); }
+    } catch { if (owns()) { const message = 'The model directory could not be read. Reload the published directory.'; setDirectoryStatus({ state: 'error', error: message }); setError(message); } }
   }, []);
   const readActive = useCallback(async () => {
     const instance = hostRef.current.instanceId, order = ++activeRead.current;
@@ -106,7 +137,19 @@ export function App() {
     const instance = hostRef.current.instanceId, order = ++catalogRead.current;
     const result = await window.medclaw.request("data.read", { page });
     if (instance !== hostRef.current.instanceId || order !== catalogRead.current) return;
-    if (result.ok) { catalogRef.current = result.data; setCatalog(result.data); } else setError(errorMessage(result.error));
+    if (result.ok) {
+      catalogRef.current = result.data; setCatalog(result.data);
+      const defaults = newSessionDraft(null, result.data);
+      setDrafts(old => {
+        const next = { ...old };
+        for (const [id, pending] of pendingDraftTime.current) {
+          const draft = next[id]; if (!draft) continue;
+          next[id] = { ...draft, ...Object.fromEntries([...pending].map(field => [field, defaults[field]])) };
+          pendingDraftTime.current.delete(id);
+        }
+        draftsRef.current = next; return next;
+      });
+    } else setError(errorMessage(result.error));
   }, []);
   const readRun = useCallback(async (runId: number): Promise<RunView | null> => {
     const instance = hostRef.current.instanceId, result = await window.medclaw.request("run.read", { runId });
@@ -213,21 +256,22 @@ export function App() {
     } finally { if (workspaceMutation.current?.instance === instance && workspaceMutation.current.kind === 'restore') { workspaceMutation.current = null; setSelecting(false); } }
   }, [applyWorkspace, readWorkspace]);
   const changed = useCallback(async () => {
-    await readUi(); if (hostRef.current.state !== "ready") return;
+    const uiRead = readUi(); if (hostRef.current.state !== "ready" || bridgeFailed.current) { await uiRead; return; }
     const instance = hostRef.current.instanceId;
-    await Promise.all([readDirectory(), readActive(), readSessions(), (async () => {
-      await readCatalog();
+    const results = await Promise.allSettled([uiRead, readDirectory(), readActive(), readSessions(), readCatalog(), (async () => {
       if (instance === hostRef.current.instanceId && hostRef.current.state === "ready") {
         if (restoredInstance.current !== instance) await restoreWorkspace();
         else if (!workspaceMutation.current) await readWorkspace(confirmedWorkspace.current);
       }
     })()]);
+    if (instance === hostRef.current.instanceId && !bridgeFailed.current && results.some(result => result.status === 'rejected')) setError('Some desktop data could not be read. Read it again before using it.');
   }, [readUi, readDirectory, readActive, readSessions, readWorkspace, readCatalog, restoreWorkspace]);
 
-  useEffect(() => window.medclaw.subscribe(notice => {
+  useEffect(() => { try { return window.medclaw.subscribe(notice => {
     if (notice.type === "host.status") {
+      hostNoticeEpoch.current++;
       const prior = hostRef.current.instanceId; hostRef.current = notice.host; setHost(notice.host);
-      if (notice.host.state !== "ready") { setDirectoryCurrent(false); setControl(null); confirmedWorkspace.current = false; setWorkspaceConfirmed(false); }
+      if (notice.host.state !== "ready") { directoryRead.current++; setDirectoryStatus({ state: 'unread', error: null }); setDirectoryCurrent(false); setControl(null); confirmedWorkspace.current = false; setWorkspaceConfirmed(false); }
       if (notice.host.instanceId !== prior) {
         workspaceMutation.current = null; unknownWorkspaceInstance.current = null; setWorkspaceRecovery(null);
         selectBusy.current = false; workspaceChangeBusy.current = false; createBusy.current = false;
@@ -263,8 +307,13 @@ export function App() {
     else if (notice.type === "auth.notify") setAuthNotify(notice.notification);
     else if (notice.type === "auth.finished") { setAuthAttempt(notice.attempt); setPrompt(null); setAuthNotify(null); void readDirectory(); }
     else if (notice.type === "config.changed") void changed();
-  }), [changed, readActive, readDirectory, readRun, readSession, refreshInputs]);
-  useEffect(() => { void readUi(); void window.medclaw.request("host.read", {}).then(result => { if (result.ok) { hostRef.current = result.data; setHost(result.data); } else setError(errorMessage(result.error)); }); }, [readUi]);
+  }); } catch { failBridge(); } }, [changed, readActive, readDirectory, readRun, readSession, refreshInputs, failBridge]);
+  useEffect(() => {
+    if (bridgeFailed.current) return;
+    const epoch = hostNoticeEpoch.current, owns = () => mounted.current && !bridgeFailed.current && epoch === hostNoticeEpoch.current;
+    void readUi();
+    void (async () => { try { const result = await window.medclaw.request("host.read", {}); if (!owns()) return; if (result.ok) { hostRef.current = result.data; setHost(result.data); } else failBridge(); } catch { if (owns()) failBridge(); } })();
+  }, [readUi, failBridge]);
   useEffect(() => { if (host.state === "ready") void changed(); }, [host.instanceId, host.state, changed]);
   useEffect(() => {
     if (host.state !== "ready") return;
@@ -457,15 +506,15 @@ export function App() {
     <main className="workspace">
       <header className="page-header"><div className="header-title">{ui.navCollapsed && <button className="quiet" onClick={() => void updateUi({ navCollapsed: false })}>Expand navigation</button>}<h1>{{ chat: "Chat", data: "Data Workspace", queries: "Query History", models: "Models", settings: "Settings" }[page]}</h1></div><button ref={detailsButton} className="quiet" onClick={() => void updateUi({ detailOpen: !ui.detailOpen })}>View run details</button></header>
       {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="Dismiss notice" onClick={() => setError(null)}>×</button></div>}
-      <section className="page-content chat-page" hidden={page !== "chat"}><Chat visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} directory={directory} directoryCurrent={directoryCurrent} host={host} active={active} control={control} run={run} preview={preview} events={runEvents.state} onFinalSource={runEvents.setFinalSource}
+      <section className="page-content chat-page" hidden={page !== "chat"}><Chat visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control} run={run} preview={preview} events={runEvents.state} onFinalSource={runEvents.setFinalSource}
         workspace={workspace} workspaceConfirmed={workspaceConfirmed} workspacePending={selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} onWorkspace={updateWorkspace} dataDefaults={catalog}
-        session={currentDetail} draft={draft} selecting={selecting || !workspaceConfirmed} sending={sending === current} runningTitle={runningSession ? sessionDisplayTitle(runningSession) : null}
+        session={currentDetail} draft={draft} selecting={selecting || !workspaceConfirmed} sending={sending !== null && sending === current} runningTitle={runningSession ? sessionDisplayTitle(runningSession) : null}
         queueRun={queueRun} queueRootInput={queueRootInput} frozenInput={frozenInput} frozenRunId={frozenRun?.id} inputs={current ? inputQueue.snapshots[current] ?? null : null} cancellingInputs={cancellingInputs}
         onRefreshInputs={() => { if (current) void refreshInputs(current, true); }} onMoreInputs={() => { if (current) void readInputPage(current, 'more'); }} onCancelInput={original => void cancelInput(original)}
         onDraft={patch => { if (current) editDraft(current, patch); }} onUseForSession={useForSession} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} /></section>
       <section className="page-content" hidden={page !== "data"}><DataWorkspace host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} catalog={catalog} batches={catalog?.batches ?? []} onRefresh={page => void readCatalog(page)} onUpdate={updateWorkspace} onError={setError} /></section>
       <section className="page-content" hidden={page !== "queries"}><QueryHistory visible={page === "queries"} requestedQuery={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} active={active} onUpdate={updateWorkspace} onError={setError} /></section>
-      <section className="page-content" hidden={page !== "models"}><ModelsPage directory={directory} directoryCurrent={directoryCurrent} host={host} active={active} control={control}
+      <section className="page-content" hidden={page !== "models"}><ModelsPage directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control}
         sessionTarget={workspaceConfirmed && !selecting && current && currentDetail && host.instanceId ? { instanceId: host.instanceId, sessionId: current } : null} onUseForSession={useForSession}
         prompt={prompt} notification={authNotify} attempt={authAttempt} onChanged={changed} onAccepted={acceptedProvider} onError={setError} /></section>
       <section className="page-content" hidden={page !== "settings"}><SettingsPage ui={ui} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost} /></section>

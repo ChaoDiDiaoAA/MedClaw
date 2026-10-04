@@ -43,7 +43,14 @@ const host = new HostController({ dataRoot, hostEntry, bunExecutable: process.en
   onExit: instanceId => { ipc?.closeInstance(instanceId); credentials.confirmHostExit(instanceId); if (shuttingDown) app.exit(0); },
   onCredentialRequest: frame => privateCredentialRequest(credentials, frame, fileTokens, window && !window.isDestroyed() ? window.id : undefined),
   onError: error => errors.add(error),
+  onStartupFailure: failure => runtimeLog.addHostStartupFailure(failure),
   onNotice: notice => {
+    if (notice.type === 'host.status') {
+      if (notice.host.state === 'handshaking') runtimeLog.add('host_handshake');
+      else if (notice.host.state === 'ready') runtimeLog.add('host_ready');
+      else if (notice.host.state === 'stopped') runtimeLog.add('host_stopped');
+      else if (notice.host.state === 'failed') runtimeLog.add('host_failure');
+    }
     notify(notice);
     if (notice.type === "auth.finished" && (notice.attempt.state === "completed" || notice.attempt.state === "sync_unknown")) void ipc?.publishCredentials().catch(error => errors.add(safeError(error instanceof Error ? error.message : "model_auth_sync_failed")));
   },
@@ -64,16 +71,24 @@ async function diagnostics(categories: string[]): Promise<DiagnosticsView> {
   }
   return composeDiagnostics({ host: host.read(), versions: { sdkVersion: "0.87.1", protocolVersion: HOST_PROTOCOL_VERSION, schemaVersion: source?.versions.schemaVersion ?? null, configVersion: settings.read().configVersion, bunVersion: source?.versions.bunVersion ?? null, electronVersion: process.versions.electron }, hostAvailable: source !== null, mainEntries: [...errors.read(), ...runtimeLog.read()], hostEntries: source?.entries, categories: categories as Parameters<typeof composeDiagnostics>[0]["categories"] });
 }
+const startupFailure = (stage: string) => { runtimeLog.add(stage); errors.add(safeError('host_start_failed')); };
 void app.whenReady().then(async () => {
+  runtimeLog.add('desktop_startup');
   window = new BrowserWindow({ width: 1440, height: 900, minWidth: 1100, minHeight: 720, backgroundColor: "#faf9f6", title: "MedClaw", webPreferences: { preload: join(desktopEntryDir, "../preload/index.cjs"), contextIsolation: true, sandbox: true, nodeIntegration: false } });
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-navigate", event => event.preventDefault());
+  window.webContents.on('preload-error', () => startupFailure('preload_failed'));
+  window.webContents.on('did-fail-load', (_event, _code, _description, _url, isMainFrame) => { if (isMainFrame) startupFailure('renderer_load_failed'); });
+  window.webContents.on('render-process-gone', () => startupFailure('renderer_process_gone'));
   ipc = registerIpc({ window, host, settings, credentials, inputs: new SecretInputs(), fileTokens, diagnostics, report: error => errors.add(error), notify });
   ipcMain.on("medclaw:subscribe", event => { if (window && event.sender.id === window.webContents.id && event.senderFrame === event.sender.mainFrame) { event.sender.send("medclaw:notice", { type: "host.status", host: host.read(), instanceId: host.read().instanceId }); if (lastPreview) event.sender.send("medclaw:notice", lastPreview); } });
-  await window.loadFile(join(desktopEntryDir, "../renderer/index.html"));
+  runtimeLog.add('renderer_load_start');
+  try { await window.loadFile(join(desktopEntryDir, "../renderer/index.html")); }
+  catch { startupFailure('renderer_load_failed'); return; }
+  runtimeLog.add('renderer_load_finished');
   runtimeLog.add("host_start");
   await host.start();
-});
+}).catch(() => startupFailure('desktop_startup_failed'));
 app.on("second-instance", () => { if (window) { if (window.isMinimized()) window.restore(); window.focus(); } });
 if (explicitRoot && process.env.MEDCLAW_DEV_CONTROL_TOKEN) {
   process.on("message", (message: unknown) => {

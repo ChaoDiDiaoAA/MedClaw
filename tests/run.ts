@@ -36,7 +36,9 @@ export async function runStage(category: TestCategory, stage: string, options: {
   const report = join(temporary, category === "e2e" ? "results.json" : "results.xml");
   try {
     const cli = category === "e2e"
-      ? ["node", join(dirname(createRequire(import.meta.url).resolve("@playwright/test/package.json")), "cli.js"), "test", ...files.map(file => relative(root, file).replaceAll("\\", "/")), "--reporter=json"]
+      // Desktop specs build the same ordinary dev output; serialize files so
+      // an active Electron cannot load another spec's in-progress build.
+      ? ["node", join(dirname(createRequire(import.meta.url).resolve("@playwright/test/package.json")), "cli.js"), "test", ...files.map(file => relative(root, file).replaceAll("\\", "/")), "--workers=1", "--reporter=json"]
       : [process.execPath, "test", ...files, "--reporter=junit", `--reporter-outfile=${report}`];
     const child = Bun.spawn(cli, {
       cwd: root,

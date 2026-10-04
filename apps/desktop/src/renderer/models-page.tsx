@@ -7,8 +7,9 @@ import type { ActiveRunView, RuntimeControlView } from "../../../../packages/con
 const blankModel = (): CustomModelDefinition => ({ id: "", name: "", input: ["text"], reasoning: false, contextWindow: 8192, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null });
 const blankProvider = (): CustomProviderDefinition => ({ providerId: "", name: "", baseUrl: "", api: "", models: [blankModel()] });
 const authLabels = { available: "Authentication available", unavailable: "Not authenticated", checking: "Checking", sync_unknown: "Credential sync unconfirmed" };
+export type DirectoryReadStatus = { state: 'unread' | 'loading' | 'ready' | 'error'; error: string | null };
 
-export function ModelsPage(props: { directory: ModelDirectoryView | null; directoryCurrent: boolean; host: HostView; active: ActiveRunView | null; control: RuntimeControlView | null;
+export function ModelsPage(props: { directory: ModelDirectoryView | null; directoryCurrent: boolean; directoryStatus?: DirectoryReadStatus; host: HostView; active: ActiveRunView | null; control: RuntimeControlView | null;
   sessionTarget: { instanceId: string; sessionId: number } | null; onUseForSession: (target: { instanceId: string; sessionId: number }, choice: ModelChoice) => void;
   prompt: AuthPromptView | null; notification: AuthNotifyView | null; attempt: AuthAttemptView | null; onChanged: () => Promise<void>; onAccepted: (value: ProviderAccepted) => Promise<void>; onError: (message: string | null) => void }) {
   const [search, setSearch] = useState("");
@@ -32,6 +33,7 @@ export function ModelsPage(props: { directory: ModelDirectoryView | null; direct
   const secretInput = useRef<HTMLInputElement>(null);
   const authInstance = useRef(props.host.instanceId);
   const directory = props.directory;
+  const directoryStatus = props.directoryStatus ?? { state: directory ? 'ready' : 'unread', error: null };
   const catalogBlocked = props.host.state !== "ready" || !props.directoryCurrent || busy || !!refreshRef;
   const blocked = catalogBlocked || props.control?.acceptingNewRuns !== true;
   const attempt = props.attempt?.id === attemptId ? props.attempt : null;
@@ -138,12 +140,14 @@ export function ModelsPage(props: { directory: ModelDirectoryView | null; direct
     <section className="panel directory-panel" aria-labelledby="directory-title">
       <div className="section-heading"><div><span className="eyebrow">Pi model directory</span><h2 id="directory-title">Browse and select models</h2></div></div>
       <p className="muted">Published: {directory?.selection ? `${directory.selection.provider} / ${directory.selection.modelId}` : "No model selected"}</p>
+      {directoryStatus.state === 'loading' && <p role="status">Reading model directory…</p>}
+      {directoryStatus.state === 'error' && <p role="status" className="error-text">Model directory read failed. {directoryStatus.error} Reload the published directory when Host is ready.</p>}
       {directory && !props.directoryCurrent && <p className="error-text" role="status">The directory has not been reverified. The last readable result is retained. Reload the published directory before sending or publishing.</p>}
       <div className="directory-toolbar"><label>Search models<input type="search" value={search} onChange={event => setSearch(event.target.value)} placeholder="Provider, model name or ID" /></label><label>Provider<select aria-label="Provider" value={providerId} onChange={event => { setProvider(event.target.value); setAuthProvider(null); }}><option value="">All providers</option>{directory?.providers.map(provider => <option key={provider.id} value={provider.id}>{provider.name} · {provider.id}</option>)}</select></label></div>
       <div className="actions"><button disabled={blocked || authRunning} onClick={() => void refresh()}>{refreshRef ? "Refreshing…" : providerId ? "Refresh this provider" : "Refresh directory"}</button>{refreshRef && <button onClick={() => void cancelRefresh()}>Cancel refresh</button>}<button disabled={props.host.state !== "ready"} onClick={() => void props.onChanged()}>Reload published directory</button></div>
       {props.active && <p role="status" className="muted">Running Run {props.active.runId}. Authentication, custom saves and refreshes must wait until the run stops and is saved.</p>}
       {refreshResult && <div role="status"><p>{refreshResult.aborted ? "Refresh cancelled; readable directory retained" : refreshResult.errors.length ? "Some providers failed to refresh; readable directory retained" : "Directory refreshed"}</p>{refreshResult.errors.map(error => <p key={error.providerId} className="error-text">{error.providerId}: {error.message}</p>)}</div>}
-      {!directory ? <p role="status">The directory has not been read. Reload it when Host is ready.</p> : !visible.length ? <p role="status">{directory.models.length ? "No models match your search" : "No models in the current directory"}</p> : <div className="model-list" aria-label="Model directory">{visible.map(model => {
+      {!directory ? directoryStatus.state === 'unread' && <p role="status">The directory has not been read. Reload it when Host is ready.</p> : !visible.length ? directoryStatus.state === 'ready' && <p role="status">{directory.models.length ? "No models match your search" : "No models in the current directory"}</p> : <div className="model-list" aria-label="Model directory">{visible.map(model => {
         const provider = directory.providers.find(provider => provider.id === model.provider);
         const isChoice = choice?.provider === model.provider && choice.modelId === model.id;
         const published = directory.selection?.provider === model.provider && directory.selection.modelId === model.id;

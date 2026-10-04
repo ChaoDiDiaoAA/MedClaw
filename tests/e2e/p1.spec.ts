@@ -392,7 +392,11 @@ test("Host stop leaves local preferences and partial diagnostics reachable", asy
   await expect(page.getByRole("button", { name: "Save display preferences", exact: true })).toBeEnabled();
   expect(await page.locator("body").innerText()).not.toContain("P1-UI-SECRET-CANARY");
   await page.getByRole("button", { name: "Start Host", exact: true }).click();
-  await expect(page.getByText("Host ready", { exact: true }).first()).toBeVisible();
+  // Historical diagnostic entries also say "Host ready". Confirm the current
+  // lifecycle panel so an old log cannot stand in for this restart's readiness.
+  await expect(page.locator('.panel').filter({ has: page.getByRole('heading', { name: 'Host', exact: true }) }).getByText("Host ready", { exact: true })).toBeVisible();
+  const restarted = await page.evaluate(() => window.medclaw.request('host.read', {}));
+  expect(restarted.ok && restarted.data.state).toBe('ready');
   expect(requests).toHaveLength(before);
 });
 
@@ -402,7 +406,7 @@ test("policy rollback publishes a new version, preserves history, and rejects an
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   const original = await page.evaluate(() => window.medclaw.request("model.config.read", {}));
   const history = await page.evaluate(() => window.medclaw.request("run.read", { recent: true }));
-  if (!original.ok || !history.ok || history.data.kind !== "recent") throw new Error("Expected published configuration and saved history");
+  if (!original.ok || !history.ok || history.data.kind !== "recent") throw new Error(`Expected published configuration and saved history (configuration=${original.ok ? 'ok' : original.error.code}, history=${history.ok ? history.data.kind : history.error.code})`);
   await page.getByLabel("Run timeout (milliseconds)").fill("2000");
   await page.getByRole("button", { name: "Publish request policy", exact: true }).click();
   await expect(page.getByText("Request policy published; applies to the next run", { exact: true })).toBeVisible();

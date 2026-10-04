@@ -500,8 +500,8 @@ test('A14 minimum window, keyboard row selection and 200 percent zoom keep table
   if (await page.getByRole('button', { name: 'Close run details', exact: true }).count()) await page.getByRole('button', { name: 'Close run details', exact: true }).click();
   await app.evaluate(({ BrowserWindow }) => { const win = BrowserWindow.getAllWindows()[0]; win.setSize(1100, 720); win.webContents.setZoomFactor(2); });
   await page.setViewportSize({ width: 1100, height: 720 });
-  expect(await page.evaluate(() => window.innerWidth)).toBe(550);
-  expect(await page.evaluate(() => window.innerHeight)).toBe(360);
+  await expect.poll(() => page.evaluate(() => window.innerWidth)).toBe(550);
+  await expect.poll(() => page.evaluate(() => window.innerHeight)).toBe(360);
   await page.getByRole('button', { name: 'Collapse navigation', exact: true }).click();
   const choice = page.getByRole('button', { name: `Select Query ${query.queryId} ${view.data.page.rowKeys[0]} field deltaCents`, exact: true });
   await choice.focus(); await expect(choice).toBeFocused(); await page.keyboard.press('Enter');

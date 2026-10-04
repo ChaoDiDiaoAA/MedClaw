@@ -206,6 +206,10 @@ test('legacy acceptance reads only its Run and an old Host input reply is ignore
   first.release(); await idle(); const readBefore = (await calls()).length; await release('legacy-send'); await expect(input()).toHaveValue('');
   await expect.poll(async () => (await calls()).slice(readBefore).some(call => call.method === 'run.read' && call.payload.runId === original.runId)).toBe(true);
   const legacyReads = (await calls()).slice(readBefore); expect(legacyReads.some(call => call.method === 'session.readInput')).toBe(false);
+  // Establish the terminal Input projection before holding its next read. A
+  // background reconciliation of the legacy receipt must not consume this gate.
+  await expect(item(original.inputId)).toContainText('Completed');
+  await expect(queue().getByRole('button', { name: 'Refresh inputs', exact: true })).toBeEnabled();
   // A genuine Host restart provides a different instance; held old reads cannot populate its cache.
   const old = await page.evaluate(() => window.medclaw.request('host.read', {})); if (!old.ok || !old.data.instanceId) throw new Error('No Host');
   const unknown: SessionInput = { ...(await readInput(original.inputId)), status: 'delivery_unknown', processingStatus: 'pending', runId: null, nativeEntryId: null, processedAt: null, error: safeError('input_delivery_unknown') };

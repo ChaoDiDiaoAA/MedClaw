@@ -10,6 +10,7 @@ import type { SessionMessagePage, SessionMessageView } from "../../../../package
 import type { PublicReturn } from "../../../../packages/contracts/src/protocol";
 import { InputQueue, type InputQueueSnapshot } from "./input-queue";
 import { finalDisplaySource, resolveReadingAnchor, shouldRecordScroll, type ReadingAnchor, type RunEventProjectionState } from './use-run-events';
+import type { DirectoryReadStatus } from './models-page';
 
 // Each public page stays bounded; the displayed collection is independent of that DTO.
 type MessageAvailability = { available: boolean; hasPage: boolean; hasHistory: boolean; hasMore: boolean; unavailable: boolean; runCovered: boolean };
@@ -115,7 +116,7 @@ export function NativeMessages(props: { host: HostView; sessionId: number | null
   </section>;
 }
 
-export function Chat(props: { visible: boolean; sessionId: number | null; onCreate: () => void; directory: ModelDirectoryView | null; directoryCurrent: boolean; host: HostView; active: ActiveRunView | null; control: RuntimeControlView | null;
+export function Chat(props: { visible: boolean; sessionId: number | null; onCreate: () => void; directory: ModelDirectoryView | null; directoryCurrent: boolean; directoryStatus?: DirectoryReadStatus; host: HostView; active: ActiveRunView | null; control: RuntimeControlView | null;
   run: RunView | null; preview: { text: string; truncated: boolean } | null; session: SessionDetail | null; draft: SessionDraft | null;
   events: RunEventProjectionState | null; onFinalSource: (source: 'native' | 'saved' | 'unavailable') => void;
   selecting: boolean; sending: boolean; runningTitle: string | null; onDraft: (patch: Partial<SessionDraft>) => void; onSend: () => void; onResend: () => void;
@@ -256,7 +257,7 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
           if (selected && props.directory && props.session && props.host.instanceId) props.onUseForSession({ instanceId: props.host.instanceId, sessionId: props.session.session.id },
             { provider: selected.provider, modelId: selected.id, expectedConfigVersion: props.directory.configVersion });
         }}>
-          <option value="" disabled>{props.directoryCurrent ? models.length ? "Select a session model" : "No configured models. Configure a model first." : "Loading model directory…"}</option>
+          <option value="" disabled>{props.directoryCurrent ? models.length ? "Select a session model" : "No configured models. Configure a model first." : props.directoryStatus?.state === 'loading' ? "Loading model directory…" : props.directoryStatus?.state === 'error' ? "Model directory read failed. Open Models to retry." : props.directory ? "Model directory needs verification" : "Model directory not yet read"}</option>
           {models.map(model => <option key={JSON.stringify([model.provider, model.id])} value={JSON.stringify([model.provider, model.id])}>{model.name} · {model.provider} / {model.id}</option>)}
         </select>
         {!selectedModel && <span className="tiny" data-testid="session-model">{choice ? "The selected model is unavailable. Select a configured model." : "No session model selected"}</span>}
