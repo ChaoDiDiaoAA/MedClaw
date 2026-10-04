@@ -36,11 +36,14 @@ CREATE TABLE batches_v7 (
   status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','deleted')),
   deleted_at TEXT,
   deletion_operation_ref TEXT REFERENCES data_deletions(operation_ref),
+  cohort_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(cohort_json)),
   CHECK((status='deleted')=(deleted_at IS NOT NULL AND deletion_operation_ref IS NOT NULL)),
   CHECK((is_baseline=1 AND previous_batch_id IS NULL) OR (is_baseline=0 AND previous_batch_id IS NOT NULL)),
   CHECK(observed_entity_count<=expected_entity_count)
 ) STRICT;
 INSERT INTO batches_v7(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at) SELECT id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at FROM batches ORDER BY id;
+-- Retain identity evidence even when an unused live device is physically deleted.
+UPDATE batches_v7 SET cohort_json=COALESCE((SELECT json_group_array(json_object('deviceId',d.id,'sourceDeviceId',d.source_device_id)) FROM devices d WHERE d.id IN (SELECT device_id FROM snapshots WHERE batch_id=batches_v7.id UNION SELECT value FROM json_each(batches_v7.declared_missing_json))),'[]');
 
 CREATE TABLE devices_v7 (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

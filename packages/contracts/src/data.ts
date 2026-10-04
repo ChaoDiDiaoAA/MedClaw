@@ -81,6 +81,9 @@ export const ArtifactSchema = z.strictObject({
   sha256: z.string().nullable(),
   sourceLockHash: z.string().nullable(),
   metadata: z.record(z.string(), z.unknown()),
+  sourceAvailability:z.enum(['available','deleted']).optional(),
+  deletedBatchIds:z.array(PositiveIdSchema).optional(),
+  unavailableFiles:z.array(z.string()).optional(),
 });
 export type ImportPreviewRequest = z.infer<typeof ImportPreviewRequestSchema>;
 export type ImportCommitRequest = z.infer<typeof ImportCommitRequestSchema>;

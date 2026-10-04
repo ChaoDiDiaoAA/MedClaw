@@ -118,6 +118,7 @@ export class SqliteImportStore implements ImportStore {
         const previous = this.db.query<{ id: number }, [string]>('SELECT id FROM batches WHERE scope_key=? AND status=\'active\' ORDER BY snapshot_date DESC LIMIT 1').get(meta.scopeKey);
         const batchId = Number(this.db.query('INSERT INTO batches(import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(record.id, meta.scopeKey, meta.snapshotDate, meta.region, meta.materialVersion, meta.sourceBundleId, meta.sourceLockHash, day.contentHash, meta.coverage, meta.cohortHash, meta.expectedEntityCount, meta.observedEntityCount, canonicalRequest(meta.declaredMissingEntityIds.map(id => deviceIds.get(id)!)), canonicalRequest(meta), previous ? 0 : 1, previous?.id ?? null, revision, now).lastInsertRowid);
         batchIds.push(batchId);
+        this.db.query('UPDATE batches SET cohort_json=? WHERE id=?').run(canonicalRequest(pkg.masters.map(master=>({deviceId:deviceIds.get(master.device_id!)!,sourceDeviceId:master.device_id!}))),batchId);
         const content = createHash('sha256').update(canonicalRequest({ metadata: meta, mappingVersion: meta.mappingVersion, calculationVersion: pkg.calculationVersion })).update('\n');
         let dayRows = 0;
         for (const row of rows(day.file, meta)) {

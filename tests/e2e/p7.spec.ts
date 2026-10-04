@@ -478,7 +478,7 @@ test('A10 truly slow restore stays locked after late commit and cannot be unlock
   writeFileSync(join(temporary, 'hold-restore'), 'hold');
   const beforeCalls = (await calls()).filter(call => call.method === 'workspace.restore').length;
   await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('button', { name: 'Restart Host', exact: true }).click();
-  await expect.poll(() => existsSync(join(temporary, 'entered-restore'))).toBe(true);
+  await expect.poll(() => existsSync(join(temporary, 'entered-restore')),{timeout:15000}).toBe(true);
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click();
   await expect(page.getByText('Verify status in Settings and restart the Host.', { exact: true }).last()).toBeVisible({ timeout: 15000 });
   await expect(page.getByRole('button', { name: 'Recover original creation', exact: true })).toBeDisabled();

@@ -41,7 +41,7 @@ test('schema4_to_latest_preserves_old_rows_and_checksums_with_only_lifecycle_met
   expect(db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations'").all()).toHaveLength(19);
   names.forEach((n,i)=>expect(db.query(`SELECT * FROM ${n} ORDER BY id`).all()).toEqual(n==='sessions'
    ? before[i]!.map(row=>({...row as Record<string,unknown>,metadata_json:'{"titleOrigin":"user"}',metadata_revision:0,deleted_at:null}))
-   : n==='batches'?before[i]!.map(row=>({...row as Record<string,unknown>,status:'active',deleted_at:null,deletion_operation_ref:null})):before[i]));
+   : n==='batches'?before[i]!.map(row=>({...row as Record<string,unknown>,status:'active',deleted_at:null,deletion_operation_ref:null,cohort_json:'[{"deviceId":1,"sourceDeviceId":"device"}]'})):before[i]));
   expect(db.query('SELECT * FROM schema_migrations ORDER BY version').all().slice(0,4)).toEqual(markers);
   expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([1,2,3,4,5,6,7].map(version=>({version})));
   expect(db.query('SELECT * FROM runtime_events').all()).toEqual([]);

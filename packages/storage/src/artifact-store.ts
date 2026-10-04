@@ -185,7 +185,8 @@ export class ArtifactStore {
       const row = this.db.query<{ id: number; operation_ref: string; status: string; bytes: number | null; sha256: string | null; metadata_json: string }, [number]>('SELECT id,operation_ref,status,bytes,sha256,metadata_json FROM artifacts WHERE id=?').get(PositiveIdSchema.parse(id));
       if (!row) return null;
       const metadata = JSON.parse(row.metadata_json) as Record<string, unknown>;
-      return ArtifactSchema.parse({ id: row.id, operationRef: row.operation_ref, status: row.status, format: 'csv', mimeType: 'application/x-directory', bytes: row.bytes, sha256: row.sha256, sourceLockHash: typeof metadata.sourceLockHash === 'string' ? metadata.sourceLockHash : null, metadata });
+      const deletedBatchIds=this.db.query("SELECT name FROM sqlite_schema WHERE name='data_deletions'").get()?this.db.query<{id:number},[number]>("SELECT b.id FROM imports i,batches b WHERE i.artifact_id=? AND b.status='deleted' AND b.id IN (SELECT value FROM json_each(i.result_json,'$.batchIds')) ORDER BY b.id").all(row.id).map(batch=>batch.id):[];
+      return ArtifactSchema.parse({ id: row.id, operationRef: row.operation_ref, status: row.status, format: 'csv', mimeType: 'application/x-directory', bytes: row.bytes, sha256: row.sha256, sourceLockHash: typeof metadata.sourceLockHash === 'string' ? metadata.sourceLockHash : null, metadata,sourceAvailability:deletedBatchIds.length?'deleted':'available',deletedBatchIds,unavailableFiles:this.deletedFilePaths(row.id) });
     }, 'storage_read_failed');
   }
 }

@@ -17,8 +17,8 @@ export function DataWorkspace(props: { host: HostView; workspace: WorkspaceView 
   const [busy, setBusy] = useState(false), [unknown, setUnknown] = useState(false), [selected, setSelected] = useState<number[]>([]), [saving, setSaving] = useState(false);
   const selectionDraftDirty = useRef(false);
   const [rows, setRows] = useState<PublicReturn<'data.rows'> | null>(null), [rowKind, setRowKind] = useState<'devices' | 'changes'>('devices'), [rowBatch, setRowBatch] = useState<number | null>(null), [rowsLoading, setRowsLoading] = useState(false);
-  const rowTarget = useRef<{ instanceId: string | null; batchId: number | null; kind: 'devices' | 'changes' }>({ instanceId: props.host.instanceId, batchId: rowBatch, kind: rowKind }), rowOrder = useRef(0);
-  rowTarget.current = { instanceId: props.host.instanceId, batchId: rowBatch, kind: rowKind };
+  const rowTarget = useRef<{ instanceId: string | null; batchId: number | null; kind: 'devices' | 'changes';catalogRevision:number|null }>({ instanceId: props.host.instanceId, batchId: rowBatch, kind: rowKind,catalogRevision:props.catalog?.catalogRevision??null }), rowOrder = useRef(0);
+  rowTarget.current = { instanceId: props.host.instanceId, batchId: rowBatch, kind: rowKind,catalogRevision:props.catalog?.catalogRevision??null };
   const original = useRef<{ operationRef: string; fileToken: string } | null>(null), committing = useRef<string | null>(null), current = useRef({ instanceId: props.host.instanceId, operationRef }), mounted = useRef(true), readOrder = useRef(0);
   current.current = { instanceId: props.host.instanceId, operationRef };
   const capture = () => ({ ...current.current });
@@ -26,13 +26,13 @@ export function DataWorkspace(props: { host: HostView; workspace: WorkspaceView 
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => { if (!selectionDraftDirty.current) setSelected(props.workspace?.batchRefs.map(batch => batch.id) ?? []); }, [props.workspace?.revision]);
   useEffect(() => { original.current = null; committing.current = null; setBusy(false); setUnknown(!!current.current.operationRef); }, [props.host.instanceId]);
-  useEffect(() => { setRows(null); rowOrder.current++; setRowsLoading(false); }, [props.host.instanceId]);
+  useEffect(() => { setRows(null); rowOrder.current++; setRowsLoading(false);if(rowBatch!==null&&props.host.state==='ready')void readRows(rowBatch,rowKind); }, [props.host.instanceId,props.catalog?.catalogRevision]);
   async function readRows(batchId: number, kind: 'devices' | 'changes', page = 1) {
     if (rowTarget.current.batchId !== batchId || rowTarget.current.kind !== kind) setRows(null);
-    setRowBatch(batchId); setRowKind(kind); rowTarget.current = { instanceId: props.host.instanceId, batchId, kind };
+    setRowBatch(batchId); setRowKind(kind); rowTarget.current = { instanceId: props.host.instanceId, batchId, kind,catalogRevision:props.catalog?.catalogRevision??null };
     const target = { ...rowTarget.current }, order = ++rowOrder.current; setRowsLoading(true);
     const result = await window.medclaw.request('data.rows', { batchId, kind, page });
-    if (!mounted.current || order !== rowOrder.current || target.instanceId !== rowTarget.current.instanceId || target.batchId !== rowTarget.current.batchId || target.kind !== rowTarget.current.kind) return;
+    if (!mounted.current || order !== rowOrder.current || target.instanceId !== rowTarget.current.instanceId || target.batchId !== rowTarget.current.batchId || target.kind !== rowTarget.current.kind || target.catalogRevision !== rowTarget.current.catalogRevision) return;
     if (result.ok && result.data.kind === kind) setRows(result.data); else props.onError(result.ok ? 'The data reply does not match this view.' : errorMessage(result.error));
     setRowsLoading(false);
   }

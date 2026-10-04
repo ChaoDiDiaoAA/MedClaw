@@ -16,17 +16,20 @@ export class DataDeletionService {
  preview(raw:DataDeletePreviewRequest){return this.execute(raw.operationRef,`preview:${canonicalRequest(raw)}`,async()=>{
    const input=DataDeletePreviewRequestSchema.parse(raw),prior=this.store.read(input.operationRef);
    if(prior)return this.store.preview(input,this.instanceId,new Date().toISOString(),[]);
-   this.store.assertIdle();const ids=this.store.targetIds(input);
+   this.store.assertIdle();const generation=this.store.importGeneration(),ids=this.store.targetIds(input);
    const files=await this.artifacts.planBatchDeletion(ids);if(this.closing)throw new Error('host_interrupted');
-   return this.store.preview(input,this.instanceId,new Date().toISOString(),files);
+   return this.store.preview(input,this.instanceId,new Date().toISOString(),files,generation);
  });}
  commit(raw:DataDeleteCommitRequest){return this.execute(raw.operationRef,`commit:${canonicalRequest(raw)}`,async()=>{
    const input=DataDeleteCommitRequestSchema.parse(raw),prior=this.store.read(input.operationRef);if(!prior)throw new Error('operation_not_found');
    if(prior.state==='committed')return this.store.commit(input,new Date().toISOString());
    this.store.assertIdle(input.operationRef);
+   const generation=this.store.importGeneration(),files=await this.artifacts.planBatchDeletion(prior.preview.batches.map(batch=>batch.id));
+   const ordered=(items:typeof files)=>[...items].sort((a,b)=>a.artifactId-b.artifactId||a.path.localeCompare(b.path));
+   if(canonicalRequest(ordered(files))!==canonicalRequest(prior.preview.files))throw new Error('state_conflict');
    for(const id of new Set(prior.preview.files.map(file=>file.artifactId)))await this.artifacts.assertDeletionOwner(id);
    if(this.closing)throw new Error('host_interrupted');
-   return this.cleanup(this.store.commit(input,new Date().toISOString()));
+   return this.cleanup(this.store.commit(input,new Date().toISOString(),generation));
  });}
  read(operationRef:string){return serviceResult(()=>this.store.read(operationRef),'storage_read_failed',{operationRef});}
  recover(operationRef:string){return this.execute(operationRef,'recover',async()=>{this.store.assertIdle(operationRef);const operation=this.store.read(operationRef);if(!operation||operation.state!=='committed')throw new Error('state_conflict');return this.cleanup(operation);});}

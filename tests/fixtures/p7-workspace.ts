@@ -25,6 +25,7 @@ export function seedWorkspaceQueries(db: Database) {
     db.query(`INSERT INTO snapshots(id,batch_id,device_id,device_name,region,price_cents,currency,unit,status,source_row_ref,source_refs_json,field_origins_json)
       VALUES(?,1,?,'器械','浙江',100,'CNY','台','active',?,'[]','{}')`).run(id, id, `row-${id}`);
   }
+  if(db.query("SELECT name FROM pragma_table_info('batches') WHERE name='cohort_json'").get())db.query("UPDATE batches SET cohort_json=(SELECT json_group_array(json_object('deviceId',id,'sourceDeviceId',source_device_id)) FROM devices) WHERE id=1").run();
   repos.updateWorkspace({ batchIds: [1] }, 1, at);
   const scope = repos.freezeAgentScope(repos.readWorkspace(), []);
   db.query(`INSERT INTO runs(id,session_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at)

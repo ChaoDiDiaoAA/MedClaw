@@ -23,7 +23,7 @@ const authenticatedDirectory = ModelDirectoryViewSchema.parse({ ...directory,
 const failure = { ok: false, error: { code: 'resource_unavailable', category: 'storage', message: 'The requested resource is temporarily unavailable.', retryable: true } };
 const emptyCatalog = DataCatalogSchema.parse({ batches: [], page: 1, pageSize: 50, batchCount: 0, deviceCount: 0, snapshotCount: 0, changeCount: 0, catalogRevision: 0, referenceDate: null, timezone: null });
 const importedCatalog = DataCatalogSchema.parse({ ...emptyCatalog, batchCount: 1, catalogRevision: 1, referenceDate: '2026-01-02', timezone: 'Asia/Shanghai', batches: [{ id: 1, scopeKey: 'imported-scope', snapshotDate: '2026-01-02', region: '浙江', coverage: 'full', previousBatchId: null, materialVersion: 'fixture/v1', sourceBundleId: 'fixture', sourceLockHash: 'a'.repeat(64), contentHash: 'b'.repeat(64), cohortHash: 'c'.repeat(64), catalogRevision: 1, expectedEntityCount: 0, observedEntityCount: 0, declaredMissingDeviceIds: [] }] });
-type Fixture = { deletionLost?:boolean;bridge?: 'missing' | 'subscribe_throw' | 'request_reject'; host?: typeof ready; modelResult?: unknown; catalogResult?: unknown; restoredSession?: boolean; hostReadResult?: unknown; hostReadReject?: boolean; holds?: string[] };
+type Fixture = { deletionReadResult?:unknown;deletionLost?:boolean;bridge?: 'missing' | 'subscribe_throw' | 'request_reject'; host?: typeof ready; modelResult?: unknown; catalogResult?: unknown; restoredSession?: boolean; hostReadResult?: unknown; hostReadReject?: boolean; holds?: string[] };
 type State = { modelResult: unknown; catalogResult: unknown; pending: Record<string, () => void>; entered: string[]; completed: string[]; holds: string[]; host: typeof ready };
 type MainGlobal = typeof globalThis & { __startupRenderer: State };
 let temporary: string, app: ElectronApplication | undefined, page: Page;
@@ -51,9 +51,9 @@ async function launch(config: Fixture = {}) {
     const sessions=${config.restoredSession ? '[session(1)]' : '[]'},inputs=[];let workspace={revision:${config.restoredSession ? '1' : '0'},sessionId:${config.restoredSession ? '1' : 'null'},materialVersion:null,batchRefs:[],deviceIds:[],queryId:null,activeView:'data',selection:null};
     let deletion=null;const ok=data=>({ok:true,data});const failed=${JSON.stringify(failure)};
     ipcMain.handle('test:request',async(_, {method,payload})=>{
-      const frozenWorkspace=structuredClone(workspace);
+      const frozenWorkspace=structuredClone(workspace),rowResult=state.catalogResult.data?.batches?.some(batch=>batch.id===payload.batchId)?ok({kind:payload.kind,items:[],selections:[],totalRows:0,page:1,pageSize:50}):failed;
       const hostReadResult=${JSON.stringify(config.hostReadResult ?? null)}??ok(structuredClone(state.host));
-      if(state.holds.includes(method)){state.entered.push(method);await new Promise(resolve=>state.pending[method]=resolve);delete state.pending[method];}
+      if(state.holds.includes(method)){if(method==='data.rows')state.holds=state.holds.filter(value=>value!==method);state.entered.push(method);await new Promise(resolve=>state.pending[method]=resolve);delete state.pending[method];}
       state.completed.push(method);
       if(method==='host.read'){if(${JSON.stringify(config.hostReadReject ?? false)})throw new Error('private late host error');return hostReadResult;}
       if(method==='settings.ui.read')return ok({configVersion:'0',ui:{navCollapsed:false,detailOpen:false,detailTab:'conditions'}});
@@ -62,7 +62,8 @@ async function launch(config: Fixture = {}) {
       if(method==='data.read')return state.catalogResult;
       if(method==='data.delete.preview'){deletion={operationRef:payload.operationRef,state:'ready',preview:{operationRef:payload.operationRef,previewHash:'a'.repeat(64),catalogRevision:payload.expectedCatalogRevision,workspaceRevision:payload.expectedWorkspaceRevision,batches:[{id:1,snapshotDate:'2026-01-02'}],snapshotCount:0,changeCount:0,deviceCount:0,queryCount:0,workspaceWillChange:false,files:[]},receipt:null,cleanup:{state:'pending',remainingCount:0,error:null},updatedAt:'2026-10-04T00:00:00Z'};return ok(deletion);}
       if(method==='data.delete.commit'){deletion={...deletion,state:'committed',receipt:{operationRef:payload.operationRef,batchIds:[1],snapshotCount:0,changeCount:0,deviceCount:0,catalogRevision:2,workspace,committedAt:'2026-10-04T00:00:00Z'},cleanup:{state:'complete',remainingCount:0,error:null}};state.catalogResult=ok({...state.catalogResult.data,batches:[],batchCount:0,catalogRevision:2});return ${JSON.stringify(config.deletionLost??false)}?{ok:false,error:{code:'operation_result_unknown',category:'storage',message:'The result is unconfirmed.',retryable:false}}:ok(deletion);}
-      if(method==='data.delete.read')return ok(deletion);
+      if(method==='data.rows')return rowResult;
+      if(method==='data.delete.read')return ${JSON.stringify(config.deletionReadResult)}??ok(deletion);
       if(method==='run.control.read')return ok({instanceId:state.host.instanceId,activeRootRun:null,acceptingNewRuns:true,blockReasons:[]});
       if(method==='run.active')return ok(null);
       if(method==='run.read')return ok(payload.runId?{kind:'one',run:null}:{kind:'recent',runs:[],nextBeforeRunId:null});
@@ -247,4 +248,23 @@ test('B03 deletion lost reply blocks new writes until original committed receipt
  await page.getByRole('button',{name:'Data Workspace',exact:true}).click();await page.getByRole('button',{name:'Read deletion result',exact:true}).click();await expect(page.getByTestId('deletion-result')).toContainText('Data deleted');await expect(page.getByRole('button',{name:'New Session',exact:true})).toBeEnabled();
  await page.getByRole('button',{name:'Chat',exact:true}).click();await expect(page.getByLabel('Message text',{exact:true})).toHaveValue('Keep my draft');await expect(page.locator('.composer').getByRole('button',{name:'Send',exact:true})).toBeEnabled();
  const completed=await app!.evaluate(()=>(globalThis as MainGlobal).__startupRenderer.completed);expect(completed.filter(method=>method==='data.delete.commit')).toHaveLength(1);expect(completed.filter(method=>method==='session.submit')).toHaveLength(0);
+});
+
+for(const [name,result]of [['null',{ok:true,data:null}],['failed',failure]] as const)test('B03 '+name+' deletion lookup does not unlock an unconfirmed write',async()=>{
+ await launch({restoredSession:true,catalogResult:{ok:true,data:importedCatalog},deletionLost:true,deletionReadResult:result});await page.getByRole('button',{name:'Data Workspace',exact:true}).click();await page.getByRole('button',{name:'Delete batch 1',exact:true}).click();await page.getByRole('button',{name:'Confirm permanent deletion',exact:true}).click();await page.getByRole('button',{name:'Read deletion result',exact:true}).click();
+ await expect(page.getByRole('button',{name:'New Session',exact:true})).toBeDisabled();await expect(page.getByRole('button',{name:'Preview delete all imported data',exact:true})).toBeDisabled();await expect(page.getByText('Deletion result unconfirmed. Read this operation before another deletion.',{exact:true})).toBeVisible();
+});
+
+test('B03 a delayed deletion lookup from an old Host cannot replace the new confirmed display',async()=>{
+ await launch({catalogResult:{ok:true,data:importedCatalog},holds:['data.delete.read'],deletionReadResult:failure});await page.getByRole('button',{name:'Data Workspace',exact:true}).click();await page.getByLabel('Deletion operation ID',{exact:true}).fill('old-operation');await page.getByRole('button',{name:'Read deletion result',exact:true}).click();
+ await expect.poll(()=>app!.evaluate(()=>(globalThis as MainGlobal).__startupRenderer.entered.includes('data.delete.read'))).toBe(true);
+ await app!.evaluate(({BrowserWindow},host)=>{const state=(globalThis as MainGlobal).__startupRenderer;state.host=host;for(const window of BrowserWindow.getAllWindows())window.webContents.send('test:notice',{type:'host.status',host,instanceId:host.instanceId});},{...ready,instanceId:'replacement-host'});
+ await expect(page.getByRole('button',{name:'New Session',exact:true})).toBeEnabled();await release('data.delete.read');await expect.poll(()=>app!.evaluate(()=>(globalThis as MainGlobal).__startupRenderer.completed.includes('data.delete.read'))).toBe(true);
+ await expect(page.getByText('Deletion result unconfirmed. Read this operation before another deletion.',{exact:true})).toHaveCount(0);await expect(page.getByText(failure.error.message,{exact:true})).toHaveCount(0);
+});
+
+test('B03 a pre-deletion row reply cannot repopulate the current data view after catalog changes',async()=>{
+ await launch({catalogResult:{ok:true,data:importedCatalog},holds:['data.rows']});await page.getByRole('button',{name:'Data Workspace',exact:true}).click();await page.getByRole('button',{name:'Read batch 1 devices',exact:true}).click();await expect.poll(()=>app!.evaluate(()=>(globalThis as MainGlobal).__startupRenderer.entered.includes('data.rows'))).toBe(true);
+ await page.getByRole('button',{name:'Delete batch 1',exact:true}).click();await page.getByRole('button',{name:'Confirm permanent deletion',exact:true}).click();await expect(page.getByTestId('deletion-result')).toContainText('Data deleted');await release('data.rows');await expect.poll(()=>app!.evaluate(()=>(globalThis as MainGlobal).__startupRenderer.completed.filter(method=>method==='data.rows').length)).toBe(2);
+ await expect(page.getByText('0 rows · Page 1',{exact:true})).toHaveCount(0);await expect(page.getByTestId('data-rows')).toHaveCount(0);
 });

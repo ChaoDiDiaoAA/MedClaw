@@ -15,19 +15,28 @@ export class SqliteDataDeletionStore {
  private row(operationRef:string){return this.db.query<Row,[string]>('SELECT * FROM data_deletions WHERE operation_ref=?').get(operationRef);}
  read(operationRef:string):DataDeleteOperation|null{const row=this.row(operationRef);return row?DataDeleteOperationSchema.parse({operationRef:row.operation_ref,state:row.state,preview:JSON.parse(row.preview_json),receipt:row.receipt_json?JSON.parse(row.receipt_json):null,cleanup:JSON.parse(row.cleanup_json),updatedAt:row.updated_at}):null;}
  private count(sql:string,params:(string|number)[]=[]){return this.db.query<{n:number},(string|number)[]>(sql).get(...params)!.n;}
+ importGeneration(){return this.count("SELECT COALESCE(MAX(id),0) n FROM business_events WHERE type IN ('import.imported','import.duplicate')");}
+ private checkImportGeneration(expected?:number){if(expected!==undefined&&this.importGeneration()!==expected)throw new Error('state_conflict');}
+ private deletableDevices(batchIds:number[]){return this.db.query<{id:number},[string]>(`SELECT d.id FROM devices d WHERE d.id IN (
+ SELECT json_extract(c.value,'$.deviceId') FROM batches b,json_each(b.cohort_json) c WHERE b.id IN (SELECT value FROM json_each(?1))
+ UNION SELECT device_id FROM snapshots WHERE batch_id IN (SELECT value FROM json_each(?1))
+ UNION SELECT device_id FROM change_events WHERE old_batch_id IN (SELECT value FROM json_each(?1)) OR new_batch_id IN (SELECT value FROM json_each(?1)))
+ AND NOT EXISTS(SELECT 1 FROM snapshots s WHERE s.device_id=d.id AND s.batch_id NOT IN (SELECT value FROM json_each(?1)))
+ AND NOT EXISTS(SELECT 1 FROM change_events e WHERE e.device_id=d.id AND e.old_batch_id NOT IN (SELECT value FROM json_each(?1)) AND e.new_batch_id NOT IN (SELECT value FROM json_each(?1))) ORDER BY d.id`).all(encode(batchIds)).map(row=>row.id);}
  targetIds(input:DataDeletePreviewRequest):number[]{return this.db.query<{id:number},[string,string]>("SELECT id FROM batches WHERE status='active' AND (?='all' OR id IN (SELECT value FROM json_each(?))) ORDER BY id").all(input.target.kind,input.target.kind==='batches'?encode(input.target.batchIds):'[]').map(row=>row.id);}
  assertIdle(operationRef?:string){
   this.assertRuntimeIdle();
   if(this.count("SELECT COUNT(*) n FROM runs WHERE status IN ('created','running')")||this.count("SELECT COUNT(*) n FROM session_inputs WHERE processing_status='pending'")||this.count("SELECT COUNT(*) n FROM imports WHERE state IN ('preparing','committing')"))throw safeError('state_conflict',undefined,{reason:'runtime_busy'});
   if(this.count("SELECT COUNT(*) n FROM data_deletions WHERE state='committed' AND json_extract(cleanup_json,'$.state')<>'complete' AND operation_ref<>?",[operationRef??'']))throw new Error('operation_result_unknown');
  }
- preview(raw:DataDeletePreviewRequest,instanceId:string,time:string,files:DataDeleteFile[]):DataDeleteOperation{
+ preview(raw:DataDeletePreviewRequest,instanceId:string,time:string,files:DataDeleteFile[],importGeneration?:number):DataDeleteOperation{
   const input=DataDeletePreviewRequestSchema.parse(raw);
   return this.transactions.immediate(()=>{
    const prior=this.row(input.operationRef);if(prior){if(prior.request_json!==canonicalRequest(input))throw new Error('state_conflict');return this.read(input.operationRef)!;}
    if(this.repositories.findOperation(input.operationRef))throw new Error('state_conflict');
    for(const table of ['imports','session_inputs'])if(this.db.query(`SELECT id FROM ${table} WHERE operation_ref=?`).get(input.operationRef))throw new Error('state_conflict');
    this.assertIdle();
+   this.checkImportGeneration(importGeneration);
    const revision=this.count('SELECT revision n FROM catalog_state WHERE id=1'),workspace=this.repositories.readWorkspace();
    if(workspace.revision!==input.expectedWorkspaceRevision)throw new Error('workspace_revision_mismatch');
    if(revision!==input.expectedCatalogRevision)throw new Error('state_conflict');
@@ -37,7 +46,7 @@ export class SqliteDataDeletionStore {
    const base={operationRef:input.operationRef,catalogRevision:revision,workspaceRevision:workspace.revision,batches:rows.map(row=>({id:row.id,snapshotDate:row.snapshot_date})),
     snapshotCount:this.count('SELECT COUNT(*) n FROM snapshots WHERE batch_id IN (SELECT value FROM json_each(?))',[encoded]),
     changeCount:this.count('SELECT COUNT(*) n FROM change_events WHERE old_batch_id IN (SELECT value FROM json_each(?1)) OR new_batch_id IN (SELECT value FROM json_each(?1))',[encoded]),
-    deviceCount:this.count('SELECT COUNT(*) n FROM devices d WHERE EXISTS(SELECT 1 FROM snapshots s WHERE s.device_id=d.id AND s.batch_id IN (SELECT value FROM json_each(?1))) AND NOT EXISTS(SELECT 1 FROM snapshots s WHERE s.device_id=d.id AND s.batch_id NOT IN (SELECT value FROM json_each(?1)))',[encoded]),
+    deviceCount:this.deletableDevices(ids).length,
     queryCount:this.count('SELECT COUNT(*) n FROM queries q WHERE EXISTS(SELECT 1 FROM json_each(q.batch_ids_json) b WHERE b.value IN (SELECT value FROM json_each(?)))',[encoded]),
     workspaceWillChange:workspace.batchRefs.some(ref=>ids.includes(ref.id)),files:[...files].sort((a,b)=>a.artifactId-b.artifactId||a.path.localeCompare(b.path))};
    const preview=DataDeletePreviewSchema.parse({...base,previewHash:createHash('sha256').update(canonicalRequest(base)).digest('hex')});
@@ -45,7 +54,7 @@ export class SqliteDataDeletionStore {
    return this.read(input.operationRef)!;
   });
  }
- commit(raw:DataDeleteCommitRequest,time:string):DataDeleteOperation{
+ commit(raw:DataDeleteCommitRequest,time:string,importGeneration?:number):DataDeleteOperation{
   const input=DataDeleteCommitRequestSchema.parse(raw);
   return this.transactions.immediate(()=>{
    const row=this.row(input.operationRef),operation=this.read(input.operationRef);if(!row||!operation)throw new Error('operation_not_found');
@@ -54,13 +63,15 @@ export class SqliteDataDeletionStore {
    if(input.previewHash!==p.previewHash||input.expectedCatalogRevision!==p.catalogRevision||input.expectedWorkspaceRevision!==p.workspaceRevision)throw new Error('state_conflict');
    if(operation.state==='committed')return operation;
    this.assertIdle(input.operationRef);
+   this.checkImportGeneration(importGeneration);
    if(this.repositories.readWorkspace().revision!==p.workspaceRevision)throw new Error('workspace_revision_mismatch');
    if(this.count('SELECT revision n FROM catalog_state WHERE id=1')!==p.catalogRevision)throw new Error('state_conflict');
    const ids=p.batches.map(batch=>batch.id),encoded=encode(ids);
    if(this.count("SELECT COUNT(*) n FROM batches WHERE status='active' AND id IN (SELECT value FROM json_each(?))",[encoded])!==ids.length)throw new Error('state_conflict');
+   const devices=this.deletableDevices(ids);if(devices.length!==p.deviceCount)throw new Error('state_conflict');
    this.db.query('DELETE FROM change_events WHERE old_batch_id IN (SELECT value FROM json_each(?1)) OR new_batch_id IN (SELECT value FROM json_each(?1))').run(encoded);
    this.db.query('DELETE FROM snapshots WHERE batch_id IN (SELECT value FROM json_each(?))').run(encoded);
-   this.db.query('DELETE FROM devices WHERE NOT EXISTS(SELECT 1 FROM snapshots WHERE device_id=devices.id) AND NOT EXISTS(SELECT 1 FROM change_events WHERE device_id=devices.id)').run();
+   this.db.query('DELETE FROM devices WHERE id IN (SELECT value FROM json_each(?))').run(encode(devices));
    this.db.query("UPDATE batches SET status='deleted',deleted_at=?,deletion_operation_ref=? WHERE id IN (SELECT value FROM json_each(?)) AND status='active'").run(time,input.operationRef,encoded);
    this.db.query('UPDATE catalog_state SET revision=revision+1,updated_at=? WHERE id=1 AND revision=?').run(time,p.catalogRevision);
    const workspace=this.repositories.reconcileDeletedWorkspace(p.workspaceRevision,time);
