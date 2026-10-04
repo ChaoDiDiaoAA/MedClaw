@@ -4,10 +4,10 @@ import { errorMessage, type Result } from "../../../../packages/contracts/src/er
 import type { AuthAttemptView, AuthNotifyView, AuthPromptView, DesktopDisplayPreferences, HostView, ModelChoice, ModelDirectoryView, ProviderAccepted } from "../../../../packages/contracts/src/model";
 import type { DesktopNotice, DesktopSecretInput, DesktopSecretInputResult, PublicMethod, PublicPayload, PublicReturn } from "../../../../packages/contracts/src/protocol";
 import type { ActiveRunView, RunView, RuntimeControlView } from "../../../../packages/contracts/src/run";
-import type { NewSessionInput, SessionDetail, SessionInput, SessionView, SubmitInput, SubmitResult } from "../../../../packages/contracts/src/session";
+import { RenameSessionInputSchema, DeleteSessionInputSchema, type NewSessionInput, type SessionDetail, type SessionInput, type SessionView, type SubmitInput, type SubmitResult, type SessionManagementReceipt, type SessionMetadataView, type RenameSessionInput, type DeleteSessionInput } from "../../../../packages/contracts/src/session";
 import type { WorkspaceChange, WorkspaceView } from "../../../../packages/contracts/src/workspace";
 import { Sidebar } from "./sidebar";
-import { SessionList, sessionDisplayTitle, newSessionDraft, selectSessionModelDraft, acceptSubmissionDraft, type SessionDraft } from "./session-list";
+import { SessionList, sessionDisplayTitle, newSessionDraft, selectSessionModelDraft, acceptSubmissionDraft, type SessionDraft, type SessionManagementEditor } from "./session-list";
 import { Chat } from "./chat";
 import { useInputQueue } from "./input-queue";
 import { ModelsPage, type DirectoryReadStatus } from "./models-page";
@@ -33,6 +33,9 @@ const initialHost: HostView = { instanceId: null, state: "starting", canStart: f
 const released = (run: RunView) => ["completed", "failed", "cancelled"].includes(run.status) && !!run.cleanup
   && (run.cleanup.executionStarted === false || run.cleanup.stopConfirmed === true) && run.cleanup.requiredPersistenceComplete === true
   && run.cleanup.resourcesReleased === true && run.cleanup.inputsSettled === true && run.cleanup.unconfirmedItems.length === 0;
+type ManagementOperation = { operationRef: string; instance: string; method: 'session.rename'; input: RenameSessionInput }
+  | { operationRef: string; instance: string; method: 'session.delete'; input: DeleteSessionInput };
+type ManagementEditor = SessionManagementEditor & { workspaceRevision: number; pending: ManagementOperation | null };
 
 function StartupFailure() {
   return <main className="page-content"><h1>Desktop startup failed</h1><p role="alert">The desktop connection could not be established. Restart the desktop application.</p><p>Sending is unavailable until the desktop connection and saved selection are confirmed.</p><button onClick={() => window.location.reload()}>Reload desktop page</button></main>;
@@ -54,6 +57,9 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   const [requestedQuery, setRequestedQuery] = useState<{ queryId: number; ownerSessionId: number } | null>(null);
   const [sessions, setSessions] = useState<SessionView[]>([]), [nextSession, setNextSession] = useState<number | null>(null);
   const [details, setDetails] = useState<Record<number, SessionDetail>>({}), [drafts, setDrafts] = useState<Record<number, SessionDraft>>({});
+  const [management, setManagement] = useState<ManagementEditor | null>(null), managementRef = useRef(management);
+  const metadata = useRef(new Map<number, SessionMetadataView>()), deletedSessions = useRef(new Set<number>());
+  const sessionListGeneration = useRef(0), sessionListRead = useRef(0);
   const [creating, setCreating] = useState(false), [creationUnknown, setCreationUnknown] = useState(false), [sending, setSending] = useState<number | null>(null);
   const [cancellingInputs, setCancellingInputs] = useState<number[]>([]), cancelBusy = useRef(new Set<number>());
   const inputQueue = useInputQueue(host), { readInput, refresh: refreshInputs, readPage: readInputPage, accept: acceptInput } = inputQueue;
@@ -67,7 +73,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   const creation = useRef<{ operationRef: string; input: NewSessionInput; model: ModelChoice | null } | null>(null);
   const directoryRead = useRef(0), activeRead = useRef(0), detailsButton = useRef<HTMLButtonElement>(null);
   const workspaceChangeBusy = useRef(false);
-  const workspaceMutation = useRef<{ instance: string | null; kind: 'create' | 'select' | 'update' | 'restore' } | null>(null);
+  const workspaceMutation = useRef<{ instance: string | null; kind: 'create' | 'select' | 'update' | 'restore' } | { instance: string; kind: 'delete'; operationRef: string } | null>(null);
   const confirmedWorkspace = useRef(false), unknownWorkspaceInstance = useRef<string | null>(null), restoredInstance = useRef<string | null>(null);
   const successfulRestoreInstance = useRef<string | null>(null);
   const [workspaceRecovery, setWorkspaceRecovery] = useState<'verify' | 'restart' | null>(null);
@@ -85,6 +91,16 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   hostRef.current = host; runRef.current = run; workspaceRef.current = workspace; sessionsRef.current = sessions; draftsRef.current = drafts; directoryRef.current = directory; catalogRef.current = catalog;
   activeRef.current = active; controlRef.current = control; detailsRef.current = details; pageRef.current = page;
+  managementRef.current = management;
+  const showManagement = (value: ManagementEditor | null) => { managementRef.current = value; setManagement(value); };
+  const mergeSession = useCallback((value: SessionView): SessionView | null => {
+    const prior = metadata.current.get(value.id);
+    if (deletedSessions.current.has(value.id) && value.status !== 'deleted') return null;
+    const next = prior && prior.metadataRevision >= value.metadataRevision ? { ...value, ...prior } : value;
+    metadata.current.set(value.id, { id: next.id, title: next.title, status: next.status, metadataRevision: next.metadataRevision, deletedAt: next.deletedAt });
+    if (next.status === 'deleted') deletedSessions.current.add(next.id);
+    return next;
+  }, []);
 
   const editDraft = useCallback((sessionId: number, patch: Partial<SessionDraft>) => {
     const pending = pendingDraftTime.current.get(sessionId), prior = draftsRef.current[sessionId];
@@ -181,23 +197,30 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       const result = await window.medclaw.request("session.read", { sessionId });
       if (!mounted.current || instance !== hostRef.current.instanceId || sessionReadOrder.current.get(sessionId) !== order) return;
       if (!result.ok) { setError(errorMessage(result.error)); return; }
-      if (result.data?.session.id === sessionId) { ensureDraft(sessionId); const next = { ...detailsRef.current, [sessionId]: result.data }; detailsRef.current = next; setDetails(next); }
+      if (result.data?.session.id === sessionId) {
+        const session = mergeSession(result.data.session); if (!session) return;
+        if (session.status === 'active') ensureDraft(sessionId);
+        const next = { ...detailsRef.current, [sessionId]: { ...result.data, session } }; detailsRef.current = next; setDetails(next);
+        setSessions(old => { const next = old.flatMap(value => value.id === sessionId ? session.status === 'active' ? [session] : [] : [value]); sessionsRef.current = next; return next; });
+      }
     } finally { if (sessionReads.current.get(sessionId) === task) {
       sessionReads.current.delete(sessionId);
       if (sessionReadAgain.current.delete(sessionId) && mounted.current && instance === hostRef.current.instanceId && hostRef.current.state === 'ready') void readSession(sessionId);
     } } })();
     sessionReads.current.set(sessionId, task); return task;
-  }, [ensureDraft]);
+  }, [ensureDraft, mergeSession]);
   const readSessions = useCallback(async (beforeSessionId?: number) => {
-    const instance = hostRef.current.instanceId, result = await window.medclaw.request("session.list", { ...(beforeSessionId ? { beforeSessionId } : {}), limit: 20 });
-    if (instance !== hostRef.current.instanceId) return;
+    const instance = hostRef.current.instanceId, generation = sessionListGeneration.current, order = ++sessionListRead.current;
+    const result = await window.medclaw.request("session.list", { ...(beforeSessionId ? { beforeSessionId } : {}), limit: 20 });
+    if (instance !== hostRef.current.instanceId || generation !== sessionListGeneration.current || order !== sessionListRead.current) return;
     if (!result.ok) { setError(errorMessage(result.error)); return; }
-    setSessions(old => { const next = beforeSessionId ? [...old, ...result.data.sessions.filter(s => !old.some(known => known.id === s.id))] : result.data.sessions;
+    const values = result.data.sessions.flatMap(value => { const current = mergeSession(value); return current?.status === 'active' ? [current] : []; });
+    setSessions(old => { const next = beforeSessionId ? [...old.filter(value => !deletedSessions.current.has(value.id)), ...values.filter(s => !old.some(known => known.id === s.id))] : values;
       sessionsRef.current = next; return next; });
     setNextSession(result.data.nextBeforeSessionId);
-  }, []);
+  }, [mergeSession]);
   const applyWorkspace = useCallback((value: WorkspaceView, instance: string | null, confirm = true) => {
-    if (instance !== hostRef.current.instanceId || value.revision < (workspaceRef.current?.revision ?? 0)) return false;
+    if (instance !== hostRef.current.instanceId || value.revision < (workspaceRef.current?.revision ?? 0) || value.sessionId !== null && deletedSessions.current.has(value.sessionId)) return false;
     const state = (view: WorkspaceView) => JSON.stringify([view.revision, view.sessionId, view.materialVersion, view.batchRefs, view.deviceIds, view.queryId, view.activeView, view.selection]);
     if (workspaceAuthority.current === instance && workspaceRef.current?.revision === value.revision && state(workspaceRef.current) !== state(value)) {
       confirmedWorkspace.current = false; setWorkspaceConfirmed(false); setWorkspaceRecovery('verify');
@@ -273,6 +296,8 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       const prior = hostRef.current.instanceId; hostRef.current = notice.host; setHost(notice.host);
       if (notice.host.state !== "ready") { directoryRead.current++; setDirectoryStatus({ state: 'unread', error: null }); setDirectoryCurrent(false); setControl(null); confirmedWorkspace.current = false; setWorkspaceConfirmed(false); }
       if (notice.host.instanceId !== prior) {
+        sessionListGeneration.current++;
+        if (managementRef.current?.pending) showManagement({ ...managementRef.current, busy: false, unknown: true, error: 'The Host changed. Read the original operation after the saved selection is restored.' });
         workspaceMutation.current = null; unknownWorkspaceInstance.current = null; setWorkspaceRecovery(null);
         selectBusy.current = false; workspaceChangeBusy.current = false; createBusy.current = false;
         if (desiredSession.current !== null) { desiredSessionNeedsConfirmation.current = true; setPendingSessionChoice(desiredSession.current); }
@@ -328,6 +353,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   useEffect(() => { if (host.state === 'ready' && page === 'chat' && workspace?.sessionId) void refreshInputs(workspace.sessionId, true); }, [host.instanceId, host.state, page, workspace?.sessionId, refreshInputs]);
 
   async function selectSession(sessionId: number) {
+    if (deletedSessions.current.has(sessionId)) { setError('This session was deleted. Its saved history remains readable.'); return; }
     setRequestedQuery(null); desiredSession.current = sessionId;
     if (!confirmedWorkspace.current) { desiredSessionNeedsConfirmation.current = true; setPendingSessionChoice(sessionId); return; }
     desiredSessionNeedsConfirmation.current = false; setPendingSessionChoice(null);
@@ -382,10 +408,92 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       const result = await window.medclaw.request("session.create", original.input, original.operationRef);
       if (instance !== hostRef.current.instanceId) { setCreationUnknown(true); return; }
       if (result.ok) {
-        ensureDraft(result.data.session.id, original.model); applyWorkspace(result.data.workspace, instance);
-        creation.current = null; setCreationUnknown(false); await Promise.all([readSessions(), readWorkspace(), readSession(result.data.session.id)]); setPage("chat");
+        creation.current = null; setCreationUnknown(false);
+        await Promise.all([readSessions(), readWorkspace(), readSession(result.data.session.id)]);
+        if (instance === hostRef.current.instanceId && !deletedSessions.current.has(result.data.session.id) && detailsRef.current[result.data.session.id]?.session.status === 'active') ensureDraft(result.data.session.id, original.model);
+        setPage("chat");
       } else { setError(errorMessage(result.error)); if (result.error.code === "operation_result_unknown") { setCreationUnknown(true); confirmedWorkspace.current = false; setWorkspaceConfirmed(false); } else { creation.current = null; setCreationUnknown(false); } }
     } finally { if (workspaceMutation.current?.instance === instance && workspaceMutation.current.kind === 'create') { workspaceMutation.current = null; createBusy.current = false; setCreating(false); setSelecting(false); if (confirmedWorkspace.current && desiredSession.current !== null && !desiredSessionNeedsConfirmation.current) void selectSession(desiredSession.current); } }
+  }
+  function openManagement(target: SessionView, action: 'rename' | 'delete') {
+    if (hostRef.current.state !== 'ready' || managementRef.current?.pending || target.status !== 'active' || deletedSessions.current.has(target.id)) return;
+    if (action === 'delete' && (!confirmedWorkspace.current || workspaceMutation.current || !workspaceRef.current)) return;
+    showManagement({ action, target, title: target.title, visible: true, busy: false, unknown: false, error: null, workspaceRevision: workspaceRef.current?.revision ?? 0, pending: null });
+  }
+  function invalidateManagement(sessionId: number) {
+    sessionListGeneration.current++;
+    sessionReadOrder.current.set(sessionId, (sessionReadOrder.current.get(sessionId) ?? 0) + 1);
+  }
+  function ownsDelete(original: ManagementOperation) {
+    const marker = workspaceMutation.current;
+    return original.method === 'session.delete' && marker?.kind === 'delete' && marker.instance === original.instance && marker.operationRef === original.operationRef;
+  }
+  async function confirmManagement(receipt: SessionManagementReceipt, original: ManagementOperation, instance: string) {
+    if (instance !== hostRef.current.instanceId || managementRef.current?.pending?.operationRef !== original.operationRef) return;
+    if (receipt.operationRef !== original.operationRef || receipt.method !== original.method || receipt.session.id !== original.input.sessionId
+      || original.method === 'session.rename' && receipt.session.title !== original.input.title) {
+      showManagement({ ...managementRef.current, busy: false, unknown: true, error: 'The reply does not match the original operation. Keep it and read its result.' });
+      if (ownsDelete(original)) { unknownWorkspaceInstance.current = instance; confirmedWorkspace.current = false; setWorkspaceConfirmed(false); setWorkspaceRecovery('restart'); setSelecting(false); }
+      return;
+    }
+    invalidateManagement(receipt.session.id);
+    if (receipt.method === 'session.delete') {
+      deletedSessions.current.add(receipt.session.id); metadata.current.set(receipt.session.id, receipt.session);
+      const next = { ...draftsRef.current }; delete next[receipt.session.id]; draftsRef.current = next; setDrafts(next); pendingDraftTime.current.delete(receipt.session.id);
+      setSessions(old => { const next = old.filter(value => value.id !== receipt.session.id); sessionsRef.current = next; return next; });
+      if (desiredSession.current === receipt.session.id) { desiredSession.current = null; desiredSessionNeedsConfirmation.current = false; setPendingSessionChoice(null); }
+      if (ownsDelete(original)) {
+        if (unknownWorkspaceInstance.current === original.instance) unknownWorkspaceInstance.current = null;
+        confirmedWorkspace.current = false; setWorkspaceConfirmed(false); setWorkspaceRecovery('verify'); setSelecting(true);
+      }
+    }
+    // A receipt is immutable history. Only fresh current reads can update the view.
+    await Promise.all([readSession(receipt.session.id), readSessions(), ...(receipt.method === 'session.delete' ? [readWorkspace(ownsDelete(original) || confirmedWorkspace.current)] : [])]);
+    if (instance === hostRef.current.instanceId && ownsDelete(original)) { workspaceMutation.current = null; setSelecting(false); }
+    if (instance === hostRef.current.instanceId && managementRef.current?.pending?.operationRef === original.operationRef) showManagement(null);
+  }
+  async function saveManagement() {
+    const editor = managementRef.current, instance = hostRef.current.instanceId;
+    if (!editor || editor.busy || editor.pending || !instance || hostRef.current.state !== 'ready' || deletedSessions.current.has(editor.target.id)) return;
+    if (editor.action === 'delete' && (!confirmedWorkspace.current || workspaceMutation.current)) return;
+    const rename = editor.action === 'rename' ? RenameSessionInputSchema.safeParse({ sessionId: editor.target.id, title: editor.title, expectedMetadataRevision: editor.target.metadataRevision }) : null;
+    if (rename && !rename.success) { showManagement({ ...editor, error: 'Use a session name containing 1–256 characters after trimming spaces.' }); return; }
+    const original: ManagementOperation = rename?.success ? { method: 'session.rename', operationRef: crypto.randomUUID(), instance, input: rename.data }
+      : { method: 'session.delete', operationRef: crypto.randomUUID(), instance, input: DeleteSessionInputSchema.parse({ sessionId: editor.target.id, expectedMetadataRevision: editor.target.metadataRevision, expectedWorkspaceRevision: editor.workspaceRevision }) };
+    showManagement({ ...editor, busy: true, error: null, pending: original }); invalidateManagement(editor.target.id);
+    if (original.method === 'session.delete') { workspaceMutation.current = { instance, kind: 'delete', operationRef: original.operationRef }; setSelecting(true); }
+    try {
+      const result = original.method === 'session.rename' ? await window.medclaw.request(original.method, original.input, original.operationRef) : await window.medclaw.request(original.method, original.input, original.operationRef);
+      if (managementRef.current?.pending?.operationRef !== original.operationRef) return;
+      if (instance !== hostRef.current.instanceId || !result.ok && result.error.code === 'operation_result_unknown') {
+        showManagement({ ...managementRef.current, busy: false, unknown: true, error: 'The result is unconfirmed. Read the original operation before trying another action.' });
+        if (instance === hostRef.current.instanceId && ownsDelete(original)) { unknownWorkspaceInstance.current = instance; confirmedWorkspace.current = false; setWorkspaceConfirmed(false); setWorkspaceRecovery('restart'); setSelecting(false); }
+        return;
+      }
+      if (result.ok) { await confirmManagement(result.data, original, instance); return; }
+      if (ownsDelete(original)) { workspaceMutation.current = null; setSelecting(false); }
+      await Promise.all([readSession(editor.target.id), ...(original.method === 'session.delete' ? [readWorkspace()] : [])]);
+      if (instance === hostRef.current.instanceId && managementRef.current?.pending?.operationRef === original.operationRef) showManagement({ ...editor, target: detailsRef.current[editor.target.id]?.session ?? editor.target, workspaceRevision: workspaceRef.current?.revision ?? editor.workspaceRevision, busy: false, pending: null, error: errorMessage(result.error) });
+    } catch {
+      if (managementRef.current?.pending?.operationRef === original.operationRef) showManagement({ ...managementRef.current, busy: false, unknown: true, error: 'The result is unconfirmed. Keep the original operation and read it again.' });
+      if (instance === hostRef.current.instanceId && ownsDelete(original)) { unknownWorkspaceInstance.current = instance; confirmedWorkspace.current = false; setWorkspaceConfirmed(false); setWorkspaceRecovery('restart'); setSelecting(false); }
+    }
+  }
+  async function readManagement() {
+    const editor = managementRef.current, original = editor?.pending, instance = hostRef.current.instanceId;
+    if (!editor || !original || editor.busy || !instance || hostRef.current.state !== 'ready') return;
+    showManagement({ ...editor, busy: true });
+    try {
+      const result = await window.medclaw.request('session.readManagementOperation', { operationRef: original.operationRef });
+      if (instance !== hostRef.current.instanceId || managementRef.current?.pending?.operationRef !== original.operationRef) return;
+      if (result.ok && result.data) { await confirmManagement(result.data, original, instance); return; }
+      if (result.ok && !result.data && original.instance !== instance && successfulRestoreInstance.current === instance) {
+        await Promise.all([readSession(original.input.sessionId), readWorkspace(confirmedWorkspace.current)]);
+        if (instance === hostRef.current.instanceId) showManagement({ ...editor, busy: false, unknown: false, pending: null, visible: true, target: detailsRef.current[editor.target.id]?.session ?? editor.target, workspaceRevision: workspaceRef.current?.revision ?? editor.workspaceRevision, error: 'The original operation was not found after Host restart. Review this action before saving again.' });
+        return;
+      }
+      showManagement({ ...editor, busy: false, unknown: true, error: result.ok ? 'The original operation is not recorded yet. Keep its identity and read it again.' : errorMessage(result.error) });
+    } catch { if (instance === hostRef.current.instanceId) showManagement({ ...editor, busy: false, unknown: true, error: 'The original operation could not be read. Keep its identity and read it again.' }); }
   }
   async function acceptedAgent(value: SubmitResult, pending: NonNullable<SessionDraft["pending"]>) {
     if (value.sessionId !== pending.input.sessionId || value.clientSequence !== pending.input.clientSequence) { setError("The acceptance reply does not match the original submission. Keep it and read its result."); return; }
@@ -414,7 +522,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   }
   async function sendSession(retry = false) {
     const sessionId = workspaceRef.current?.sessionId, draft = sessionId ? draftsRef.current[sessionId] : null, instance = hostRef.current.instanceId;
-    if (!sessionId || !draft || !instance || hostRef.current.state !== 'ready' || sendBusy.current || workspaceMutation.current || !confirmedWorkspace.current) return;
+    if (!sessionId || !draft || !instance || deletedSessions.current.has(sessionId) || detailsRef.current[sessionId]?.session.status !== 'active' || hostRef.current.state !== 'ready' || sendBusy.current || workspaceMutation.current || !confirmedWorkspace.current) return;
     const originalControl = detailsRef.current[sessionId]?.session.inputControl, root = selectedRuns.current.get(sessionId);
     const mode = originalControl ? draft.mode ?? 'send' : 'send';
     if (retry && !draft.resendConfirmed) return;
@@ -446,7 +554,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       if (!result.ok) { setError(errorMessage(result.error)); return; }
       const [gate, original] = await Promise.all([window.medclaw.request('run.control.read', {}), window.medclaw.request('session.read', { sessionId: pending.input.sessionId })]);
       if (instance !== hostRef.current.instanceId) return;
-      const canRetry = gate.ok && original.ok && original.data?.history.available && (pending.input.mode === 'send' ? gate.data.acceptingNewRuns && gate.data.activeRootRun === null
+      const canRetry = gate.ok && original.ok && original.data?.session.status === 'active' && original.data.history.available && (pending.input.mode === 'send' ? gate.data.acceptingNewRuns && gate.data.activeRootRun === null
         : original.data.session.inputControl?.runId === pending.input.targetRunId && original.data.session.inputControl.acceptingInputs);
       editDraft(sessionId, { resendConfirmed: !!canRetry });
       setError(canRetry ? 'The original submission was not found and execution is confirmed available. You can resend its original identity.' : 'The original submission was not found. Execution is unconfirmed or busy; keep its identity and read it again.');
@@ -488,7 +596,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     } finally { if (instance === hostRef.current.instanceId) { cancelBusy.current.delete(original.id); setCancellingInputs([...cancelBusy.current]); } }
   }
   async function closeDetails() { await updateUi({ detailOpen: false }); detailsButton.current?.focus(); }
-  const current = workspace?.sessionId ?? null, currentDetail = current ? details[current] ?? null : null, draft = current ? drafts[current] ?? null : null;
+  const current = workspace?.sessionId && !deletedSessions.current.has(workspace.sessionId) ? workspace.sessionId : null, currentDetail = current ? details[current] ?? null : null, draft = current ? drafts[current] ?? null : null;
   const runEvents = useRunEvents(host, run, page === 'chat' || ui.detailOpen && ui.detailTab === 'runtime', (runId, sessionId) => {
     void readActive(); void readRun(runId); void readSession(sessionId); void refreshInputs(sessionId);
   });
@@ -500,6 +608,9 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   return <div className={"desktop " + (ui.navCollapsed ? "nav-collapsed " : "") + (ui.detailOpen ? "has-details" : "")}>
     <Sidebar page={page} onPage={page => { setRequestedQuery(null); setPage(page); }} collapsed={ui.navCollapsed} onCollapse={() => void updateUi({ navCollapsed: true })} host={host}>
       <SessionList sessions={sessions} current={current} running={active?.sessionId ?? null} creating={creating} canCreate={host.state === "ready" && workspaceConfirmed && !selecting} canSelect={host.state === 'ready' && workspaceConfirmed} canRecoverCreate={host.state === 'ready' && !selecting && workspaceRecovery !== 'restart' && successfulRestoreInstance.current === host.instanceId}
+        management={management} canManage={host.state === 'ready' && !management?.pending} canDelete={host.state === 'ready' && workspaceConfirmed && !selecting} onManage={openManagement}
+        onManagementTitle={title => { if (managementRef.current && !managementRef.current.pending) showManagement({ ...managementRef.current, title, error: null }); }} onManagementSave={() => void saveManagement()}
+        onManagementClose={() => { if (managementRef.current && !managementRef.current.busy) showManagement(managementRef.current.pending ? { ...managementRef.current, visible: false } : null); }} onManagementRead={() => void readManagement()} onRefresh={() => void readSessions()}
         creationUnknown={creationUnknown} nextBefore={nextSession} onCreate={() => void createSession()} onRecoverCreate={() => void createSession(true)} onSelect={id => void selectSession(id)} onMore={() => void readSessions(nextSession!)} />
       {pendingSessionChoice !== null && <p role="status">Session {pendingSessionChoice} is still your requested selection. <button disabled={!workspaceConfirmed || selecting} onClick={() => void selectSession(pendingSessionChoice)}>Confirm Session {pendingSessionChoice}</button></p>}
     </Sidebar>

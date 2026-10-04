@@ -10,12 +10,29 @@ import type { ReadSessionMessagesInput, SessionMessagePage } from "./messages";
 
 export const NewSessionInputSchema = z.strictObject({ selectOnCreate: z.literal(true).default(true), expectedWorkspaceRevision: RevisionSchema });
 export const SelectSessionInputSchema = z.strictObject({ sessionId: PositiveIdSchema, expectedWorkspaceRevision: RevisionSchema });
+export const SessionTitleSchema = z.string().trim().min(1).max(256);
+export const RenameSessionInputSchema = z.strictObject({ sessionId: PositiveIdSchema, title: SessionTitleSchema, expectedMetadataRevision: RevisionSchema });
+export const DeleteSessionInputSchema = z.strictObject({ sessionId: PositiveIdSchema, expectedMetadataRevision: RevisionSchema, expectedWorkspaceRevision: RevisionSchema });
+export const ReadManagementOperationInputSchema = z.strictObject({ operationRef: OpaqueIdSchema });
+const metadataFields = { id: PositiveIdSchema, title: z.string().max(256), status: z.enum(['active', 'deleted']), metadataRevision: RevisionSchema, deletedAt: TimestampSchema.nullable() };
+export const SessionMetadataViewSchema = z.strictObject(metadataFields)
+  .refine(session => (session.status === 'deleted') === (session.deletedAt !== null), 'Deletion time must match session lifecycle');
+const receiptFields = { operationRef: OpaqueIdSchema, committedAt: TimestampSchema };
+const RenameSessionReceiptSchema = z.strictObject({ ...receiptFields, method: z.literal('session.rename'),
+  session: SessionMetadataViewSchema.refine(session => session.status === 'active'), workspace: z.null() });
+const DeleteSessionReceiptSchema = z.strictObject({ ...receiptFields, method: z.literal('session.delete'),
+  session: SessionMetadataViewSchema.refine(session => session.status === 'deleted'), workspace: WorkspaceViewSchema });
+export const SessionManagementReceiptSchema = z.discriminatedUnion('method', [RenameSessionReceiptSchema, DeleteSessionReceiptSchema]);
+export const SessionManagementDetailsSchema = z.union([
+  z.strictObject({ format: z.literal('medclaw.session-management/v1'), originalRequest: RenameSessionInputSchema, receipt: RenameSessionReceiptSchema }),
+  z.strictObject({ format: z.literal('medclaw.session-management/v1'), originalRequest: DeleteSessionInputSchema, receipt: DeleteSessionReceiptSchema }),
+]).refine(details => details.originalRequest.sessionId === details.receipt.session.id, 'Management receipt target differs from original request');
 export const InputControlSchema = z.strictObject({ runId: PositiveIdSchema, acceptingInputs: z.boolean(), blockReasons: z.array(AppErrorSchema).max(32) });
 export type InputControl = z.infer<typeof InputControlSchema>;
 export const SessionViewSchema = z.strictObject({
-  id: PositiveIdSchema, title: z.string().max(256), nativeSessionId: OpaqueIdSchema, kind: z.literal("user"), status: z.literal("active"),
+  ...metadataFields, nativeSessionId: OpaqueIdSchema, kind: z.literal("user"),
   inputControl: InputControlSchema.nullable(), storageVersion: z.literal(0), leafId: OpaqueIdSchema.nullable(), nextSubmissionSequence: PositiveIdSchema,
-});
+}).refine(session => (session.status === 'deleted') === (session.deletedAt !== null), 'Deletion time must match session lifecycle');
 export const NewSessionResultSchema = z.strictObject({ session: SessionViewSchema, workspace: WorkspaceViewSchema });
 export const ListSessionsRequestSchema = z.strictObject({ beforeSessionId: PositiveIdSchema.optional(), limit: z.number().int().min(1).max(50).default(20) });
 export const SessionPageSchema = z.strictObject({ sessions: z.array(SessionViewSchema).max(50), nextBeforeSessionId: PositiveIdSchema.nullable() });
@@ -108,6 +125,12 @@ export interface InputStore {
 }
 export const ReadSubmissionRequestSchema = z.strictObject({ sessionId: PositiveIdSchema, clientSequence: PositiveIdSchema });
 export type NewSessionInput = z.input<typeof NewSessionInputSchema>;
+export type RenameSessionInput = z.infer<typeof RenameSessionInputSchema>;
+export type DeleteSessionInput = z.infer<typeof DeleteSessionInputSchema>;
+export type ReadManagementOperationInput = z.infer<typeof ReadManagementOperationInputSchema>;
+export type SessionMetadataView = z.infer<typeof SessionMetadataViewSchema>;
+export type SessionManagementReceipt = z.infer<typeof SessionManagementReceiptSchema>;
+export type SessionManagementDetails = z.infer<typeof SessionManagementDetailsSchema>;
 export type SelectSessionInput = z.infer<typeof SelectSessionInputSchema>;
 export type SessionView = z.infer<typeof SessionViewSchema>;
 export type NewSessionResult = z.infer<typeof NewSessionResultSchema>;
@@ -127,6 +150,9 @@ export type NativeSessionBindings = {
 export interface SessionStore extends Pick<InputStore, "readInput" | "listInputs"> {
   createSession(input: NewSessionInput, operationRef: string, nativeSessionId: string, time: string): NewSessionResult;
   selectSession(input: SelectSessionInput, time: string): WorkspaceView;
+  renameSession(input: RenameSessionInput, operationRef: string, time: string): SessionManagementReceipt;
+  deleteSession(input: DeleteSessionInput, operationRef: string, time: string): SessionManagementReceipt;
+  readManagementOperation(input: ReadManagementOperationInput): SessionManagementReceipt | null;
   readSession(sessionId: number): SessionView | null;
   listSessions(input: { beforeSessionId?: number; limit?: number }): SessionPage;
   readWorkspace(): WorkspaceView;

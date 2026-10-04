@@ -4,8 +4,8 @@ import { readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
-export const SCHEMA_VERSION = 5;
-const migrations = ["001_p1.sql", "002_p2.sql", "003_p3.sql", "004_p5.sql", "005_p6.sql"].map(name => {
+export const SCHEMA_VERSION = 6;
+const migrations = ["001_p1.sql", "002_p2.sql", "003_p3.sql", "004_p5.sql", "005_p6.sql", "006_session_lifecycle.sql"].map(name => {
   const sql = readFileSync(new URL(`./migrations/${name}`, import.meta.url));
   // Git checkout newline conversion changes byte hashes without changing SQL.
   // Accept only these two forms of the current content; retain stored identities.
@@ -21,7 +21,7 @@ const expectedSchemas = (() => {
   const reference = new Database(":memory:", { strict: true });
   try {
     return migrations.map((migration, index) => {
-      if(index===1||index===3){
+      if(index===1||index===3||index===5){
         reference.exec("PRAGMA foreign_keys=OFF");
         if(reference.query<{foreign_keys:number},[]>("PRAGMA foreign_keys").get()?.foreign_keys!==0)throw new Error("storage_migration_failed");
         try{reference.transaction(()=>reference.exec(migration.sql)).immediate();}
@@ -128,6 +128,37 @@ export function openDatabase(path: string, beforeMigrationCommit?: (phase?: stri
         beforeMigrationCommit?.("p6_marker");
         db.query("INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(5,?,?)").run(migrations[4]!.checksum, new Date().toISOString());
       }).immediate();
+    }
+    if (version <= 5) {
+      const names = db.query<{name:string},[]>("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations' ORDER BY name").all().map(row=>row.name);
+      const before = names.map(name=>db.query<Record<string,unknown>,[]>(`SELECT * FROM ${name} ORDER BY id`).all());
+      try {
+        db.exec('PRAGMA foreign_keys=OFF');
+        if(db.query<{foreign_keys:number},[]>('PRAGMA foreign_keys').get()?.foreign_keys!==0)throw new Error('storage_migration_failed');
+        db.transaction(()=>{
+          const sql=migrations[5]!.sql, boundary=sql.indexOf('DROP TABLE sessions;');
+          db.exec(sql.slice(0,boundary)); beforeMigrationCommit?.('lifecycle_copy');
+          db.exec(sql.slice(boundary)); beforeMigrationCommit?.('lifecycle_rename');
+          for(const [i,name] of names.entries()) {
+            const rows=db.query<Record<string,unknown>,[]>(`SELECT * FROM ${name} ORDER BY id`).all();
+            if(name==='sessions') {
+              if(rows.length!==before[i]!.length)throw new Error('storage_migration_failed');
+              for(const [n,row] of rows.entries()) {
+                const old=before[i]![n]!;
+                for(const key of Object.keys(old))if(key!=='metadata_json'&&!isDeepStrictEqual(old[key],row[key]))throw new Error('storage_migration_failed');
+                const metadata=JSON.parse(String(old.metadata_json)), next=JSON.parse(String(row.metadata_json));
+                for(const key of Object.keys(metadata))if(key!=='titleOrigin'&&!isDeepStrictEqual(metadata[key],next[key]))throw new Error('storage_migration_failed');
+                if(!['default','user'].includes(next.titleOrigin)||row.metadata_revision!==0||row.deleted_at!==null)throw new Error('storage_migration_failed');
+              }
+            }else if(!isDeepStrictEqual(before[i],rows))throw new Error('storage_migration_failed');
+          }
+          validate(db,6); beforeMigrationCommit?.('lifecycle_marker');
+          db.query('INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(6,?,?)').run(migrations[5]!.checksum,new Date().toISOString());
+        }).immediate();
+      } finally {
+        db.exec('PRAGMA foreign_keys=ON');
+        if(db.query<{foreign_keys:number},[]>('PRAGMA foreign_keys').get()?.foreign_keys!==1)throw new Error('storage_migration_failed');
+      }
     }
     validate(db, SCHEMA_VERSION);
     return db;

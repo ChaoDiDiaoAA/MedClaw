@@ -4,7 +4,7 @@ import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } fro
 import { AgentPolicySchema, BudgetSummarySchema, MeasurementContextSchema, ModelSelectionSchema, ReferenceDateSchema, RequestPolicySchema, TimezoneSchema, ToolProfileSnapshotSchema } from "./model";
 import type { AppError } from "./error";
 import type { AgentPolicy, BudgetSummary, DiagnoseRequest, MeasurementContext, ModelSelection, ProviderAccepted, ProviderRequest, RequestPolicy, ToolProfileSnapshot } from "./model";
-import type { NewSessionInput, NewSessionResult, SubmitInput, SubmitResult, SessionStore, InputStore, InputAdapterPort, InputSettlementProof, InputControl } from "./session";
+import type { NewSessionInput, NewSessionResult, SubmitInput, SubmitResult, SessionStore, InputStore, InputAdapterPort, InputSettlementProof, InputControl, RenameSessionInput, DeleteSessionInput, SessionManagementReceipt } from "./session";
 import type { WorkspaceView, WorkspaceContext } from "./workspace";
 import { StoredToolConfigurationSchema, type ToolConfiguration } from './tool-config';
 import { RuntimeConfigurationSchema, type RuntimeConfiguration } from './runtime-config';
@@ -201,7 +201,9 @@ export type AgentRuntimePort<Resolved> = {
 export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord; inputSettlement?: InputSettlementProof };
 export type StoredOperation = ProviderOperation
   | { method: "session.create"; operationRef: string; originalRequest: NewSessionInput; result: NewSessionResult }
-  | { method: "session.submit"; operationRef: string; originalRequest: SubmitInput; result: SubmitResult };
+  | { method: "session.submit"; operationRef: string; originalRequest: SubmitInput; result: SubmitResult }
+  | { method: "session.rename"; operationRef: string; originalRequest: RenameSessionInput; result: SessionManagementReceipt }
+  | { method: "session.delete"; operationRef: string; originalRequest: DeleteSessionInput; result: SessionManagementReceipt };
 export function canonicalRequest(value: unknown): string {
   const ordered = (item: unknown): unknown => Array.isArray(item) ? item.map(ordered)
     : item !== null && typeof item === "object" ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, val]) => [key, ordered(val)])) : item;

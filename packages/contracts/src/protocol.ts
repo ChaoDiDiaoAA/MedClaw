@@ -9,6 +9,7 @@ import {
 } from "./model";
 import { ActiveRunViewSchema, CancelRunResultSchema, ReadRunRequestSchema, ReadRunResultSchema, RunViewSchema, RuntimeControlViewSchema } from "./run";
 import { ListSessionsRequestSchema, NewSessionInputSchema, NewSessionResultSchema, ReadSubmissionRequestSchema, SelectSessionInputSchema,
+  RenameSessionInputSchema, DeleteSessionInputSchema, ReadManagementOperationInputSchema, SessionManagementReceiptSchema,
   ReadInputRequestSchema, ListInputsRequestSchema, CancelInputRequestSchema, SessionInputSchema, SessionInputPageSchema, SessionDetailSchema, SessionPageSchema, SubmitInputSchema, SubmitResultSchema } from "./session";
 import { WorkspaceViewSchema, UpdateWorkspaceRequestSchema } from "./workspace";
 import { ImportPreviewRequestSchema, ImportCommitRequestSchema, ImportPreviewSchema, ImportOperationSchema, ImportReferenceSchema, ArtifactSchema, DataCatalogSchema, DataRowsSchema } from "./data";
@@ -20,12 +21,12 @@ import { ReadSessionMessagesInputSchema, SessionMessagePageSchema } from "./mess
 
 import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, EventSubscribeResultSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema } from './event';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p7-v1" as const;
-export const DATABASE_SCHEMA_VERSION = 5 as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p7-v2" as const;
+export const DATABASE_SCHEMA_VERSION = 6 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
-  return method === "event.subscribe" || method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method.startsWith('evidence.read') || method === 'data.rows' || method === 'tool.read' || method === "run.active" || method === "session.readSubmission" || method === "session.readInput" || method === "session.listInputs";
+  return method === "session.readManagementOperation" || method === "event.subscribe" || method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method.startsWith('evidence.read') || method === 'data.rows' || method === 'tool.read' || method === "run.active" || method === "session.readSubmission" || method === "session.readInput" || method === "session.listInputs";
 }
 export const EmptyPayloadSchema = z.strictObject({});
 const accepted = z.strictObject({ accepted: z.literal(true) });
@@ -122,6 +123,9 @@ export const publicMethodSchemas = {
   "model.diagnose": { input: DiagnoseRequestSchema, output: ProviderAcceptedSchema },
   "session.create": { input: NewSessionInputSchema, output: NewSessionResultSchema },
   "session.select": { input: SelectSessionInputSchema, output: WorkspaceViewSchema },
+  "session.rename": { input: RenameSessionInputSchema, output: SessionManagementReceiptSchema },
+  "session.delete": { input: DeleteSessionInputSchema, output: SessionManagementReceiptSchema },
+  "session.readManagementOperation": { input: ReadManagementOperationInputSchema, output: SessionManagementReceiptSchema.nullable() },
   "session.list": { input: ListSessionsRequestSchema, output: SessionPageSchema },
   "session.read": { input: z.strictObject({ sessionId: PositiveIdSchema }), output: SessionDetailSchema.nullable() },
   "session.messages.read": { input: ReadSessionMessagesInputSchema, output: SessionMessagePageSchema },
@@ -238,6 +242,9 @@ export const PublicHostRequestSchema = z.discriminatedUnion("method", [
   hostRequest("model.diagnose", publicMethodSchemas["model.diagnose"].input),
   hostRequest("session.create", publicMethodSchemas["session.create"].input),
   hostRequest("session.select", publicMethodSchemas["session.select"].input),
+  hostRequest("session.rename", publicMethodSchemas["session.rename"].input),
+  hostRequest("session.delete", publicMethodSchemas["session.delete"].input),
+  hostRequest("session.readManagementOperation", publicMethodSchemas["session.readManagementOperation"].input),
   hostRequest("session.list", publicMethodSchemas["session.list"].input),
   hostRequest("session.read", publicMethodSchemas["session.read"].input),
   hostRequest("session.messages.read", publicMethodSchemas["session.messages.read"].input),

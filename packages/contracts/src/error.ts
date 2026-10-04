@@ -4,7 +4,7 @@ export const PositiveIdSchema = z.number().int().positive().max(Number.MAX_SAFE_
 export const OpaqueIdSchema = z.string().min(1).max(256).regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/);
 export const TimestampSchema = z.string().datetime({ offset: true }).max(64);
 export const ErrorCategorySchema = z.enum(["provider", "runtime", "tool", "session", "storage", "input", "extension", "internal"]);
-export const ErrorReasonSchema = z.enum(["runtime_busy", "workspace_revision_mismatch", "session_not_found", "message_cursor_invalid", "input_cursor_invalid", "host_interrupted"]);
+export const ErrorReasonSchema = z.enum(["runtime_busy", "workspace_revision_mismatch", "session_not_found", "session_deleted", "session_metadata_revision_mismatch", "message_cursor_invalid", "input_cursor_invalid", "host_interrupted"]);
 
 export const EventRangeErrorSchema = z.strictObject({ runId: PositiveIdSchema, firstSequence: PositiveIdSchema.nullable(), lastSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), resumeAfterSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable() }).refine(value => (value.firstSequence === null ? value.lastSequence === 0 : value.firstSequence <= value.lastSequence) && (value.resumeAfterSequence === null || value.resumeAfterSequence <= value.lastSequence));
 export type EventRangeError = z.infer<typeof EventRangeErrorSchema>;
@@ -128,6 +128,8 @@ export function safeError(code: string, _native?: unknown, context: ErrorContext
   if (safeCode === "runtime_busy" || safeCode === "host_interrupted" || safeCode === "workspace_revision_mismatch" || safeCode === "session_not_found") error.reason = safeCode;
   if (safeCode === "state_conflict" && error.reason === "runtime_busy") error.message = errorDefinitions.runtime_busy[1];
   if (safeCode === "state_conflict" && error.reason === "workspace_revision_mismatch") error.message = errorDefinitions.workspace_revision_mismatch[1];
+  if (safeCode === "state_conflict" && error.reason === "session_deleted") error.message = 'This session has been deleted. Its original records remain available for reading.';
+  if (safeCode === "state_conflict" && error.reason === "session_metadata_revision_mismatch") error.message = 'The session details have changed. Read the current session before trying again.';
   if (safeCode === "input_invalid" && error.reason === "session_not_found") error.message = errorDefinitions.session_not_found[1];
   if (safeCode === "runtime_interrupted") error.reason = "host_interrupted";
   return error;

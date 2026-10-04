@@ -37,8 +37,10 @@ test('LF schema 3 upgrades under the current checkout without rewriting old chec
     const db = openDatabase(path);
     try {
       expect(db.query('SELECT * FROM schema_migrations WHERE version<=3 ORDER BY version').all()).toEqual(markers);
-      expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
-      expect(db.query('SELECT * FROM sessions').all()).toEqual(sessions);
+      expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
+      expect(db.query('SELECT * FROM sessions').all()).toEqual(sessions.map(session => ({
+        ...session as Record<string, unknown>, metadata_json: '{"titleOrigin":"user"}', metadata_revision: 0, deleted_at: null,
+      })));
       expect(db.query('SELECT active_session_id,revision FROM workspace').get()).toEqual({ active_session_id: 1, revision: 7 });
       expect(db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
       expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
@@ -53,7 +55,11 @@ for (const ending of ['LF', 'CRLF'] as const) test(`schema 5 created with ${endi
     const old = historicalDatabase(path, 5, ending), markers = old.query('SELECT * FROM schema_migrations ORDER BY version').all(); old.close();
     const db = openDatabase(path);
     try {
-      expect(db.query('SELECT * FROM schema_migrations ORDER BY version').all()).toEqual(markers);
+      expect(db.query('SELECT * FROM schema_migrations WHERE version<=5 ORDER BY version').all()).toEqual(markers);
+      const lifecycleSql = readFileSync(new URL('../../packages/storage/src/migrations/006_session_lifecycle.sql', import.meta.url), 'utf8');
+      expect(db.query('SELECT version,checksum FROM schema_migrations WHERE version=6').get()).toEqual({
+        version: 6, checksum: createHash('sha256').update(lifecycleSql).digest('hex'),
+      });
       expect(db.query('SELECT title,creation_result_json FROM sessions WHERE id=1').get()).toEqual({ title: 'Existing session', creation_result_json: '{ "unicode": "器械😀" }' });
     } finally { db.close(); }
   } finally { rmSync(root, { recursive: true, force: true }); }
