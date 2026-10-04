@@ -235,7 +235,7 @@ describe("P1 public and private protocol", () => {
       "session.create", "session.select", "session.list", "session.read", "session.messages.read", "session.submit", "session.readSubmission", "session.readInput", "session.listInputs", "session.cancelInput", "workspace.read", "workspace.restore", "run.control.read",
       "session.rename", "session.delete", "session.readManagementOperation",
       "settings.ui.read", "settings.ui.update", "diagnostics.read", "host.read", "host.start", "host.stop", "host.restart",
-      "workspace.update", "data.read", "data.rows", "query.execute", "query.read", "query.list", "evidence.read", "tool.read",
+      "data.delete.preview", "data.delete.commit", "data.delete.read", "data.delete.recover", "workspace.update", "data.read", "data.rows", "query.execute", "query.read", "query.list", "evidence.read", "tool.read",
       "import.preview", "import.commit", "import.read", "import.cancel", "import.recover", "evidence.readOperation", "evidence.readArtifact",
       "event.read", "event.subscribe",
     ].sort());

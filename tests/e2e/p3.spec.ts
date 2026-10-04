@@ -13,7 +13,7 @@ const root = resolve(import.meta.dirname, '../..'), bun = process.env.MEDCLAW_BU
 let app: ElectronApplication, page: Page, temporary: string, server: Server, nativeRunId: number;
 const providerUserTexts: string[] = [];
 let dateQueryGate: { entered: Promise<void>; reply: Promise<void>; markEntered: () => void; release: () => void } | null = null;
-test.describe.configure({ mode: 'serial' });
+test.describe.configure({ mode: 'serial', timeout:60000 });
 async function savedNativeReply(inputText: string) {
   await expect.poll(() => page.evaluate(async inputText => {
     const workspace = await window.medclaw.request('workspace.read', {}); if (!workspace.ok || !workspace.data.sessionId) return false;

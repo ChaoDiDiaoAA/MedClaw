@@ -17,6 +17,9 @@ import { projectToolCall } from "../../../packages/runtime-pi/src/messages.ts";
 import { SqliteCatalogStore } from '../../../packages/storage/src/catalog-store.ts';
 import { SqliteToolStore } from '../../../packages/storage/src/tool-store.ts';
 import { SqliteImportStore } from '../../../packages/storage/src/import-store.ts';
+import { SqliteDataDeletionStore } from '../../../packages/storage/src/data-deletion-store.ts';
+import { DataDeletionService } from '../../../packages/core/src/data/data-deletion-service.ts';
+import { HistorySourceStore } from '../../../packages/storage/src/history-source-store.ts';
 import { ArtifactStore } from '../../../packages/storage/src/artifact-store.ts';
 import { CatalogService } from '../../../packages/core/src/data/catalog-service.ts';
 import { QueryService } from '../../../packages/core/src/data/query-service.ts';
@@ -43,6 +46,7 @@ let hello: HostHello | null = null, application: Application<ResolvedModel> | nu
 let sessions: SessionService | null = null, workspace: WorkspaceService | null = null;
 let repositories: Repositories, catalog: SqliteCatalogStore, toolStore: SqliteToolStore, queries: QueryService, evidence: EvidenceReader, imports: ImportService, artifacts: ArtifactStore;
 let database: ReturnType<typeof openDatabase> | null = null;
+let deletions:DataDeletionService;
 let events: EventService | null = null;
 let locked = false, closing = false, controlCount = 0;
 let terminating = false, shutdownTask: Promise<void> | null = null, fatalTask: Promise<void> | null = null;
@@ -145,7 +149,7 @@ function shutdownHost(): Promise<void> {
   if (streamTimer) clearTimeout(streamTimer);
   streamTimer = null; streams.clear(); streamRevisions.clear(); events?.closeAll();
   return shutdownTask = (async () => {
-    const stopped = await Promise.allSettled([application?.shutdown(), imports?.shutdown()]);
+    const stopped = await Promise.allSettled([application?.shutdown(), imports?.shutdown(), deletions?.shutdown()]);
     for (const result of stopped) if (result.status === 'rejected') throw result.reason;
     database?.close(); database = null; await releaseLock();
   })();
@@ -202,6 +206,7 @@ async function initialize(raw: unknown) {
     () => application!.runs.activeHandle, sessionId => application!.runs.readInputControl(sessionId),
     (inputId, context) => application!.runs.cancelInput(inputId, context), application.runs);
   workspace = new WorkspaceService(repositories, artifacts);
+  deletions=new DataDeletionService(new SqliteDataDeletionStore(database,repositories,()=>{if(application!.busy)throw new Error('runtime_busy');}),artifacts,config.instanceId);
   await sendRaw(`${JSON.stringify({ protocolVersion: HOST_PROTOCOL_VERSION, instanceId: config.instanceId, sdkVersion: actualVersion, schemaVersion: SCHEMA_VERSION, configVersion: settings.configVersion, dataRoot: config.paths.dataRoot })}\n`);
   runtimeLog.add("host_ready");
   startupPhase = "ready";
@@ -209,7 +214,7 @@ async function initialize(raw: unknown) {
 function unwrap<T>(result: Result<T>): T { if (!result.ok) throw result.error; return result.data; }
 function summary(query: QueryRecord) {
   const { rows, snapshotIds: _snapshots, eventIds: _events, ...metadata } = query;
-  return QuerySummarySchema.parse({ ...metadata, totalRows: rows.length });
+  return QuerySummarySchema.parse({ ...metadata, totalRows: rows.length, ...new HistorySourceStore(database!).availability(query.batchIds) });
 }
 function evidenceSummary(record: Evidence) {
   const { snapshotIds, eventIds, sourceRowRefs: _sources, ...metadata } = record;
@@ -230,17 +235,15 @@ function frozenConfiguration(runId: number) {
 }
 function queryView(queryId: number, page: number, pageSize: number) {
   const saved = toolStore.readQuery(queryId); if (!saved) throw new Error('operation_not_found');
+  const history=new HistorySourceStore(database!);readContext(saved.runId,false);
+  if(history.availability(readContext(saved.runId,false).scope.batchIds).sourceAvailability==='deleted')return history.query(queryId,page,pageSize);
   const context = readContext(saved.runId, false), query = queries.read(queryId, context);
   const resultPage = queries.page({ queryId, page, pageSize }, context), keys = queryRowKeys(query);
   return { query: summary(query), page: { ...resultPage, targetVersion: query.resultHash, rowKeys: keys.slice((resultPage.page - 1) * resultPage.pageSize, resultPage.page * resultPage.pageSize) },
     evidence: evidence.readQuery(queryId, context).slice(0, BUSINESS_RULES.evidenceSummaryLimit).map(evidenceSummary) };
 }
 function dataCatalog(page: number, pageSize: number) {
-  const counts = (table: 'batches' | 'devices' | 'snapshots' | 'change_events') => database!.query<{ count: number }, []>(`SELECT COUNT(*) AS count FROM ${table}`).get()!.count;
-  const ids = database!.query<{ id: number }, [number, number]>('SELECT id FROM batches ORDER BY snapshot_date,id LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize).map(row => row.id);
-  const contexts = database!.query<{ reference_date: string; timezone: string }, []>("SELECT DISTINCT json_extract(metadata_json,'$.referenceDate') AS reference_date,json_extract(metadata_json,'$.timezone') AS timezone FROM batches LIMIT 2").all();
-  return { batches: catalog.readBatches(ids), page, pageSize, batchCount: counts('batches'), deviceCount: counts('devices'), snapshotCount: counts('snapshots'), changeCount: counts('change_events'),
-    catalogRevision: catalog.readRevision(), referenceDate: contexts.length === 1 ? contexts[0]!.reference_date : null, timezone: contexts.length === 1 ? contexts[0]!.timezone : null };
+  return catalog.readCatalog(page,pageSize);
 }
 async function dispatch(request: HostRequest): Promise<unknown> {
   const app = application;
@@ -294,6 +297,14 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case 'import.read': case 'evidence.readOperation': return unwrap(await imports.read(request.payload.operationRef));
     case 'import.cancel': return unwrap(await imports.cancel(request.payload.operationRef));
     case 'import.recover': return unwrap(await imports.recover(request.payload.operationRef));
+    case 'data.delete.preview':
+      if(request.operationRef!==request.payload.operationRef)throw new Error('invalid_argument');
+      return unwrap(await deletions.preview(request.payload));
+    case 'data.delete.commit':
+      if(request.operationRef!==request.payload.operationRef)throw new Error('invalid_argument');
+      return unwrap(await deletions.commit(request.payload));
+    case 'data.delete.read':return unwrap(await deletions.read(request.payload.operationRef));
+    case 'data.delete.recover':return unwrap(await deletions.recover(request.payload.operationRef));
     case 'evidence.readArtifact': return unwrap(await artifacts.read(request.payload.artifactId));
     case 'data.read': {
       const { page, pageSize } = createPublicMethodSchemas()['data.read'].input.parse(request.payload);
@@ -306,6 +317,7 @@ async function dispatch(request: HostRequest): Promise<unknown> {
       const totalRows = database!.query<{ count: number }, [number]>(`SELECT COUNT(*) AS count FROM ${table} WHERE ${column}=?`).get(batchId)!.count;
       const ids = database!.query<{ id: number }, [number, number, number]>(`SELECT id FROM ${table} WHERE ${column}=? ORDER BY id LIMIT ? OFFSET ?`).all(batchId, pageSize, (page - 1) * pageSize).map(row => row.id);
       const selectedBatch = catalog.readBatches([batchId]), previousIds = selectedBatch.flatMap(batch => batch.previousBatchId === null ? [] : [batch.previousBatchId]);
+      if(kind==='changes'&&catalog.readBatches(previousIds).length!==previousIds.length)throw new Error('data_coverage_missing');
       const items = kind === 'devices' ? catalog.readSnapshotsById(ids) : catalog.readChanges([batchId], previousIds, null).slice((page - 1) * pageSize, page * pageSize);
       const batches = catalog.readBatches([...new Set([batchId, ...previousIds])]);
       return { kind, items, selections: items.map(item => describeDataSelection(item, batches)), totalRows, page, pageSize };
@@ -333,15 +345,17 @@ async function dispatch(request: HostRequest): Promise<unknown> {
       const { sessionId, beforeQueryId, limit } = createPublicMethodSchemas()['query.list'].input.parse(request.payload);
       if (repositories.readWorkspace().sessionId !== sessionId) throw new Error('access_denied');
       const rows = database!.query<{ id: number }, [number, number, number]>('SELECT id FROM queries WHERE session_id=? AND id<? ORDER BY id DESC LIMIT ?').all(sessionId, beforeQueryId ?? Number.MAX_SAFE_INTEGER, limit + 1);
-      return { items: rows.slice(0, limit).map(row => { const saved = toolStore.readQuery(row.id)!; return summary(queries.read(row.id, readContext(saved.runId))); }), nextBeforeQueryId: rows.length > limit ? rows[limit - 1]!.id : null };
+      return { items: rows.slice(0, limit).map(row => { const saved = toolStore.readQuery(row.id)!; const context=readContext(saved.runId);return new HistorySourceStore(database!).availability(context.scope.batchIds).sourceAvailability==='deleted'?new HistorySourceStore(database!).query(saved.id,1,1).query:summary(queries.read(row.id, context)); }), nextBeforeQueryId: rows.length > limit ? rows[limit - 1]!.id : null };
     }
     case 'evidence.read': {
       const payload = createPublicMethodSchemas()['evidence.read'].input.parse(request.payload);
       const saved = toolStore.readQuery(payload.queryId); if (!saved) throw new Error('operation_not_found');
+      const availability=new HistorySourceStore(database!).availability(saved.batchIds);
+      if(new HistorySourceStore(database!).availability(readContext(saved.runId,false).scope.batchIds).sourceAvailability==='deleted')return new HistorySourceStore(database!).evidence(saved.id,payload.evidenceId,payload.page,payload.pageSize);
       const context = readContext(saved.runId, false), record = evidence.read(payload.evidenceId, context);
       if (record.queryId !== payload.queryId) throw new Error('access_denied');
       const rows = evidence.rows(payload, context);
-      return { ...rows, evidence: evidenceSummary(record), targetVersion: record.resultHash, rowKeys: rows.items.map(item => `snapshot:${item.id}`) };
+      return { ...rows, ...availability, evidence: evidenceSummary(record), targetVersion: record.resultHash, rowKeys: rows.items.map(item => `snapshot:${item.id}`) };
     }
     case 'tool.read': {
       const { runId, page, pageSize } = createPublicMethodSchemas()['tool.read'].input.parse(request.payload), context = readContext(runId, false);

@@ -9,7 +9,7 @@ import { openDatabase, SCHEMA_VERSION } from '../../packages/storage/src/databas
 const roots: string[] = [];
 const handles: Database[] = [];
 const time = '2026-10-01T00:00:00.000Z';
-const tables = ['answers', 'artifacts', 'batches', 'business_events', 'catalog_state', 'change_events', 'devices', 'imports', 'model_calls', 'queries', 'query_evidence', 'runs', 'runtime_events', 'schema_migrations', 'session_inputs', 'sessions', 'snapshots', 'tool_calls', 'workspace'];
+const tables = ['answers', 'artifacts', 'batches', 'business_events', 'catalog_state', 'change_events', 'data_deletions', 'devices', 'imports', 'model_calls', 'queries', 'query_evidence', 'runs', 'runtime_events', 'schema_migrations', 'session_inputs', 'sessions', 'snapshots', 'tool_calls', 'workspace'];
 const oldTables = ['model_calls', 'runs', 'schema_migrations', 'sessions', 'workspace'];
 function file() {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p3-migration-'));
@@ -56,13 +56,13 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-test('formal P2 upgrades to 19 STRICT latest tables and preserves old rows, JSON bytes, NULL and checksums', () => {
+test('formal P2 upgrades to 20 STRICT latest tables and preserves old rows, JSON bytes, NULL and checksums', () => {
   const path = file();
   const old = oldDatabase(path);
   const before = Object.fromEntries(oldTables.map(name => [name, old.query<Record<string, unknown>, []>(`SELECT * FROM ${name} ORDER BY ${name === 'schema_migrations' ? 'version' : 'id'}`).all()]));
   close(old);
   const db = open(path);
-  expect(SCHEMA_VERSION).toBe(6);
+  expect(SCHEMA_VERSION).toBe(7);
   expect(db.query<{ name: string; strict: number }, []>("SELECT name,strict FROM pragma_table_list WHERE schema='main' AND name NOT LIKE 'sqlite_%' ORDER BY name").all())
     .toEqual(tables.map(name => ({ name, strict: 1 })));
   for (const name of oldTables) {
@@ -72,7 +72,7 @@ test('formal P2 upgrades to 19 STRICT latest tables and preserves old rows, JSON
     expect(after.slice(0, oldRows.length).map(row => Object.fromEntries(Object.keys(oldRows[0] ?? {}).map(key => [key, row[key]])))).toEqual(expected);
     if (name === 'sessions') expect(after.map(row => ({ metadataRevision: row.metadata_revision, deletedAt: row.deleted_at }))).toEqual([{ metadataRevision: 0, deletedAt: null }]);
   }
-  expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
+  expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }]);
   expect(db.query('SELECT revision FROM catalog_state WHERE id=1').get()).toEqual({ revision: 0 });
   expect(db.query('SELECT material_version,batch_refs_json,device_ids_json,active_query_id,active_view,selection_json FROM workspace').get())
     .toEqual({ material_version: null, batch_refs_json: '[]', device_ids_json: '[]', active_query_id: null, active_view: 'data', selection_json: null });
@@ -99,7 +99,7 @@ test('late 003 fault rolls back every P3 table, workspace change and migration m
   expect(db.query("SELECT name FROM pragma_table_list WHERE schema='main' AND name NOT LIKE 'sqlite_%' ORDER BY name").all()).toEqual(oldTables.map(name => ({ name })));
   for (const name of oldTables) expect(db.query(`SELECT * FROM ${name}`).all()).toEqual(before[name]);
   close(db);
-  expect(open(path).query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
+  expect(open(path).query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }]);
 });
 
 test('reopening rejects P3 schema drift in columns, triggers, indexes, tables and migration checksum', () => {
@@ -112,7 +112,7 @@ test('reopening rejects P3 schema drift in columns, triggers, indexes, tables an
   ]) {
     const path = file();
     const db = open(path);
-    expect(SCHEMA_VERSION).toBe(6);
+    expect(SCHEMA_VERSION).toBe(7);
     db.exec(mutation);
     close(db);
     expect(() => openDatabase(path)).toThrow('storage_migration_failed');

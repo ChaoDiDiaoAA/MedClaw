@@ -119,7 +119,7 @@ test.beforeAll(async () => {
 test.afterAll(async () => { httpReleases.forEach(release => release()); await app?.evaluate(() => Object.values((globalThis as MainGlobal).__p6Gate.pending).forEach(release => release())).catch(() => {}); await app?.close(); if (server) await new Promise<void>(resolve => server.close(() => resolve())); if (temporary) { const target = resolve(temporary), within = relative(resolve(tmpdir()), target); if (within && !within.startsWith('..') && !within.includes(':')) rmSync(target, { recursive: true, force: true }); } });
 test.afterEach(async ({}, info) => {
   const name = info.title.replaceAll(/[^a-zA-Z0-9]+/g, '-'); mkdirSync(evidence, { recursive: true });
-  if (info.status === info.expectedStatus) { save('dom-' + name, { currentSession: await page.getByTestId('current-session').innerText(), inputQueue: await queue().ariaSnapshot(), composer: await page.locator('.composer').ariaSnapshot() }); await page.screenshot({ path: join(evidence, name + '.png'), fullPage: true }); }
+  if (info.status === info.expectedStatus) { save('dom-' + name, { currentSession: await page.getByTestId('current-session').innerText(), inputQueue: await queue().count() ? await queue().ariaSnapshot() : null, composer: await page.locator('.composer').ariaSnapshot() }); await page.screenshot({ path: join(evidence, name + '.png'), fullPage: true }); }
   else await page?.screenshot({ path: join(evidence, 'failure-' + name + '.png'), fullPage: true }).catch(() => {});
   await app?.evaluate(()=>{(globalThis as MainGlobal).__p6Gate.drop=[];}).catch(()=>{});
 });

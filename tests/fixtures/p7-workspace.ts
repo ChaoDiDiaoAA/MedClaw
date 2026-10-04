@@ -18,7 +18,7 @@ export function seedWorkspaceQueries(db: Database) {
     VALUES(1,'import','host','imported','hash','{}',?,?)`).run(at, at);
   db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,
     expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at)
-    VALUES(1,1,'scope','2026-10-04','浙江','material/v1','bundle','lock',?,'full','cohort',3,3,'[]','{}',1,NULL,1,?)`).run('a'.repeat(64), at);
+    VALUES(1,1,'scope','2026-10-04','浙江','material/v1','bundle','lock',?,'full','cohort',3,3,'[]','{"expectedEntityCount":3,"observedEntityCount":3,"declaredMissingEntityIds":[]}',1,NULL,1,?)`).run('a'.repeat(64), at);
   for (const id of [1, 2, 3]) {
     db.query(`INSERT INTO devices(id,source_device_id,source_bundle_id,source_submission_id,source_refs_json,created_at)
       VALUES(?,?,'bundle','submission','[]',?)`).run(id, `device-${id}`, at);

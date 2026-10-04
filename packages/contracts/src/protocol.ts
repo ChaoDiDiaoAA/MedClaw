@@ -13,6 +13,7 @@ import { ListSessionsRequestSchema, NewSessionInputSchema, NewSessionResultSchem
   ReadInputRequestSchema, ListInputsRequestSchema, CancelInputRequestSchema, SessionInputSchema, SessionInputPageSchema, SessionDetailSchema, SessionPageSchema, SubmitInputSchema, SubmitResultSchema } from "./session";
 import { WorkspaceViewSchema, UpdateWorkspaceRequestSchema } from "./workspace";
 import { ImportPreviewRequestSchema, ImportCommitRequestSchema, ImportPreviewSchema, ImportOperationSchema, ImportReferenceSchema, ArtifactSchema, DataCatalogSchema, DataRowsSchema } from "./data";
+import {DataDeletePreviewRequestSchema,DataDeleteCommitRequestSchema,DataDeleteReferenceSchema,DataDeleteOperationSchema} from './data-deletion';
 import { BUSINESS_RULES, createQuerySchemas, EvidenceViewSchema, PageSchema, QueryRequestParamsSchema, QuerySummarySchema, QueryViewSchema } from './query';
 import { TOOL_READ_RULES, RunToolsViewSchema } from './tool';
 import { StoredToolConfigurationSchema, normalizeToolConfiguration } from './tool-config';
@@ -21,8 +22,8 @@ import { ReadSessionMessagesInputSchema, SessionMessagePageSchema } from "./mess
 
 import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, EventSubscribeResultSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema } from './event';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p7-v2" as const;
-export const DATABASE_SCHEMA_VERSION = 6 as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p7-v3" as const;
+export const DATABASE_SCHEMA_VERSION = 7 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
@@ -139,6 +140,10 @@ export const publicMethodSchemas = {
   "workspace.update": { input: UpdateWorkspaceRequestSchema, output: WorkspaceViewSchema },
   'data.read': { input: PageSchema.extend({ page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional() }), output: DataCatalogSchema },
   'data.rows': { input: PageSchema.extend({ page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional(), kind: z.enum(['devices', 'changes']), batchId: PositiveIdSchema }), output: DataRowsSchema },
+  'data.delete.preview': {input:DataDeletePreviewRequestSchema,output:DataDeleteOperationSchema},
+  'data.delete.commit': {input:DataDeleteCommitRequestSchema,output:DataDeleteOperationSchema},
+  'data.delete.read': {input:DataDeleteReferenceSchema,output:DataDeleteOperationSchema.nullable()},
+  'data.delete.recover': {input:DataDeleteReferenceSchema,output:DataDeleteOperationSchema},
   'query.execute': { input: z.strictObject({ params: QueryRequestParamsSchema, expectedRevision: z.number().int().nonnegative() }), output: QueryViewSchema },
   'query.read': { input: PageSchema.extend({ page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional(), queryId: PositiveIdSchema }), output: QueryViewSchema },
   'query.list': { input: z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.optional() }), output: z.strictObject({ items: z.array(QuerySummarySchema), nextBeforeQueryId: PositiveIdSchema.nullable() }) },
@@ -258,6 +263,10 @@ export const PublicHostRequestSchema = z.discriminatedUnion("method", [
   hostRequest("workspace.update", publicMethodSchemas["workspace.update"].input),
   hostRequest('data.read', publicMethodSchemas['data.read'].input),
   hostRequest('data.rows', publicMethodSchemas['data.rows'].input),
+  hostRequest('data.delete.preview',publicMethodSchemas['data.delete.preview'].input),
+  hostRequest('data.delete.commit',publicMethodSchemas['data.delete.commit'].input),
+  hostRequest('data.delete.read',publicMethodSchemas['data.delete.read'].input),
+  hostRequest('data.delete.recover',publicMethodSchemas['data.delete.recover'].input),
   hostRequest('query.execute', publicMethodSchemas['query.execute'].input),
   hostRequest('query.read', publicMethodSchemas['query.read'].input),
   hostRequest('query.list', publicMethodSchemas['query.list'].input),

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { errorMessage, type Result } from "../../../../packages/contracts/src/error";
+import { errorMessage, safeError, type Result } from "../../../../packages/contracts/src/error";
+import type {DataDeleteCommitRequest,DataDeleteOperation} from '../../../../packages/contracts/src/data-deletion';
 import type { AuthAttemptView, AuthNotifyView, AuthPromptView, DesktopDisplayPreferences, HostView, ModelChoice, ModelDirectoryView, ProviderAccepted } from "../../../../packages/contracts/src/model";
 import type { DesktopNotice, DesktopSecretInput, DesktopSecretInputResult, PublicMethod, PublicPayload, PublicReturn } from "../../../../packages/contracts/src/protocol";
 import type { ActiveRunView, RunView, RuntimeControlView } from "../../../../packages/contracts/src/run";
@@ -73,7 +74,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   const creation = useRef<{ operationRef: string; input: NewSessionInput; model: ModelChoice | null } | null>(null);
   const directoryRead = useRef(0), activeRead = useRef(0), detailsButton = useRef<HTMLButtonElement>(null);
   const workspaceChangeBusy = useRef(false);
-  const workspaceMutation = useRef<{ instance: string | null; kind: 'create' | 'select' | 'update' | 'restore' } | { instance: string; kind: 'delete'; operationRef: string } | null>(null);
+  const workspaceMutation = useRef<{ instance: string | null; kind: 'create' | 'select' | 'update' | 'restore' } | { instance: string; kind: 'delete' | 'batch-delete'; operationRef: string } | null>(null);
   const confirmedWorkspace = useRef(false), unknownWorkspaceInstance = useRef<string | null>(null), restoredInstance = useRef<string | null>(null);
   const successfulRestoreInstance = useRef<string | null>(null);
   const [workspaceRecovery, setWorkspaceRecovery] = useState<'verify' | 'restart' | null>(null);
@@ -382,6 +383,26 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       }
     } finally { if (workspaceMutation.current?.instance === instance && workspaceMutation.current.kind === 'select') { workspaceMutation.current = null; selectBusy.current = false; setSelecting(false); } }
   }
+  async function confirmDataDeletion(value:DataDeleteOperation){
+    const marker=workspaceMutation.current,instance=hostRef.current.instanceId;
+    if(marker?.kind==='batch-delete'&&marker.operationRef!==value.operationRef)return;
+    if(marker?.kind==='batch-delete'&&unknownWorkspaceInstance.current===instance&&value.state!=='committed'){await readWorkspace(false);setError('Deletion has no final receipt yet. Verify status and restart the Host before another write.');return;}
+    if(marker?.kind==='batch-delete'&&marker.instance===instance){unknownWorkspaceInstance.current=null;workspaceMutation.current=null;setSelecting(false);}
+    await Promise.all([readWorkspace(),readCatalog(),readActive()]);
+  }
+  async function commitDataDeletion(input:DataDeleteCommitRequest):Promise<Result<DataDeleteOperation>>{
+    const instance=hostRef.current.instanceId;
+    if(!instance||!confirmedWorkspace.current||workspaceMutation.current||hostRef.current.state!=='ready')return{ok:false,error:safeError('workspace_revision_mismatch')};
+    workspaceMutation.current={instance,kind:'batch-delete',operationRef:input.operationRef};setSelecting(true);
+    const unknown=()=>{if(instance===hostRef.current.instanceId){unknownWorkspaceInstance.current=instance;confirmedWorkspace.current=false;setWorkspaceConfirmed(false);setWorkspaceRecovery('restart');setSelecting(false);}};
+    try{
+      const result=await window.medclaw.request('data.delete.commit',input,input.operationRef);
+      if(instance!==hostRef.current.instanceId)return{ok:false,error:safeError('operation_result_unknown')};
+      if(result.ok){await confirmDataDeletion(result.data);return result;}
+      if(result.error.code==='operation_result_unknown')unknown();else{workspaceMutation.current=null;setSelecting(false);await Promise.all([readWorkspace(),readCatalog()]);}
+      return result;
+    }catch{unknown();return{ok:false,error:safeError('operation_result_unknown')};}
+  }
   async function updateWorkspace(change: WorkspaceChange) {
     const original = workspaceRef.current, instance = hostRef.current.instanceId;
     if (!original || !confirmedWorkspace.current || workspaceMutation.current || hostRef.current.state !== "ready") return false;
@@ -638,14 +659,14 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
         queueRun={queueRun} queueRootInput={queueRootInput} frozenInput={frozenInput} frozenRunId={frozenRun?.id} inputs={current ? inputQueue.snapshots[current] ?? null : null} cancellingInputs={cancellingInputs}
         onRefreshInputs={() => { if (current) void refreshInputs(current, true); }} onMoreInputs={() => { if (current) void readInputPage(current, 'more'); }} onCancelInput={original => void cancelInput(original)}
         onDraft={patch => { if (current) editDraft(current, patch); }} onUseForSession={useForSession} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onNewAttempt={pending => { if (current) startNewAttempt({ instanceId: host.instanceId, sessionId: current, pending }); }} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} /></section>
-      <section className="page-content" hidden={page !== "data"}><DataWorkspace host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} catalog={catalog} batches={catalog?.batches ?? []} onRefresh={page => void readCatalog(page)} onUpdate={updateWorkspace} onError={setError} /></section>
+      <section className="page-content" hidden={page !== "data"}><DataWorkspace host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} onDeleteCommit={commitDataDeletion} onDeleteResult={confirmDataDeletion} catalog={catalog} batches={catalog?.batches ?? []} onRefresh={page => void readCatalog(page)} onUpdate={updateWorkspace} onError={setError} /></section>
       <section className="page-content" hidden={page !== "queries"}><QueryHistory visible={page === "queries"} requestedQuery={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} active={active} onUpdate={updateWorkspace} onError={setError} /></section>
       <section className="page-content" hidden={page !== "models"}><ModelsPage directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control}
         sessionTarget={workspaceConfirmed && !selecting && current && currentDetail && host.instanceId ? { instanceId: host.instanceId, sessionId: current } : null} onUseForSession={useForSession}
         prompt={prompt} notification={authNotify} attempt={authAttempt} onChanged={changed} onAccepted={acceptedProvider} onError={setError} /></section>
       <section className="page-content" hidden={page !== "settings"}><SettingsPage ui={ui} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost} /></section>
     </main>
-    {ui.detailOpen && <RunDetails run={run} host={host} viewSessionId={current} tab={ui.detailTab} active={active} control={control} events={runEvents.state} onResumeGap={runEvents.resumeGap} onTab={tab => void updateUi({ detailTab: tab })} onClose={() => void closeDetails()} onError={setError}
+    {ui.detailOpen && <RunDetails inputs={inputQueue.snapshots[run?.kind === "agent" ? run.sessionId : current ?? 0] ?? null} onRefreshInputs={() => { const id=run?.kind === "agent" ? run.sessionId : current; if(id)void refreshInputs(id,true); }} onMoreInputs={() => { const id=run?.kind === "agent" ? run.sessionId : current; if(id)void readInputPage(id,"more"); }} cancellingInputs={cancellingInputs} onCancelInput={original => void cancelInput(original)} run={run} host={host} viewSessionId={current} tab={ui.detailTab} active={active} control={control} events={runEvents.state} onResumeGap={runEvents.resumeGap} onTab={tab => void updateUi({ detailTab: tab })} onClose={() => void closeDetails()} onError={setError}
       onQuery={(queryId, sessionId) => { setRequestedQuery({ queryId, ownerSessionId: sessionId }); setPage("queries"); }}
       onRun={value => { inspectedRun.current = value.id; runRef.current = value; setRun(value); setPreview(null); }} onRetrySaved={() => { void readActive(); if (activeRef.current?.sessionId) { void readSession(activeRef.current.sessionId); void refreshInputs(activeRef.current.sessionId); } }} />}
   </div>;

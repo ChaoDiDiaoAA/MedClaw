@@ -10,7 +10,7 @@ import { DataCatalogSchema } from '../../packages/contracts/src/data';
 // Only the external desktop bridge is substituted. These tests run the actual
 // renderer and assert user-visible admission and results, not fixture call counts.
 const root = resolve(import.meta.dirname, '../..'), bun = process.env.MEDCLAW_BUN_EXECUTABLE ?? 'bun';
-const ready = { instanceId: 'startup-renderer-instance', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion: 6, error: null };
+const ready = { instanceId: 'startup-renderer-instance', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion: 7, error: null };
 const directory = ModelDirectoryViewSchema.parse({ configVersion: '0', selection: null, customApis: [],
   providers: [{ id: 'offline-provider', name: 'Offline provider', source: 'pi_builtin', loginTypes: ['api_key'],
     auth: { providerId: 'offline-provider', state: 'unavailable', type: null, source: null, checkKind: 'snapshot', checkedAt: '2026-10-04T00:00:00Z' } }],
@@ -23,7 +23,7 @@ const authenticatedDirectory = ModelDirectoryViewSchema.parse({ ...directory,
 const failure = { ok: false, error: { code: 'resource_unavailable', category: 'storage', message: 'The requested resource is temporarily unavailable.', retryable: true } };
 const emptyCatalog = DataCatalogSchema.parse({ batches: [], page: 1, pageSize: 50, batchCount: 0, deviceCount: 0, snapshotCount: 0, changeCount: 0, catalogRevision: 0, referenceDate: null, timezone: null });
 const importedCatalog = DataCatalogSchema.parse({ ...emptyCatalog, batchCount: 1, catalogRevision: 1, referenceDate: '2026-01-02', timezone: 'Asia/Shanghai', batches: [{ id: 1, scopeKey: 'imported-scope', snapshotDate: '2026-01-02', region: '浙江', coverage: 'full', previousBatchId: null, materialVersion: 'fixture/v1', sourceBundleId: 'fixture', sourceLockHash: 'a'.repeat(64), contentHash: 'b'.repeat(64), cohortHash: 'c'.repeat(64), catalogRevision: 1, expectedEntityCount: 0, observedEntityCount: 0, declaredMissingDeviceIds: [] }] });
-type Fixture = { bridge?: 'missing' | 'subscribe_throw' | 'request_reject'; host?: typeof ready; modelResult?: unknown; catalogResult?: unknown; restoredSession?: boolean; hostReadResult?: unknown; hostReadReject?: boolean; holds?: string[] };
+type Fixture = { deletionLost?:boolean;bridge?: 'missing' | 'subscribe_throw' | 'request_reject'; host?: typeof ready; modelResult?: unknown; catalogResult?: unknown; restoredSession?: boolean; hostReadResult?: unknown; hostReadReject?: boolean; holds?: string[] };
 type State = { modelResult: unknown; catalogResult: unknown; pending: Record<string, () => void>; entered: string[]; completed: string[]; holds: string[]; host: typeof ready };
 type MainGlobal = typeof globalThis & { __startupRenderer: State };
 let temporary: string, app: ElectronApplication | undefined, page: Page;
@@ -49,7 +49,7 @@ async function launch(config: Fixture = {}) {
     const state=globalThis.__startupRenderer={modelResult:${JSON.stringify(config.modelResult ?? { ok: true, data: directory })},catalogResult:${JSON.stringify(config.catalogResult ?? { ok: true, data: emptyCatalog })},host:${JSON.stringify(config.host ?? ready)},holds:${JSON.stringify(config.holds ?? [])},pending:{},entered:[],completed:[]};
     const session=id=>({id,title:'New Session '+id,nativeSessionId:'native-'+id,kind:'user',status:'active',metadataRevision:0,deletedAt:null,inputControl:null,storageVersion:0,leafId:null,nextSubmissionSequence:1});
     const sessions=${config.restoredSession ? '[session(1)]' : '[]'},inputs=[];let workspace={revision:${config.restoredSession ? '1' : '0'},sessionId:${config.restoredSession ? '1' : 'null'},materialVersion:null,batchRefs:[],deviceIds:[],queryId:null,activeView:'data',selection:null};
-    const ok=data=>({ok:true,data});const failed=${JSON.stringify(failure)};
+    let deletion=null;const ok=data=>({ok:true,data});const failed=${JSON.stringify(failure)};
     ipcMain.handle('test:request',async(_, {method,payload})=>{
       const frozenWorkspace=structuredClone(workspace);
       const hostReadResult=${JSON.stringify(config.hostReadResult ?? null)}??ok(structuredClone(state.host));
@@ -60,6 +60,9 @@ async function launch(config: Fixture = {}) {
       if(method==='model.read')return state.modelResult;
       if(method==='model.custom.read')return ok({definitions:[]});
       if(method==='data.read')return state.catalogResult;
+      if(method==='data.delete.preview'){deletion={operationRef:payload.operationRef,state:'ready',preview:{operationRef:payload.operationRef,previewHash:'a'.repeat(64),catalogRevision:payload.expectedCatalogRevision,workspaceRevision:payload.expectedWorkspaceRevision,batches:[{id:1,snapshotDate:'2026-01-02'}],snapshotCount:0,changeCount:0,deviceCount:0,queryCount:0,workspaceWillChange:false,files:[]},receipt:null,cleanup:{state:'pending',remainingCount:0,error:null},updatedAt:'2026-10-04T00:00:00Z'};return ok(deletion);}
+      if(method==='data.delete.commit'){deletion={...deletion,state:'committed',receipt:{operationRef:payload.operationRef,batchIds:[1],snapshotCount:0,changeCount:0,deviceCount:0,catalogRevision:2,workspace,committedAt:'2026-10-04T00:00:00Z'},cleanup:{state:'complete',remainingCount:0,error:null}};state.catalogResult=ok({...state.catalogResult.data,batches:[],batchCount:0,catalogRevision:2});return ${JSON.stringify(config.deletionLost??false)}?{ok:false,error:{code:'operation_result_unknown',category:'storage',message:'The result is unconfirmed.',retryable:false}}:ok(deletion);}
+      if(method==='data.delete.read')return ok(deletion);
       if(method==='run.control.read')return ok({instanceId:state.host.instanceId,activeRootRun:null,acceptingNewRuns:true,blockReasons:[]});
       if(method==='run.active')return ok(null);
       if(method==='run.read')return ok(payload.runId?{kind:'one',run:null}:{kind:'recent',runs:[],nextBeforeRunId:null});
@@ -175,7 +178,8 @@ test('S07 actual pending submission belongs to its Session and settles without c
   await release('session.submit');
   await expect(page.locator('.composer').getByRole('button', { name: 'Submitting…', exact: true })).toHaveCount(0);
   await expect(page.getByLabel('Message text', { exact: true })).toHaveValue('');
-  await expect(page.getByTestId('input-queue')).toContainText('Original Session 1 submission');
+  await expect(page.getByTestId('input-queue')).toHaveCount(0);
+  await expect.poll(()=>page.evaluate(async()=>{const w=await window.medclaw.request('workspace.read',{});if(!w.ok||!w.data.sessionId)return '';const inputs=await window.medclaw.request('session.listInputs',{sessionId:w.data.sessionId});return inputs.ok?inputs.data.items.map(item=>item.text).join(' '):'';})).toContain('Original Session 1 submission');
   await select(2); await expect(page.getByLabel('Message text', { exact: true })).toHaveValue('Unrelated Session 2 draft');
 });
 
@@ -234,3 +238,13 @@ for (const scenario of ['stopped', 'same_instance_handshaking', 'failed_result',
     await expect(page.getByRole('heading', { name: 'Desktop startup failed', exact: true })).toHaveCount(0);
   });
 }
+
+test('B03 deletion lost reply blocks new writes until original committed receipt and current facts are read',async()=>{
+ await launch({restoredSession:true,modelResult:{ok:true,data:authenticatedDirectory},catalogResult:{ok:true,data:importedCatalog},deletionLost:true});
+ await page.getByLabel('Message text',{exact:true}).fill('Keep my draft');await page.getByRole('button',{name:'Data Workspace',exact:true}).click();await page.getByRole('button',{name:'Delete batch 1',exact:true}).click();await page.getByRole('button',{name:'Confirm permanent deletion',exact:true}).click();
+ await expect(page.getByText('Deletion result unconfirmed. Read this operation before another deletion.',{exact:true})).toBeVisible();await expect(page.getByRole('button',{name:'New Session',exact:true})).toBeDisabled();await expect(page.getByRole('button',{name:'Preview delete all imported data',exact:true})).toBeDisabled();
+ await page.getByRole('button',{name:'Chat',exact:true}).click();await expect(page.getByLabel('Message text',{exact:true})).toHaveValue('Keep my draft');await expect(page.locator('.composer').getByRole('button',{name:'Send',exact:true})).toBeDisabled();
+ await page.getByRole('button',{name:'Data Workspace',exact:true}).click();await page.getByRole('button',{name:'Read deletion result',exact:true}).click();await expect(page.getByTestId('deletion-result')).toContainText('Data deleted');await expect(page.getByRole('button',{name:'New Session',exact:true})).toBeEnabled();
+ await page.getByRole('button',{name:'Chat',exact:true}).click();await expect(page.getByLabel('Message text',{exact:true})).toHaveValue('Keep my draft');await expect(page.locator('.composer').getByRole('button',{name:'Send',exact:true})).toBeEnabled();
+ const completed=await app!.evaluate(()=>(globalThis as MainGlobal).__startupRenderer.completed);expect(completed.filter(method=>method==='data.delete.commit')).toHaveLength(1);expect(completed.filter(method=>method==='session.submit')).toHaveLength(0);
+});

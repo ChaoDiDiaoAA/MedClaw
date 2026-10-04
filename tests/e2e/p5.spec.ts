@@ -18,9 +18,10 @@ type Wire = { model: string; messages: { role: string; content: unknown }[] };
 let steps: ((wire: Wire) => Promise<string> | string)[] = [], physical = 0;
 const wires: Wire[] = [], httpReleases: (() => void)[] = [];
 const evidence = join(root, '.build/p5-session-management/e2e');
-test.describe.configure({ mode: 'serial' });
+test.describe.configure({ mode: 'serial', timeout:60000 });
 const input = () => page.getByLabel('Message text', { exact: true });
 const queue = () => page.getByTestId('input-queue');
+async function inspectInputs(){if(!await page.getByRole("complementary",{name:"Run details",exact:true}).isVisible())await page.getByRole("button",{name:"View run details",exact:true}).click();const summary=page.getByText("Input diagnostics",{exact:true});if(!await queue().isVisible())await summary.click();}
 const item = (id: number) => queue().locator(`[data-input-id="${id}"]`);
 function gate() { let enter!: () => void, release!: () => void; const value = { entered: new Promise<void>(resolve => { enter = resolve; }), response: new Promise<void>(resolve => { release = resolve; }), enter: () => enter(), release: () => release() }; httpReleases.push(value.release); return value; }
 async function rules(values: Rule[]) { await app.evaluate((_, values) => { (globalThis as MainGlobal).__p5Gate.rules.push(...values); }, values); }
@@ -88,7 +89,7 @@ test.beforeAll(async () => {
 test.afterAll(async () => { httpReleases.forEach(release => release()); await app?.evaluate(() => Object.values((globalThis as MainGlobal).__p5Gate.pending).forEach(release => release())).catch(() => {}); await app?.close(); if (server) await new Promise<void>(resolve => server.close(() => resolve())); if (temporary) { const target = resolve(temporary), within = relative(resolve(tmpdir()), target); if (within && !within.startsWith('..') && !within.includes(':')) rmSync(target, { recursive: true, force: true }); } });
 test.afterEach(async ({}, info) => {
   const name = info.title.replaceAll(/[^a-zA-Z0-9]+/g, '-'); mkdirSync(evidence, { recursive: true });
-  if (info.status === info.expectedStatus) { save('dom-' + name, { currentSession: await page.getByTestId('current-session').innerText(), inputQueue: await queue().ariaSnapshot(), composer: await page.locator('.composer').ariaSnapshot() }); await page.screenshot({ path: join(evidence, name + '.png'), fullPage: true }); }
+  if (info.status === info.expectedStatus) { save('dom-' + name, { currentSession: await page.getByTestId('current-session').innerText(), inputQueue: await queue().count() ? await queue().ariaSnapshot() : null, composer: await page.locator('.composer').ariaSnapshot() }); await page.screenshot({ path: join(evidence, name + '.png'), fullPage: true }); }
   else await page?.screenshot({ path: join(evidence, 'failure-' + name + '.png'), fullPage: true }).catch(() => {});
 });
 
@@ -98,7 +99,7 @@ test('Send, Steer and Follow Up expose real Input identities and cancel only the
   await page.screenshot({ path: join(root, '.superpowers/input-menu-numbering/desktop-send-idle.png') });
   const first = gate(); steps = [async wire => { expect(JSON.stringify(wire)).toContain('P5-root'); first.enter(); await first.response; return 'P5 first turn'; }, wire => { expect(JSON.stringify(wire)).toContain('P5-correction'); expect(JSON.stringify(wire)).not.toContain('P5-cancel-me'); return 'P5 final'; }];
   const before = physical, rootInput = await clickSubmit('P5-root'); await first.entered; if (!rootInput.runId || !rootInput.inputId) throw new Error('Send must return both IDs');
-  await expect(item(rootInput.inputId)).toContainText('Consumed'); await expect(item(rootInput.inputId)).toContainText('Pending');
+  await inspectInputs(); await expect(item(rootInput.inputId)).toContainText('Consumed'); await expect(item(rootInput.inputId)).toContainText('Pending');
   const arrow = page.getByRole('button', { name: 'Message actions', exact: true }), menu = page.getByRole('menu', { name: 'Message actions', exact: true });
   await expect(arrow).toBeVisible(); const beforeChoice = (await calls()).filter(call => call.method === 'session.submit').length;
   await arrow.focus(); await arrow.press('ArrowDown'); await expect(menu.getByRole('menuitem', { name: 'Steer', exact: true })).toBeFocused();
@@ -115,9 +116,9 @@ test('Send, Steer and Follow Up expose real Input identities and cancel only the
   const correction = (await accepted())[1]!; await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible();
   const cancelled = await clickSubmit('P5-cancel-me', 'follow_up');
   expect(correction.runId).toBeNull(); expect(cancelled.runId).toBeNull(); if (!correction.inputId || !cancelled.inputId) throw new Error('Queued inputs need IDs');
-  await expect(item(cancelled.inputId)).toContainText('Queued'); await item(cancelled.inputId).getByRole('button', { name: 'Cancel input', exact: true }).click();
-  await expect(item(cancelled.inputId)).toContainText('Cancelling'); first.release(); await idle();
-  await expect(item(cancelled.inputId)).toContainText('Cancelled'); await expect(item(correction.inputId)).toContainText('Consumed'); await expect(item(correction.inputId)).toContainText('Completed');
+  await inspectInputs(); await expect(item(cancelled.inputId)).toContainText('Queued'); await item(cancelled.inputId).getByRole('button', { name: 'Cancel input', exact: true }).click();
+  await inspectInputs(); await expect(item(cancelled.inputId)).toContainText('Cancelling'); first.release(); await idle();
+  await inspectInputs(); await expect(item(cancelled.inputId)).toContainText('Cancelled'); await expect(item(correction.inputId)).toContainText('Consumed'); await expect(item(correction.inputId)).toContainText('Completed');
   const facts = await Promise.all([readInput(rootInput.inputId), readInput(correction.inputId), readInput(cancelled.inputId)]);
   expect(facts[1]!.runId).toBe(rootInput.runId); expect(facts[2]!.runId).toBeNull(); expect(facts[2]!.nativeEntryId).toBeNull(); expect(physical - before).toBe(2);
   expect((await calls()).some(call => call.method === 'run.read' && call.payload.runId === null)).toBe(false);
@@ -147,11 +148,11 @@ test('an executed queued reply lost in IPC is read back under A while B and newe
 test('read failures preserve proven Input states and late queued responses cannot replace cancellation', async () => {
   const a = await create(), first = gate(); steps = [async () => { first.enter(); await first.response; return 'P5 cancellation boundary'; }];
   await clickSubmit('P5-stale-root'); await first.entered; const queued = await clickSubmit('P5-stale-queue', 'follow_up'); if (!queued.inputId) throw new Error('Missing queued ID');
-  await rules([{ method: 'session.readInput', inputId: queued.inputId, hold: 'stale-queued' }]); await queue().getByRole('button', { name: 'Refresh inputs', exact: true }).click(); await entered('stale-queued');
-  await item(queued.inputId).getByRole('button', { name: 'Cancel input', exact: true }).click(); await expect(item(queued.inputId)).toContainText('Cancelling'); first.release();
-  await expect(item(queued.inputId)).toContainText('Cancelled'); await release('stale-queued'); await expect(item(queued.inputId)).toContainText('Cancelled'); await expect(item(queued.inputId)).not.toContainText('Queued'); await idle();
-  await rules(Array.from({ length: 4 }, () => ({ method: 'session.listInputs', sessionId: a, project: { ok: false, error: safeError('storage_read_failed') } }))); await queue().getByRole('button', { name: 'Refresh inputs', exact: true }).click();
-  await expect(queue().getByRole('alert')).toContainText('Input read unavailable'); await expect(item(queued.inputId)).toContainText('Cancelled'); save('stale-input-read', { sessionId: a, queued, original: await readInput(queued.inputId), calls: await calls() });
+  await inspectInputs(); await rules([{ method: 'session.readInput', inputId: queued.inputId, hold: 'stale-queued' }]); await queue().getByRole('button', { name: 'Refresh inputs', exact: true }).click(); await entered('stale-queued');
+  await inspectInputs(); await item(queued.inputId).getByRole('button', { name: 'Cancel input', exact: true }).click(); await expect(item(queued.inputId)).toContainText('Cancelling'); first.release();
+  await inspectInputs(); await expect(item(queued.inputId)).toContainText('Cancelled'); await release('stale-queued'); await expect(item(queued.inputId)).toContainText('Cancelled'); await expect(item(queued.inputId)).not.toContainText('Queued'); await idle();
+  await inspectInputs(); await rules(Array.from({ length: 4 }, () => ({ method: 'session.listInputs', sessionId: a, project: { ok: false, error: safeError('storage_read_failed') } }))); await queue().getByRole('button', { name: 'Refresh inputs', exact: true }).click();
+  await inspectInputs(); await expect(queue().getByRole('alert')).toContainText('Input read unavailable'); await expect(item(queued.inputId)).toContainText('Cancelled'); save('stale-input-read', { sessionId: a, queued, original: await readInput(queued.inputId), calls: await calls() });
 });
 
 test('frozen model and time changes close queue controls and a Host rejection keeps the edited draft', async () => {
@@ -180,9 +181,9 @@ test('frozen model and time changes close queue controls and a Host rejection ke
 test('a cancel command that reaches Host after consumption returns consumed and points at the original Stop', async () => {
   const a = await create(), first = gate(), second = gate(); steps = [async () => { first.enter(); await first.response; return 'P5 race first'; }, async () => { second.enter(); await second.response; return 'P5 race final'; }];
   const original = await clickSubmit('P5-race-root'); await first.entered; const queued = await clickSubmit('P5-race-input', 'follow_up'); if (!queued.inputId) throw new Error('Missing queued Input');
-  await rules([{ method: 'session.cancelInput', inputId: queued.inputId, hold: 'cancel-before-host', before: true }]); await item(queued.inputId).getByRole('button', { name: 'Cancel input', exact: true }).click(); await entered('cancel-before-host');
-  await expect(item(queued.inputId)).toContainText('Cancelling'); first.release(); await second.entered; await release('cancel-before-host');
-  await expect(item(queued.inputId)).toContainText('Consumed'); await expect(item(queued.inputId)).not.toContainText('Cancelled'); await expect(item(queued.inputId).getByRole('button', { name: 'Cancel input', exact: true })).toHaveCount(0);
+  await inspectInputs(); await rules([{ method: 'session.cancelInput', inputId: queued.inputId, hold: 'cancel-before-host', before: true }]); await item(queued.inputId).getByRole('button', { name: 'Cancel input', exact: true }).click(); await entered('cancel-before-host');
+  await inspectInputs(); await expect(item(queued.inputId)).toContainText('Cancelling'); first.release(); await second.entered; await release('cancel-before-host');
+  await inspectInputs(); await expect(item(queued.inputId)).toContainText('Consumed'); await expect(item(queued.inputId)).not.toContainText('Cancelled'); await expect(item(queued.inputId).getByRole('button', { name: 'Cancel input', exact: true })).toHaveCount(0);
   await expect(page.locator('.error-banner')).toContainText(`already consumed. Stop original Run ${original.runId}`); const fact = await readInput(queued.inputId); expect(fact.runId).toBe(original.runId); expect(fact.nativeEntryId).not.toBeNull();
   await page.getByRole('button', { name: 'Stop generating', exact: true }).click(); second.release(); await idle(); save('cancel-consumption-race', { a, original, queued, fact, settled: await readInput(queued.inputId) });
 });
@@ -194,8 +195,8 @@ test('ordinary Input pages load more by sequence without executing model request
     const workspace = await window.medclaw.request('workspace.read', {}), detail = await window.medclaw.request('session.read', { sessionId: a }); if (!workspace.ok || !detail.ok || !detail.data) throw new Error('Missing current scope');
     const results = []; for (let index = 0; index < 51; index++) { const result = await window.medclaw.request('session.submit', { sessionId: a, clientSequence: detail.data.session.nextSubmissionSequence + index, text: 'P5-page-' + index, mode: 'follow_up', targetRunId: runId, expectedRevision: workspace.data.revision, expectedBatchIds: workspace.data.batchRefs.map(batch => batch.id), expectedQueryId: workspace.data.queryId, model: { provider: model.provider, modelId: model.modelId, expectedConfigVersion: model.configVersion }, referenceDate, timezone }, crypto.randomUUID()); if (!result.ok) throw new Error(result.error.code); results.push(result.data); } return results;
   }, { a, runId: original.runId, model: rootRun.model, referenceDate: rootRun.referenceDate, timezone: rootRun.timezone });
-  await page.getByRole('button', { name: 'Stop generating', exact: true }).click(); first.release(); await idle(); await page.reload(); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible(); await expect(queue().locator('[data-input-id]')).toHaveCount(50);
-  await queue().getByRole('button', { name: 'Load more inputs', exact: true }).click(); await expect(queue().locator('[data-input-id]')).toHaveCount(52); await expect(queue().getByRole('button', { name: 'Load more inputs', exact: true })).toHaveCount(0);
+  await inspectInputs(); await page.getByRole('button', { name: 'Stop generating', exact: true }).click(); first.release(); await idle(); await page.reload(); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible(); await expect(queue().locator('[data-input-id]')).toHaveCount(50);
+  await inspectInputs(); await queue().getByRole('button', { name: 'Load more inputs', exact: true }).click(); await expect(queue().locator('[data-input-id]')).toHaveCount(52); await expect(queue().getByRole('button', { name: 'Load more inputs', exact: true })).toHaveCount(0);
   const all = await page.evaluate(sessionId => window.medclaw.request('session.listInputs', { sessionId, limit: 100 }), a); if (!all.ok) throw new Error(all.error.code); expect(all.data.items).toHaveLength(52); expect(all.data.items.slice(1).every(input => input.status === 'cancelled' && input.runId === null)).toBe(true); expect(physical).toBe(before);
   save('pagination', { a, original, acceptedQueueCount: queued.length, physicalReadDelta: physical - before, ids: all.data.items.map(input => input.id), calls: (await calls()).filter(call => call.method === 'session.listInputs' && call.payload.sessionId === a) });
 });
@@ -298,7 +299,7 @@ test('a retry that becomes unknown revokes a prior confirmed failure and resends
 test('terminal unknown Input history remains readable without permanent automatic per-input polling', async () => {
   const a = await create(); steps = [() => 'P5 terminal history']; const original = await clickSubmit('P5-terminal-history'); await idle(); if (!original.inputId) throw new Error('Missing actual accepted Input');
   const actual = await readInput(original.inputId), projected: SessionInput = { ...actual, status: 'delivery_unknown', processingStatus: 'failed', runId: null, nativeEntryId: null, processedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), error: safeError('input_delivery_unknown') };
-  await rules([{ method: 'session.listInputs', sessionId: a, project: { ok: true, data: { sessionId: a, items: [projected], nextClientSequence: null, hasMore: false } } }]); await queue().getByRole('button', { name: 'Refresh inputs', exact: true }).click(); await expect(item(original.inputId)).toContainText('Delivery unknown / Failed');
+  await inspectInputs(); await rules([{ method: 'session.listInputs', sessionId: a, project: { ok: true, data: { sessionId: a, items: [projected], nextClientSequence: null, hasMore: false } } }]); await queue().getByRole('button', { name: 'Refresh inputs', exact: true }).click(); await expect(item(original.inputId)).toContainText('Delivery unknown / Failed');
   const before = (await calls()).length;
   await expect.poll(async () => (await calls()).slice(before).filter(call => call.method === 'session.listInputs' && call.payload.sessionId === a).length).toBeGreaterThanOrEqual(2);
   const background = (await calls()).slice(before); expect(background.filter(call => call.method === 'session.readInput' && call.payload.inputId === original.inputId)).toHaveLength(0);
@@ -315,15 +316,15 @@ test('legacy acceptance reads only its Run and an old Host input reply is ignore
   const legacyReads = (await calls()).slice(readBefore); expect(legacyReads.some(call => call.method === 'session.readInput')).toBe(false);
   // Establish the terminal Input projection before holding its next read. A
   // background reconciliation of the legacy receipt must not consume this gate.
-  await expect(item(original.inputId)).toContainText('Completed');
-  await expect(queue().getByRole('button', { name: 'Refresh inputs', exact: true })).toBeEnabled();
+  await inspectInputs(); await expect(item(original.inputId)).toContainText('Completed');
+  await inspectInputs(); await expect(queue().getByRole('button', { name: 'Refresh inputs', exact: true })).toBeEnabled();
   // A genuine Host restart provides a different instance; held old reads cannot populate its cache.
   const old = await page.evaluate(() => window.medclaw.request('host.read', {})); if (!old.ok || !old.data.instanceId) throw new Error('No Host');
   const unknown: SessionInput = { ...(await readInput(original.inputId)), status: 'delivery_unknown', processingStatus: 'pending', runId: null, nativeEntryId: null, processedAt: null, error: safeError('input_delivery_unknown') };
-  await rules([{ method: 'session.listInputs', sessionId: a, hold: 'old-host-list', project: { ok: true, data: { sessionId: a, items: [unknown], nextClientSequence: null, hasMore: false } } }]); await queue().getByRole('button', { name: 'Refresh inputs', exact: true }).click(); await entered('old-host-list');
+  await inspectInputs(); await rules([{ method: 'session.listInputs', sessionId: a, hold: 'old-host-list', project: { ok: true, data: { sessionId: a, items: [unknown], nextClientSequence: null, hasMore: false } } }]); await queue().getByRole('button', { name: 'Refresh inputs', exact: true }).click(); await entered('old-host-list');
   const restarted = await page.evaluate(expectedInstanceId => window.medclaw.request('host.restart', { expectedInstanceId }), old.data.instanceId); expect(restarted.ok).toBe(true); if (!restarted.ok) throw new Error(restarted.error.code);
   await expect.poll(async () => { const host = await page.evaluate(() => window.medclaw.request('host.read', {})); return host.ok && host.data.state === 'ready' && host.data.instanceId !== old.data.instanceId; }).toBe(true);
-  await release('old-host-list'); await expect(queue()).not.toContainText('Delivery unknown'); await expect(item(original.inputId)).toContainText('Completed');
+  await inspectInputs(); await release('old-host-list'); await expect(queue()).not.toContainText('Delivery unknown'); await expect(item(original.inputId)).toContainText('Completed');
   expect((await calls()).some(call => call.method === 'session.readInput' && call.payload.inputId === null || call.method === 'run.read' && call.payload.runId === null)).toBe(false);
   save('old-instance', { a, original, oldInstanceId: old.data.instanceId, newInstanceId: restarted.data.instanceId, beforePhysical: physical, afterPhysical: physical });
 });

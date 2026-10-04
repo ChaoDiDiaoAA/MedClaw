@@ -106,6 +106,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   private readonly p3: boolean;
   private readonly inputs: SqliteInputStore;
   private readonly p5: boolean;
+  private readonly batchLifecycle:boolean;
   private readonly events: EventWriter | undefined;
   constructor(private readonly db: Database, private readonly beforeCommit?: () => void, events?: EventWriter,
     private readonly transactions = SqliteWriteTransactions.forDatabase(db)) {
@@ -113,6 +114,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     this.inputs = new SqliteInputStore(db, this.events);
     this.p5 = db.query("SELECT name FROM sqlite_schema WHERE name='session_inputs'").get() !== null;
     this.p3 = this.db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name='answers'").get() !== null;
+    this.batchLifecycle=!!db.query("SELECT name FROM pragma_table_info('batches') WHERE name='status'").get();
   }
 
   private event(row: RunRow, fact: RegisteredEventPayload, at: string, source: RegisteredEventDraft['source'] = 'application', toolCallId: number | null = null): void {
@@ -269,6 +271,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
 
   findOperation(operationRef: string): StoredOperation | null {
     checked(OpaqueIdSchema, operationRef);
+    if(this.batchLifecycle&&this.db.query('SELECT id FROM data_deletions WHERE operation_ref=?').get(operationRef))fail('state_conflict');
     const sources=["SELECT id FROM sessions WHERE creation_operation_ref=?1","SELECT id FROM runs WHERE submission_operation_ref=?1 OR (kind='provider' AND json_extract(config_json,'$.providerRequest.operationRef')=?1)"];
     if(this.p5)sources.push("SELECT id FROM session_inputs WHERE operation_ref=?1");
     if(this.p3)sources.push("SELECT id FROM business_events WHERE operation_ref=?1 AND type IN ('session_renamed','session_deleted')");
@@ -305,7 +308,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   private batchReferences(ids: number[]): { refs: BatchRef[]; materialVersion: string | null } {
     const rows = ids.map(batchId => {
       const row = this.db.query<{ id: number; content_hash: string; snapshot_date: string; scope_key: string; material_version: string }, [number]>(
-        "SELECT id,content_hash,snapshot_date,scope_key,material_version FROM batches WHERE id=?").get(batchId);
+        `SELECT id,content_hash,snapshot_date,scope_key,material_version FROM batches WHERE id=?${this.batchLifecycle?" AND status='active'":""}`).get(batchId);
       if (!row) fail("access_denied");
       return row;
     });
@@ -361,7 +364,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const batch=load('batch',ref.id);
       const owner=batch?load('import',Number(batch.import_id)):null;
       const artifact=owner&&owner.artifact_id!==null?load('artifact',Number(owner.artifact_id)):null;
-      const valid=batch&&batch.content_hash===ref.contentHash&&batch.snapshot_date===ref.snapshotDate&&batch.scope_key===ref.scopeKey
+      const valid=batch&&batch.status==='active'&&batch.content_hash===ref.contentHash&&batch.snapshot_date===ref.snapshotDate&&batch.scope_key===ref.scopeKey
         &&batch.material_version===state.materialVersion&&owner&&['imported','duplicate'].includes(String(owner.state))&&artifact
         &&artifact.import_id===owner.id&&artifact.operation_ref===owner.operation_ref&&artifact.status==='ready';
       if(valid)artifactIds.push(Number(artifact.id));
@@ -419,6 +422,20 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     if (!query || query.sessionId !== state.sessionId || query.batchIds.some(id => !state.batchRefs.some(batch => batch.id === id))
       || state.deviceIds.length > 0 && (query.scopeDeviceIds === null || query.scopeDeviceIds.some(id => !state.deviceIds.includes(id)))) fail('access_denied');
     return query;
+  }
+
+  reconcileDeletedWorkspace(expectedRevision:number,time:string):WorkspaceState {
+    return this.transactions.immediate(()=>{
+      const old=this.readWorkspace();if(old.revision!==expectedRevision)fail('workspace_revision_mismatch');
+      const next=structuredClone(old),catalog=new SqliteCatalogStore(this.db);
+      const live=new Set(catalog.readBatches(old.batchRefs.map(ref=>ref.id)).map(batch=>batch.id));
+      next.batchRefs=old.batchRefs.filter(ref=>live.has(ref.id));next.materialVersion=next.batchRefs.length?old.materialVersion:null;
+      next.deviceIds=old.deviceIds.filter(id=>next.batchRefs.some(batch=>this.db.query('SELECT id FROM snapshots WHERE batch_id=? AND device_id=?').get(batch.id,id)));
+      if(next.queryId!==null){try{this.workspaceQuery(next.queryId,next);}catch(error){if(error instanceof Error&&error.message==='access_denied')next.queryId=null;else throw error;}}
+      next.selection=this.compatibleSelection(next.selection,next);
+      if(next.queryId===null&&['query','evidence'].includes(next.activeView))next.activeView='data';
+      return this.saveWorkspace(old,next,time);
+    });
   }
 
   private validateSelection(selection: WorkspaceSelection, state: WorkspaceState): void {

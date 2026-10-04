@@ -1,6 +1,6 @@
 import type { Database } from 'bun:sqlite';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { lstat, mkdir, readdir, realpath, writeFile, readFile } from 'node:fs/promises';
+import { lstat, mkdir, readdir, realpath, writeFile, readFile, unlink } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createHash } from 'node:crypto';
@@ -8,6 +8,7 @@ import { ArtifactSchema, type Artifact, type CheckedPackage } from '../../contra
 import { PositiveIdSchema, serviceResult, type Result } from '../../contracts/src/error';
 import { canonicalRequest } from '../../contracts/src/run';
 import type { ManagedImportInspection } from '../../contracts/src/workspace';
+import type {DataDeleteFile} from '../../contracts/src/data-deletion';
 import { z } from 'zod';
 
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
@@ -90,13 +91,62 @@ export class ArtifactStore {
     if (new Set(manifest.files.map(file=>file.path)).size!==manifest.files.length || manifest.sourceHash!==row.sha256
       || createHash('sha256').update(canonicalRequest(sourceFiles)).digest('hex')!==manifest.sourceHash
       || manifest.files.reduce((sum,file)=>sum+file.bytes,0)!==row.bytes) throw new Error('import_preview_stale');
+    const removed=new Set(pkg?[]:this.deletedFilePaths(id));
     const actualFiles = await listPackageFiles(this.inputPath(id));
-    if (canonicalRequest(actualFiles) !== canonicalRequest(manifest.files.map(file => file.path.slice(6)).sort())) throw new Error('import_preview_stale');
+    if (canonicalRequest(actualFiles.filter(path=>!removed.has(`input/${path}`))) !== canonicalRequest(manifest.files.filter(file=>!removed.has(file.path)).map(file => file.path.slice(6)).sort())) throw new Error('import_preview_stale');
     for (const file of manifest.files) {
       if (!permittedRelativePath(file.path) || !file.path.startsWith('input/')) throw new Error('import_preview_stale');
+      if(removed.has(file.path)&&!actualFiles.includes(file.path.slice(6)))continue;
       const actual = await hashFile(join(this.artifactsRoot, String(id), file.path));
       if (actual.bytes !== file.bytes || actual.sha256 !== file.sha256) throw new Error('import_preview_stale');
     }
+  }
+  private deletedFilePaths(id:number,operationRef?:string):string[]{
+    if(!this.db.query("SELECT name FROM sqlite_schema WHERE name='data_deletions'").get())return [];
+    return this.db.query<{path:string},[number,string|null]>("SELECT json_extract(f.value,'$.path') path FROM data_deletions d,json_each(d.preview_json,'$.files') f WHERE d.state='committed' AND json_extract(f.value,'$.artifactId')=? AND (?2 IS NULL OR d.operation_ref=?2)").all(id,operationRef??null).map(row=>row.path);
+  }
+  async assertDeletionOwner(id:number){const row=this.db.query<{operation_ref:string},[number]>('SELECT operation_ref FROM artifacts WHERE id=?').get(id);if(!row)throw new Error('artifact_not_ready');await this.verifyManifest(id,row.operation_ref);}
+  async planBatchDeletion(batchIds:number[]):Promise<DataDeleteFile[]>{
+    const encoded=JSON.stringify(batchIds),targets=this.db.query<{id:number;scope_key:string;snapshot_date:string;metadata_json:string},[string]>("SELECT id,scope_key,snapshot_date,metadata_json FROM batches WHERE status='active' AND id IN (SELECT value FROM json_each(?))").all(encoded);
+    const owners=this.db.query<{artifact_id:number;operation_ref:string;result_json:string},[string]>("SELECT artifact_id,operation_ref,result_json FROM imports WHERE state IN ('imported','duplicate') AND artifact_id IS NOT NULL AND EXISTS(SELECT 1 FROM json_each(result_json,'$.batchIds') WHERE value IN (SELECT value FROM json_each(?)))").all(encoded);
+    const plans:DataDeleteFile[]=[];
+    for(const owner of owners){
+      await this.verifyManifest(owner.artifact_id,owner.operation_ref);
+      const manifest=managedManifest.parse(JSON.parse(await readFile(this.manifestPath(owner.artifact_id),'utf8')));
+      const resultIds=JSON.parse(owner.result_json).batchIds as number[];
+      const active=this.db.query<{id:number},[string]>("SELECT id FROM batches WHERE status='active' AND id IN (SELECT value FROM json_each(?))").all(JSON.stringify(resultIds));
+      if(active.every(row=>batchIds.includes(row.id))){for(const file of manifest.files)if(!this.deletedFilePaths(owner.artifact_id).includes(file.path))plans.push({artifactId:owner.artifact_id,path:file.path});continue;}
+      for(const file of manifest.files.filter(file=>file.path.endsWith('.metadata.json')&&!this.deletedFilePaths(owner.artifact_id).includes(file.path))){
+        const metadata=JSON.parse(await readFile(join(this.artifactsRoot,String(owner.artifact_id),file.path),'utf8'));
+        const target=targets.find(batch=>batch.scope_key===metadata.scopeKey&&batch.snapshot_date===metadata.snapshotDate&&resultIds.includes(batch.id));
+        if(!target)continue;
+        if(canonicalRequest(metadata)!==canonicalRequest(JSON.parse(target.metadata_json)))throw new Error('import_preview_stale');
+        const csv=file.path.replace(/\.metadata\.json$/,'.csv');if(!manifest.files.some(entry=>entry.path===csv))throw new Error('import_preview_stale');
+        plans.push({artifactId:owner.artifact_id,path:file.path},{artifactId:owner.artifact_id,path:csv});
+      }
+    }
+    return plans;
+  }
+  async deleteManagedFile(file:DataDeleteFile,operationRef:string):Promise<void>{
+    if(!permittedRelativePath(file.path)||!file.path.startsWith('input/'))throw new Error('access_denied');
+    PositiveIdSchema.parse(file.artifactId);
+    if(!this.deletedFilePaths(file.artifactId,operationRef).includes(file.path))throw new Error('access_denied');
+    const rootStat=await lstat(this.artifactsRoot);if(!rootStat.isDirectory()||rootStat.isSymbolicLink())throw new Error('access_denied');
+    const root=await realpath(this.artifactsRoot),parts=[String(file.artifactId),...file.path.split('/')];let directory=root;
+    for(const part of parts.slice(0,-1)){
+      directory=join(directory,part);const stat=await lstat(directory);if(!stat.isDirectory()||stat.isSymbolicLink())throw new Error('access_denied');
+      const rel=relative(root,await realpath(directory));if(rel==='..'||rel.startsWith(`..${sep}`)||isAbsolute(rel))throw new Error('access_denied');
+    }
+    const target=join(directory,parts.at(-1)!);
+    let stat;try{stat=await lstat(target);}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return;throw error;}
+    if(!stat.isFile()||stat.isSymbolicLink())throw new Error('access_denied');
+    const artifact=this.db.query<{operation_ref:string;metadata_sha256:string;metadata_json:string},[number]>('SELECT operation_ref,metadata_sha256,metadata_json FROM artifacts WHERE id=?').get(file.artifactId);
+    if(!artifact)throw new Error('artifact_not_ready');
+    const manifestText=await readFile(this.manifestPath(file.artifactId),'utf8'),manifest=managedManifest.parse(JSON.parse(manifestText));
+    if(createHash('sha256').update(manifestText).digest('hex')!==artifact.metadata_sha256||canonicalRequest(manifest)!==artifact.metadata_json||manifest.artifactId!==file.artifactId||manifest.operationRef!==artifact.operation_ref)throw new Error('artifact_not_ready');
+    const expected=manifest.files.find(value=>value.path===file.path);if(!expected)throw new Error('access_denied');
+    const actual=await hashFile(target);if(actual.sha256!==expected.sha256||actual.bytes!==expected.bytes)throw new Error('artifact_not_ready');
+    await unlink(target);
   }
   async inspectManagedImport(id: number): Promise<ManagedImportInspection> {
     let operationRef: string;

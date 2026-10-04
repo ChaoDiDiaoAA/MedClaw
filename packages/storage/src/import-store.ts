@@ -5,7 +5,7 @@ import { canonicalRequest } from '../../contracts/src/run';
 import { SnapshotSchema, type Snapshot } from '../../contracts/src/query';
 
 type ImportDbRow = { id: number; instance_id: string; preview_request_json: string; commit_request_json: string | null; operation_ref: string; prior_operation_ref: string | null; state: string; preview_json: string | null; result_json: string | null; artifact_id: number | null; error_json: string | null; updated_at: string };
-type BatchRow = { id: number; snapshot_date: string; source_bundle_id: string; source_lock_hash: string; region: string; cohort_hash: string; metadata_json: string; content_hash: string };
+type BatchRow = { id: number; status: string; deletion_operation_ref: string | null; observed_entity_count: number; snapshot_date: string; source_bundle_id: string; source_lock_hash: string; region: string; cohort_hash: string; metadata_json: string; content_hash: string };
 const fingerprint = (value: unknown) => createHash('sha256').update(canonicalRequest(value)).digest('hex');
 
 export class SqliteImportStore implements ImportStore {
@@ -25,6 +25,7 @@ export class SqliteImportStore implements ImportStore {
         if (canonicalRequest(previous.previewRequest) !== canonicalRequest(request)) throw new Error('state_conflict');
         return previous;
       }
+      if(this.db.query("SELECT name FROM sqlite_schema WHERE name='data_deletions'").get()&&this.db.query('SELECT id FROM data_deletions WHERE operation_ref=?').get(request.operationRef))throw new Error('state_conflict');
       const prior = request.priorOperationRef ? this.read(request.priorOperationRef) : null;
       if (request.priorOperationRef && !prior) throw new Error('operation_not_found');
       const now = new Date().toISOString();
@@ -56,7 +57,18 @@ export class SqliteImportStore implements ImportStore {
     if (!record || !result || !preview || !['imported', 'duplicate'].includes(record.operation.state)) throw new Error('operation_result_unknown');
     const batches = result.batchIds.map(id => this.db.query<BatchRow, [number]>('SELECT * FROM batches WHERE id=?').get(id));
     if (batches.some(batch => !batch) || batches.length !== preview.batchCount || canonicalRequest(batches.map(batch => batch!.snapshot_date).sort()) !== canonicalRequest(preview.snapshotDates) || batches.some(batch => batch!.source_bundle_id !== result.sourceBundleId)) throw new Error('storage_read_failed');
-    const count = result.batchIds.reduce((sum, id) => sum + (this.db.query<{ n: number }, [number]>('SELECT count(*) n FROM snapshots WHERE batch_id=?').get(id)?.n ?? 0), 0);
+    let count = 0;
+    for (const batch of batches) {
+      if (!batch) throw new Error('storage_read_failed');
+      const actual = this.db.query<{ n: number }, [number]>('SELECT count(*) n FROM snapshots WHERE batch_id=?').get(batch.id)!.n;
+      if (batch.status === 'active') {
+        if (actual !== batch.observed_entity_count) throw new Error('storage_read_failed');
+      } else {
+        const deletion = this.db.query<{ receipt_json: string }, [string]>('SELECT receipt_json FROM data_deletions WHERE operation_ref=? AND state=\'committed\'').get(batch.deletion_operation_ref!);
+        if (!deletion || !JSON.parse(deletion.receipt_json).batchIds.includes(batch.id) || actual !== 0 || this.db.query('SELECT id FROM change_events WHERE old_batch_id=? OR new_batch_id=? LIMIT 1').get(batch.id, batch.id)) throw new Error('storage_read_failed');
+      }
+      count += batch.observed_entity_count;
+    }
     const artifact = this.db.query<{ status: string; import_id: number }, [number]>('SELECT status,import_id FROM artifacts WHERE id=?').get(result.artifactId!);
     if (count !== result.rowCount || artifact?.status !== 'ready' || artifact.import_id !== record.id || !this.db.query('SELECT id FROM business_events WHERE operation_ref=? AND type=?').get(operationRef, `import.${result.status}`)) throw new Error('storage_read_failed');
   }
@@ -64,9 +76,9 @@ export class SqliteImportStore implements ImportStore {
     let newBatchCount = 0, duplicateBatchCount = 0;
     for (const day of pkg.days) {
       const metadata = day.metadata;
-      const latest = this.db.query<BatchRow, [string]>('SELECT * FROM batches WHERE scope_key=? ORDER BY snapshot_date DESC LIMIT 1').get(metadata.scopeKey);
+      const latest = this.db.query<BatchRow, [string]>('SELECT * FROM batches WHERE scope_key=? AND status=\'active\' ORDER BY snapshot_date DESC LIMIT 1').get(metadata.scopeKey);
       if (latest && (latest.source_bundle_id !== metadata.sourceBundleId || latest.source_lock_hash !== metadata.sourceLockHash || latest.region !== metadata.region || latest.cohort_hash !== metadata.cohortHash)) throw new Error('import_conflict');
-      const existing = this.db.query<BatchRow, [string, string]>('SELECT * FROM batches WHERE scope_key=? AND snapshot_date=?').get(metadata.scopeKey, metadata.snapshotDate);
+      const existing = this.db.query<BatchRow, [string, string]>('SELECT * FROM batches WHERE scope_key=? AND snapshot_date=? AND status=\'active\'').get(metadata.scopeKey, metadata.snapshotDate);
       if (existing) {
         if (existing.content_hash !== day.contentHash || canonicalRequest(JSON.parse(existing.metadata_json)) !== canonicalRequest(metadata)) throw new Error('import_conflict');
         duplicateBatchCount++;
@@ -101,9 +113,9 @@ export class SqliteImportStore implements ImportStore {
       const batchIds: number[] = []; let acceptedRows = 0, duplicateRows = 0;
       for (const day of pkg.days) {
         const meta = day.metadata;
-        const existing = this.db.query<{ id: number }, [string, string]>('SELECT id FROM batches WHERE scope_key=? AND snapshot_date=?').get(meta.scopeKey, meta.snapshotDate);
+        const existing = this.db.query<{ id: number }, [string, string]>('SELECT id FROM batches WHERE scope_key=? AND snapshot_date=? AND status=\'active\'').get(meta.scopeKey, meta.snapshotDate);
         if (existing) { batchIds.push(existing.id); duplicateRows += meta.observedEntityCount; continue; }
-        const previous = this.db.query<{ id: number }, [string]>('SELECT id FROM batches WHERE scope_key=? ORDER BY snapshot_date DESC LIMIT 1').get(meta.scopeKey);
+        const previous = this.db.query<{ id: number }, [string]>('SELECT id FROM batches WHERE scope_key=? AND status=\'active\' ORDER BY snapshot_date DESC LIMIT 1').get(meta.scopeKey);
         const batchId = Number(this.db.query('INSERT INTO batches(import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(record.id, meta.scopeKey, meta.snapshotDate, meta.region, meta.materialVersion, meta.sourceBundleId, meta.sourceLockHash, day.contentHash, meta.coverage, meta.cohortHash, meta.expectedEntityCount, meta.observedEntityCount, canonicalRequest(meta.declaredMissingEntityIds.map(id => deviceIds.get(id)!)), canonicalRequest(meta), previous ? 0 : 1, previous?.id ?? null, revision, now).lastInsertRowid);
         batchIds.push(batchId);
         const content = createHash('sha256').update(canonicalRequest({ metadata: meta, mappingVersion: meta.mappingVersion, calculationVersion: pkg.calculationVersion })).update('\n');

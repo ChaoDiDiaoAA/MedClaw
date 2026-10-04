@@ -24,6 +24,7 @@ export class CatalogService {
   private readonly snapshotById: Map<number, Snapshot>;
   private readonly snapshotByPair = new Map<string, Snapshot>();
   private readonly store: CatalogStore | null;
+  private cachedRevision:number|null=null;
   constructor(data: BusinessData | CatalogStore) {
     this.store = 'readBatches' in data ? data : null;
     this.data = this.store ? { batches: [], devices: [], snapshots: [], changes: [] } : BusinessDataSchema.parse(data);
@@ -94,6 +95,8 @@ export class CatalogService {
     }
     BusinessDateSchema.parse(context.referenceDate);
     if (this.store) {
+      const revision=this.store.readRevision();
+      if(revision!==this.cachedRevision){this.batchById.clear();this.deviceById.clear();this.cachedRevision=revision;}
       const batches = context.scope.batchIds.filter(id => !this.batchById.has(id));
       if (batches.length) for (const batch of this.store.readBatches(batches)) {
         if (!batches.includes(batch.id) || this.batchById.has(batch.id)) throw new Error('tool_output_inconsistent');
@@ -106,6 +109,7 @@ export class CatalogService {
         this.deviceById.set(device.id, device);
       }
     }
+    if(this.store?.readDeletedBatchIds?.(context.scope.batchIds).length)throw new Error('data_coverage_missing');
     if (context.scope.batchIds.some(id => !this.batchById.has(id)) || context.scope.deviceIds?.some(id => !this.deviceById.has(id))) throw new Error("access_denied");
     this.checkActive(context);
   }
@@ -132,6 +136,7 @@ export class CatalogService {
   }
   batches(ids: number[], context: QueryContext): Batch[] {
     this.assertContext(context);
+    if(this.store?.readDeletedBatchIds?.(ids).length)throw new Error('data_coverage_missing');
     if (!ids.length || new Set(ids).size !== ids.length || ids.some(id => !context.scope.batchIds.includes(id))) throw new Error("access_denied");
     ids.forEach(id => PositiveIdSchema.parse(id));
     const rows = ids.map(id => this.batchById.get(id)!);

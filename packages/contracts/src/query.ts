@@ -196,6 +196,8 @@ export const QueryRecordSchema = z.strictObject({ id: PositiveIdSchema, sessionI
 export type QueryRecord = z.infer<typeof QueryRecordSchema>;
 export const QuerySummarySchema = QueryRecordSchema.omit({ rows: true, snapshotIds: true, eventIds: true }).extend({
   totalRows: z.number().int().nonnegative(),
+  sourceAvailability: z.enum(['available', 'deleted']).optional(),
+  deletedBatchIds: z.array(PositiveIdSchema).optional(),
 });
 export type QuerySummary = z.infer<typeof QuerySummarySchema>;
 export const QueryPageSchema = z.strictObject({ queryId: PositiveIdSchema, rows: z.array(QueryRowSchema), totalRows: z.number().int().nonnegative(),
@@ -221,6 +223,8 @@ export const QueryViewSchema = z.strictObject({
   evidence: z.array(EvidenceSummarySchema),
 });
 export const EvidenceViewSchema = z.strictObject({
+  sourceAvailability: z.enum(['available', 'deleted']).optional(),
+  deletedBatchIds: z.array(PositiveIdSchema).optional(),
   evidence: EvidenceSummarySchema,
   items: z.array(SnapshotSchema),
   targetVersion: WorkspaceTargetVersionSchema,
@@ -233,6 +237,7 @@ export const EvidenceViewSchema = z.strictObject({
 export type SnapshotReference = Pick<Snapshot, 'id' | 'batchId' | 'deviceId' | 'sourceRowRef'>;
 export type CatalogSummary = { rows: QueryRecord['rows']; snapshotIds: number[]; eventIds: number[] };
 export interface CatalogStore {
+  readDeletedBatchIds?(ids:number[]):number[];
   readRevision(): number;
   readBatches(ids: number[]): Batch[];
   readDevices(ids: number[]): Device[];

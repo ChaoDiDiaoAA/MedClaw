@@ -8,7 +8,7 @@ import { sessionDisplayTitle, type SessionDraft } from "./session-list";
 import { ContextPanel } from "./context-panel";
 import type { SessionMessagePage, SessionMessageView } from "../../../../packages/contracts/src/messages";
 import type { PublicReturn } from "../../../../packages/contracts/src/protocol";
-import { InputQueue, type InputQueueSnapshot } from "./input-queue";
+import { type InputQueueSnapshot } from "./input-queue";
 import { finalDisplaySource, resolveReadingAnchor, shouldRecordScroll, type ReadingAnchor, type RunEventProjectionState } from './use-run-events';
 import type { DirectoryReadStatus } from './models-page';
 
@@ -271,7 +271,6 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
     </div>
     {contentUpdated === readingKey && !following && <p className="tiny evidence-gap reading-update" data-testid="reading-content-updated">Content updated. Kept the nearest available message.</p>}
     {!following && <button className="new-content" data-testid="back-to-latest" onClick={() => { if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; if (readingKey) positions.current.set(readingKey, { following: true, top: scroll.current?.scrollTop ?? 0, anchor: null, offset: 0 }); followingRef.current = true; setFollowing(true); setContentUpdated(null); }}>New content · Back to latest</button>}
-    {props.sessionId && <div className="reading-width input-queue-wrap"><InputQueue snapshot={props.inputs} sessionId={props.sessionId} ready={props.host.state === 'ready' && props.visible} cancelling={props.cancellingInputs} onRefresh={props.onRefreshInputs} onMore={props.onMoreInputs} onCancel={props.onCancelInput} /></div>}
     <div className="composer-wrap"><div className="composer reading-width">
       <div className="composer-model"><span aria-hidden="true">◇</span><div className="composer-model-choice">
         <select aria-label="Session model" value={choiceValue} disabled={props.host.state !== "ready" || props.selecting || !props.session || !draft || !props.directoryCurrent} onChange={event => {

@@ -1,6 +1,7 @@
 import type { Database } from 'bun:sqlite';
 import { z } from 'zod';
 import { PositiveIdSchema } from '../../contracts/src/error';
+import { DataCatalogSchema } from '../../contracts/src/data';
 import { BatchSchema, ChangeSchema, DeviceSchema, QueryRowSchema, SnapshotSchema, type Batch, type CatalogFilters, type CatalogStore, type CatalogSummary, type Change, type Device, type QueryParams, type Snapshot, type SnapshotReference } from '../../contracts/src/query';
 
 type Row = Record<string, unknown>;
@@ -10,7 +11,9 @@ const ids = (values: number[]) => JSON.stringify(IdsSchema.parse(values));
 const decode = (value: unknown) => JSON.parse(z.string().parse(value)) as unknown;
 
 export class SqliteCatalogStore implements CatalogStore {
-  constructor(private readonly db: Database) {}
+  private readonly lifecycle:boolean;
+  constructor(private readonly db: Database) {this.lifecycle=!!db.query("SELECT name FROM pragma_table_info('batches') WHERE name='status'").get();}
+  readDeletedBatchIds(values:number[]):number[]{return this.lifecycle?this.rows("SELECT id FROM batches WHERE status='deleted' AND id IN (SELECT value FROM json_each(?))",[ids(values)]).map(row=>PositiveIdSchema.parse(row.id)):[];}
   private rows(sql: string, params: Binding[] = []): Row[] {
     try { return this.db.query<Row, Binding[]>(sql).all(...params); }
     catch { throw new Error('storage_read_failed'); }
@@ -22,8 +25,20 @@ export class SqliteCatalogStore implements CatalogStore {
   readRevision() {
     return this.parse(() => z.number().int().nonnegative().parse(this.rows('SELECT revision FROM catalog_state WHERE id=1')[0]?.revision));
   }
+  readCatalog(page:number,pageSize:number) {
+    return this.db.transaction(()=>{
+      const records=this.rows("SELECT id,metadata_json FROM batches WHERE status='active' ORDER BY snapshot_date,id LIMIT ? OFFSET ?",[pageSize,(page-1)*pageSize]),selected=records.map(row=>PositiveIdSchema.parse(row.id));
+      const batches=this.readBatches(selected),counts=this.rows('SELECT batch_id,COUNT(*) n,COUNT(DISTINCT device_id) devices,json_group_array(device_id) ids FROM snapshots WHERE batch_id IN (SELECT value FROM json_each(?)) GROUP BY batch_id',[ids(selected)]);
+      for(const batch of batches){const count=counts.find(row=>row.batch_id===batch.id),actual=Number(count?.n??0),devices=decode(count?.ids??'[]') as number[],missing=batch.declaredMissingDeviceIds;
+        const metadata=z.object({expectedEntityCount:z.number().int().positive(),observedEntityCount:z.number().int().nonnegative(),declaredMissingEntityIds:z.array(z.string())}).safeParse(decode(records.find(row=>row.id===batch.id)!.metadata_json));
+        if(!metadata.success||metadata.data.expectedEntityCount!==batch.expectedEntityCount||metadata.data.observedEntityCount!==actual||metadata.data.declaredMissingEntityIds.length!==missing.length||new Set(metadata.data.declaredMissingEntityIds).size!==missing.length||actual!==batch.observedEntityCount||Number(count?.devices??0)!==actual||actual+missing.length!==batch.expectedEntityCount||new Set(missing).size!==missing.length||missing.some(id=>devices.includes(id)))throw new Error('tool_output_inconsistent');}
+      const count=(sql:string)=>Number(this.rows(sql)[0]?.n??0);
+      const contexts=this.rows("SELECT DISTINCT json_extract(metadata_json,'$.referenceDate') reference_date,json_extract(metadata_json,'$.timezone') timezone FROM batches WHERE status='active' LIMIT 2");
+      return DataCatalogSchema.parse({batches,page,pageSize,batchCount:count("SELECT COUNT(*) n FROM batches WHERE status='active'"),deviceCount:count('SELECT COUNT(DISTINCT device_id) n FROM snapshots'),snapshotCount:count('SELECT COUNT(*) n FROM snapshots'),changeCount:count('SELECT COUNT(*) n FROM change_events'),catalogRevision:this.readRevision(),referenceDate:contexts.length===1?contexts[0]!.reference_date??null:null,timezone:contexts.length===1?contexts[0]!.timezone??null:null});
+    }).deferred();
+  }
   readBatches(values: number[]): Batch[] {
-    return this.parse(() => this.rows('SELECT * FROM batches WHERE id IN (SELECT value FROM json_each(?)) ORDER BY scope_key,snapshot_date,id', [ids(values)]).map(row => BatchSchema.parse({
+    return this.parse(() => this.rows(`SELECT * FROM batches WHERE ${this.lifecycle?"status='active' AND ":""}id IN (SELECT value FROM json_each(?)) ORDER BY scope_key,snapshot_date,id`, [ids(values)]).map(row => BatchSchema.parse({
       id: row.id,
       scopeKey: row.scope_key,
       snapshotDate: row.snapshot_date,
