@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createServer, type Server } from "node:http";
+import { nativeUserMessages } from '../fixtures/p1-provider';
 import type { MessageStreamSnapshot, OpenEventSubscriptionInput, OpenEventSubscriptionResult } from '../../packages/contracts/src/event';
 
 const root = resolve(import.meta.dirname, "../.."), bun = process.env.MEDCLAW_BUN_EXECUTABLE ?? "bun";
@@ -22,7 +23,7 @@ test.beforeAll(async () => {
   server = createServer(async (request, response) => {
     let body = ""; request.setEncoding("utf8"); for await (const chunk of request) body += chunk;
     const payload = JSON.parse(body); requests.push(payload);
-    const text = JSON.stringify(payload.messages.filter((message: { role: string }) => message.role === "user").at(-1)?.content ?? "");
+    const text = JSON.stringify(nativeUserMessages(payload.messages).at(-1)?.content ?? "");
     response.writeHead(200, { "content-type": "text/event-stream" });
     const send = (chunk: unknown) => response.write(`data: ${JSON.stringify(chunk)}\n\n`);
     send({ id: "p2-ui", model: payload.model, choices: [{ index: 0, delta: { role: "assistant", content: "P2 reply" }, finish_reason: null }] });

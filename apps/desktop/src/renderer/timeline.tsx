@@ -27,7 +27,8 @@ export function Timeline(props: { state: RunEventProjectionState | null; onResum
       <div><strong>{event.type.replaceAll('_', ' ')}</strong><span className="tiny muted"> · sequence {event.sequence}</span></div>
       <time className="tiny muted" dateTime={event.occurredAt}>{event.occurredAt}</time>
       {'inputId' in event.payload && <p className="tiny"><button onClick={() => { if ('inputId' in event.payload) void readInput(event.payload.inputId); }}>Read original Input {event.payload.inputId}</button> · {event.payload.status} · processing {event.payload.processingStatus}{'phase' in event.payload ? ' · ' + event.payload.phase : ''}</p>}
-      {'callId' in event.payload && <p className="tiny"><a href={`#tool-call-${event.payload.callId}`}>Tool {event.payload.callId}</a> · {event.payload.status}{event.payload.queryIds.length > 0 ? ' · Queries ' + event.payload.queryIds.join(', ') : ''}</p>}
+      {'nativeToolCallId' in event.payload && <p className="tiny"><a href={`#tool-call-${event.payload.callId}`}>Tool {event.payload.callId}</a> · {event.payload.status}{event.payload.queryIds.length > 0 ? ' · Queries ' + event.payload.queryIds.join(', ') : ''}</p>}
+      {event.type === 'context_delivered' && <p className="tiny">Context {event.payload.snapshotId} · original Call {event.payload.callId} · delivery saved</p>}
       {'queryId' in event.payload && <button onClick={() => { if ('queryId' in event.payload) props.onQuery?.(event.payload.queryId); }} disabled={!props.onQuery}>Read original Query {event.payload.queryId}</button>}
       {'answerId' in event.payload && <p className="tiny">Answer {event.payload.answerId ?? 'not available'} · execution stop {event.payload.stopConfirmed === true ? 'confirmed' : 'unconfirmed'}. Runtime admission is read separately.</p>}
       {'errorCode' in event.payload && event.payload.errorCode && <p className="tiny error-text">{event.payload.errorCode}</p>}

@@ -44,7 +44,7 @@ test('P5 safe UTF16 preview and UTF8 page budget', () => {
  expect(contracts.SessionInputPageSchema.safeParse({ sessionId: 1, items: Array.from({ length: 100 }, (_, index) => ({ ...item, id: index + 1, clientSequence: index + 1 })), nextClientSequence: null, hasMore: false }).success).toBe(false);
 });
 test('P5 protocol constants and explicit read classification', () => {
- expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p7-v3'); expect(DATABASE_SCHEMA_VERSION).toBe(7);
+ expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p8-v1'); expect(DATABASE_SCHEMA_VERSION).toBe(8);
  for (const method of ['session.readInput', 'session.listInputs']) expect(isReadOnlyMethod(method)).toBe(true);
  expect(isReadOnlyMethod('session.cancelInput')).toBe(false);
  expect(publicMethodSchemas['session.cancelInput']).toBeDefined();

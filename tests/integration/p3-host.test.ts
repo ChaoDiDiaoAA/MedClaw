@@ -191,7 +191,7 @@ test('manual Query and native Steer Follow Up retain the original P3 Run and fro
     const linked = new Database(f.host.paths.databasePath, { readonly: true });
     try {
       expect(linked.query('SELECT id,input_id FROM runs').all()).toEqual([{ id: accepted.runId, input_id: accepted.inputId }]);
-      expect(linked.query('SELECT input_id FROM model_calls ORDER BY id').all()).toEqual(Array.from({ length: 4 }, () => ({ input_id: accepted.inputId })));
+      expect(linked.query('SELECT input_id FROM model_calls ORDER BY id').all()).toEqual([accepted.inputId,accepted.inputId,...queuedIds].map(input_id=>({input_id})));
       expect(linked.query('SELECT source,input_id FROM queries ORDER BY id').all()).toEqual([{ source: 'agent_tool', input_id: accepted.inputId }, { source: 'user_form', input_id: accepted.inputId }]);
       expect(linked.query('SELECT run_id,input_id FROM answers').all()).toEqual([{ run_id: accepted.runId, input_id: accepted.inputId }]);
     } finally { linked.close(); }

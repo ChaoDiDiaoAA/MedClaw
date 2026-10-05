@@ -8,6 +8,7 @@ import { businessToolSchemas } from "../../contracts/src/business-tools";
 import { safePreview } from "../../contracts/src/run";
 import type { ToolSdkDelivery } from "../../contracts/src/tool";
 import { isDeepStrictEqual } from "node:util";
+import type { ContextSnapshot } from '../../contracts/src/context';
 
 const encoder = new TextEncoder();
 const markers = {
@@ -20,6 +21,40 @@ const invalid = (): never => { throw safeError("session_history_invalid"); };
 const badCursor = (): never => { throw safeError("input_invalid", undefined, { reason: "message_cursor_invalid" }); };
 const nativeToolNames = new Set(["read", "write", "edit", "bash", "powershell", "grep", "find", "ls"]);
 const object = (value: unknown): Record<string, unknown> | null => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+
+/** Text paths emitted by Pi 0.87.1; arbitrary nested text is never delivery proof. */
+export function contextMessageText(content: unknown): string | null {
+  if (typeof content === 'string') return content.isWellFormed() ? content : null;
+  if (!Array.isArray(content)) return null;
+  const texts = content.map(object).map(block => block && typeof block.text === 'string' && (block.type === undefined || block.type === 'text' || block.type === 'input_text') ? block.text : null);
+  return texts.every(text => text !== null && text.isWellFormed()) ? texts.join('\n') : null;
+}
+
+export function matchProviderContext(api: string, payload: unknown, snapshot: Pick<ContextSnapshot, 'renderedProjection' | 'runtimeFeedback'>): boolean {
+  const body = object(payload); if (!body) return false;
+  let messages: unknown, systems: unknown[] = [];
+  switch (api) {
+    case 'openai-completions': case 'mistral-conversations': messages = body.messages; break;
+    case 'openai-responses': case 'azure-openai-responses': messages = body.input; break;
+    case 'openai-codex-responses': messages = body.input; systems = [body.instructions]; break;
+    case 'anthropic-messages': case 'bedrock-converse-stream': messages = body.messages; systems = [body.system]; break;
+    case 'pi-messages': messages = object(body.context)?.messages; break;
+    default: return false;
+  }
+  if (!Array.isArray(messages)) return false;
+  const users: string[] = [], trusted: string[] = [];
+  for (const item of messages) {
+    const message = object(item), text = contextMessageText(message?.content);
+    if (text === null) continue;
+    if (message?.role === 'user') users.push(text);
+    if (message?.role === 'system' || message?.role === 'developer') trusted.push(text);
+  }
+  for (const system of systems) { const text = contextMessageText(system); if (text !== null) trusted.push(text); }
+  const feedback = snapshot.runtimeFeedback;
+  // Pi folds later system content with double-newline boundaries for Anthropic/Bedrock.
+  const matchesFeedback = (text: string) => text === feedback || text.startsWith(`${feedback}\n\n`) || text.endsWith(`\n\n${feedback}`) || text.includes(`\n\n${feedback}\n\n`);
+  return users.filter(text => text === snapshot.renderedProjection).length === 1 && trusted.filter(matchesFeedback).length === 1;
+}
 
 /** Compare receipt identity and content, excluding metadata that is absent from the wire. */
 export function sameToolReceipt(message: unknown, receipt: ToolSdkDelivery): boolean {
@@ -64,6 +99,7 @@ export function projectToolCall(record: ToolCallRecord): ToolCallView {
     name: native || business ? record.name : "Unknown tool", version: record.version, executionMode: record.executionMode, status: record.status,
     error: record.error === null ? null : safeError(record.error.code, undefined, { runId: record.runId, sessionId: record.sessionId, toolCallId: record.id }),
     sdkReturned: record.sdkReturned, nativeEntryId: record.nativeEntryId,
+    contextSnapshotId: record.contextSnapshotId ?? null,
     ...(record.modelCallId === undefined ? {} : { modelCallId: record.modelCallId }),
     ...(record.stoppedAt === undefined ? {} : { stoppedAt: record.stoppedAt }),
     ...(record.nextModelCallId === undefined ? {} : { nextModelCallId: record.nextModelCallId }),

@@ -19,11 +19,12 @@ import { TOOL_READ_RULES, RunToolsViewSchema } from './tool';
 import { StoredToolConfigurationSchema, normalizeToolConfiguration } from './tool-config';
 import { RuntimeConfigurationSchema, normalizeRuntimeConfiguration, projectRuntimePolicies } from './runtime-config';
 import { ReadSessionMessagesInputSchema, SessionMessagePageSchema } from "./messages";
+import { ReadContextInputSchema, ContextReadResultSchema } from './context';
 
 import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, EventSubscribeResultSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema } from './event';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p7-v3" as const;
-export const DATABASE_SCHEMA_VERSION = 7 as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p8-v1" as const;
+export const DATABASE_SCHEMA_VERSION = 8 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
@@ -81,6 +82,7 @@ export const DiagnosticsViewSchema = z.strictObject({
 
 /** Each public method owns its exact input and output; private control and secrets are absent. */
 export const publicMethodSchemas = {
+  "context.read": { input: ReadContextInputSchema, output: ContextReadResultSchema },
   "event.read": { input: ReadEventsInputSchema, output: EventPageSchema },
   "event.subscribe": { input: EventSubscribeInputSchema, output: EventSubscribeResultSchema },
   "model.list": { input: EmptyPayloadSchema, output: ModelDirectoryViewSchema },
@@ -227,6 +229,7 @@ export type HostPrivateMethod = keyof typeof hostPrivateMethodSchemas;
 const hostFields = { protocolVersion: z.literal(HOST_PROTOCOL_VERSION), kind: z.literal("request"), requestId: OpaqueIdSchema, instanceId: OpaqueIdSchema, operationRef: OpaqueIdSchema };
 const hostRequest = <M extends string, S extends z.ZodType>(method: M, payload: S) => z.strictObject({ ...hostFields, method: z.literal(method), payload });
 export const PublicHostRequestSchema = z.discriminatedUnion("method", [
+  hostRequest("context.read", publicMethodSchemas["context.read"].input),
   hostRequest("event.read", publicMethodSchemas["event.read"].input),
   hostRequest("event.subscribe", publicMethodSchemas["event.subscribe"].input),
   hostRequest("model.list", publicMethodSchemas["model.list"].input),

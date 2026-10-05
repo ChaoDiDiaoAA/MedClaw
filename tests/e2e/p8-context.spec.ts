@@ -1,0 +1,164 @@
+import { expect, test as base, _electron as electron, type ElectronApplication, type Page } from '@playwright/test';
+import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { join, relative, resolve } from 'node:path';
+import { createServer } from 'node:http';
+import { createStartupPackage, launchActualDev, readStartupFacts } from '../fixtures/desktop-dev';
+
+// Focused real-browser renderer checks use controlled IPC replies. The dev test below
+// independently proves the ordinary Electron/Host/SDK path and network count.
+let rendererServer:ReturnType<typeof createServer>, rendererUrl:string, rendererApp:ElectronApplication;
+const test=base.extend<{page:Page}>({page:async({},use)=>{await use(await rendererApp.firstWindow());}});
+test.beforeAll(async()=>{
+  const directory=resolve('.build/p8-context/renderer');mkdirSync(directory,{recursive:true});
+  const entry=join(directory,'context-fixture.ts'), bundle=join(directory,'context-fixture.js'), require=createRequire(resolve('apps/desktop/package.json'));
+  writeFileSync(entry,`import React from ${JSON.stringify(require.resolve('react'))};import {createRoot} from ${JSON.stringify(require.resolve('react-dom/client'))};import {ContextDetails} from ${JSON.stringify(resolve('apps/desktop/src/renderer/context-panel.tsx'))};
+    const root=createRoot(document.getElementById('root'));globalThis.__contextPending=[];
+    window.medclaw={request:async(method,input)=>new Promise(resolve=>globalThis.__contextPending.push({method,input,resolve}))};
+    globalThis.__contextRender=(callId='call-a',runId=1,sessionId=1)=>root.render(React.createElement(ContextDetails,{host:{state:'ready',instanceId:'ui-fixture'},callId,runId,sessionId}));
+    globalThis.__contextRender();`);
+  execFileSync('bun',['build',entry,'--target=browser',`--outfile=${bundle}`],{cwd:resolve('.'),stdio:'pipe'});
+  const html='<link rel="stylesheet" href="/styles.css"><main id="root"></main><script type="module" src="/fixture.js"></script>';
+  rendererServer=createServer((request,response)=>{response.setHeader('content-type',request.url==='/fixture.js'?'text/javascript':request.url==='/styles.css'?'text/css':'text/html');response.end(request.url==='/fixture.js'?readFileSync(bundle):request.url==='/styles.css'?readFileSync(resolve('apps/desktop/src/renderer/styles.css')):html);});
+  await new Promise<void>(resolve=>rendererServer.listen(0,'127.0.0.1',resolve));rendererUrl=`http://127.0.0.1:${(rendererServer.address() as {port:number}).port}`;
+  const main=join(directory,'context-browser.cjs');writeFileSync(main,`const {app,BrowserWindow}=require('electron');app.whenReady().then(()=>{const win=new BrowserWindow({show:false,webPreferences:{backgroundThrottling:false}});win.loadURL(${JSON.stringify(rendererUrl)});});`);
+  const env=Object.fromEntries(Object.entries(process.env).filter((entry):entry is [string,string]=>entry[1]!==undefined));delete env.ELECTRON_RUN_AS_NODE;
+  rendererApp=await electron.launch({executablePath:require('electron'),args:[main],env});
+});
+test.afterAll(async()=>{await rendererApp?.close();if(rendererServer){rendererServer.closeAllConnections();await new Promise<void>(resolve=>rendererServer.close(()=>resolve()));}});
+const uiSnapshot={contract:'medclaw.context/v1',id:1,runId:1,sessionId:1,inputId:1,sequence:1,createdAt:'2026-10-05T00:00:00.000Z',deliveredCallIds:[],workspaceContext:null,selectedRefs:[],projectionHash:'a'.repeat(64),renderedProjection:'<script>data, not instructions</script>',runtimeFeedback:'{}',feedbackHash:'b'.repeat(64),resourceVersions:{},nativeRefs:[],omitted:[],projectionLimitBytes:262144};
+for(const [name,reply,text] of [
+  ['empty',{ok:true,data:{kind:'snapshot',snapshot:uiSnapshot,deliveries:[],selectedCallId:'call-a',evidence:'unconfirmed'}},'No material references were selected.'],
+  ['gap',{ok:true,data:{kind:'snapshot',snapshot:uiSnapshot,deliveries:[],selectedCallId:'call-a',evidence:'persistence_gap'}},'Delivery evidence has not been confirmed saved. Retry saving the original Run.'],
+  ['legacy',{ok:true,data:{kind:'not_recorded',runId:1,sessionId:1,callId:'call-a',reason:'pre_p8'}},'Context was not recorded for this pre-P8 call.'],
+  ['provider',{ok:true,data:{kind:'not_recorded',runId:1,sessionId:1,callId:'call-a',reason:'not_applicable'}},'Context snapshots do not apply to this Provider or diagnostic call.'],
+  ['wrong owner',{ok:true,data:{kind:'snapshot',snapshot:{...uiSnapshot,runId:2},deliveries:[],selectedCallId:'call-a',evidence:'unconfirmed'}},'Context ownership could not be verified. Read the original call again.'],
+] as const) test(`p8 ContextDetails ${name} is explicit and read only`,async({page})=>{
+  await page.goto(rendererUrl);await page.getByRole('button',{name:'View context for call call-a'}).click();
+  await page.evaluate(reply=>Reflect.get(globalThis,'__contextPending')[0].resolve(reply),reply);await expect(page.getByText(text,{exact:true})).toBeVisible();
+  expect(await page.evaluate(()=>Reflect.get(globalThis,'__contextPending').map((request:{method:string})=>request.method))).toEqual(['context.read']);
+  if(name==='empty'){await page.getByText('Rendered materials and sources',{exact:true}).click();await expect(page.locator('pre').first()).toHaveText(uiSnapshot.renderedProjection);expect(await page.locator('#root script').count()).toBe(0);}
+});
+test('p8 ContextDetails discards a late reply after navigating to another original call',async({page})=>{
+  await page.goto(rendererUrl);await page.getByRole('button',{name:'View context for call call-a'}).click();
+  await page.evaluate(()=>Reflect.get(globalThis,'__contextRender')('call-b',2,2));
+  await page.getByRole('button',{name:'View context for call call-b'}).click();
+  await page.evaluate(snapshot=>{const pending=Reflect.get(globalThis,'__contextPending');pending[1].resolve({ok:true,data:{kind:'snapshot',snapshot:{...snapshot,id:2,runId:2,sessionId:2},deliveries:[],selectedCallId:'call-b',evidence:'unconfirmed'}});pending[0].resolve({ok:true,data:{kind:'snapshot',snapshot,deliveries:[],selectedCallId:'call-a',evidence:'unconfirmed'}});},uiSnapshot);
+  await expect(page.getByTestId('context-details')).toContainText('Snapshot 2 · Run 2 · Session 2');await expect(page.getByTestId('context-details')).not.toContainText('Snapshot 1 · Run 1');
+});
+test('p8 ContextDetails read rejection stays an error and can be read again',async({page})=>{
+  await page.goto(rendererUrl);const button=page.getByRole('button',{name:'View context for call call-a'});await button.click();
+  await page.evaluate(()=>Reflect.get(globalThis,'__contextPending')[0].resolve({ok:false,error:{code:'storage_read_failed'}}));
+  await expect(page.getByRole('alert')).toBeVisible();await expect(page.getByText('No material references were selected.',{exact:true})).toHaveCount(0);
+  await button.focus();await button.press('Enter');await page.evaluate(snapshot=>Reflect.get(globalThis,'__contextPending')[1].resolve({ok:true,data:{kind:'snapshot',snapshot,deliveries:[],selectedCallId:'call-a',evidence:'unconfirmed'}}),uiSnapshot);await expect(page.getByText('Selected materials',{exact:true})).toBeVisible();
+});
+
+test('p8 actual desktop shows original materials and delivery evidence across Session navigation without model calls', async ({},testInfo) => {
+  test.setTimeout(90000);
+  const temporary = mkdtempSync(join(tmpdir(),'medclaw-p8-desktop-')), dataRoot = join(temporary,'isolated root'), received: unknown[] = [];
+  let release!:()=>void;const responseGate=new Promise<void>(resolve=>{release=resolve;});
+  const server = createServer(async (request,response) => {
+    let body = '';for await (const chunk of request) body += chunk;
+    received.push(JSON.parse(body));if(received.length===3)await responseGate;
+    const delta=received.length===1 || received.length===3 ? {role:'assistant',tool_calls:[{index:0,id:`desktop-origin-tool-${received.length}`,type:'function',function:{name:received.length===1?'query_current_devices':'read_data_scope',arguments:received.length===1?JSON.stringify({batchIds:[1],time:{start:'2026-01-01',endExclusive:'2026-01-02'}}):'{}'}}]} : {role:'assistant',content:'Verified frozen materials'};
+    response.writeHead(200,{'content-type':'text/event-stream'});
+    response.end(`data: ${JSON.stringify({id:'p8-fixture',model:'fixture',choices:[{index:0,delta,finish_reason:'tool_calls' in delta?'tool_calls':'stop'}]})}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise<void>(resolve => server.listen(0,'127.0.0.1',resolve));
+  let desktop:Awaited<ReturnType<typeof launchActualDev>>|undefined;
+  try {
+    const importDirectory=join(temporary,'source package');createStartupPackage(importDirectory);
+    desktop = await launchActualDev(temporary,dataRoot,importDirectory); const {page} = desktop;
+    await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible({timeout:30000});
+    const configured = await page.evaluate(async baseUrl => {
+      const directory = await window.medclaw.request('model.read',{});if(!directory.ok) throw new Error(directory.error.code);
+      const token = await window.medclaw.secretInput({providerId:'p8-fixture',purpose:'custom_api_key',value:'P8-LOCAL-NONSECRET'});if(!token.ok) throw new Error(token.error.code);
+      const saved = await window.medclaw.request('model.custom.save',{expectedConfigVersion:directory.data.configVersion,credentialInput:token.data.token,definition:{providerId:'p8-fixture',name:'P8 local fixture',api:'openai-completions',baseUrl,models:[{id:'fixture',name:'Fixture',input:['text'],reasoning:false,contextWindow:32768,maxTokens:1024,outputLimitConfirmed:true,pricingKnown:false,cost:null}]}});if(!saved.ok)throw new Error(saved.error.code);
+      return window.medclaw.request('model.configure',{provider:'p8-fixture',modelId:'fixture',expectedConfigVersion:saved.data.configVersion});
+    },`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`);expect(configured.ok).toBe(true);
+    await page.getByRole('button',{name:'New Session',exact:true}).click();
+    await page.getByRole('button',{name:'Data Workspace',exact:true}).click();await page.getByRole('button',{name:'Choose snapshot directory',exact:true}).click();await expect(page.getByRole('button',{name:'Confirm import',exact:true})).toBeEnabled();await page.getByRole('button',{name:'Confirm import',exact:true}).click();
+    await expect.poll(async()=>{const result=await page.evaluate(()=>window.medclaw.request('data.read',{}));return result.ok?result.data.batchCount:0;}).toBe(1);
+    await page.getByLabel('Select batch 1',{exact:true}).check();
+    await page.getByRole('button',{name:'Apply 1 selected batches',exact:true}).click();
+    await page.getByRole('button',{name:'Chat',exact:true}).click();
+    await page.getByLabel('Message text',{exact:true}).fill('Save the selected batch Query.');await page.getByRole('button',{name:'Send',exact:true}).click();
+    await expect.poll(async()=>{const result=await page.evaluate(()=>window.medclaw.request('run.read',{recent:true}));return result.ok&&result.data.kind==='recent'?result.data.runs[0]?.status:null;}).toBe('completed');
+    expect(received).toHaveLength(2);
+    const savedQuery=await page.evaluate(async()=>{
+      const workspace=await window.medclaw.request('workspace.read',{});if(!workspace.ok||workspace.data.sessionId===null)throw new Error('No saved scope');
+      const queries=await window.medclaw.request('query.list',{sessionId:workspace.data.sessionId});if(!queries.ok||!queries.data.items[0])throw new Error('No saved Query');
+      const query=await window.medclaw.request('query.read',{queryId:queries.data.items[0].id});if(!query.ok)throw new Error(query.error.code);
+      return {id:query.data.query.id,runId:query.data.query.runId,rowKey:query.data.page.rowKeys[0]!};
+    });
+    await page.getByRole('button',{name:'Query History',exact:true}).click();
+    await page.getByRole('button',{name:`Read Query ${savedQuery.id} from Run ${savedQuery.runId}`,exact:true}).click();
+    await page.getByRole('button',{name:`Select Query ${savedQuery.id} ${savedQuery.rowKey} field priceCents`,exact:true}).click();
+    const selected=await page.evaluate(async()=>{const read=await window.medclaw.request('workspace.read',{});if(!read.ok)throw new Error(read.error.code);return {sessionId:read.data.sessionId,selection:read.data.selection};});
+    expect(selected.selection).toMatchObject({kind:'query-row',field:'priceCents'});
+    await page.getByRole('button',{name:'Chat',exact:true}).click();
+    await page.getByLabel('Message text',{exact:true}).fill('Explain the frozen material scope.');
+    await page.getByRole('button',{name:'Send',exact:true}).click();
+    await expect.poll(()=>received.length).toBe(3);
+    const pending=await page.evaluate(async()=>{const recent=await window.medclaw.request('run.read',{recent:true});if(!recent.ok||recent.data.kind!=='recent')throw new Error('No run');const run=await window.medclaw.request('run.read',{runId:recent.data.runs[0]!.id});if(!run.ok||run.data.kind!=='one'||!run.data.run)throw new Error('No call');return window.medclaw.request('context.read',{callId:run.data.run.calls[0]!.callId});});
+    expect(pending).toMatchObject({ok:true,data:{kind:'snapshot',evidence:'unconfirmed',deliveries:[],snapshot:{workspaceContext:{selection:selected.selection}}}});
+    await page.getByRole('button',{name:'Data Workspace',exact:true}).click();
+    await page.getByRole('button',{name:'Clear selection',exact:true}).click();
+    await expect(page.getByTestId('confirmed-selection')).toHaveCount(0);
+    await expect.poll(async()=>{const current=await page.evaluate(()=>window.medclaw.request('workspace.read',{}));return current.ok && current.data.selection === null;}).toBe(true);
+    await page.getByRole('button',{name:'Chat',exact:true}).click();
+    await page.getByRole('button',{name:'New Session',exact:true}).click();
+    await expect.poll(async()=>{const current=await page.evaluate(()=>window.medclaw.request('workspace.read',{}));return current.ok && current.data.sessionId !== null && current.data.sessionId !== selected.sessionId;}).toBe(true);
+    release();
+    await expect.poll(async () => {const result = await page.evaluate(() => window.medclaw.request('run.read',{recent:true}));return result.ok && result.data.kind === 'recent' ? result.data.runs[0]?.status : null;}).toBe('completed');
+    const original = await page.evaluate(async () => {const recent = await window.medclaw.request('run.read',{recent:true});if(!recent.ok || recent.data.kind !== 'recent' || !recent.data.runs[0]) throw new Error('No original run');const read = await window.medclaw.request('run.read',{runId:recent.data.runs[0].id});if(!read.ok || read.data.kind !== 'one' || !read.data.run) throw new Error('No original call');return {runId:read.data.run.id,sessionId:read.data.run.sessionId,callId:read.data.run.calls[0]!.callId};});
+    expect(received).toHaveLength(4);expect(original.sessionId).toBe(selected.sessionId);
+    await page.getByRole('button',{name:'View run details',exact:true}).click();await page.getByRole('tab',{name:'Run details',exact:true}).click();
+    await page.getByRole('button',{name:`View Run ${original.runId}`,exact:true}).click();
+    const panel = page.locator(`[data-testid="context-details"][data-call-id="${original.callId}"]`);
+    const open = panel.getByRole('button',{name:`View context for call ${original.callId}`,exact:true});await open.focus();await open.press('Enter');
+    await expect(panel.getByRole('heading',{name:'Selected materials',exact:true})).toBeVisible();
+    await expect(panel.getByText('Actual delivery associations',{exact:true})).toBeVisible();await expect(panel.getByText('Saved HTTP observation',{exact:false})).toBeVisible();
+    await expect(panel).toContainText(`Session ${original.sessionId}`);await expect(panel).toContainText('Native history observed');
+    await panel.getByText('Rendered materials and sources',{exact:true}).click();await expect(panel).toContainText('priceCents');await expect(panel).toContainText('source_data');
+    const before = readStartupFacts(dataRoot);
+    await page.getByRole('button',{name:'Models',exact:true}).click();await page.getByRole('button',{name:'Chat',exact:true}).click();
+    await page.getByRole('button',{name:'New Session',exact:true}).click();
+    if (!await page.getByRole('tab',{name:'Run details',exact:true}).count()) await page.getByRole('button',{name:'View run details',exact:true}).click();
+    await page.getByRole('tab',{name:'Run details',exact:true}).click();await page.getByRole('button',{name:'Refresh recent runs',exact:true}).click();await page.getByRole('button',{name:`View Run ${original.runId}`,exact:true}).click();
+    await panel.getByRole('button',{name:new RegExp(`(View|Refresh) context for call ${original.callId}`)}).click();await expect(panel).toContainText(`Session ${original.sessionId}`);
+    await page.setViewportSize({width:900,height:900});await expect(page.getByRole('dialog',{name:'Run details',exact:true})).toBeVisible();
+    await panel.getByRole('button',{name:`Refresh context for call ${original.callId}`,exact:true}).focus();await page.keyboard.press('Enter');await expect(panel).toContainText('HTTP 200');
+    await page.screenshot({path:testInfo.outputPath('context-narrow.png'),fullPage:true});
+    await page.evaluate(()=>{document.body.style.zoom='2';});
+    await expect(panel.getByRole('button',{name:`Refresh context for call ${original.callId}`,exact:true})).toBeVisible();
+    await page.screenshot({path:testInfo.outputPath('context-200-percent.png'),fullPage:true});
+    const after = readStartupFacts(dataRoot);expect(after.runs).toBe(before.runs);expect(after.calls).toBe(before.calls);expect(received).toHaveLength(4);
+    await testInfo.attach('context-desktop-evidence',{body:JSON.stringify({original,requests:received.length,before:{runs:before.runs,calls:before.calls},after:{runs:after.runs,calls:after.calls},accessibility:await panel.ariaSnapshot()}),contentType:'application/json'});
+    await page.keyboard.press('Escape');await expect(page.getByRole('dialog',{name:'Run details',exact:true})).toHaveCount(0);
+    await page.evaluate(()=>{document.body.style.zoom='1';});await page.setViewportSize({width:1400,height:1000});
+    const databasePath=join(dataRoot,'data/app.sqlite');
+    execFileSync('bun',['-e',`import{Database}from'bun:sqlite';const db=new Database(Bun.argv[1]);db.exec("CREATE TRIGGER p8_desktop_delivery_fault BEFORE INSERT ON context_deliveries BEGIN SELECT RAISE(ABORT,'fixture delivery save failure'); END;");db.close();`,databasePath],{cwd:resolve('.'),stdio:'pipe'});
+    await page.getByLabel('Message text',{exact:true}).fill('Show original delivery save failure.');await page.getByRole('button',{name:'Send',exact:true}).click();
+    await expect.poll(()=>received.length).toBe(5);
+    await expect.poll(async()=>{const recent=await page.evaluate(()=>window.medclaw.request('run.read',{recent:true}));if(!recent.ok||recent.data.kind!=='recent'||!recent.data.runs[0])return false;const run=await page.evaluate(runId=>window.medclaw.request('run.read',{runId}),recent.data.runs[0].id);return run.ok&&run.data.kind==='one'&&run.data.run?.cleanup?.unconfirmedItems.includes('context_persistence');}).toBe(true);
+    const gapCall=await page.evaluate(async()=>{const recent=await window.medclaw.request('run.read',{recent:true});if(!recent.ok||recent.data.kind!=='recent')throw new Error('No gap Run');const run=await window.medclaw.request('run.read',{runId:recent.data.runs[0]!.id});if(!run.ok||run.data.kind!=='one'||!run.data.run)throw new Error('No gap call');return {runId:run.data.run.id,callId:run.data.run.calls[0]!.callId};});
+    await page.getByRole('button',{name:'View run details',exact:true}).click();await page.getByRole('tab',{name:'Run details',exact:true}).click();
+    const gapPanel=page.locator(`[data-testid="context-details"][data-call-id="${gapCall.callId}"]`);
+    await gapPanel.getByRole('button',{name:`View context for call ${gapCall.callId}`,exact:true}).click();
+    await expect(gapPanel).toContainText('Delivery evidence has not been confirmed saved.');await expect(page.getByRole('button',{name:'Retry save',exact:true})).toBeVisible();
+    await page.screenshot({path:testInfo.outputPath('context-save-gap.png'),fullPage:true});
+    execFileSync('bun',['-e',`import{Database}from'bun:sqlite';const db=new Database(Bun.argv[1]);db.exec('DROP TRIGGER p8_desktop_delivery_fault');db.close();`,databasePath],{cwd:resolve('.'),stdio:'pipe'});
+    await page.getByRole('button',{name:'Retry save',exact:true}).click();
+    await gapPanel.getByRole('button',{name:`Refresh context for call ${gapCall.callId}`,exact:true}).click();await expect(gapPanel).toContainText('HTTP 200');
+    const repaired=await page.evaluate(runId=>window.medclaw.request('run.read',{runId}),gapCall.runId);
+    expect(repaired).toMatchObject({ok:true,data:{kind:'one',run:{status:'failed',cleanup:{requiredPersistenceComplete:true,unconfirmedItems:[]}}}});expect(received).toHaveLength(5);
+    await testInfo.attach('context-desktop-gap-evidence',{body:JSON.stringify({gapCall,requests:received.length,repaired}),contentType:'application/json'});
+  } finally {
+    release();
+    await desktop?.close(); await new Promise<void>(resolve => server.close(() => resolve()));
+    const within = relative(resolve(tmpdir()),resolve(temporary));if(existsSync(join(temporary,'dev-exit-confirmed')) && within && !within.startsWith('..') && !within.includes(':')) rmSync(temporary,{recursive:true,force:true});
+  }
+});

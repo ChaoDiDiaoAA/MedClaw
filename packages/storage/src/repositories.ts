@@ -8,11 +8,13 @@ import { ToolControlObservationSchema } from "../../contracts/src/model";
 import { SqliteInputStore } from "./input-store";
 import { SqliteEventStore } from './event-store';
 import { SqliteWriteTransactions } from './write-transactions';
+import { verifyPriorContextFacts } from './context-store';
+import { ModelCallContextSchema, type StartCallContext } from '../../contracts/src/context';
 import type { EventWriter, RegisteredEventDraft, RegisteredEventPayload } from '../../contracts/src/event';
 import { InputContentSchema, type PreparedInput, type InputStore, type InputCancelProof, type InputSettlementProof, type ReadInputRequest, type ListInputsRequest } from "../../contracts/src/session";
 import { SqliteToolStore } from "./tool-store";
 import { SqliteCatalogStore } from './catalog-store';
-import { assertSelectionField, describeDataSelection, resolveQueryRow } from './workspace-selection';
+import { readWorkspaceBatchReferences, readWorkspaceQuery, validateWorkspaceSelection, freezeWorkspaceScope } from './workspace-selection';
 import type { QueryRecord } from '../../contracts/src/query';
 import { RenameSessionInputSchema, DeleteSessionInputSchema, ReadManagementOperationInputSchema, SessionManagementDetailsSchema, SessionManagementReceiptSchema,
   type RenameSessionInput, type DeleteSessionInput, type ReadManagementOperationInput, type SessionManagementReceipt, type SessionManagementDetails,
@@ -62,7 +64,7 @@ const agentConfigSchema = z.strictObject({ selection: ModelSelectionSchema, poli
   measurementContext: MeasurementContextSchema.optional(),
   toolProfileSnapshot: ToolProfileSnapshotSchema.optional(),
   referenceDate: z.string(), timezone: z.string(), agent: P2AgentOptionsSchema.extend({ stage: z.enum(["P2", "P3"]), nativeSessionId: OpaqueIdSchema,
-    tools: z.array(z.string()), autoCompaction: z.literal(false), autoRetry: z.literal(false), cacheWarming: z.literal("off") }) });
+    tools: z.array(z.string()), autoCompaction: z.literal(false), autoRetry: z.literal(false), cacheWarming: z.literal("off"), contextContract: z.literal('medclaw.context/v1').optional() }) });
 const commonConfigSchema = z.object({ selection: ModelSelectionSchema, policy: RequestPolicySchema });
 const savedDeliverySchema = z.object({ contract: z.literal("medclaw.tool-delivery/v1"), resultRecorded: z.boolean(), sdkReturned: z.boolean(),
   nativeEntryId: OpaqueIdSchema.nullable(), deliveredAt: TimestampSchema.nullable(), nextModelCallId: z.string().min(1).nullable(), consumedAt: TimestampSchema.nullable(),
@@ -194,7 +196,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const inputId=Number(saved.lastInsertRowid);
       if(plan.execution.mode==='send'){
         const run=plan.execution.run;checked(OpaqueIdSchema,run.instanceId);timestamp(run.createdAt);
-        const config=checked(agentConfigSchema,{selection:run.model,policy:run.policy,referenceDate:run.referenceDate,timezone:run.timezone,...(run.agentPolicy?{agentPolicy:run.agentPolicy}:{}),...(run.runtimeConfiguration?{runtimeConfiguration:run.runtimeConfiguration}:{}),...(run.toolConfiguration?{toolConfiguration:run.toolConfiguration}:{}),...(run.measurementContext?{measurementContext:run.measurementContext}:{}),...(run.toolProfileSnapshot?{toolProfileSnapshot:run.toolProfileSnapshot}:{}),agent:{...run.agentOptions,stage:run.scope.allowedToolNames.length?'P3':'P2',nativeSessionId:session.nativeSessionId,tools:run.scope.allowedToolNames,autoCompaction:false,autoRetry:false,cacheWarming:'off'}});
+        const config=checked(agentConfigSchema,{selection:run.model,policy:run.policy,referenceDate:run.referenceDate,timezone:run.timezone,...(run.agentPolicy?{agentPolicy:run.agentPolicy}:{}),...(run.runtimeConfiguration?{runtimeConfiguration:run.runtimeConfiguration}:{}),...(run.toolConfiguration?{toolConfiguration:run.toolConfiguration}:{}),...(run.measurementContext?{measurementContext:run.measurementContext}:{}),...(run.toolProfileSnapshot?{toolProfileSnapshot:run.toolProfileSnapshot}:{}),agent:{...run.agentOptions,stage:run.scope.allowedToolNames.length?'P3':'P2',nativeSessionId:session.nativeSessionId,tools:run.scope.allowedToolNames,autoCompaction:false,autoRetry:false,cacheWarming:'off',...(run.contextContract?{contextContract:run.contextContract}:{})}});
         const r=this.db.query("INSERT INTO runs(session_id,input_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at) VALUES(?,?,'agent',?,NULL,NULL,NULL,'created','answer',?,?,?,?,?,?,?)").run(session.id,inputId,run.instanceId,content.text,JSON.stringify(config),JSON.stringify(run.scope),JSON.stringify(frozenWorkspace),run.referenceDate,run.timezone,run.createdAt);target=Number(r.lastInsertRowid);
         this.db.query('UPDATE session_inputs SET target_run_id=? WHERE id=? AND target_run_id IS NULL').run(target,inputId);
         this.runLifecycle(this.row(target)!, 'run_created', run.createdAt);
@@ -214,9 +216,10 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const model = checked(z.object({
         selection: ModelSelectionSchema, responseModel: z.string().nullable(),
         sdkStopReason: z.enum(["stop", "length", "toolUse", "error", "aborted", "deferred"]).nullable(),
+        context: ModelCallContextSchema.optional(),
       }).strict(), decoded(row.model_json), "storage_write_failed");
       return checked(ModelCallViewSchema, {
-        id: row.id, inputId: row.input_id, callId: row.call_id, kind: row.kind, state: row.state,
+        id: row.id, inputId: row.input_id, callId: row.call_id, kind: row.kind, state: row.state, contextSnapshotId: model.context?.snapshotId ?? null,
         granularity: row.granularity, attempt: row.attempt, attemptCountUnknown: row.attempt_count_unknown === 1,
         model: model.selection, responseModel: model.responseModel, sdkStopReason: model.sdkStopReason,
         startedAt: row.started_at, endedAt: row.ended_at, durationMs: row.duration_ms,
@@ -305,18 +308,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       queryId: row.active_query_id ?? null, activeView: row.active_view ?? "data", selection: row.selection_json === undefined ? null : readJson(row.selection_json) }, "storage_read_failed");
   }
 
-  private batchReferences(ids: number[]): { refs: BatchRef[]; materialVersion: string | null } {
-    const rows = ids.map(batchId => {
-      const row = this.db.query<{ id: number; content_hash: string; snapshot_date: string; scope_key: string; material_version: string }, [number]>(
-        `SELECT id,content_hash,snapshot_date,scope_key,material_version FROM batches WHERE id=?${this.batchLifecycle?" AND status='active'":""}`).get(batchId);
-      if (!row) fail("access_denied");
-      return row;
-    });
-    const versions = new Set(rows.map(row => row.material_version));
-    if (versions.size > 1) fail("invalid_argument");
-    return { refs: rows.map(row => ({ id: row.id, contentHash: row.content_hash, snapshotDate: row.snapshot_date, scopeKey: row.scope_key })),
-      materialVersion: rows[0]?.material_version ?? null };
-  }
+  private batchReferences(ids: number[]): { refs: BatchRef[]; materialVersion: string | null } { return readWorkspaceBatchReferences(this.db, ids); }
 
   inspectWorkspace(invalidArtifactIds: readonly number[] = []): WorkspaceInspection {
     // One synchronous read snapshot fixes all DB evidence before any filesystem await.
@@ -417,12 +409,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     });
   }
 
-  private workspaceQuery(queryId: number, state: WorkspaceState): QueryRecord {
-    const query = new SqliteToolStore(this.db).readQuery(queryId);
-    if (!query || query.sessionId !== state.sessionId || query.batchIds.some(id => !state.batchRefs.some(batch => batch.id === id))
-      || state.deviceIds.length > 0 && (query.scopeDeviceIds === null || query.scopeDeviceIds.some(id => !state.deviceIds.includes(id)))) fail('access_denied');
-    return query;
-  }
+  private workspaceQuery(queryId: number, state: WorkspaceState): QueryRecord { return readWorkspaceQuery(this.db, queryId, state); }
 
   reconcileDeletedWorkspace(expectedRevision:number,time:string):WorkspaceState {
     return this.transactions.immediate(()=>{
@@ -438,55 +425,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     });
   }
 
-  private validateSelection(selection: WorkspaceSelection, state: WorkspaceState): void {
-    const catalog = new SqliteCatalogStore(this.db), store = new SqliteToolStore(this.db);
-    const batchIds = state.batchRefs.map(batch => batch.id);
-    const inScope = (batchId: number, deviceId: number) => {
-      if (!batchIds.includes(batchId) || state.deviceIds.length > 0 && !state.deviceIds.includes(deviceId)) fail('access_denied');
-    };
-    const snapshot = (key: string) => {
-      const item = catalog.readSnapshot(Number(key.slice(9)));
-      if (!item) fail('access_denied');
-      inScope(item.batchId, item.deviceId);
-      return item;
-    };
-    if (selection.kind === 'device') {
-      const item = snapshot(selection.rowKey), version = state.batchRefs.find(batch => batch.id === item.batchId)!.contentHash;
-      if (item.deviceId !== Number(selection.targetId) || version !== selection.targetVersion) fail('access_denied');
-      assertSelectionField(item, selection.field);
-    } else if (selection.kind === 'change') {
-      const item = catalog.readChanges(batchIds, batchIds, state.deviceIds.length ? state.deviceIds : null).find(item => item.id === Number(selection.targetId));
-      if (!item || selection.rowKey !== `change:${item.id}`) fail('access_denied');
-      const expected = describeDataSelection(item, catalog.readBatches([item.oldBatchId, item.newBatchId]));
-      if (expected.targetVersion !== selection.targetVersion) fail('access_denied');
-      assertSelectionField(item, selection.field);
-    } else {
-      if (state.queryId === null) fail('access_denied');
-      const query = this.workspaceQuery(state.queryId, state);
-      if (selection.targetVersion !== query.resultHash) fail('access_denied');
-      if (selection.kind === 'query-row') {
-        if (Number(selection.targetId) !== query.id) fail('access_denied');
-        const row = resolveQueryRow(query, selection.rowKey);
-        if (query.kind === 'current') {
-          const item = snapshot(selection.rowKey);
-          if (!query.snapshotIds.includes(item.id)) fail('access_denied');
-        } else if (query.kind === 'changes') {
-          const change = catalog.readChanges(batchIds, batchIds, state.deviceIds.length ? state.deviceIds : null).find(item => item.id === Number(selection.rowKey.slice(7)));
-          if (!change || !query.eventIds.includes(change.id)) fail('access_denied');
-        }
-        assertSelectionField(row, selection.field);
-      } else {
-        const evidence = store.readEvidence(Number(selection.targetId));
-        if (!evidence || evidence.queryId !== query.id || evidence.resultHash !== query.resultHash || evidence.batchIds.some(id => !batchIds.includes(id))) fail('access_denied');
-        if (selection.rowKey === null) { if (selection.field !== null) fail('invalid_argument'); }
-        else {
-          const item = snapshot(selection.rowKey);
-          if (!evidence.snapshotIds.includes(item.id) || !query.snapshotIds.includes(item.id)) fail('access_denied');
-          assertSelectionField(item, selection.field);
-        }
-      }
-    }
-  }
+  private validateSelection(selection: WorkspaceSelection, state: WorkspaceState): void { return validateWorkspaceSelection(this.db, selection, state); }
 
   private compatibleSelection(selection: WorkspaceSelection | null, state: WorkspaceState): WorkspaceSelection | null {
     if (selection === null) return null;
@@ -544,26 +483,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     });
   }
 
-  freezeAgentScope(workspace: WorkspaceView, toolNames: readonly string[]): RunScope {
-    const selected = checked(WorkspaceStateSchema, { revision: workspace.revision, sessionId: workspace.sessionId, materialVersion: workspace.materialVersion,
-      batchRefs: workspace.batchRefs, deviceIds: workspace.deviceIds, queryId: workspace.queryId, activeView: workspace.activeView, selection: workspace.selection });
-    const ids = selected.batchRefs.map(batch => batch.id);
-    const batches = this.batchReferences(ids);
-    if (!isDeepStrictEqual(batches.refs, selected.batchRefs) || batches.materialVersion !== selected.materialVersion) fail("access_denied");
-    const names = [...toolNames], supported = new Set([...Object.keys(businessToolSchemas), "read", "grep", "find", "ls", "edit", "write", "bash", "powershell"]);
-    if (new Set(names).size !== names.length || names.some(name => !supported.has(name))) fail("invalid_argument");
-    for (const deviceId of selected.deviceIds) {
-      if (!ids.some(batchId => this.db.query("SELECT id FROM snapshots WHERE batch_id=? AND device_id=?").get(batchId, deviceId))) fail("access_denied");
-    }
-    if (selected.queryId !== null) this.workspaceQuery(selected.queryId,selected);
-    if (selected.selection !== null) this.validateSelection(selected.selection,selected);
-    const artifacts = ids.flatMap(batchId => {
-      const row = this.db.query<{ artifact_id: number | null }, [number]>("SELECT i.artifact_id FROM batches b JOIN imports i ON i.id=b.import_id WHERE b.id=?").get(batchId);
-      return row?.artifact_id === null || row === null ? [] : [row.artifact_id];
-    });
-    return { batchIds: [...ids], deviceIds: selected.deviceIds.length ? [...selected.deviceIds] : null, allowedToolNames: names,
-      allowedResourceRefs: [], artifactIds: [...new Set(artifacts)], readOnly: !names.some(name => ["edit", "write", "bash", "powershell"].includes(name)) };
-  }
+  freezeAgentScope(workspace: WorkspaceView, toolNames: readonly string[]): RunScope { return freezeWorkspaceScope(this.db, workspace, toolNames); }
 
   readSession(sessionId: number): SessionView | null {
     id(sessionId);
@@ -826,7 +746,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         ...(input.measurementContext ? { measurementContext: input.measurementContext } : {}),
         ...(input.toolProfileSnapshot ? { toolProfileSnapshot: input.toolProfileSnapshot } : {}),
         timezone: request.timezone, agent: { ...input.agentOptions, stage: input.scope.allowedToolNames.length ? "P3" : "P2", nativeSessionId: session.nativeSessionId, tools: input.scope.allowedToolNames,
-          autoCompaction: false, autoRetry: false, cacheWarming: "off" } });
+          autoCompaction: false, autoRetry: false, cacheWarming: "off", ...(input.contextContract ? {contextContract:input.contextContract} : {}) } });
       const result = this.db.query(`INSERT INTO runs(session_id,input_id,kind,instance_id,submission_operation_ref,submission_client_sequence,
         submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at)
         VALUES(?,NULL,'agent',?,?,?,?,'created','answer',?,?,?,?,?,?,?)`)
@@ -872,7 +792,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     });
   }
 
-  startCall(runId: number, callId: string, kind: "main" | "diagnostic", time: string): void {
+  startCall(runId: number, callId: string, kind: "main" | "diagnostic", time: string, context?: StartCallContext): void {
     id(runId); timestamp(time);
     if (!callId || callId.length > 512) fail("invalid_argument");
     this.transactions.immediate(() => {
@@ -880,6 +800,9 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if (!row || row.status !== "created" && !(row.kind === "agent" && row.status === "running")) fail("state_conflict");
       if (row.kind === "provider" && this.calls(runId).length) fail("state_conflict");
       if (kind !== (row.goal === "verify" ? "diagnostic" : "main")) fail("invalid_argument");
+      const requiresContext = row.kind === 'agent' && checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.contextContract === 'medclaw.context/v1';
+      if (requiresContext && !context || context && (row.kind !== 'agent' || kind !== 'main')) fail('state_conflict');
+      if (context && !this.db.query('SELECT id FROM context_snapshots WHERE id=? AND run_id=? AND session_id=? AND input_id=?').get(context.snapshotId,runId,row.session_id,context.inputId)) fail('access_denied');
       if (row.status === "created") {
         const changed = this.db.query("UPDATE runs SET status='running',started_at=? WHERE id=? AND status='created'").run(time, runId);
         if (changed.changes !== 1) fail("state_conflict");
@@ -889,7 +812,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         attempt_count_unknown,model_json,state,started_at,ended_at,duration_ms,input_tokens,output_tokens,
         cost,cost_currency,usage_source,unavailable_reason,error_json)
         VALUES(?,?,?,?,?,1,'logical_request',1,?,'started',?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)`)
-        .run(callId, runId, row.session_id, row.input_id, kind, JSON.stringify({ selection: this.config(row).selection, responseModel: null, sdkStopReason: null }), time);
+        .run(callId, runId, row.session_id, context?.inputId ?? row.input_id, kind, JSON.stringify({ selection: this.config(row).selection, responseModel: null, sdkStopReason: null, ...(context ? {context:checked(ModelCallContextSchema,{contract:'medclaw.context-call/v1',...context,observation:null,responseStatus:null,payloadVerified:null})} : {}) }), time);
       this.beforeCommit?.();
     });
   }
@@ -955,8 +878,15 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       for (const original of calls) {
         const incoming = finalCalls.find(call => call.callId === original.callId);
         if (!incoming) fail("state_conflict");
-        if("inputId" in incoming && incoming.inputId !== row.input_id) fail("state_conflict");
-        const finalCall = checked(ModelCallViewSchema, { ...original, ...incoming });
+        if("inputId" in incoming && incoming.inputId !== original.inputId) fail("state_conflict");
+        const {context: incomingContext, ...incomingView} = incoming;
+        const savedModel = decoded(this.db.query<{model_json:string},[string]>('SELECT model_json FROM model_calls WHERE call_id=?').get(original.callId)!.model_json) as Record<string,unknown>;
+        if (incomingContext) {
+          const next = checked(ModelCallContextSchema,incomingContext), prior = checked(ModelCallContextSchema,savedModel.context,'storage_read_failed');
+          if (next.snapshotId !== prior.snapshotId || next.inputId !== prior.inputId || next.observation && !isDeepStrictEqual(next.observation,prior.observation)) fail('state_conflict');
+          savedModel.context = checked(ModelCallContextSchema,{...next,observation:prior.observation ?? next.observation,responseStatus:prior.observation ? prior.responseStatus : next.responseStatus ?? prior.responseStatus,payloadVerified:prior.observation ? prior.payloadVerified : next.payloadVerified ?? prior.payloadVerified});
+        }
+        const finalCall = checked(ModelCallViewSchema, { ...original, ...incomingView });
         if (finalCall.state === "started") fail("invalid_argument");
         if (original.state !== "started") {
           if (!isDeepStrictEqual(original, finalCall)) fail("state_conflict");
@@ -964,11 +894,12 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         }
         const result = this.db.query(`UPDATE model_calls SET state=?,model_json=?,ended_at=?,duration_ms=?,input_tokens=?,
           output_tokens=?,cost=?,cost_currency=?,usage_source=?,unavailable_reason=?,error_json=? WHERE run_id=? AND call_id=? AND state='started'`)
-          .run(finalCall.state, JSON.stringify({ selection: original.model, responseModel: finalCall.responseModel, sdkStopReason: finalCall.sdkStopReason }),
+          .run(finalCall.state, JSON.stringify({ ...savedModel, selection: original.model, responseModel: finalCall.responseModel, sdkStopReason: finalCall.sdkStopReason }),
             finalCall.endedAt, finalCall.durationMs, finalCall.inputTokens, finalCall.outputTokens, finalCall.cost, finalCall.costCurrency,
             finalCall.usageSource, finalCall.unavailableReason, json(finalCall.error), runId, finalCall.callId);
         if (result.changes !== 1) fail("state_conflict");
       }
+      if (cleanup && 'contract' in cleanup && cleanup.requiredPersistenceComplete && !this.verifyPriorContextFacts(runId).requiredPersistenceComplete) fail('storage_write_failed');
       this.db.query(`UPDATE runs SET status=?,output_text=?,stopped_at=COALESCE(stopped_at,?),ended_at=COALESCE(ended_at,?),cancel_requested_at=?,
         error_json=?,cleanup_json=?,usage_json=? WHERE id=?`)
         .run(terminal ? row.status : fact.status, row.output_text ?? fact.outputText, fact.stoppedAt, fact.endedAt, cancelRequestedAt,
@@ -1021,7 +952,11 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     const saved = this.calls(runId), expected = "calls" in fact ? fact.calls : fact.call ? [fact.call] : [];
     return saved.length === expected.length && expected.every(call => {
       const original = saved.find(item => item.callId === call.callId);
-      return original !== undefined && Object.entries(call).every(([key, value]) => isDeepStrictEqual(original[key as keyof ModelCallView], value));
+      if (call.context) {
+        const model = decoded(this.db.query<{model_json:string},[string]>('SELECT model_json FROM model_calls WHERE call_id=?').get(call.callId)!.model_json) as {context?:unknown}, marker = ModelCallContextSchema.safeParse(model.context);
+        if (!marker.success || marker.data.snapshotId !== call.context.snapshotId || marker.data.inputId !== call.context.inputId || call.context.observation !== null && !isDeepStrictEqual(marker.data.observation,call.context.observation)) return false;
+      }
+      return original !== undefined && Object.entries(call).filter(([key]) => key !== 'context').every(([key, value]) => isDeepStrictEqual(original[key as keyof ModelCallView], value));
     });
   }
 
@@ -1034,6 +969,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if (terminal && (row.status !== "failed" || !isDeepStrictEqual(decoded(row.error_json), error))) fail("state_conflict");
       if(this.p5&&cleanup.inputsSettled&&this.inputs.hasPendingInputsForRun(runId))fail('state_conflict');
       const checkedCleanup = this.validateCleanup(decoded(row.cleanup_json), cleanup);
+      if (checkedCleanup.requiredPersistenceComplete && !this.verifyPriorContextFacts(runId).requiredPersistenceComplete) fail('storage_write_failed');
       this.db.query("UPDATE runs SET status='failed',error_json=?,ended_at=COALESCE(ended_at,?),cleanup_json=? WHERE id=?")
         .run(json(error), time, json(checkedCleanup), runId);
       if(!terminal)this.runTerminal(row,'failed',error,checkedCleanup,time);
@@ -1047,6 +983,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const row = this.row(runId);
       if (!row) fail("run_not_found");
       if(this.p5&&cleanup.inputsSettled&&this.inputs.hasPendingInputsForRun(runId))fail('state_conflict');
+      if (cleanup.requiredPersistenceComplete && !this.verifyPriorContextFacts(runId).requiredPersistenceComplete) fail('storage_write_failed');
       const checkedCleanup = this.validateCleanup(decoded(row.cleanup_json), cleanup);
       this.db.query("UPDATE runs SET cleanup_json=? WHERE id=?").run(json(checkedCleanup), runId);
       this.beforeCommit?.();
@@ -1065,7 +1002,8 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         OR (tool_name IN ('bash','powershell','grep','find') AND started_at IS NOT NULL AND stopped_at IS NULL AND ?<>1)) LIMIT 1`)
         .get(row.id, cleanup.success && cleanup.data.stopConfirmed === true ? 1 : 0) !== null;
       const inputGap=this.p5&&this.inputs.hasPendingInputsForRun(row.id);
-      return row.status === "created" || row.status === "running" || !released || toolGap || inputGap ? [this.view(row)] : [];
+      const contextGap = !this.verifyPriorContextFacts(row.id).requiredPersistenceComplete;
+      return row.status === "created" || row.status === "running" || !released || toolGap || inputGap || contextGap ? [this.view(row)] : [];
     });
   }
 
@@ -1122,6 +1060,8 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     });
   }
 
+  verifyPriorContextFacts(runId: number) { id(runId); return this.inputRead(() => verifyPriorContextFacts(this.db,runId)); }
+
   read(request: z.input<typeof ReadRunRequestSchema>): ReadRunResult {
     const input = checked(ReadRunRequestSchema, request);
     if ("recent" in input) {
@@ -1166,10 +1106,11 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         const prior = RunCleanupRecordSchema.safeParse(decoded(row.cleanup_json));
         const inputFacts = this.verifyPriorInputFacts(row.id,true,time);
         const facts = row.kind === 'agent' && this.p3 ? this.verifyPriorToolFacts(row.id, true, time) : null;
+        const contextFacts = this.verifyPriorContextFacts(row.id);
         const cleanup = facts ? checked(RunCleanupRecordSchema, {
           contract: 'medclaw.run-cleanup/v1', executionStarted: prior.success ? prior.data.executionStarted : null,
-          stopConfirmed: facts.stopConfirmed, requiredPersistenceComplete: facts.requiredPersistenceComplete && inputFacts.requiredPersistenceComplete,
-          inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed, unconfirmedItems: [...facts.unconfirmedItems,...inputFacts.unconfirmedItems],
+          stopConfirmed: facts.stopConfirmed, requiredPersistenceComplete: facts.requiredPersistenceComplete && inputFacts.requiredPersistenceComplete && contextFacts.requiredPersistenceComplete,
+          inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed, unconfirmedItems: [...facts.unconfirmedItems,...inputFacts.unconfirmedItems,...contextFacts.unconfirmedItems],
           secondaryErrors: prior.success ? prior.data.secondaryErrors : [], verifiedAt: facts.stopConfirmed === true ? time : prior.success ? prior.data.verifiedAt : null,
           ...(prior.success && prior.data.budgetSummary !== undefined ? { budgetSummary: prior.data.budgetSummary } : {}),
         }) : { previousInstanceId: row.instance_id, oldProcessExited: true, observationGap: true };

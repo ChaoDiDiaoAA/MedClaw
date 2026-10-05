@@ -31,6 +31,7 @@ export const RegisteredEventPayloadSchema = z.discriminatedUnion('type', [
   variant('tool_started', { ...tool, status: z.literal('running') }),
   variant('tool_finished', { ...tool, status: z.enum(['succeeded', 'failed', 'cancelled']) }),
   variant('query_completed', { queryId: PositiveIdSchema, resultHash: z.string().regex(/^[a-f0-9]{64}$/), batchIds: ids }),
+  variant('context_delivered', { snapshotId: PositiveIdSchema, callId: OpaqueIdSchema }),
 ]);
 export const EventSourceSchema = z.enum(['application', 'pi', 'intent', 'tool', 'host']);
 const envelope = { runId: PositiveIdSchema, sessionId: PositiveIdSchema, source: EventSourceSchema, sourceConnection: OpaqueIdSchema.nullable(), sourceSequence: nonnegative.nullable(), toolCallId: PositiveIdSchema.nullable(), occurredAt: TimestampSchema, receivedAt: TimestampSchema };
@@ -39,7 +40,8 @@ function validEvent(event: RegisteredEventDraft, ctx: z.RefinementCtx) {
   if (new TextEncoder().encode(JSON.stringify(event.payload)).byteLength > EVENT_LIMITS.payloadBytes) ctx.addIssue({ code: 'custom', message: 'Event payload exceeds byte budget' });
   if ('sessionId' in event.payload && event.payload.sessionId !== event.sessionId) ctx.addIssue({ code: 'custom', message: 'Session identity mismatch' });
   if ('inputId' in event.payload && (event.payload.runId ?? event.payload.targetRunId) !== event.runId) ctx.addIssue({ code: 'custom', message: 'Input run identity mismatch' });
-  if ('callId' in event.payload && event.payload.callId !== event.toolCallId) ctx.addIssue({ code: 'custom', message: 'Tool identity mismatch' });
+  if (event.type.startsWith('tool_') && 'callId' in event.payload && event.payload.callId !== event.toolCallId) ctx.addIssue({ code: 'custom', message: 'Tool identity mismatch' });
+  if (event.type === 'context_delivered' && (event.toolCallId !== null || event.source !== 'pi' || event.sourceConnection !== null)) ctx.addIssue({ code: 'custom', message: 'Context delivery source mismatch' });
 }
 const drafts = RegisteredEventPayloadSchema.options.map(option => option.extend(envelope));
 export const RegisteredEventDraftSchema = z.union(drafts).superRefine(validEvent);

@@ -56,7 +56,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     if (execution && (execution.handle.sessionId === sessionId || execution.handle.sessionId === null && (execution.cause || execution.pendingSave))) {
       const context = { runId: execution.handle.runId };
       if (execution.cause && !execution.stopped) throw safeError('stop_unconfirmed', undefined, context);
-      if (execution.pendingSave || execution.toolGap || this.agent?.inputPersistencePending?.(execution.handle.runId)) throw safeError('storage_write_failed', undefined, context);
+      if (execution.pendingSave || execution.toolGap || this.agent?.inputPersistencePending?.(execution.handle.runId) || this.agent?.hasPendingContextPersistence?.(execution.handle.runId)) throw safeError('storage_write_failed', undefined, context);
       throw safeError('state_conflict', undefined, { ...context, reason: 'runtime_busy' });
     }
     let active: RunHandle | null, gaps: RunView[];
@@ -99,7 +99,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     if (!execution.acceptingInputs || execution.nativeTerminal || execution.stopped || execution.cause || this.closing || this.modelControlBusy()
       || !native?.acceptingInputs) reasons.push(safeError('state_conflict', undefined, { reason: 'runtime_busy' }));
     if (execution.primaryError) reasons.push(execution.primaryError);
-    if (execution.pendingSave || this.agent?.inputPersistencePending?.(execution.handle.runId)) reasons.push(safeError('storage_write_failed'));
+    if (execution.pendingSave || this.agent?.inputPersistencePending?.(execution.handle.runId) || this.agent?.hasPendingContextPersistence?.(execution.handle.runId)) reasons.push(safeError('storage_write_failed'));
     return { runId: execution.handle.runId, acceptingInputs: reasons.length === 0, blockReasons: reasons.slice(0, 32) };
   }
   read(input: Parameters<RuntimeRunStore["read"]>[0]) { return serviceResult(() => this.store.read(input), "storage_read_failed"); }
@@ -163,7 +163,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const fields = { sessionId: request.sessionId, text: request.text, model: resolved.selection, policy: resolved.policy, goal: "answer" as const,
           workspace: toWorkspaceContext(workspace), scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: resolved.policy.timeoutMs,
           agentPolicy, runtimeConfiguration, toolConfiguration, ...(profiles ? structuredClone(profiles) : {}),
-          agentOptions: this.agent.describe(resolved) };
+          agentOptions: this.agent.describe(resolved), ...(this.agent.contextContract ? {contextContract:this.agent.contextContract} : {}) };
         const createdAt = now(), content: InputContent = { contract: 'medclaw.session-input/v1', originalSubmitInput: request, text: request.text,
           workspaceContext: toWorkspaceContext(workspace), scope: structuredClone(scope), model: structuredClone(resolved.selection),
           referenceDate: request.referenceDate, timezone: request.timezone, deliveryAttempt: null };
@@ -294,7 +294,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       && proof.nativeIdle && proof.nativeQueuesEmpty && !proof.pendingPersistence;
     return { contract: "medclaw.run-cleanup/v1", executionStarted: execution.executionStarted, stopConfirmed: execution.stopped,
       requiredPersistenceComplete: complete, inputsSettled, resourcesReleased: execution.stopped,
-      unconfirmedItems: [...(execution.stopped ? [] : ['stop', 'resources']), ...(complete ? [] : ['persistence']), ...(inputsSettled ? [] : ['inputs']), ...(execution.toolGap && !complete ? ['tool_persistence'] : [])], secondaryErrors: execution.secondaryErrors, verifiedAt: complete && execution.stopped && inputsSettled ? now() : null,
+      unconfirmedItems: [...(execution.stopped ? [] : ['stop', 'resources']), ...(complete ? [] : ['persistence']), ...(inputsSettled ? [] : ['inputs']), ...(execution.toolGap && !complete ? ['tool_persistence'] : []), ...(this.agent?.hasPendingContextPersistence?.(execution.handle.runId) ? ['context_persistence'] : [])], secondaryErrors: execution.secondaryErrors, verifiedAt: complete && execution.stopped && inputsSettled ? now() : null,
       ...(execution.budgetSummary ? { budgetSummary: structuredClone(execution.budgetSummary) } : {}) };
   }
   private deadline(execution: Execution, timeout: number) {
@@ -324,10 +324,11 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     if (execution.deadlineAt !== null && performance.now() >= execution.deadlineAt && !execution.cause) this.expire(execution);
     if (execution.primaryError) throw execution.primaryError;
     if (execution.abort.signal.aborted) throw safeError(execution.cause === 'deadline' ? 'run_timeout' : 'tool_cancelled');
-    if (execution.pendingSave || this.agent?.toolPersistencePending?.(execution.handle.runId)) throw safeError('storage_write_failed');
+    if (execution.pendingSave || this.agent?.toolPersistencePending?.(execution.handle.runId) || this.agent?.hasPendingContextPersistence?.(execution.handle.runId)) throw safeError('storage_write_failed');
   }
   private checkpoint(execution: Execution, error: AppError) {
     execution.acceptingInputs = false;
+    if (execution.primaryError && !isDeepStrictEqual(execution.primaryError,error) && !execution.secondaryErrors.some(item => isDeepStrictEqual(item,error))) execution.secondaryErrors.push(error);
     execution.primaryError ??= error; execution.failureAt ??= now();
     try { this.store.checkpointFailure(execution.handle.runId, execution.primaryError, this.cleanup(execution, false), execution.failureAt); }
     catch { this.persistenceFailure(execution); }
@@ -367,7 +368,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         runId: execution.handle.runId, sessionId: input.sessionId, inputId: input.inputId, text: input.text, resolved: input.resolved, agentOptions: input.agentOptions,
         scope: input.scope, workspaceContext: toWorkspaceContext(input.workspace), referenceDate: input.referenceDate, timezone: input.timezone, signal: execution.abort.signal, deadlineAt,
         agentPolicy: input.agentPolicy, runtimeConfiguration: input.runtimeConfiguration, toolConfiguration: input.toolConfiguration, measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot }, {
-        startCall: time => this.startCall(execution.handle.runId, "main", time), preview: text => this.preview(execution, text),
+        startCall: (time,context) => this.startCall(execution.handle.runId, "main", time,context), preview: text => this.preview(execution, text),
         stream: snapshot => { if (snapshot.runId !== execution.handle.runId || snapshot.sessionId !== execution.handle.sessionId) return;
           try { this.stream?.(structuredClone(snapshot)); } catch { try { this.report(safeError('preview_delivery_failed')); } catch {} } },
         inputStore: this.store, admissionClosed: () => { execution.acceptingInputs = false; },
@@ -435,7 +436,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     if (!fact || !execution.stopped) throw new Error("state_conflict");
     let saved = false;
     if (execution.handle.kind === 'agent' && (this.agent?.toolPersistencePending?.(execution.handle.runId)
-      || this.agent?.inputPersistencePending?.(execution.handle.runId) || execution.pendingInputFailures.size)) {
+      || this.agent?.inputPersistencePending?.(execution.handle.runId) || this.agent?.hasPendingContextPersistence?.(execution.handle.runId) || execution.pendingInputFailures.size)) {
       this.persistenceFailure(execution); fact.cleanup = this.cleanup(execution, false);
       this.emit({ type: 'agent.persistence_failed', sessionId: execution.handle.sessionId!, runId: execution.handle.runId,
         noticeSequence: ++execution.sequence, error: safeError('storage_write_failed') });
@@ -488,13 +489,18 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     const execution = this.execution, recovery = this.recoveries.get(runId);
     if (recovery) {
       if (!recovery.verified) throw new Error("stop_unconfirmed");
+      const contextFacts = this.store.verifyPriorContextFacts?.(runId);
+      if (contextFacts) {
+        recovery.cleanup.unconfirmedItems = [...new Set([...recovery.cleanup.unconfirmedItems.filter(item => !item.startsWith('context_')),...contextFacts.unconfirmedItems])];
+        recovery.cleanup.requiredPersistenceComplete = contextFacts.requiredPersistenceComplete && !recovery.cleanup.unconfirmedItems.some(item => item.endsWith('_persistence') || item.endsWith('_unknown') || item === 'persistence');
+      }
       if (recovery.cleanup.requiredPersistenceComplete !== true) throw new Error('run_save_unavailable');
       this.saveRecovery(recovery);
       if (this.recoveries.has(runId)) throw new Error("storage_write_failed");
     } else {
       if (!execution || execution.handle.runId !== runId || !execution.pendingSave || !execution.stopped || !execution.fact) throw new Error("run_save_unavailable");
       if (execution.handle.kind === 'agent') {
-        this.agent?.retryToolPersistence?.(runId); this.agent?.retryInputPersistence?.(runId);
+        this.agent?.retryContextPersistence?.(runId); this.agent?.retryToolPersistence?.(runId); this.agent?.retryInputPersistence?.(runId);
         for (const [inputId, fact] of [...execution.pendingInputFailures]) {
           const current = this.store.readInput({ inputId });
           // Consumption/removal evidence supersedes a tentative unknown result; never overwrite it.
@@ -520,10 +526,11 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const inputFacts = this.store.verifyPriorInputFacts?.(run.id, previousProcessExited, at)
           ?? { inputsSettled: run.kind !== 'agent' || run.inputId === null, requiredPersistenceComplete: run.kind !== 'agent' || run.inputId === null,
             unconfirmedItems: run.kind === 'agent' && run.inputId !== null ? ['inputs'] : [] };
+        const contextFacts = this.store.verifyPriorContextFacts?.(run.id) ?? {requiredPersistenceComplete:true,unconfirmedItems:[]};
         this.recoveries.set(run.id, { run, at, verified: facts.stopConfirmed === true,
           cleanup: { contract: "medclaw.run-cleanup/v1", executionStarted: run.cleanup?.executionStarted ?? null, stopConfirmed: facts.stopConfirmed,
-            requiredPersistenceComplete: facts.requiredPersistenceComplete && inputFacts.requiredPersistenceComplete, inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed,
-            unconfirmedItems: [...new Set([...facts.unconfirmedItems, ...inputFacts.unconfirmedItems])], secondaryErrors: run.cleanup?.secondaryErrors ?? [], verifiedAt: facts.stopConfirmed === true && inputFacts.inputsSettled ? at : run.cleanup?.verifiedAt ?? null,
+            requiredPersistenceComplete: facts.requiredPersistenceComplete && inputFacts.requiredPersistenceComplete && contextFacts.requiredPersistenceComplete, inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed,
+            unconfirmedItems: [...new Set([...facts.unconfirmedItems, ...inputFacts.unconfirmedItems,...contextFacts.unconfirmedItems])], secondaryErrors: run.cleanup?.secondaryErrors ?? [], verifiedAt: facts.stopConfirmed === true && inputFacts.inputsSettled && contextFacts.requiredPersistenceComplete ? at : run.cleanup?.verifiedAt ?? null,
             ...(run.cleanup?.budgetSummary !== undefined ? { budgetSummary: run.cleanup.budgetSummary } : {}) } });
       }
       if (previousProcessExited) for (const recovery of [...this.recoveries.values()]) this.saveRecovery(recovery);
