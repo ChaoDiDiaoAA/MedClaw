@@ -1,3 +1,9 @@
+import { CONTEXT_MATERIAL_PREFIX } from '../../packages/contracts/src/context';
+
+/** Controlled receiver scripts distinguish this request's product projection from user history. */
+export function nativeUserMessages<T extends {role:string;content:unknown}>(messages:T[]):T[] {
+  return messages.filter(message=>message.role==='user' && !(typeof message.content==='string' ? message.content : Array.isArray(message.content) ? message.content.map(part=>part?.text ?? '').join('') : '').startsWith(CONTEXT_MATERIAL_PREFIX));
+}
 // Test-only HTTP endpoint; Pi owns the production protocol and retry parser.
 export function providerFixture(mode: "success" | "cached" | "partial" | "retry" | "busy" | "wait" | "unauthorized" | "slow" | "drop" | "unknown" | "tool" = "success") {
   const requests: { url: string; method: string; body: Record<string, unknown> }[] = [];

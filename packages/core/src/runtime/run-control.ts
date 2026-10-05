@@ -5,6 +5,7 @@ import { canonicalRequest, type RunScope, type RuntimeBudgetView } from '../../.
 import { groupWorkload, TOOL_PROFILE_RULES } from '../tools/tool-profile';
 import { normalizeToolConfiguration, type ToolConfiguration } from '@medclaw/contracts/tool-config';
 import { normalizeRuntimeConfiguration, RUNTIME_CONFIG, type RuntimeConfiguration } from '@medclaw/contracts/runtime-config';
+import type { ModelAdmissionPreview } from '../../../contracts/src/context';
 
 export const RUN_CONTROL_RULES = Object.freeze({
   callConvergenceRatio: 0.75,
@@ -56,6 +57,8 @@ export class RunControl {
   private episodeUsed = 0;
   private recoveryAttempts = 0;
   private stopReason: string | null = null;
+  private revision = 0;
+  private readonly previews = new WeakMap<ModelAdmissionPreview, {allowTools:boolean; convergence:boolean; episodeUsed:number; recoveryAttempts:number; stopReason:string|null}>();
   private readonly options: Options;
   private readonly configurationSnapshot: ToolConfiguration;
   private readonly runtimeSnapshot: RuntimeConfiguration;
@@ -73,24 +76,33 @@ export class RunControl {
     if (this.options.signal.aborted) throw new Error('tool_cancelled');
     if (this.remaining() <= 0) throw new Error('run_timeout');
   };
-  admitModelCall(): { allowTools: boolean; feedback: string } {
+  previewModelCall(): ModelAdmissionPreview {
     this.checkActive();
-    if (this.modelCalls >= this.runtimeSnapshot.runBudget.maxModelCalls) {
-      this.modelAdmissionsRejected++;
-      this.stopReason = 'agent_call_limit';
-      throw new Error('agent_call_limit');
-    }
-    this.modelCalls++;
+    if (this.modelCalls >= this.runtimeSnapshot.runBudget.maxModelCalls) throw new Error('agent_call_limit');
+    const preparedAt = performance.now(), remainingTimeMs = Math.max(0,this.options.deadlineAt - preparedAt), modelCalls = this.modelCalls + 1;
     const scheduling = RUN_CONTROL_RULES;
     const reserve = Math.min(scheduling.answerReserveMaxMs, this.runtimeSnapshot.runBudget.timeoutMs * scheduling.answerReserveRatio);
-    this.allowTools = this.modelCalls < this.runtimeSnapshot.runBudget.maxModelCalls && this.toolCalls < this.runtimeSnapshot.runBudget.maxToolCalls
-      && this.remaining() > reserve && (!this.episodeId || this.episodeUsed < this.runtimeSnapshot.runBudget.maxRecoveryAttempts);
-    if (this.episodeId && this.allowTools) { this.episodeUsed++; this.recoveryAttempts++; }
-    if (!this.allowTools && this.episodeId && this.episodeUsed >= this.runtimeSnapshot.runBudget.maxRecoveryAttempts) this.stopReason = 'tool_recovery_limit';
-    this.convergenceRequested ||= this.toolCalls >= this.runtimeSnapshot.runBudget.maxToolCalls * scheduling.callConvergenceRatio
-      || this.modelCalls >= this.runtimeSnapshot.runBudget.maxModelCalls * scheduling.callConvergenceRatio
-      || this.remaining() < this.runtimeSnapshot.runBudget.timeoutMs * scheduling.remainingTimeConvergenceRatio;
-    return { allowTools: this.allowTools, feedback: this.feedback() };
+    const allowTools = modelCalls < this.runtimeSnapshot.runBudget.maxModelCalls && this.toolCalls < this.runtimeSnapshot.runBudget.maxToolCalls
+      && remainingTimeMs > reserve && (!this.episodeId || this.episodeUsed < this.runtimeSnapshot.runBudget.maxRecoveryAttempts);
+    const episodeUsed = this.episodeUsed + (this.episodeId && allowTools ? 1 : 0), recoveryAttempts = this.recoveryAttempts + (this.episodeId && allowTools ? 1 : 0);
+    const convergence = this.convergenceRequested || this.toolCalls >= this.runtimeSnapshot.runBudget.maxToolCalls * scheduling.callConvergenceRatio
+      || modelCalls >= this.runtimeSnapshot.runBudget.maxModelCalls * scheduling.callConvergenceRatio
+      || remainingTimeMs < this.runtimeSnapshot.runBudget.timeoutMs * scheduling.remainingTimeConvergenceRatio;
+    const budget = this.readBudget(); budget.modelCalls.used = modelCalls; budget.modelCalls.remaining = Math.max(0,budget.modelCalls.limit-modelCalls);
+    budget.remainingTimeMs = remainingTimeMs; budget.recovery.used = episodeUsed; budget.recovery.remaining = Math.max(0,this.runtimeSnapshot.runBudget.maxRecoveryAttempts-episodeUsed);
+    const preview = Object.freeze({revision:this.revision,preparedAt,allowTools,feedback:this.feedback(budget,convergence,allowTools)});
+    this.previews.set(preview,{allowTools,convergence,episodeUsed,recoveryAttempts,stopReason:!allowTools && this.episodeId && episodeUsed >= this.runtimeSnapshot.runBudget.maxRecoveryAttempts ? 'tool_recovery_limit' : this.stopReason});
+    return preview;
+  }
+  admitModelCall(preview?: ModelAdmissionPreview): { allowTools: boolean; feedback: string } {
+    this.checkActive();
+    if (!preview && this.modelCalls >= this.runtimeSnapshot.runBudget.maxModelCalls) { this.modelAdmissionsRejected++; this.stopReason='agent_call_limit'; throw new Error('agent_call_limit'); }
+    preview ??= this.previewModelCall();
+    const decision = this.previews.get(preview);
+    if (!decision || preview.revision !== this.revision) throw new Error('state_conflict');
+    this.previews.delete(preview); this.revision++; this.modelCalls++;
+    this.allowTools=decision.allowTools; this.convergenceRequested=decision.convergence; this.episodeUsed=decision.episodeUsed; this.recoveryAttempts=decision.recoveryAttempts; this.stopReason=decision.stopReason;
+    return {allowTools:preview.allowTools,feedback:preview.feedback};
   }
 
   observeToolAttempt(id: string, name: string, raw: unknown): void {
@@ -100,6 +112,7 @@ export class RunControl {
       return;
     }
     this.toolCalls++;
+    this.revision++;
     const allowed = this.allowTools && this.toolCalls <= this.runtimeSnapshot.runBudget.maxToolCalls;
     this.attempts.set(id, { name, raw: structuredClone(raw), allowed, observation: createToolControlObservation({
       admission: { status: allowed ? 'not_reached' : 'blocked', reason: allowed ? null : 'tool_call_limit' },
@@ -134,6 +147,7 @@ export class RunControl {
   }
   observation(id: string): ToolControlObservation { return structuredClone(this.attempts.get(id)?.observation ?? createToolControlObservation()); }
   updateObservation(id: string, patch: Partial<ToolControlObservation>): void {
+    this.revision++;
     const attempt = this.attempts.get(id);
     if (attempt) attempt.observation = { ...attempt.observation, ...patch };
   }
@@ -223,6 +237,7 @@ export class RunControl {
     return this.observation(id);
   }
   noteFailure(id: string, failure: { code: string; stage: string; recordId?: number | null; queryId?: number | null; evidenceId?: number | null; queryCommitUnknown?: boolean }): void {
+    this.revision++;
     const attempt = this.attempts.get(id);
     if (!attempt) return;
     if (attempt.observation.failureClass === null) {
@@ -263,6 +278,7 @@ export class RunControl {
     return strip(failed.raw) === strip(raw);
   }
   acknowledgeDelivery(id: string, isError = false): void {
+    this.revision++;
     const failure = this.failures.get(id);
     if (failure) failure.delivered = true;
     const attempt = this.attempts.get(id);
@@ -278,8 +294,8 @@ export class RunControl {
       remainingTimeMs: this.remaining(), recovery: { episodeId: this.episodeId, used: this.episodeUsed,
         remaining: Math.max(0, this.runtimeSnapshot.runBudget.maxRecoveryAttempts - this.episodeUsed), unresolvedItems: [...this.failures.keys()] } };
   }
-  feedback(): string {
-    return JSON.stringify({ budget: this.readBudget(), converge: this.convergenceRequested, allowTools: this.allowTools,
+  feedback(budget = this.readBudget(), converge = this.convergenceRequested, allowTools = this.allowTools): string {
+    return JSON.stringify({ budget, converge, allowTools,
       failures: [...this.failures].map(([id, failure]) => ({ id, tool: this.attempts.get(id)?.name, code: failure.code, stage: failure.stage,
         queryId: failure.queryId, evidenceId: failure.evidenceId, delivered: failure.delivered,
         hookFailure: this.attempts.get(id)?.observation.hookFailure })),

@@ -30,6 +30,9 @@ export const resultSchema = <S extends z.ZodType>(data: S) => z.discriminatedUni
 ]);
 
 const errorDefinitions = {
+  context_delivery_unsupported: ['provider', 'Context delivery cannot be verified for this model API.', false],
+  context_payload_mismatch: ['runtime', 'The final model payload does not contain the saved context.', false],
+  context_projection_too_large: ['input', 'The required context exceeds the delivery limit. Select fewer materials.', false],
   event_cursor_invalid: ["input", "The event cursor is outside the saved range.", false],
   event_gap: ["storage", "The saved event range has a gap. Read the original facts before resuming.", false],
   event_subscription_invalid: ["input", "The event subscription identity or parameters are invalid.", false],

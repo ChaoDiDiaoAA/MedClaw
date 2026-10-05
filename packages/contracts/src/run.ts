@@ -1,4 +1,5 @@
 import type { StreamSnapshot, StreamSnapshotReader } from './event';
+import type { ModelCallContext, StartCallContext } from './context';
 import { z } from "zod";
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } from "./error";
 import { AgentPolicySchema, BudgetSummarySchema, MeasurementContextSchema, ModelSelectionSchema, ReferenceDateSchema, RequestPolicySchema, TimezoneSchema, ToolProfileSnapshotSchema } from "./model";
@@ -20,6 +21,7 @@ const nullableAmount = z.number().finite().nonnegative().nullable();
 const nullableToken = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable();
 const safeLabel = z.string().min(1).max(256);
 export const ModelCallViewSchema = z.strictObject({
+  contextSnapshotId: PositiveIdSchema.nullable().optional(),
   id: PositiveIdSchema, inputId: PositiveIdSchema.nullable().default(null), callId: OpaqueIdSchema, kind: z.enum(["main", "diagnostic"]), state: z.enum(["started", "completed", "failed", "cancelled"]),
   granularity: z.literal("logical_request"), attempt: z.literal(1), attemptCountUnknown: z.literal(true), model: ModelSelectionSchema,
   responseModel: z.string().min(1).max(256).nullable(), sdkStopReason: SdkStopReasonSchema.nullable(),
@@ -158,7 +160,7 @@ export interface ProviderOperation {
 export type FinalCallFact = Pick<ModelCallView,
   "callId" | "state" | "responseModel" | "sdkStopReason" | "endedAt" | "durationMs" |
   "inputTokens" | "outputTokens" | "cost" | "costCurrency" | "usageSource" | "unavailableReason" | "error"
-> & { state: "completed" | "failed" | "cancelled" };
+> & { state: "completed" | "failed" | "cancelled"; context?: ModelCallContext };
 export interface FinalProviderFact {
   status: "completed" | "failed" | "cancelled"; outputText: string | null;
   stoppedAt: string | null; endedAt: string; cancelRequestedAt?: string | null;
@@ -167,6 +169,7 @@ export interface FinalProviderFact {
   cleanup?: RunCleanupRecord | { oldProcessExited?: boolean; observationGap?: boolean; previousInstanceId?: string; errors?: AppError[] } | null;
 }
 interface AgentStartCommon {
+  contextContract?: 'medclaw.context/v1';
   sessionId: number; text: string; model: ModelSelection; policy: RequestPolicy; goal: "answer";
   workspace: WorkspaceView; scope: RunScope; referenceDate: string; timezone: string; timeoutMs: number; agentOptions: P2AgentOptions;
   agentPolicy?: AgentPolicy;
@@ -180,6 +183,9 @@ export type StartRunInput<Resolved> = AgentStartFields & { resolved: Resolved };
 export type RegisterAgentInput = AgentStartFields & { instanceId: string; createdAt: string };
 export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[]; budgetSummary?: BudgetSummary; inputSettlement?: InputSettlementProof };
 export type AgentRuntimePort<Resolved> = {
+  readonly contextContract?: 'medclaw.context/v1';
+  hasPendingContextPersistence?: (runId: number) => boolean;
+  retryContextPersistence?: (runId: number) => void;
   readSnapshots?: StreamSnapshotReader["readSnapshots"];
   readonly inputAdapter?: InputAdapterPort;
   readInputControl?: (runId: number) => InputControl | null;
@@ -195,7 +201,7 @@ export type AgentRuntimePort<Resolved> = {
   describe: (resolved: Resolved) => P2AgentOptions;
   execute: (input: { runId: number; sessionId: number; inputId?: number | null; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number;
     workspaceContext?: WorkspaceContext; scope?: RunScope; referenceDate?: string; timezone?: string; agentPolicy?: AgentPolicy; runtimeConfiguration?: RuntimeConfiguration; toolConfiguration?: ToolConfiguration; measurementContext?: MeasurementContext; toolProfileSnapshot?: ToolProfileSnapshot },
-    callbacks: { stream?: (snapshot: StreamSnapshot) => void; startCall: (time: string) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
+    callbacks: { stream?: (snapshot: StreamSnapshot) => void; startCall: (time: string, context?: StartCallContext) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
       fatal?: (error: AppError) => void; inputStore?: InputStore; admissionClosed?: () => void }) => Promise<AgentExecutionObservation>;
 };
 export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord; inputSettlement?: InputSettlementProof };
@@ -212,13 +218,14 @@ export function canonicalRequest(value: unknown): string {
 export interface ProviderRunStore {
   findProviderOperation(operationRef: string): ProviderOperation | null;
   registerProvider(input: RegisterProviderInput): ProviderAccepted;
-  startCall(runId: number, callId: string, kind: "main" | "diagnostic", time: string): void;
+  startCall(runId: number, callId: string, kind: "main" | "diagnostic", time: string, context?: StartCallContext): void;
   requestCancel(runId: number, time: string): boolean;
   finalizeProvider(runId: number, fact: FinalProviderFact): RunView;
   read(request: z.input<typeof ReadRunRequestSchema>): ReadRunResult;
   active(): RunHandle | null;
 }
 export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputStore {
+  verifyPriorContextFacts?(runId: number): { requiredPersistenceComplete: boolean; unconfirmedItems: string[] };
   freezeAgentScope(workspace: WorkspaceView, toolNames: readonly string[]): RunScope;
   registerAgent(input: RegisterAgentInput): SubmitResult;
   finalizeAgent(runId: number, fact: FinalAgentFact): RunView;
@@ -236,7 +243,7 @@ export interface ModelCallRecorderPort {
   readonly callId?: string;
   finish(outcome: ProviderOutcome, endedAt: string): FinalCallFact;
 }
-export type ModelCallStarter = (runId: number, kind: "main" | "diagnostic", time: string) => ModelCallRecorderPort;
+export type ModelCallStarter = (runId: number, kind: "main" | "diagnostic", time: string, context?: StartCallContext) => ModelCallRecorderPort;
 
 /** Pi initializes omitted usage fields to zero; zero alone does not establish usage or free pricing. */
 export function safeUsage(value: unknown, pricingKnown: boolean): UsageView {

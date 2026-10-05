@@ -185,6 +185,10 @@ legend { padding: 0 6px; font-weight: 600; }
 .detail-run { display: flex; justify-content: space-between; gap: 10px; margin: 6px 0 18px; }
 .call-summary { border: 1px solid var(--line); border-radius: 6px; padding: 14px; margin-bottom: 14px; }
 .call-summary .facts { margin-bottom: 0; }
+.context-detail { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+.context-detail pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; }
+.context-detail code, .context-detail summary { overflow-wrap: anywhere; }
+.context-detail h4 { margin: 14px 0 8px; }
 .saved-output { font: inherit; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 6px; padding: 14px; max-height: 420px; overflow-y: auto; }
 .recent-runs { margin-top: 26px; border-top: 1px solid var(--line); padding-top: 18px; }
 .recent-runs > button { display: flex; flex-direction: column; gap: 4px; text-align: left; width: 100%; margin: 8px 0; overflow-wrap: anywhere; }

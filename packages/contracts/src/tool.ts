@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AppErrorSchema, PositiveIdSchema, TimestampSchema, type AppError } from "./error";
+import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, type AppError } from "./error";
 import { RunScopeSchema, type RunScope } from "./run";
 import { MeasurementContextSchema, ReferenceDateSchema, TimezoneSchema, ToolControlObservationSchema, type ToolControlObservation } from "./model";
 import type { ToolConfiguration } from './tool-config';
@@ -31,6 +31,7 @@ export interface ToolDefinition<I, O> extends AgentTool<I, O> { label: string }
 export type AnyToolDefinition = ToolDefinition<unknown, unknown>;
 export type ToolCallIdentity = Pick<AnyToolDefinition, "name" | "version" | "effect" | "executionMode">;
 export type ToolExecutionContext = {
+  contextSnapshotId?: number | null; modelCallId?: string;
   runId: number; sessionId: number; nativeToolCallId: string; scope: RunScope;
   referenceDate: string; timezone: string; signal: AbortSignal;
   checkActive?: () => void;
@@ -41,12 +42,14 @@ export type ToolExecutionContext = {
   workspaceRevision?: number;
 };
 export const ToolContextFieldsSchema = z.object({
+  contextSnapshotId: PositiveIdSchema.nullable().optional(), modelCallId: OpaqueIdSchema.optional(),
   runId: PositiveIdSchema, sessionId: PositiveIdSchema, nativeToolCallId: z.string().min(1).max(256),
   scope: RunScopeSchema, referenceDate: ReferenceDateSchema, timezone: TimezoneSchema,
   workspaceContext: WorkspaceContextSchema.nullable().optional(), workspaceInputId: PositiveIdSchema.nullable().optional(),
   basedOnQueryId: PositiveIdSchema.nullable().optional(), workspaceRevision: RevisionSchema.optional(),
 });
 export const ToolContextIdentitySchema = ToolContextFieldsSchema.superRefine((identity, ctx) => {
+  if ((identity.contextSnapshotId != null) !== (identity.modelCallId !== undefined)) ctx.addIssue({ code: 'custom', message: 'Context requires both original call and snapshot' });
   const keys = ['workspaceContext', 'workspaceInputId', 'basedOnQueryId', 'workspaceRevision'] as const;
   if (!keys.some(key => identity[key] !== undefined)) return;
   if (keys.some(key => identity[key] === undefined) || !identity.workspaceContext) {
@@ -70,6 +73,7 @@ export const ToolSdkDeliverySchema = z.strictObject({
 });
 export type ToolSdkDelivery = z.infer<typeof ToolSdkDeliverySchema>;
 export const ToolCallRecordSchema = z.strictObject({
+  contextSnapshotId: PositiveIdSchema.nullable().optional(),
   id: PositiveIdSchema, runId: PositiveIdSchema, sessionId: PositiveIdSchema,
   nativeToolCallId: z.string().min(1).max(256), name: z.string(), version: z.string(),
   executionMode: ToolExecutionModeSchema, input: z.unknown(),

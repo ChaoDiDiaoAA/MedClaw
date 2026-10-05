@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
+import { nativeUserMessages } from '../fixtures/p1-provider';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -60,7 +61,7 @@ test.beforeAll(async () => {
   const counts = new Map<string, number>();
   server = createServer(async (request, response) => {
     let body = ''; for await (const chunk of request) body += chunk;
-    const payload = JSON.parse(body), text = JSON.stringify(payload.messages.filter((message: { role: string }) => message.role === 'user').at(-1)?.content ?? ''), count = counts.get(text) ?? 0;
+    const payload = JSON.parse(body), text = JSON.stringify(nativeUserMessages(payload.messages).at(-1)?.content ?? ''), count = counts.get(text) ?? 0;
     providerUserTexts.push(text);
     if (dateQueryGate && text.includes('Hold date query scope')) { dateQueryGate.markEntered(); await dateQueryGate.reply; }
     counts.set(text, count + 1); response.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -271,7 +272,7 @@ test('P3 actual business tool creates a saved query with inspectable source evid
 });
 test('P3 actual native write has separate execution, SDK delivery and model-consumption facts', async () => {
   await page.getByRole('button', { name: 'Chat', exact: true }).click(); await page.getByLabel('Message text', { exact: true }).fill('Write fixture file'); await page.getByRole('button', { name: 'Send', exact: true }).click();
-  await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  await savedNativeReply('Write fixture file');
   const run = await page.evaluate(() => window.medclaw.request('run.read', { recent: true, sessionId: 1, limit: 1 }));
   if (!run.ok || run.data.kind !== 'recent' || !run.data.runs[0]) throw new Error('Missing saved run');
   nativeRunId = run.data.runs[0].id;

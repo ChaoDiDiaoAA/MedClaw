@@ -39,6 +39,8 @@ import { PromptTrace } from "../../../packages/logging/src/prompt-trace.ts";
 import { SqliteWriteTransactions } from '../../../packages/storage/src/write-transactions.ts';
 import { SqliteEventStore } from '../../../packages/storage/src/event-store.ts';
 import { EventService } from '../../../packages/core/src/events/event-service.ts';
+import { ContextService } from '../../../packages/core/src/context/context-service.ts';
+import { SqliteContextStore } from '../../../packages/storage/src/context-store.ts';
 
 const errorLog = new ErrorLog("host"), runtimeLog = new RuntimeLog("host"), promptTrace = new PromptTrace();
 
@@ -48,6 +50,7 @@ let repositories: Repositories, catalog: SqliteCatalogStore, toolStore: SqliteTo
 let database: ReturnType<typeof openDatabase> | null = null;
 let deletions:DataDeletionService;
 let events: EventService | null = null;
+let contexts: ContextService;
 let locked = false, closing = false, controlCount = 0;
 let terminating = false, shutdownTask: Promise<void> | null = null, fatalTask: Promise<void> | null = null;
 let startupPhase = "hello";
@@ -193,13 +196,14 @@ async function initialize(raw: unknown) {
     });
     return { registry, executor };
   };
-  agent = new PiAgentRuntime(runtime, config.paths.dataRoot, { ...configure(), recorder, configure });
   artifacts = new ArtifactStore(database, join(config.paths.dataRoot, 'artifacts'));
+  contexts = new ContextService(new SqliteContextStore(database, events, transactions),artifacts);
+  agent = new PiAgentRuntime(runtime, config.paths.dataRoot, { ...configure(), recorder, configure },contexts);
   imports = new ImportService({ store: new SqliteImportStore(database), artifacts, instanceId: config.instanceId,
     resolveToken: async (fileToken, operationRef) => AbsolutePathSchema.parse(await credentials('file.resolve', { fileToken, operationRef })) });
   application = new Application(config.instanceId, settings, runtime, repositories,
     (context, action) => credentialStore.withContext(context, action),
-    (runId, kind, time) => new ModelCallRecorder(repositories, runId, kind, time),
+    (runId, kind, time, context) => new ModelCallRecorder(repositories, runId, kind, time, context),
     notice, error => errorLog.add(error), agent, events);
   application.runs.recoverInterrupted(true); // The writer lock proves that the previous owning process exited.
   sessions = new SessionService(config.instanceId, repositories, agent, (input, context) => application!.runs.submitAgent(input, context),
@@ -260,6 +264,7 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case "model.request": return app.submitProvider(request, "main");
     case "model.diagnose": return app.submitProvider(request, "diagnostic");
     case "run.read": return unwrap(await app.runs.read(request.payload));
+    case 'context.read': return unwrap(contexts.read(request.payload));
     case 'event.read': return unwrap(events!.read(request.payload));
     case 'event.subscribe': {
       const input = request.payload;
@@ -360,9 +365,14 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case 'tool.read': {
       const { runId, page, pageSize } = createPublicMethodSchemas()['tool.read'].input.parse(request.payload), context = readContext(runId, false);
       const totalRows = database!.query<{ count: number }, [number]>('SELECT COUNT(*) AS count FROM tool_calls WHERE run_id=?').get(runId)!.count;
-      const rows = database!.query<{ native_tool_call_id: string }, [number, number, number]>('SELECT native_tool_call_id FROM tool_calls WHERE run_id=? ORDER BY id LIMIT ? OFFSET ?').all(runId, pageSize, (page - 1) * pageSize);
+      const rows = database!.query<{ native_tool_call_id: string; context_snapshot_id:number|null; model_call_id:number|null }, [number, number, number]>('SELECT native_tool_call_id,context_snapshot_id,model_call_id FROM tool_calls WHERE run_id=? ORDER BY id LIMIT ? OFFSET ?').all(runId, pageSize, (page - 1) * pageSize);
       const items = rows.map(row => {
-        const record = toolStore.readCall({ ...context, nativeToolCallId: row.native_tool_call_id })!;
+        const snapshot=row.context_snapshot_id === null ? null : unwrap(contexts.read({snapshotId:row.context_snapshot_id}));
+        if(snapshot && snapshot.kind !== 'snapshot') throw new Error('storage_read_failed');
+        const origin=snapshot?.kind === 'snapshot' ? snapshot.snapshot : null;
+        const call=origin ? database!.query<{call_id:string},[number]>('SELECT call_id FROM model_calls WHERE id=?').get(row.model_call_id!) : null;
+        if(origin && (!call || !origin.workspaceContext || origin.inputId === null)) throw new Error('storage_read_failed');
+        const record = toolStore.readCall({ ...context, nativeToolCallId: row.native_tool_call_id,...(origin ? {contextSnapshotId:origin.id,modelCallId:call!.call_id,workspaceContext:origin.workspaceContext,workspaceInputId:origin.inputId,basedOnQueryId:origin.workspaceContext!.queryId,workspaceRevision:origin.workspaceContext!.revision} : {}) })!;
         return projectToolCall(record);
       });
       return { runId, scope: context.scope, items, totalRows, page, pageSize };

@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, resolve, join } from "node:path";
 import { createServer, type Server } from "node:http";
+import { nativeUserMessages } from '../fixtures/p1-provider';
 import type { MessageStreamSnapshot, OpenEventSubscriptionInput } from '../../packages/contracts/src/event';
 
 type ObservedStream = { instanceId: string | null; subscriptionId: string; snapshot: MessageStreamSnapshot };
@@ -75,8 +76,8 @@ test.beforeAll(async () => {
     request.setEncoding("utf8");
     for await (const chunk of request) body += chunk;
     const payload = JSON.parse(body);
-    const content = payload.messages?.filter((message: { role: string }) => message.role === "user").at(-1)?.content ?? "";
-    const text: string = typeof content === "string" ? content : content.filter((part: { type: string }) => part.type === "text").map((part: { text: string }) => part.text).join("");
+    const content = nativeUserMessages(payload.messages ?? []).at(-1)?.content ?? "";
+    const text: string = typeof content === "string" ? content : Array.isArray(content) ? content.filter((part: { type: string }) => part.type === "text").map((part: { text: string }) => part.text).join("") : '';
     requests.push({ text, model: payload.model });
     response.writeHead(200, { "content-type": "text/event-stream" });
     const send = (chunk: unknown) => response.write(`data: ${JSON.stringify(chunk)}\n\n`);

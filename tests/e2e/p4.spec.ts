@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { createServer, type Server } from 'node:http';
+import { nativeUserMessages } from '../fixtures/p1-provider';
 import type { SessionMessagePage, SessionMessageView } from '../../packages/contracts/src/messages';
 import { canonicalRequest } from '../../packages/contracts/src/run';
 import type { SubmitResult } from '../../packages/contracts/src/session';
@@ -129,7 +130,7 @@ test.beforeAll(async () => {
     const payload = JSON.parse(body); httpCount++;
     if (script) {
       inFlight++; const ordinal = ++scriptIndex;
-      wireFacts.push({ ordinal, toolIds: payload.messages.filter((m: WireMessage) => m.role === 'tool').map((m: WireMessage) => m.tool_call_id!), userCount: payload.messages.filter((m: WireMessage) => m.role === 'user').length });
+      wireFacts.push({ ordinal, toolIds: payload.messages.filter((m: WireMessage) => m.role === 'tool').map((m: WireMessage) => m.tool_call_id!), userCount: nativeUserMessages(payload.messages).length });
       try {
         const step = script[ordinal - 1]; if (!step) throw new Error(`Unexpected scripted HTTP ${ordinal}`);
         const reply = await step(payload);
@@ -141,7 +142,7 @@ test.beforeAll(async () => {
       finally { inFlight--; }
       return;
     }
-    const last = JSON.stringify(payload.messages.filter((message: { role: string }) => message.role === 'user').at(-1)?.content ?? '');
+    const last = JSON.stringify(nativeUserMessages(payload.messages).at(-1)?.content ?? '');
     const hasTool = payload.messages.some((message: { role: string; tool_call_id?: string }) => message.role === 'tool' && message.tool_call_id === 'p4-scope');
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const tool = last.includes('slow A') && !hasTool;

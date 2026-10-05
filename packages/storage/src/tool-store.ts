@@ -14,6 +14,7 @@ import { ToolCallRecordSchema, ToolContextIdentitySchema, ToolContextFieldsSchem
   ToolObservationSchema, type ToolObservation, type ToolCallStore, type ToolExecutionContext, type ToolResult, type ToolSdkDelivery } from "../../contracts/src/tool";
 import { InputContentSchema } from '../../contracts/src/session';
 import { WorkspaceContextSchema } from '../../contracts/src/workspace';
+import { ModelCallContextSchema, ContextSnapshotBodySchema } from '../../contracts/src/context';
 
 const knownErrors = new Set(["invalid_argument", "access_denied", "state_conflict", "operation_not_found", "runtime_interrupted", "storage_read_failed", "storage_write_failed"]);
 function fail(code: string): never { throw new Error(code); }
@@ -67,7 +68,7 @@ export function initializeToolStorage(db: Database): void {
   }, "storage_write_failed");
 }
 
-type CallRow = { id: number; run_id: number; session_id: number; native_tool_call_id: string; tool_name: string; tool_version: string; model_call_id?: number | null; stopped_at?: string | null;
+type CallRow = { id: number; run_id: number; session_id: number; native_tool_call_id: string; tool_name: string; tool_version: string; model_call_id?: number | null; context_snapshot_id?: number | null; stopped_at?: string | null;
   requested_at: string; started_at: string | null;
   effect: string; execution_mode: string; args_json: string; status: ToolCallRecord["status"]; result_json: string | null;
   error_json: string | null; delivery_json: string | null; ended_at:string|null };
@@ -112,12 +113,21 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
     const { signal: _signal, ...identity } = context;
     if (!("nativeToolCallId" in identity ? ToolContextIdentitySchema : ToolContextFieldsSchema.omit({ nativeToolCallId: true })).safeParse(identity).success) fail("invalid_argument");
     if ("source" in context && (!["agent_tool", "intent", "user_form"].includes(context.source) || !context.callRef)) fail("invalid_argument");
-    const run = this.db.query<{ input_id?:number|null; workspace_json: string | null; session_id: number; status: string; scope_json: string; reference_date: string; timezone: string }, [number]>(
+    const run = this.db.query<{ input_id?:number|null; config_json:string; workspace_json: string | null; session_id: number; status: string; scope_json: string; reference_date: string; timezone: string }, [number]>(
       "SELECT * FROM runs WHERE id=?").get(context.runId);
     if (!run || run.session_id !== context.sessionId || run.reference_date !== context.referenceDate || run.timezone !== context.timezone) fail("access_denied");
     if('inputId' in context && context.inputId !== (run.input_id ?? null)) fail('access_denied');
     const scope = RunScopeSchema.safeParse(decode(run.scope_json));
     if (!scope.success || !isDeepStrictEqual(scope.data, context.scope)) fail("access_denied");
+    const p8 = this.p3 && this.db.query("SELECT id FROM runs WHERE id=? AND json_extract(config_json,'$.agent.contextContract')='medclaw.context/v1'").get(context.runId) !== null;
+    if (p8 && 'nativeToolCallId' in context) {
+      if (context.contextSnapshotId == null || !context.modelCallId || !context.workspaceContext || context.workspaceInputId == null) fail('state_conflict');
+      const owner = this.db.query<{snapshot_json:string;input_id:number;model_json:string},[number,string,number,number]>(`SELECT s.snapshot_json,s.input_id,c.model_json FROM context_snapshots s JOIN model_calls c ON c.run_id=s.run_id AND c.session_id=s.session_id WHERE s.id=? AND c.call_id=? AND s.run_id=? AND s.session_id=?`).get(context.contextSnapshotId,context.modelCallId,context.runId,context.sessionId);
+      if (!owner) fail('access_denied');
+      const body = ContextSnapshotBodySchema.safeParse(decode(owner.snapshot_json)), model = decode(owner.model_json) as {context?:unknown}, marker = ModelCallContextSchema.safeParse(model.context);
+      if (!body.success || !marker.success) fail('storage_read_failed');
+      if (marker.data.snapshotId !== context.contextSnapshotId || marker.data.inputId !== context.workspaceInputId || owner.input_id !== context.workspaceInputId || !isDeepStrictEqual(body.data.workspaceContext,context.workspaceContext)) fail('access_denied');
+    } else if ('nativeToolCallId' in context && context.contextSnapshotId != null) fail('state_conflict');
     if ('nativeToolCallId' in context && context.workspaceContext !== undefined) {
       if (context.workspaceInputId != null) {
         const input = this.db.query<{ session_id: number; target_run_id: number | null; run_id: number | null; status: string;
@@ -127,7 +137,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
         const content = InputContentSchema.safeParse(decode(input.content_json));
         if (!content.success) fail('storage_read_failed');
         if (!isDeepStrictEqual(content.data.workspaceContext, context.workspaceContext)
-          || !isDeepStrictEqual(content.data.scope, context.scope) || content.data.referenceDate !== context.referenceDate
+          || !p8 && !isDeepStrictEqual(content.data.scope, context.scope) || content.data.referenceDate !== context.referenceDate
           || content.data.timezone !== context.timezone) fail('access_denied');
       } else {
         if (run.input_id != null || run.workspace_json == null) fail('state_conflict');
@@ -150,6 +160,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       name: row.tool_name, version: row.tool_version, executionMode: row.execution_mode, input: decode(row.args_json), status: row.status,
       data: row.result_json === null ? null : decode(row.result_json), error: row.error_json === null ? null : decode(row.error_json),
       sdkReturned: receipt?.sdkReturned ?? false, nativeEntryId: receipt?.nativeEntryId ?? null,
+      contextSnapshotId: row.context_snapshot_id ?? null,
       ...(receipt?.message ? { sdkDelivery: receipt.message } : {}), ...(model ? { modelCallId: model.call_id } : {}),
       ...(row.stopped_at ? { stoppedAt: row.stopped_at } : {}), ...(receipt?.nextModelCallId ? { nextModelCallId: receipt.nextModelCallId } : {}),
       ...(receipt?.consumedAt ? { consumedAt: receipt.consumedAt } : {}), ...(receipt?.control ? { control: receipt.control } : {}),
@@ -159,6 +170,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   private callRow(context: ToolExecutionContext): CallRow | null {
     const row = this.db.query<CallRow, [number, string]>("SELECT * FROM tool_calls WHERE session_id=? AND native_tool_call_id=?").get(context.sessionId, context.nativeToolCallId);
     if (row && row.run_id !== context.runId) fail("state_conflict");
+    if (row && context.contextSnapshotId != null && (row.context_snapshot_id !== context.contextSnapshotId || this.db.query<{call_id:string},[number]>('SELECT call_id FROM model_calls WHERE id=?').get(row.model_call_id!)?.call_id !== context.modelCallId)) fail('state_conflict');
     return row;
   }
   readCall(context: ToolExecutionContext): ToolCallRecord | null {
@@ -175,9 +187,10 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
         return this.call(prior);
       }
       if (!ToolExecutionModeSchema.safeParse(tool.executionMode).success || !tool.name || !tool.version) fail("invalid_argument");
-      this.db.query(`INSERT INTO tool_calls(session_id,run_id,native_tool_call_id,tool_name,tool_version,effect,execution_mode,args_json,status,requested_at)
-        VALUES(?,?,?,?,?,?,?,?,'requested',?)`).run(context.sessionId, context.runId, context.nativeToolCallId, tool.name, tool.version, tool.effect, tool.executionMode, args, new Date().toISOString());
-      if (this.p3) this.db.query(`UPDATE tool_calls SET model_call_id=(SELECT MAX(id) FROM model_calls WHERE run_id=? AND session_id=?)
+      const origin = context.contextSnapshotId != null;
+      this.db.query(`INSERT INTO tool_calls(session_id,run_id,native_tool_call_id,tool_name,tool_version,effect,execution_mode,args_json,status,requested_at${origin ? ',model_call_id,context_snapshot_id' : ''})
+        VALUES(?,?,?,?,?,?,?,?,'requested',?${origin ? ',(SELECT id FROM model_calls WHERE call_id=?),?' : ''})`).run(context.sessionId, context.runId, context.nativeToolCallId, tool.name, tool.version, tool.effect, tool.executionMode, args, new Date().toISOString(),...(origin ? [context.modelCallId!,context.contextSnapshotId!] : []));
+      if (this.p3 && !origin) this.db.query(`UPDATE tool_calls SET model_call_id=(SELECT MAX(id) FROM model_calls WHERE run_id=? AND session_id=?)
         WHERE session_id=? AND native_tool_call_id=?`).run(context.runId, context.sessionId, context.sessionId, context.nativeToolCallId);
       const saved=this.callRow(context)!;this.event(saved,'tool_requested',saved.requested_at);
       return this.call(this.callRow(context)!);
@@ -189,9 +202,10 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       if (this.callRow(context)) fail('state_conflict');
       if (!ToolExecutionModeSchema.safeParse(tool.executionMode).success || !tool.name || !tool.version || !Number.isFinite(Date.parse(requestedAt))) fail('invalid_argument');
       const problem = safeError(AppErrorSchema.parse(error).code, undefined, { runId: context.runId, sessionId: context.sessionId });
-      this.db.query(`INSERT INTO tool_calls(session_id,run_id,native_tool_call_id,tool_name,tool_version,effect,execution_mode,args_json,status,error_json,requested_at,ended_at${this.p3 ? ',model_call_id' : ''})
-        VALUES(?,?,?,?,?,?,?,?,'failed',?,?,?${this.p3 ? ',(SELECT MAX(id) FROM model_calls WHERE run_id=?)' : ''})`).run(context.sessionId, context.runId, context.nativeToolCallId, tool.name,
-          tool.version, tool.effect, tool.executionMode, json(input), json(problem), requestedAt, new Date().toISOString(), ...(this.p3 ? [context.runId] : []));
+      const origin = context.contextSnapshotId != null;
+      this.db.query(`INSERT INTO tool_calls(session_id,run_id,native_tool_call_id,tool_name,tool_version,effect,execution_mode,args_json,status,error_json,requested_at,ended_at${origin ? ',model_call_id,context_snapshot_id' : this.p3 ? ',model_call_id' : ''})
+        VALUES(?,?,?,?,?,?,?,?,'failed',?,?,?${origin ? ',(SELECT id FROM model_calls WHERE call_id=?),?' : this.p3 ? ',(SELECT MAX(id) FROM model_calls WHERE run_id=?)' : ''})`).run(context.sessionId, context.runId, context.nativeToolCallId, tool.name,
+          tool.version, tool.effect, tool.executionMode, json(input), json(problem), requestedAt, new Date().toISOString(), ...(origin ? [context.modelCallId!,context.contextSnapshotId!] : this.p3 ? [context.runId] : []));
       const saved=this.callRow(context)!;this.event(saved,'tool_finished',saved.ended_at!);
     }), 'storage_write_failed');
   }
