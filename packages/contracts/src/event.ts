@@ -32,6 +32,7 @@ export const RegisteredEventPayloadSchema = z.discriminatedUnion('type', [
   variant('tool_finished', { ...tool, status: z.enum(['succeeded', 'failed', 'cancelled']) }),
   variant('query_completed', { queryId: PositiveIdSchema, resultHash: z.string().regex(/^[a-f0-9]{64}$/), batchIds: ids }),
   variant('context_delivered', { snapshotId: PositiveIdSchema, callId: OpaqueIdSchema }),
+  variant('history_saved', { storageVersion: PositiveIdSchema, nativeLeafId: OpaqueIdSchema.nullable() }),
 ]);
 export const EventSourceSchema = z.enum(['application', 'pi', 'intent', 'tool', 'host']);
 const envelope = { runId: PositiveIdSchema, sessionId: PositiveIdSchema, source: EventSourceSchema, sourceConnection: OpaqueIdSchema.nullable(), sourceSequence: nonnegative.nullable(), toolCallId: PositiveIdSchema.nullable(), occurredAt: TimestampSchema, receivedAt: TimestampSchema };

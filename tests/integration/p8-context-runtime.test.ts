@@ -1,3 +1,4 @@
+import { sqliteHistory } from '../fixtures/p9-memory';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -59,7 +60,8 @@ async function fixture(options: Parameters<typeof setup>[0] = {}) {
   const errors: AppError[] = [], controller = new AbortController();
   const toolStore = new SqliteToolStore(db), catalog = new CatalogService(new SqliteCatalogStore(db)), queries = new QueryService(catalog,toolStore), evidence = new EvidenceReader(catalog,queries,toolStore);
   const registry = new ToolRegistry(createBusinessTools({catalog,queries,evidence})), recorder = new ToolRecorder(toolStore,error => {errors.push(error);controller.abort();});
-  const agent = new PiAgentRuntime(runtime,root,options.tools ? {registry,recorder,executor:new ToolExecutor(registry,recorder)} : undefined,service), allocated = agent.allocate();
+  const history=sqliteHistory(db),repo=new Repositories(db,undefined,undefined,undefined,history.store);
+  const agent = new PiAgentRuntime(runtime,root,history,options.tools ? {registry,recorder,executor:new ToolExecutor(registry,recorder)} : undefined,service), allocated = agent.allocate();
   if ('payloadReplacement' in options || options.payloadHook || options.responseFailure || options.responseCancel) {
     const prepare = Reflect.get(agent,'prepare').bind(agent);
     Reflect.set(agent,'prepare',async (...args:unknown[]) => {
@@ -68,7 +70,7 @@ async function fixture(options: Parameters<typeof setup>[0] = {}) {
       session.agent.streamFunction = (model,context,streamOptions) => original(model,context,{...streamOptions,...('payloadReplacement' in options ? {onPayload:() => options.payloadReplacement} : options.payloadHook ? {onPayload:options.payloadHook} : {}),...(options.responseFailure || options.responseCancel ? {onResponse:() => {if(options.responseCancel)controller.abort();if(options.responseFailure)throw new Error('fixture callback failure');}} : {})});
     });
   }
-  const f = acceptContextInput(db,{consume:false,nativeSessionId:allocated.nativeSessionId,model:resolved.selection,toolNames:agent.toolNames}); allocated.bind(f.input.sessionId);
+  const f = acceptContextInput(db,{consume:false,nativeSessionId:allocated.nativeSessionId,initialHistory:allocated.history,repositories:repo,model:resolved.selection,toolNames:agent.toolNames}); allocated.bind(f.input.sessionId);
   f.repos.beginInputDelivery(f.input.inputId,'host',new Date().toISOString());
   const execute = () => agent.execute({runId:f.input.runId,sessionId:f.input.sessionId,inputId:f.input.inputId,text:f.request.text,resolved,agentOptions:agent.describe(resolved),scope:f.input.scope,workspaceContext:f.input.workspaceContext,referenceDate:f.request.referenceDate,timezone:f.request.timezone,signal:controller.signal,deadlineAt:performance.now()+15000},{startCall:(at,context) => new ModelCallRecorder(f.repos,f.input.runId,'main',at,context),preview:() => {},nativeTerminal:() => {},inputStore:f.repos,fatal:error => {errors.push(error);controller.abort();}});
   return {...f,agent,contexts,service,controller,db,requests,errors,execute};
@@ -113,7 +115,7 @@ test('p8 actually consumed queued input and original tool facts bind distinct sn
   expect(f.db.query('SELECT context_snapshot_id,model_call_id FROM tool_calls').all()).toEqual([{context_snapshot_id:old.snapshot.id,model_call_id:old.deliveries[0]!.modelCallId}]);
   const secondMessages = f.requests[1]!.messages as {role:string;content:unknown}[];
   expect(secondMessages.filter(message => contextMessageText(message.content) === next.snapshot.renderedProjection)).toHaveLength(1);
-  const native = f.agent.readMessages({sessionId:f.input.sessionId,leafId:null,afterEntryId:null,limit:50});
+  const native = (await f.agent.readMessages({sessionId:f.input.sessionId,leafId:null,afterEntryId:null,limit:50}));
   expect(native.items.filter(item => item.displayRole === 'user').map(item => item.text)).toEqual([f.request.text,request.text]);
   expect(native.items.some(item => item.text === next.snapshot.renderedProjection)).toBe(false);
 },15000);
@@ -130,10 +132,10 @@ test('p8 a third real request verifies old tool facts without replacing their fi
 
 for(const delayedStop of [false,true]) test(`p8 Application blocks and repairs original delivery without HTTP replay (stop delayed=${delayedStop})`, async () => {
   let reject = true;
-  const f = await setup({deliveryFailure:() => reject}), repo = new Repositories(f.db), agent = new PiAgentRuntime(f.runtime,f.root,undefined,f.service);
+  const f = await setup({deliveryFailure:() => reject}), history=sqliteHistory(f.db), repo = new Repositories(f.db,undefined,undefined,undefined,history.store), agent = new PiAgentRuntime(f.runtime,f.root,history,undefined,f.service);
   let release!:()=>void;const stopped = new Promise<void>(resolve => {release=resolve;});
   if(delayedStop) {const execute=agent.execute.bind(agent);agent.execute=async (...args) => {const observed=await execute(...args);await stopped;return observed;};}
-  const native = agent.allocate(), session = repo.createSession({expectedWorkspaceRevision:0},'app-session',native.nativeSessionId,new Date().toISOString()).session; native.bind(session.id);
+  const native = agent.allocate(), session = repo.createSession({expectedWorkspaceRevision:0},'app-session',native.nativeSessionId,new Date().toISOString(),native.history).session; native.bind(session.id);
   const settings = PublishedSettingsSchema.parse({schemaVersion:'medclaw.settings/p1-v1',configVersion:'1',model:{provider:'p8-fixture',modelId:'fixture'},customProviders:[{definition:f.definition,credentialRef:null}],credentialRefs:{},requestPolicy:{timeoutMs:15000,maxRetries:0,maxRetryDelayMs:2000},ui:{navCollapsed:false,detailOpen:false,detailTab:'conditions'},previous:null,rollbackFromVersion:null});
   const app = new Application('host',settings,f.runtime,repo,(_context,action) => action(),(runId,kind,at,context) => new ModelCallRecorder(repo,runId,kind,at,context),() => {},undefined,agent);
   const request = SubmitInputSchema.parse({sessionId:session.id,clientSequence:1,text:'Original evidence',mode:'send',expectedRevision:repo.readWorkspace().revision,expectedBatchIds:[],expectedQueryId:null,model:{provider:'p8-fixture',modelId:'fixture',expectedConfigVersion:'1'},referenceDate:'2026-10-05',timezone:'Asia/Shanghai'});

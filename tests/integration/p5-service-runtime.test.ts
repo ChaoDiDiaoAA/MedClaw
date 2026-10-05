@@ -1,3 +1,4 @@
+import { sqliteHistory } from '../fixtures/p9-memory';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -22,12 +23,13 @@ afterEach(async () => { for (const close of closers.splice(0)) await close(); })
 
 function readFixture() {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p5-service-'));
-  const db = openDatabase(join(root, 'app.sqlite')), repo = new Repositories(db);
+  const db = openDatabase(join(root, 'app.sqlite')), repo = new Repositories(db,undefined,undefined,undefined,sqliteHistory(db).store);
   const session = repo.createSession({ expectedWorkspaceRevision: 0 }, 'create-a', 'native-a', new Date().toISOString()).session;
   const native: NativeSessionBindings = {
     allocate: () => { throw new Error('Unexpected allocation'); },
-    read: () => ({ available: true, reason: null, leafId: null, messages: [], truncated: false }),
-    readMessages: () => { throw new Error('Unexpected message read'); },
+    read: async () => ({ available: true, reason: null, leafId: null,storageVersion:0, messages: [], truncated: false }),
+    readMessages: async () => { throw new Error('Unexpected message read'); },
+    ensureLoaded:async()=>{},restore:async()=>{},readAvailability:()=>({availability:'ready',error:null}),
   };
   const service = new SessionService('host-a', repo, native, async () => ({ ok: false, error: safeError('runtime_busy') }), () => null);
   closers.push(() => { db.close(); rmSync(root, { recursive: true, force: true }); });
@@ -52,7 +54,7 @@ test('ordinary input read reports database failure separately from absence', asy
 
 async function runtimeFixture() {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p5-runtime-'));
-  const db = openDatabase(join(root, 'app.sqlite')), repo = new Repositories(db);
+  const db = openDatabase(join(root, 'app.sqlite')), repo = new Repositories(db,undefined,undefined,undefined,sqliteHistory(db).store);
   let release!: () => void, received!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   const requested = new Promise<void>(resolve => { received = resolve; });
@@ -70,7 +72,7 @@ async function runtimeFixture() {
     models: [{ id: 'fixture', name: 'Fixture', input: ['text'], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }] }]);
   const settings = PublishedSettingsSchema.parse({ schemaVersion: 'medclaw.settings/p1-v1', configVersion: '1', model: null, customProviders: [], credentialRefs: {},
     requestPolicy: { timeoutMs: 10000, maxRetries: 0, maxRetryDelayMs: 2000 }, previous: null, rollbackFromVersion: null });
-  const agent = new PiAgentRuntime(runtime, root);
+  const agent = new PiAgentRuntime(runtime, root, sqliteHistory(db));
   const notices: RuntimeNotice[] = [];
   const app = new Application('host-a', settings, runtime, repo, (_context, action) => action(),
     (runId, kind, at) => new ModelCallRecorder(repo, runId, kind, at), notice => notices.push(notice), () => {}, agent);

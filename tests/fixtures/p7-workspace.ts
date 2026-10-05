@@ -11,9 +11,9 @@ import { canonicalRequest } from '../../packages/contracts/src/run';
 const at = '2026-10-04T00:00:00.000Z';
 
 /** Saved SQLite facts used by read-only Host and transaction fault tests. */
-export function seedWorkspaceQueries(db: Database) {
-  const repos = new Repositories(db);
-  repos.createSession({ expectedWorkspaceRevision: 0 }, 'create-a', 'native-a', at);
+export function seedWorkspaceQueries(db: Database, repositories?:Repositories) {
+  const repos = repositories??new Repositories(db);
+  if(repos.readWorkspace().sessionId===null)repos.createSession({ expectedWorkspaceRevision: 0 }, 'create-a', 'native-a', at);
   db.query(`INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_hash,preview_request_json,created_at,updated_at)
     VALUES(1,'import','host','imported','hash','{}',?,?)`).run(at, at);
   db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,
@@ -26,6 +26,7 @@ export function seedWorkspaceQueries(db: Database) {
       VALUES(?,1,?,'器械','浙江',100,'CNY','台','active',?,'[]','{}')`).run(id, id, `row-${id}`);
   }
   if(db.query("SELECT name FROM pragma_table_info('batches') WHERE name='cohort_json'").get())db.query("UPDATE batches SET cohort_json=(SELECT json_group_array(json_object('deviceId',id,'sourceDeviceId',source_device_id)) FROM devices) WHERE id=1").run();
+  if(repositories)db.query("UPDATE batches SET metadata_json=json_set(metadata_json,'$.referenceDate','2026-10-04','$.timezone','Asia/Shanghai') WHERE id=1").run();
   repos.updateWorkspace({ batchIds: [1] }, 1, at);
   const scope = repos.freezeAgentScope(repos.readWorkspace(), []);
   db.query(`INSERT INTO runs(id,session_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at)

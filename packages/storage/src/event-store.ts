@@ -13,6 +13,13 @@ export class SqliteEventStore implements EventStore {
   const owned=(table:string,id:number)=>!!this.db.query(`SELECT id FROM ${table} WHERE id=? AND run_id=? AND session_id=?`).get(id,draft.runId,draft.sessionId);
   if(draft.toolCallId!==null&&!owned('tool_calls',draft.toolCallId))fail(code);
   const p=draft.payload;
+  if(draft.type==='history_saved') {
+   const history=this.db.query<{storage_version:number;current_leaf_id:string|null;native_header_json:string|null},[number]>('SELECT storage_version,current_leaf_id,native_header_json FROM sessions WHERE id=?').get(draft.sessionId);
+   if(!history?.native_header_json||draft.payload.storageVersion>history.storage_version)fail(code);
+   if(draft.payload.nativeLeafId!==null&&!this.db.query('SELECT id FROM memories WHERE session_id=? AND native_entry_id=?').get(draft.sessionId,draft.payload.nativeLeafId))fail(code);
+   // Writes prove the committing position. Later reads prove the original event, not the current branch.
+   if(code==='storage_write_failed'&&(draft.payload.storageVersion!==history.storage_version||draft.payload.nativeLeafId!==history.current_leaf_id))fail(code);
+  }
   if(draft.type==='context_delivered'&&!this.db.query(`SELECT d.id FROM context_deliveries d JOIN model_calls c ON c.id=d.model_call_id WHERE d.snapshot_id=? AND c.call_id=? AND d.run_id=? AND d.session_id=?`).get(draft.payload.snapshotId,draft.payload.callId,draft.runId,draft.sessionId))fail(code);
   if('inputId' in p){const row=this.db.query<{run_id:number|null;target_run_id:number|null},[number,number]>('SELECT run_id,target_run_id FROM session_inputs WHERE id=? AND session_id=?').get(p.inputId,draft.sessionId);if(!row||(row.run_id??row.target_run_id)!==draft.runId||p.runId!==null&&row.run_id!==p.runId||p.targetRunId!==null&&row.target_run_id!==p.targetRunId)fail(code);}
   if('answerId' in p&&p.answerId!==null&&!owned('answers',p.answerId))fail(code);

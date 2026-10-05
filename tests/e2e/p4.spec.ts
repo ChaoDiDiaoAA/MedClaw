@@ -171,9 +171,14 @@ test.beforeAll(async () => {
   const hostEntry = join(temporary, 't06-host.ts');
   const sdkEntry = import.meta.resolve('@earendil-works/pi-coding-agent');
   // Isolated prototype observers preserve real Host and public SDK behavior. No production toggle.
+  // Structural fixture entries are appended after binding through P9's real collector,
+  // never injected again into a manager reconstructing an existing SQLite snapshot.
   writeFileSync(hostEntry, `import {existsSync,readFileSync,writeFileSync} from 'node:fs';
     import {SqliteToolStore} from ${JSON.stringify(join(root, 'packages/storage/src/tool-store.ts'))};
     import {QueryService} from ${JSON.stringify(join(root, 'packages/core/src/data/query-service.ts'))};
+    import {PiAgentRuntime} from ${JSON.stringify(join(root, 'packages/runtime-pi/src/agent-runtime.ts'))};
+    import {SqliteMemoryStore} from ${JSON.stringify(join(root, 'packages/storage/src/memory-store.ts'))};
+    import {canonicalRequest} from ${JSON.stringify(join(root, 'packages/contracts/src/run.ts'))};
     import {SessionManager} from ${JSON.stringify(sdkEntry)};
     const control=${JSON.stringify(temporary)}, faultFile=control+'/fault.json', release=control+'/release-fault';
     let executions=0;const changes=QueryService.prototype.changes;
@@ -186,14 +191,18 @@ test.beforeAll(async () => {
         writeFileSync(faultFile,JSON.stringify({runId:context.runId,sessionId:context.sessionId,toolId:call.id,queryId:query.id,resultHash:query.resultHash,nativeEntryId:entry,toolCallId:message.toolCallId,isError:message.isError,executions}));throw Error('storage_write_failed');
       }return delivery.call(this,context,entry,message);
     };
+    let seededManager,seedNative,seededOriginal;const load=SqliteMemoryStore.prototype.load;
+    SqliteMemoryStore.prototype.load=async function(id){const result=await load.call(this,id);if(result.ok&&result.data.nativeSessionId===seededOriginal?.nativeSessionId)writeFileSync(control+'/seed-observed.json',JSON.stringify({nativeSessionId:result.data.nativeSessionId,unchanged:canonicalRequest(result.data.entries)===seededOriginal.entries}));return result};
+    const allocate=PiAgentRuntime.prototype.allocate;
+    PiAgentRuntime.prototype.allocate=function(){const allocated=allocate.call(this);if(seededManager?.getSessionId()===allocated.nativeSessionId){const seed=seedNative,bind=allocated.bind;allocated.bind=id=>{bind(id);seed()};seededManager=undefined}return allocated};
     const factory=SessionManager.inMemory;
-    SessionManager.inMemory=function(...args){const manager=factory.apply(this,args);if(existsSync(control+'/seed-structure')){
+    SessionManager.inMemory=function(...args){const manager=factory.apply(this,args);if(args[2]===undefined&&existsSync(control+'/seed-structure')){seededManager=manager;seedNative=()=>{
       const secret='STRUCTURE-CANARY';manager.appendMessage({role:'user',content:[{type:'text',text:'ordinary seeded user',textSignature:secret},{type:'image',data:secret,mimeType:'image/png'}],timestamp:1});
       manager.appendMessage({role:'assistant',content:[{type:'text',text:'x'.repeat(8191)+'😀'+'\\u0000',textSignature:secret},{type:'thinking',thinking:secret,thinkingSignature:secret},{type:'toolCall',id:'seeded-read',name:'read',arguments:{path:secret},thoughtSignature:secret}],api:'openai-completions',provider:'seeded',model:'seeded',usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:'toolUse',timestamp:2});
       manager.appendMessage({role:'toolResult',toolName:'read',toolCallId:'seeded-read',content:[{type:'text',text:secret}],details:{path:secret,command:secret,file:secret,unknown:secret},isError:false,timestamp:3});
       manager.appendCustomEntry(secret,{private:secret});manager.appendCustomMessageEntry(secret,secret,true,{details:secret});
-      const original=JSON.stringify(manager.getEntries());const read=manager.getEntries.bind(manager);manager.getEntries=()=>{const entries=read();writeFileSync(control+'/seed-observed.json',JSON.stringify({nativeSessionId:manager.getSessionId(),unchanged:JSON.stringify(entries)===original}));return entries};
-    }return manager};
+      seededOriginal={nativeSessionId:manager.getSessionId(),entries:canonicalRequest(manager.getEntries())};
+    };}return manager};
     await import(${JSON.stringify(join(root, 'apps/host/src/main.ts'))});`);
   writeFileSync(join(evidenceDirectory, 'host-entry.ts'), readFileSync(hostEntry));
   const require = createRequire(join(root, 'apps/desktop/package.json')), electronPath: string = require('electron');
@@ -329,8 +338,8 @@ test('chat message pages reject late session, host and leaf replies', async () =
   await rules([{ method: 'session.messages.read', sessionId: a.id, hold: 'old-host', project: projection(a.id, a.nativeSessionId, 'HOST OLD', [entry('host-old', 'OLD HOST TEXT')]) }]); await refresh(); await entered('old-host');
   const host = await page.evaluate(() => window.medclaw.request('host.read', {})); if (!host.ok || !host.data.instanceId) throw new Error('No host');
   expect(await page.evaluate(instanceId => window.medclaw.request('host.restart', { expectedInstanceId: instanceId }), host.data.instanceId)).toMatchObject({ ok: true });
-  await expect(page.getByText('This session cannot continue after a restart. Create a new session.', { exact: true })).toBeVisible(); await release('old-host'); await expect(region()).not.toContainText('OLD HOST TEXT'); await expect(region()).not.toContainText('HOST OLD'); expect(httpCount).toBe(readHttpBefore);
-  expect(await page.evaluate(sessionId => window.medclaw.request('session.messages.read', { sessionId, leafId: null, afterEntryId: null, limit: 50 }), a.id)).toMatchObject({ ok: false, error: { code: 'resource_unavailable' } }); expect(httpCount).toBe(readHttpBefore);
+  await expect(region()).toContainText('Saved history'); await release('old-host'); await expect(region()).not.toContainText('OLD HOST TEXT'); await expect(region()).not.toContainText('HOST OLD'); expect(httpCount).toBe(readHttpBefore);
+  expect(await page.evaluate(sessionId => window.medclaw.request('session.messages.read', { sessionId, leafId: null, afterEntryId: null, limit: 50 }), a.id)).toMatchObject({ ok: true, data: {source:'sqlite_history'} }); expect(httpCount).toBe(readHttpBefore);
 });
 
 // Binding Stop and tool reads to the displayed B instead of the original active A breaks this test.
@@ -408,6 +417,7 @@ test('temporary output and saved messages remain separate while scrolling', asyn
   await page.locator('.messages').evaluate(element => { element.scrollTop = 200; element.dispatchEvent(new Event('scroll')); }); await expect(page.getByRole('button', { name: 'New content · Back to latest', exact: true })).toBeVisible();
   const facts = await page.evaluate(async () => ({ host: await window.medclaw.request('host.read', {}), active: await window.medclaw.request('run.active', {}) })); if (!facts.host.ok || !facts.active.ok || !facts.active.data) throw new Error('Missing original preview target');
   const previewTarget = await streamTarget(facts.active.data.runId); expect(previewTarget.snapshot.sessionId).toBe(a.id);
+  expect(await page.locator('.messages').evaluate(element => element.scrollTop), 'reading position before the injected preview').toBeCloseTo(200, 0);
   const currentSnapshot = { ...previewTarget.snapshot, revision: previewTarget.snapshot.revision + 100, phase: 'streaming' as const, blocks: [{ contentIndex: 0, text: 'New temporary preview while reading' }], totalChars: 'New temporary preview while reading'.length + 1, truncated: true };
   await app.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0]!.webContents.send('medclaw:notice', { type: 'event.stream', instanceId: value.instanceId, subscriptionId: value.subscriptionId, snapshot: value.snapshot }), { ...previewTarget, snapshot: currentSnapshot }); await expect(temporaryAnswer()).toHaveText('New temporary preview while reading'); expect(await page.locator('.messages').evaluate(element => element.scrollTop)).toBeCloseTo(200, 0); await expect(region()).not.toContainText('New temporary preview');
   await page.getByRole('button', { name: 'Models', exact: true }).click(); const previewHiddenTop = await page.locator('.messages').evaluate(element => element.scrollTop), previewHiddenReads = (await calls()).filter(call => call.method === 'session.messages.read').length;
@@ -545,7 +555,7 @@ test('tool success survives failed delivery without a falsely consumed message o
 });
 
 test('actual same-text submissions, cursors and native structural omission remain model-free on reads', async () => {
-  const a = await create(); await expect(region()).toContainText('No native messages'); const empty = await messages(a.id); expect(empty).toMatchObject({ source: 'native_memory', leafId: null, items: [], hasMore: false });
+  const a = await create(); await expect(region()).toContainText('No native messages'); const empty = await messages(a.id); expect(empty).toMatchObject({ source: 'sqlite_history', leafId: null, items: [], hasMore: false });
   const before = httpCount, text = 'P4-SAME-ACTUAL-TEXT';
   arm([wire => { expect(wire.messages.filter(message => message.role === 'user' && JSON.stringify(message.content).includes(text))).toHaveLength(1); return { text: 'P4-SAME-FIRST' }; }, wire => { expect(wire.messages.filter(message => message.role === 'user' && JSON.stringify(message.content).includes(text))).toHaveLength(2); return { text: 'P4-SAME-SECOND' }; }, () => ({ text: 'P4-CURSOR-B' })]);
   const one = await send(text), two = await send(text); expect(one.origin.clientSequence).not.toBe(two.origin.clientSequence); expect(one.run.id).not.toBe(two.run.id); const nativeA = await messages(a.id); const users = nativeA.items.filter(item => item.displayRole === 'user' && item.text === text); expect(users).toHaveLength(2); expect(new Set(users.map(item => item.nativeEntryId)).size).toBe(2); expect(users.map(item => item.runId)).toEqual([one.run.id, two.run.id]); await refresh(); await expect(region().getByText(text, { exact: true })).toHaveCount(2);

@@ -1,3 +1,4 @@
+import { nativeHistoryFixture } from '../fixtures/p9-memory';
 import { expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -52,9 +53,8 @@ test('Pi session freezes result limits and rebuilds only for actual tool Schema 
         execute: async (input: PageInput, context: ToolExecutionContext) => { observed.push({ ceiling: configuration.maxResultBytes, pageSize: input.pageSize, contextCeiling: context.toolConfiguration!.maxResultBytes }); return configuration.maxResultBytes; } }]);
       return { registry, executor: new ToolExecutor(registry, recorder) };
     };
-    agent = new PiAgentRuntime(runtime, root, { ...configure(TOOL_CONFIG), recorder, configure });
-    const native = agent.allocate(); native.bind(1);
-    const nativeSessionId = native.nativeSessionId;
+    const history=nativeHistoryFixture();agent = new PiAgentRuntime(runtime, root, history.history, { ...configure(TOOL_CONFIG), recorder, configure });
+    const nativeSessionId = history.bind(agent,1).nativeSessionId;
     const scope = RunScopeSchema.parse({ batchIds: [], deviceIds: null, allowedToolNames: agent.toolNames, allowedResourceRefs: [], artifactIds: [], readOnly: true });
     const workspaceContext = WorkspaceContextSchema.parse({ revision: 1, sessionId: 1, materialVersion: null,
       batchRefs: [], deviceIds: [], queryId: null, activeView: 'data', selection: null });
@@ -62,8 +62,9 @@ test('Pi session freezes result limits and rebuilds only for actual tool Schema 
     let runId = 0;
     const execute = async (configuration: ToolConfiguration, controller = new AbortController()) => {
       db.query("INSERT INTO runs VALUES(?,1,'running',?,?,'2026-01-01','Asia/Shanghai')").run(++runId, JSON.stringify(scope), JSON.stringify(workspaceContext));
-      return agent!.execute({ runId, sessionId: 1, text: `run-${runId}`, resolved, agentOptions: agent!.describe(resolved), scope, workspaceContext, referenceDate: '2026-01-01', timezone: 'Asia/Shanghai', toolConfiguration: configuration,
+      const result=await agent!.execute({ runId, sessionId: 1, text: `run-${runId}`, resolved, agentOptions: agent!.describe(resolved), scope, workspaceContext, referenceDate: '2026-01-01', timezone: 'Asia/Shanghai', toolConfiguration: configuration,
         signal: controller.signal, deadlineAt: performance.now() + 10000 }, { startCall: () => ({ finish: (outcome, endedAt) => ({ callId: `run-${runId}-call`, state: outcome.callState, responseModel: outcome.responseModel, sdkStopReason: outcome.sdkStopReason === 'pending' ? null : outcome.sdkStopReason, endedAt, durationMs: 1, inputTokens: outcome.usage.inputTokens, outputTokens: outcome.usage.outputTokens, cost: outcome.usage.cost, costCurrency: outcome.usage.costCurrency, usageSource: outcome.usage.source, unavailableReason: outcome.usage.unavailableReason, error: outcome.error }) }), preview: () => {}, nativeTerminal: () => {} });
+      if(result.history){history.saveFinal(agent!,result);agent!.releaseInputFacts(runId);agent!.releaseToolFacts(runId);}return result;
     };
     const binding = () => (Reflect.get(agent!, 'sessions') as Map<number, { session: AgentSession; manager: { getSessionId(): string } }>).get(1)!;
     expect((await execute(first)).lastOutcome).toMatchObject({ text: 'Done', error: null });
@@ -80,7 +81,7 @@ test('Pi session freezes result limits and rebuilds only for actual tool Schema 
     expect(observed[2]).toEqual({ ceiling: 3072, pageSize: 50, contextCeiling: 3072 });
     expect(JSON.stringify(requests[4]!.messages)).toContain('run-1');
     expect(JSON.stringify(requests[4]!.messages)).toContain('run-2');
-    expect(agent.read(1).messages.filter(message => message.role === 'user').map(message => message.text)).toEqual(['run-1', 'run-2', 'run-3']);
+    expect((await agent.read(1)).messages.filter(message => message.role === 'user').map(message => message.text)).toEqual(['run-1', 'run-2', 'run-3']);
     const thirdSession = binding().session, fourth = { ...TOOL_CONFIG, maxResultBytes: 4096 };
     expect((await execute(fourth)).lastOutcome?.error).toBeNull();
     expect(binding().session).toBe(thirdSession);
@@ -94,7 +95,7 @@ test('Pi session freezes result limits and rebuilds only for actual tool Schema 
     expect(candidateDisposal).toHaveBeenCalledTimes(1);
     candidateDisposal?.mockRestore();
     expect(binding().session).toBe(preserved);
-    expect(agent.read(1).available).toBe(true);
+    expect((await agent.read(1)).available).toBe(true);
     schemaVersion = 2;
     expect((await execute(fourth)).lastOutcome?.error).toBeNull();
     expect(binding().session).toBe(preserved);

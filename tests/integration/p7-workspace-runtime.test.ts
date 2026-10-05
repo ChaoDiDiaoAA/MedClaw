@@ -1,3 +1,4 @@
+import { sqliteHistory, nativeHistoryFixture } from '../fixtures/p9-memory';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -177,7 +178,7 @@ import type { RuntimeNotice } from '../../packages/contracts/src/protocol';
 // Break caught: RuntimeService loses accepted selection, tools read live Workspace, or Query commit loses its frozen parent.
 test('production accepted Input and Run preserve selected Query row through real tools, provider wire, and Query commit', async () => {
   const root = await mkdtemp(join(tmpdir(), 'medclaw-p7-production-')), db = openDatabase(join(root, 'app.sqlite'));
-  const repo = new Repositories(db), at = new Date().toISOString(), requests: Record<string, unknown>[] = [], gates: ReturnType<typeof deferred>[] = [];
+  const repo = new Repositories(db,undefined,undefined,undefined,sqliteHistory(db).store), at = new Date().toISOString(), requests: Record<string, unknown>[] = [], gates: ReturnType<typeof deferred>[] = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     requests.push(await request.json() as Record<string, unknown>); const index = requests.length - 1, gate = deferred(); gates.push(gate); await gate.promise;
     const calls = index === 0 ? [{ index: 0, id: 'scope-root', type: 'function', function: { name: 'read_data_scope', arguments: '{}' } }]
@@ -206,8 +207,8 @@ test('production accepted Input and Run preserve selected Query row through real
   const credentials = new InMemoryCredentialStore(); await credentials.modify('p7-production', async () => ({ type: 'api_key', key: 'fixture' }));
   const runtime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
   const definition = { providerId: 'p7-production', name: 'Fixture', api: 'openai-completions', baseUrl: `http://127.0.0.1:${server.port}/v1`, models: [{ id: 'fixture', name: 'Fixture', input: ['text' as const], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true as const, pricingKnown: false, cost: null }] };
-  await runtime.installCustom([definition]); agent = new PiAgentRuntime(runtime, root, { registry, recorder, executor });
-  const native = agent.allocate(), session = repo.createSession({ expectedWorkspaceRevision: 0 }, 'create', native.nativeSessionId, at).session; native.bind(session.id);
+  await runtime.installCustom([definition]); agent = new PiAgentRuntime(runtime, root, sqliteHistory(db), { registry, recorder, executor });
+  const native = agent.allocate(), session = repo.createSession({ expectedWorkspaceRevision: 0 }, 'create', native.nativeSessionId, at,native.history).session; native.bind(session.id);
   repo.updateWorkspace({ batchIds: [1] }, repo.readWorkspace().revision, at);
   const priorScope = repo.freezeAgentScope(repo.readWorkspace(), agent.toolNames ?? []);
   db.query(`INSERT INTO runs(id,session_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at)
@@ -255,8 +256,8 @@ test('production accepted Input and Run preserve selected Query row through real
 test('production tool context without an accepted frozen workspace fails closed with state_conflict', async () => {
   const c = await fixture(), d = await databaseFixture(), faults: string[] = [], abort = new AbortController();
   const registry = new ToolRegistry([createReadDataScopeTool({ catalog: new CatalogService({ batches: [], devices: [], snapshots: [], changes: [] }) })]);
-  const recorder = new ToolRecorder(new SqliteToolStore(d.db)), agent = new PiAgentRuntime(c.runtime, c.root, { registry, recorder, executor: new ToolExecutor(registry, recorder) });
-  agent.allocate().bind(d.context.sessionId);
+  const recorder = new ToolRecorder(new SqliteToolStore(d.db)), history=nativeHistoryFixture(),agent = new PiAgentRuntime(c.runtime, c.root, history.history, { registry, recorder, executor: new ToolExecutor(registry, recorder) });
+  history.bind(agent,d.context.sessionId);
   const running = agent.execute({ runId: d.context.runId, sessionId: d.context.sessionId, text: 'scope', resolved: c.resolved, agentOptions: agent.describe(c.resolved), scope,
     referenceDate: '2026-01-01', timezone: 'Asia/Shanghai', signal: abort.signal, deadlineAt: performance.now() + 10000 }, {
     startCall: time => new ModelCallRecorder(d.repo, d.context.runId, 'main', time), preview: () => {}, nativeTerminal: () => {}, fatal: error => { faults.push(error.code); abort.abort(); },

@@ -4,7 +4,7 @@ export const PositiveIdSchema = z.number().int().positive().max(Number.MAX_SAFE_
 export const OpaqueIdSchema = z.string().min(1).max(256).regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/);
 export const TimestampSchema = z.string().datetime({ offset: true }).max(64);
 export const ErrorCategorySchema = z.enum(["provider", "runtime", "tool", "session", "storage", "input", "extension", "internal"]);
-export const ErrorReasonSchema = z.enum(["runtime_busy", "workspace_revision_mismatch", "session_not_found", "session_deleted", "session_metadata_revision_mismatch", "message_cursor_invalid", "input_cursor_invalid", "host_interrupted"]);
+export const ErrorReasonSchema = z.enum(["runtime_busy", "workspace_revision_mismatch", "session_not_found", "session_deleted", "session_metadata_revision_mismatch", "message_cursor_invalid", "input_cursor_invalid", "host_interrupted", "checkpoint_invalid", "history_version_mismatch", "session_restore_failed"]);
 
 export const EventRangeErrorSchema = z.strictObject({ runId: PositiveIdSchema, firstSequence: PositiveIdSchema.nullable(), lastSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), resumeAfterSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable() }).refine(value => (value.firstSequence === null ? value.lastSequence === 0 : value.firstSequence <= value.lastSequence) && (value.resumeAfterSequence === null || value.resumeAfterSequence <= value.lastSequence));
 export type EventRangeError = z.infer<typeof EventRangeErrorSchema>;
@@ -30,6 +30,7 @@ export const resultSchema = <S extends z.ZodType>(data: S) => z.discriminatedUni
 ]);
 
 const errorDefinitions = {
+  answer_evidence_invalid: ['runtime', 'Final answer references cannot be verified. Read the original saved query facts.', false],
   context_delivery_unsupported: ['provider', 'Context delivery cannot be verified for this model API.', false],
   context_payload_mismatch: ['runtime', 'The final model payload does not contain the saved context.', false],
   context_projection_too_large: ['input', 'The required context exceeds the delivery limit. Select fewer materials.', false],
@@ -56,14 +57,14 @@ const errorDefinitions = {
   input_cancel_unconfirmed: ["runtime", "Input cancellation is unconfirmed. Read the original input or stop its run.", false],
   input_hook_handled: ["input", "The input was handled before native consumption.", false],
   input_invalid: ["input", "The input object is invalid. Check it and try again.", false],
-  session_history_invalid: ["session", "This session's in-process history is unavailable. Create a new session.", false],
+  session_history_invalid: ["session", "The saved session history is invalid or was never recorded. Read its original records before starting a new session.", false],
   resource_unavailable: ["session", "The required session history or message structure is unavailable. Read the original saved facts.", false],
   runtime_interrupted: ["runtime", "The run ended because the Host was interrupted. The original request will not be resent automatically.", false],
   state_conflict: ["runtime", "The original operation identity does not match these parameters.", false],
   workspace_revision_mismatch: ["session", "The current view has changed. Read it again before selecting.", true],
   session_not_found: ["session", "Session not found.", false],
-  session_history_unavailable: ["session", "This session's in-process history is no longer available. Create a new session.", false],
-  native_state_invalid: ["session", "This session's native state is unconfirmed. Create a new session.", false],
+  session_history_unavailable: ["session", "The saved session history is unavailable. Read the original session records.", false],
+  native_state_invalid: ["session", "The session instance cannot continue yet. Restore the current saved position explicitly.", false],
   stop_unconfirmed: ["runtime", "Execution has not been confirmed stopped. A new run cannot start yet.", true],
   agent_response_unsupported: ["runtime", "The model returned a tool or deferred response that is unsupported at this stage.", false],
   agent_call_limit: ["runtime", "The run reached its model request limit. Review the saved results before starting a new run.", false],
@@ -133,6 +134,9 @@ export function safeError(code: string, _native?: unknown, context: ErrorContext
   if (safeCode === "state_conflict" && error.reason === "workspace_revision_mismatch") error.message = errorDefinitions.workspace_revision_mismatch[1];
   if (safeCode === "state_conflict" && error.reason === "session_deleted") error.message = 'This session has been deleted. Its original records remain available for reading.';
   if (safeCode === "state_conflict" && error.reason === "session_metadata_revision_mismatch") error.message = 'The session details have changed. Read the current session before trying again.';
+  if (safeCode === 'state_conflict' && error.reason === 'history_version_mismatch') error.message = 'The saved history position has changed. Read it again before restoring.';
+  if (safeCode === 'session_history_invalid' && error.reason === 'checkpoint_invalid') error.message = 'This entry is not an eligible saved user turn in this session.';
+  if (safeCode === 'resource_unavailable' && error.reason === 'session_restore_failed') error.message = 'The saved history position is preserved, but this session cannot continue yet. Restore the session explicitly.';
   if (safeCode === "input_invalid" && error.reason === "session_not_found") error.message = errorDefinitions.session_not_found[1];
   if (safeCode === "runtime_interrupted") error.reason = "host_interrupted";
   return error;

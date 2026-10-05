@@ -190,7 +190,7 @@ test("healthy empty history differs from unavailable or invalid native history",
     expect(() => project(manager, request(), new Map())).toThrow(expect.objectContaining({ code: "session_history_invalid" }));
   }
   const legal = native(), first = user(legal, "first root"); legal.resetLeaf();
-  expect(() => project(legal, request(), new Map())).toThrow(expect.objectContaining({ code: "resource_unavailable" }));
+  expect(project(legal, request(), new Map())).toMatchObject({leafId:null,items:[],hasMore:false,nextEntryId:null});
   expect(project(legal, request({ leafId: first }), new Map()).items[0]?.text).toBe("first root");
   const second = user(legal, "second root");
   expect(project(legal, request({ leafId: first }), new Map()).items[0]?.text).toBe("first root");

@@ -6,20 +6,25 @@ import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, safe
 import { ToolSdkDeliverySchema } from "../../contracts/src/tool";
 import { ToolControlObservationSchema } from "../../contracts/src/model";
 import { SqliteInputStore } from "./input-store";
+import type { SqliteMemoryStore } from './memory-store';
 import { SqliteEventStore } from './event-store';
 import { SqliteWriteTransactions } from './write-transactions';
 import { verifyPriorContextFacts } from './context-store';
 import { ModelCallContextSchema, type StartCallContext } from '../../contracts/src/context';
 import type { EventWriter, RegisteredEventDraft, RegisteredEventPayload } from '../../contracts/src/event';
-import { InputContentSchema, type PreparedInput, type InputStore, type InputCancelProof, type InputSettlementProof, type ReadInputRequest, type ListInputsRequest } from "../../contracts/src/session";
+import { RegisteredEventPayloadSchema } from '../../contracts/src/event';
+import { NATIVE_HISTORY_FORMAT, InputContentSchema, type NativeHistoryCommit, type InitialNativeHistory, type PreparedInput, type InputStore, type InputCancelProof, type InputSettlementProof, type ReadInputRequest, type ListInputsRequest } from "../../contracts/src/session";
 import { SqliteToolStore } from "./tool-store";
 import { SqliteCatalogStore } from './catalog-store';
+import { HistorySourceStore } from './history-source-store';
 import { readWorkspaceBatchReferences, readWorkspaceQuery, validateWorkspaceSelection, freezeWorkspaceScope } from './workspace-selection';
 import type { QueryRecord } from '../../contracts/src/query';
 import { RenameSessionInputSchema, DeleteSessionInputSchema, ReadManagementOperationInputSchema, SessionManagementDetailsSchema, SessionManagementReceiptSchema,
   type RenameSessionInput, type DeleteSessionInput, type ReadManagementOperationInput, type SessionManagementReceipt, type SessionManagementDetails,
   NewSessionInputSchema, NewSessionResultSchema, SelectSessionInputSchema, SessionViewSchema, ListSessionsRequestSchema, SubmitInputSchema, ReadSubmissionRequestSchema,
   type NewSessionInput, type NewSessionResult, type SelectSessionInput, type SessionView, type SessionPage, type ReadSubmissionRequest, type SubmitResult, type SessionStore } from "../../contracts/src/session";
+import { ReadSessionCheckpointsInputSchema, RestoreSessionCheckpointInputSchema, SessionCheckpointDetailsSchema, SessionCheckpointPageSchema,
+  type ReadSessionCheckpointsInput,type RestoreSessionCheckpointInput,type SessionCheckpointReceipt,type SessionCheckpointDetails,type NativeHistorySnapshot } from '../../contracts/src/session';
 import { WorkspaceStateSchema, WorkspaceViewSchema, WorkspaceChangeSchema, RevisionSchema, toWorkspaceContext, type WorkspaceState, type WorkspaceSelection, type WorkspaceView, type WorkspaceChange, type BatchRef, type WorkspaceStore, type WorkspaceInspection, type WorkspaceNotice } from "../../contracts/src/workspace";
 import { businessToolSchemas } from "../../contracts/src/business-tools";
 import { StoredToolConfigurationSchema } from '../../contracts/src/tool-config';
@@ -64,7 +69,7 @@ const agentConfigSchema = z.strictObject({ selection: ModelSelectionSchema, poli
   measurementContext: MeasurementContextSchema.optional(),
   toolProfileSnapshot: ToolProfileSnapshotSchema.optional(),
   referenceDate: z.string(), timezone: z.string(), agent: P2AgentOptionsSchema.extend({ stage: z.enum(["P2", "P3"]), nativeSessionId: OpaqueIdSchema,
-    tools: z.array(z.string()), autoCompaction: z.literal(false), autoRetry: z.literal(false), cacheWarming: z.literal("off"), contextContract: z.literal('medclaw.context/v1').optional() }) });
+    tools: z.array(z.string()), autoCompaction: z.literal(false), autoRetry: z.literal(false), cacheWarming: z.literal("off"), contextContract: z.literal('medclaw.context/v1').optional(),historyContract:z.literal('medclaw.history/p9-v1').optional() }) });
 const commonConfigSchema = z.object({ selection: ModelSelectionSchema, policy: RequestPolicySchema });
 const savedDeliverySchema = z.object({ contract: z.literal("medclaw.tool-delivery/v1"), resultRecorded: z.boolean(), sdkReturned: z.boolean(),
   nativeEntryId: OpaqueIdSchema.nullable(), deliveredAt: TimestampSchema.nullable(), nextModelCallId: z.string().min(1).nullable(), consumedAt: TimestampSchema.nullable(),
@@ -111,7 +116,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   private readonly batchLifecycle:boolean;
   private readonly events: EventWriter | undefined;
   constructor(private readonly db: Database, private readonly beforeCommit?: () => void, events?: EventWriter,
-    private readonly transactions = SqliteWriteTransactions.forDatabase(db)) {
+    private readonly transactions = SqliteWriteTransactions.forDatabase(db),private readonly memory?:SqliteMemoryStore) {
     this.events = events ?? (db.query("SELECT name FROM sqlite_schema WHERE name='runtime_events'").get() ? new SqliteEventStore(db, transactions) : undefined);
     this.inputs = new SqliteInputStore(db, this.events);
     this.p5 = db.query("SELECT name FROM sqlite_schema WHERE name='session_inputs'").get() !== null;
@@ -196,7 +201,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const inputId=Number(saved.lastInsertRowid);
       if(plan.execution.mode==='send'){
         const run=plan.execution.run;checked(OpaqueIdSchema,run.instanceId);timestamp(run.createdAt);
-        const config=checked(agentConfigSchema,{selection:run.model,policy:run.policy,referenceDate:run.referenceDate,timezone:run.timezone,...(run.agentPolicy?{agentPolicy:run.agentPolicy}:{}),...(run.runtimeConfiguration?{runtimeConfiguration:run.runtimeConfiguration}:{}),...(run.toolConfiguration?{toolConfiguration:run.toolConfiguration}:{}),...(run.measurementContext?{measurementContext:run.measurementContext}:{}),...(run.toolProfileSnapshot?{toolProfileSnapshot:run.toolProfileSnapshot}:{}),agent:{...run.agentOptions,stage:run.scope.allowedToolNames.length?'P3':'P2',nativeSessionId:session.nativeSessionId,tools:run.scope.allowedToolNames,autoCompaction:false,autoRetry:false,cacheWarming:'off',...(run.contextContract?{contextContract:run.contextContract}:{})}});
+        const config=checked(agentConfigSchema,{selection:run.model,policy:run.policy,referenceDate:run.referenceDate,timezone:run.timezone,...(run.agentPolicy?{agentPolicy:run.agentPolicy}:{}),...(run.runtimeConfiguration?{runtimeConfiguration:run.runtimeConfiguration}:{}),...(run.toolConfiguration?{toolConfiguration:run.toolConfiguration}:{}),...(run.measurementContext?{measurementContext:run.measurementContext}:{}),...(run.toolProfileSnapshot?{toolProfileSnapshot:run.toolProfileSnapshot}:{}),agent:{...run.agentOptions,stage:run.scope.allowedToolNames.length?'P3':'P2',nativeSessionId:session.nativeSessionId,tools:run.scope.allowedToolNames,autoCompaction:false,autoRetry:false,cacheWarming:'off',...(run.contextContract?{contextContract:run.contextContract}:{}),...(run.historyContract?{historyContract:run.historyContract}:{})}});
         const r=this.db.query("INSERT INTO runs(session_id,input_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at) VALUES(?,?,'agent',?,NULL,NULL,NULL,'created','answer',?,?,?,?,?,?,?)").run(session.id,inputId,run.instanceId,content.text,JSON.stringify(config),JSON.stringify(run.scope),JSON.stringify(frozenWorkspace),run.referenceDate,run.timezone,run.createdAt);target=Number(r.lastInsertRowid);
         this.db.query('UPDATE session_inputs SET target_run_id=? WHERE id=? AND target_run_id IS NULL').run(target,inputId);
         this.runLifecycle(this.row(target)!, 'run_created', run.createdAt);
@@ -252,6 +257,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       output,
       calls: row.kind === "provider" ? calls : calls.slice(callOffset, callOffset + callLimit), persistence: "committed",
       ...(agent ? { clientSequence: rootInput?.client_sequence ?? row.submission_client_sequence, nativeSessionId: agent.agent.nativeSessionId,
+        answerNativeLeafId:this.p3 ? this.db.query<{native_leaf_id:string|null},[number]>('SELECT native_leaf_id FROM answers WHERE run_id=?').get(row.id)?.native_leaf_id??null : null,
         nextCallOffset: callOffset + callLimit < calls.length ? callOffset + callLimit : null,
         control: agent.runtimeConfiguration || agent.toolConfiguration || agent.agentPolicy || agent.measurementContext || agent.toolProfileSnapshot ? {
           runtimeConfiguration: agent.runtimeConfiguration ?? null,
@@ -275,11 +281,13 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   findOperation(operationRef: string): StoredOperation | null {
     checked(OpaqueIdSchema, operationRef);
     if(this.batchLifecycle&&this.db.query('SELECT id FROM data_deletions WHERE operation_ref=?').get(operationRef))fail('state_conflict');
+    if(this.p3&&this.db.query('SELECT id FROM imports WHERE operation_ref=?').get(operationRef))fail('state_conflict');
     const sources=["SELECT id FROM sessions WHERE creation_operation_ref=?1","SELECT id FROM runs WHERE submission_operation_ref=?1 OR (kind='provider' AND json_extract(config_json,'$.providerRequest.operationRef')=?1)"];
     if(this.p5)sources.push("SELECT id FROM session_inputs WHERE operation_ref=?1");
-    if(this.p3)sources.push("SELECT id FROM business_events WHERE operation_ref=?1 AND type IN ('session_renamed','session_deleted')");
+    if(this.p3)sources.push("SELECT id FROM business_events WHERE operation_ref=?1 AND type IN ('session_renamed','session_deleted','session_checkpoint_restored')");
     const count=this.db.query<{n:number},[string]>(`SELECT COUNT(*) AS n FROM (${sources.join(' UNION ALL ')})`).get(operationRef)!.n;
     if(count>1)fail('state_conflict');
+    if(this.p3){const checkpoint=this.readCheckpointOperation(operationRef);if(checkpoint)return {method:'session.restoreCheckpoint',operationRef,originalRequest:checkpoint.request,result:checkpoint.receipt};}
     if(this.p3){const management=this.managementDetails(operationRef);if(management){const {receipt,originalRequest}=management;
       if(receipt.method==='session.rename'&&'title' in originalRequest)return {method:receipt.method,operationRef,originalRequest,result:receipt};
       if(receipt.method==='session.delete'&&'expectedWorkspaceRevision' in originalRequest)return {method:receipt.method,operationRef,originalRequest,result:receipt};
@@ -436,10 +444,10 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     }
   }
 
-  private saveWorkspace(old: WorkspaceState, candidate: WorkspaceState, time: string): WorkspaceState {
+  private saveWorkspace(old: WorkspaceState, candidate: WorkspaceState, time: string, forceRevision=false): WorkspaceState {
     const next = checked(WorkspaceStateSchema, candidate);
     const semantic=(state:WorkspaceState)=>({...state,batchRefs:[...state.batchRefs].sort((a,b)=>a.id-b.id),deviceIds:[...state.deviceIds].sort((a,b)=>a-b)});
-    if (isDeepStrictEqual(semantic(old), semantic(next))) return old;
+    if (!forceRevision&&isDeepStrictEqual(semantic(old), semantic(next))) return old;
     if (old.revision === Number.MAX_SAFE_INTEGER) fail('state_conflict');
     next.revision = old.revision + 1;
     const saved = this.p3 ? this.db.query(`UPDATE workspace SET active_session_id=?,material_version=?,batch_refs_json=?,device_ids_json=?,active_query_id=?,active_view=?,selection_json=?,revision=?,updated_at=? WHERE id=1 AND revision=?`)
@@ -487,11 +495,11 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
 
   readSession(sessionId: number): SessionView | null {
     id(sessionId);
-    const row = this.db.query<{ id: number; native_session_id: string; title: string; kind: string; status: string; storage_version: number; metadata_json:string; metadata_revision?:number; deleted_at?:string|null }, [number]>("SELECT * FROM sessions WHERE id=?").get(sessionId);
+    const row = this.db.query<{ id: number; native_session_id: string; title: string; kind: string; status: string; storage_version: number; current_leaf_id?:string|null; metadata_json:string; metadata_revision?:number; deleted_at?:string|null }, [number]>("SELECT * FROM sessions WHERE id=?").get(sessionId);
     if (!row) return null;
     const sequence = this.db.query<{ n: number | null }, [number]>(this.p5 ? "SELECT MAX(n) AS n FROM (SELECT submission_client_sequence AS n FROM runs WHERE session_id=?1 UNION ALL SELECT client_sequence AS n FROM session_inputs WHERE session_id=?1)" : "SELECT MAX(submission_client_sequence) AS n FROM runs WHERE session_id=?").get(sessionId)?.n ?? 0;
     return checked(SessionViewSchema, { id: row.id, title: this.sessionTitle(row), metadataRevision:row.metadata_revision??0, deletedAt:row.deleted_at??null, nativeSessionId: row.native_session_id, kind: row.kind, status: row.status,
-      inputControl: null, storageVersion: row.storage_version, leafId: null, nextSubmissionSequence: sequence + 1 }, "storage_read_failed");
+      inputControl: null, storageVersion: row.storage_version, leafId: row.current_leaf_id??null, nextSubmissionSequence: sequence + 1 }, "storage_read_failed");
   }
 
   private sessionTitle(row:{id:number;title:string;metadata_json:string}):string {
@@ -502,6 +510,69 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   private assertSessionActive(session:SessionView):void {
     if(session.status==='deleted')throw safeError('state_conflict',undefined,{reason:'session_deleted'});
     if(session.kind!=='user')fail('access_denied');
+  }
+  private checkpointHistory(sessionId:number) {
+    if(!this.memory)fail('session_history_invalid');return this.memory.loadInTransaction(sessionId);
+  }
+  private checkpointPath(history:NativeHistorySnapshot,leaf:string|null):Set<string> {
+    const entries=new Map((history.entries as {id:string;parentId:string|null}[]).map(entry=>[entry.id,entry])),path=new Set<string>();
+    while(leaf!==null){const entry=entries.get(leaf);if(!entry||path.has(leaf))fail('session_history_invalid');path.add(leaf);leaf=entry.parentId;}
+    return path;
+  }
+  private eligibleCheckpoints(history:NativeHistorySnapshot) {
+    // ponytail: O(Session history + answers); page the candidate scan if measured long histories make reads slow.
+    const entries=new Map((history.entries as {id:string;parentId:string|null;type:string;message?:{role:string;stopReason?:string;content:{type:string}[]}}[]).map(entry=>[entry.id,entry]));
+    const rows=this.db.query<{id:number;run_id:number;input_id:number;text:string;native_leaf_id:string;created_at:string;input_text:string;native_entry_id:string;cleanup_json:string},[number]>(`SELECT a.*,r.input_text,r.cleanup_json,i.native_entry_id FROM answers a
+      JOIN runs r ON r.id=a.run_id AND r.session_id=a.session_id AND r.kind='agent' AND r.status='completed'
+      JOIN session_inputs i ON i.id=a.input_id AND i.id=r.input_id AND i.session_id=a.session_id AND i.run_id=r.id AND i.status='consumed' AND i.processing_status='completed'
+      WHERE a.session_id=? AND a.native_leaf_id IS NOT NULL ORDER BY a.id DESC`).all(history.sessionId);
+    return rows.filter(row=>{
+      const cleanup=RunCleanupRecordSchema.safeParse(decoded(row.cleanup_json));
+      if(!cleanup.success||cleanup.data.stopConfirmed!==true||cleanup.data.requiredPersistenceComplete!==true||cleanup.data.inputsSettled!==true||cleanup.data.resourcesReleased!==true||cleanup.data.unconfirmedItems.length)return false;
+      const path=this.checkpointPath(history,row.native_leaf_id),user=entries.get(row.native_entry_id);
+      if(!user||user.type!=='message'||user.message?.role!=='user'||!path.has(user.id))return false;
+      const assistant=[...path].map(id=>entries.get(id)!).find(entry=>entry.type==='message');
+      if(!assistant||assistant.message?.role!=='assistant'||!['stop','length'].includes(assistant.message.stopReason??'')||assistant.message.content.some(part=>part.type==='toolCall'))return false;
+      return !!this.db.query('SELECT id FROM memories WHERE session_id=? AND native_entry_id=? AND run_id=?').get(history.sessionId,assistant.id,row.run_id)
+        &&!!this.db.query('SELECT id FROM memories WHERE session_id=? AND native_entry_id=? AND run_id=?').get(history.sessionId,user.id,row.run_id);
+    });
+  }
+  readCheckpoints(input:ReadSessionCheckpointsInput) {
+    const request=checked(ReadSessionCheckpointsInputSchema,input);
+    return this.inputRead(()=>this.db.transaction(()=>{
+      const session=this.readSession(request.sessionId);if(!session)fail('session_not_found');if(session.kind!=='user')fail('access_denied');
+      const history=this.checkpointHistory(session.id),eligible=this.eligibleCheckpoints(history),current=this.checkpointPath(history,history.activeLeafId);
+      if(request.afterAnswerId!==null&&!eligible.some(row=>row.id===request.afterAnswerId))throw safeError('session_history_invalid',undefined,{reason:'checkpoint_invalid'});
+      const rows=eligible.filter(row=>request.afterAnswerId===null||row.id<request.afterAnswerId),page=rows.slice(0,request.limit),hasMore=rows.length>request.limit;
+      return checked(SessionCheckpointPageSchema,{sessionId:session.id,storageVersion:history.storageVersion,items:page.map(row=>({answerId:row.id,runId:row.run_id,nativeLeafId:row.native_leaf_id,committedAt:row.created_at,questionSummary:safePreview(row.input_text,512).text,answerSummary:safePreview(row.text,512).text,conditionSummary:null,isCurrentBranch:current.has(row.native_leaf_id)})),nextAnswerId:hasMore?page.at(-1)!.id:null,hasMore},'storage_read_failed');
+    }).deferred());
+  }
+  readCheckpointOperation(operationRef:string):{request:RestoreSessionCheckpointInput;receipt:SessionCheckpointReceipt}|null {
+    checked(OpaqueIdSchema,operationRef);
+    return this.inputRead(()=>{
+      const rows=this.db.query<{session_id:number|null;actor:string;run_id:number|null;import_id:number|null;query_id:number|null;artifact_id:number|null;details_json:string;occurred_at:string},[string]>("SELECT * FROM business_events WHERE operation_ref=? AND type='session_checkpoint_restored'").all(operationRef);
+      if(rows.length>1)fail('storage_read_failed');const row=rows[0];if(!row)return null;
+      const details=checked(SessionCheckpointDetailsSchema,decoded(row.details_json),'storage_read_failed');
+      if(row.actor!=='user'||row.session_id!==details.receipt.sessionId||details.receipt.operationRef!==operationRef||row.occurred_at!==details.receipt.committedAt
+        ||row.run_id!==null||row.import_id!==null||row.query_id!==null||row.artifact_id!==null||!this.readSession(details.receipt.sessionId))fail('storage_read_failed');
+      return {request:details.request,receipt:details.receipt};
+    });
+  }
+  restoreCheckpointInTransaction(input:RestoreSessionCheckpointInput,operationRef:string,time:string):SessionCheckpointReceipt {
+    this.transactions.assertActive();const request=checked(RestoreSessionCheckpointInputSchema,input);checked(OpaqueIdSchema,operationRef);timestamp(time);
+    const prior=this.findOperation(operationRef);if(prior){if(prior.method!=='session.restoreCheckpoint'||canonicalRequest(prior.originalRequest)!==canonicalRequest(request))fail('state_conflict');return prior.result;}
+    const session=this.readSession(request.sessionId);if(!session)fail('session_not_found');this.assertSessionActive(session);const workspace=this.readWorkspace();
+    if(workspace.revision!==request.expectedWorkspaceRevision)throw safeError('state_conflict',undefined,{reason:'workspace_revision_mismatch'});
+    if(workspace.sessionId!==session.id)fail('state_conflict');
+    if(session.storageVersion!==request.expectedStorageVersion||session.storageVersion===Number.MAX_SAFE_INTEGER)throw safeError('state_conflict',undefined,{reason:'history_version_mismatch'});
+    this.assertHistoryMutationAllowed(session.id);
+    const history=this.checkpointHistory(session.id);if(!this.eligibleCheckpoints(history).some(row=>row.native_leaf_id===request.targetLeafId))throw safeError('session_history_invalid',undefined,{reason:'checkpoint_invalid'});
+    if(this.db.query('UPDATE sessions SET current_leaf_id=?,storage_version=storage_version+1,updated_at=? WHERE id=? AND storage_version=?').run(request.targetLeafId,time,session.id,session.storageVersion).changes!==1)fail('state_conflict');
+    const next=this.saveWorkspace(workspace,this.sessionWorkspace(workspace,session.id),time,true);
+    const receipt:SessionCheckpointReceipt={operationRef,sessionId:session.id,targetLeafId:request.targetLeafId,storageVersion:session.storageVersion+1,workspaceRevision:next.revision,committedAt:time};
+    const details:SessionCheckpointDetails=checked(SessionCheckpointDetailsSchema,{format:'medclaw.session-checkpoint/v1',request,before:{leafId:session.leafId,storageVersion:session.storageVersion,workspaceRevision:workspace.revision},receipt});
+    this.db.query("INSERT INTO business_events(operation_ref,type,actor,session_id,details_json,occurred_at) VALUES(?,'session_checkpoint_restored','user',?,?,?)").run(operationRef,session.id,canonicalRequest(details),time);
+    this.beforeCommit?.();return receipt;
   }
   private managementDetails(operationRef:string):SessionManagementDetails|null {
     const rows=this.db.query<{operation_ref:string;type:string;actor:string;session_id:number|null;run_id:number|null;import_id:number|null;query_id:number|null;artifact_id:number|null;details_json:string;occurred_at:string},[string]>(
@@ -563,6 +634,11 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if(this.p3&&this.db.query("SELECT id FROM tool_calls WHERE run_id=? AND (status IN ('requested','running') OR (effect='LOCAL_WRITE' AND json_extract(result_json,'$.outcomeUnknown')=1)) LIMIT 1").get(row.id))fail('runtime_busy');
     }
   }
+  assertHistoryMutationAllowed(sessionId:number):void {
+    const session=this.readSession(sessionId);if(!session)fail('session_not_found');this.assertSessionActive(session);
+    if(this.active())throw safeError('state_conflict',undefined,{reason:'runtime_busy'});
+    this.assertSessionPersistedClosed(sessionId);
+  }
   deleteSession(input:DeleteSessionInput,operationRef:string,time:string):SessionManagementReceipt {
     const request=checked(DeleteSessionInputSchema,input);checked(OpaqueIdSchema,operationRef);checked(TimestampSchema,time);
     return this.inputWrite(()=>{
@@ -600,7 +676,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     return { sessions: page.map(row => this.readSession(row.id)!), nextBeforeSessionId: rows.length > request.limit ? page.at(-1)!.id : null };
   }
 
-  createSession(input: NewSessionInput, operationRef: string, nativeSessionId: string, time: string): NewSessionResult {
+  createSession(input: NewSessionInput, operationRef: string, nativeSessionId: string, time: string, initialHistory?:InitialNativeHistory): NewSessionResult {
     const request = checked(NewSessionInputSchema, input); checked(OpaqueIdSchema, operationRef); checked(OpaqueIdSchema, nativeSessionId); timestamp(time);
     return this.transactions.immediate(() => {
       const existing = this.findOperation(operationRef);
@@ -610,6 +686,13 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       }
       const workspace = this.readWorkspace();
       if (workspace.revision !== request.expectedWorkspaceRevision) fail("workspace_revision_mismatch");
+      // The omitted history path is retained solely for original-schema fixtures and legacy import compatibility.
+      // Product SessionStore callers must provide the authentic newly allocated empty native history.
+      let header:unknown;
+      if(initialHistory) {
+        header=checked(z.object({type:z.literal('session'),version:z.literal(3),id:OpaqueIdSchema,timestamp:TimestampSchema,cwd:z.string(),parentSession:z.string().optional()}).passthrough(),initialHistory.header,'session_history_invalid');
+        if((header as {id:string}).id!==nativeSessionId||!Array.isArray(initialHistory.entries)||initialHistory.entries.length||initialHistory.activeLeafId!==null)fail('session_history_invalid');
+      }
       const sessionId = (this.db.query<{ n: number | null }, []>("SELECT MAX(id) AS n FROM sessions").get()?.n ?? 0) + 1;
       checked(PositiveIdSchema, sessionId);
       if (workspace.revision === Number.MAX_SAFE_INTEGER) fail('state_conflict');
@@ -624,9 +707,11 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       while (occupiedNumbers.has(displayNumber)) displayNumber++;
       const next = this.sessionWorkspace(workspace,sessionId);
       const result = checked(NewSessionResultSchema, { session: { id: sessionId, title: `New Session ${displayNumber}`, nativeSessionId,
-        kind: "user", status: "active", metadataRevision:0, deletedAt:null, inputControl: null, storageVersion: 0, leafId: null, nextSubmissionSequence: 1 },
+        kind: "user", status: "active", metadataRevision:0, deletedAt:null, inputControl: null, storageVersion: initialHistory?1:0, leafId: null, nextSubmissionSequence: 1 },
         workspace: { ...next, revision: workspace.revision + 1 } });
-      this.db.query(`INSERT INTO sessions(id,native_session_id,creation_operation_ref,creation_request_json,creation_result_json,title,metadata_json,created_at,updated_at)
+      if(initialHistory)this.db.query(`INSERT INTO sessions(id,native_session_id,creation_operation_ref,creation_request_json,creation_result_json,title,metadata_json,created_at,updated_at,native_header_json,history_format_version,storage_version)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,1)`).run(sessionId,nativeSessionId,operationRef,canonicalRequest(request),JSON.stringify(result),result.session.title,'{"titleOrigin":"default"}',time,time,canonicalRequest(header),NATIVE_HISTORY_FORMAT);
+      else this.db.query(`INSERT INTO sessions(id,native_session_id,creation_operation_ref,creation_request_json,creation_result_json,title,metadata_json,created_at,updated_at)
         VALUES(?,?,?,?,?,?,?,?,?)`).run(sessionId, nativeSessionId, operationRef, canonicalRequest(request), JSON.stringify(result), result.session.title, '{"titleOrigin":"default"}', time, time);
       this.saveWorkspace(workspace,next,time);
       this.beforeCommit?.();
@@ -670,13 +755,25 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     } catch { return fail("storage_read_failed"); }
   }
 
-  readMessageLinks(sessionId: number, nativeEntryIds: readonly string[]): Map<string, { runId: number; toolCallRef: string; references: string[] }> {
+  readMessageLinks(sessionId: number, nativeEntryIds: readonly string[]): Map<string, { runId: number; toolCallRef: string | null; references: string[] }> {
     id(sessionId);
     checked(z.array(OpaqueIdSchema).max(100), nativeEntryIds);
-    const links = new Map<string, { runId: number; toolCallRef: string; references: string[] }>();
+    const links = new Map<string, { runId: number; toolCallRef: string | null; references: string[] }>();
     if (!nativeEntryIds.length) return links;
     try {
-      // ponytail: Validate O(target Session saved receipts) so corrupt envelopes cannot vanish through JSON filtering; indexed history belongs to P9.
+      if (this.db.query("SELECT name FROM sqlite_schema WHERE name='memories'").get()) {
+        const messages = this.db.query<{ native_entry_id:string; entry_json:string; run_id:number; owner:number|null; kind:string|null }, [string,number]>(
+          `SELECT m.native_entry_id,m.entry_json,m.run_id,r.session_id AS owner,r.kind FROM memories m
+           JOIN json_each(?) entry ON entry.value=m.native_entry_id LEFT JOIN runs r ON r.id=m.run_id
+           WHERE m.session_id=? AND m.entry_type='message' AND m.run_id IS NOT NULL`).all(JSON.stringify([...new Set(nativeEntryIds)]),sessionId);
+        for (const row of messages) {
+          checked(PositiveIdSchema,row.run_id,'storage_read_failed');
+          const entry=checked(z.object({type:z.literal('message'),id:OpaqueIdSchema,message:z.object({role:z.string()})}),JSON.parse(row.entry_json),'storage_read_failed');
+          if(row.owner!==sessionId||row.kind!=='agent'||entry.id!==row.native_entry_id) fail('storage_read_failed');
+          if(entry.message.role==='user'||entry.message.role==='assistant') links.set(row.native_entry_id,{runId:row.run_id,toolCallRef:null,references:[`run:${row.run_id}`]});
+        }
+      }
+      // ponytail: Validate O(target Session saved receipts); index further only if large Session reads become slow.
       const receipts = this.db.query<{ id: number; native_tool_call_id: string; tool_name: string; delivery_json: string }, [number]>(
         "SELECT id,native_tool_call_id,tool_name,delivery_json FROM tool_calls WHERE session_id=? AND delivery_json IS NOT NULL").all(sessionId);
       for (const row of receipts) {
@@ -746,7 +843,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         ...(input.measurementContext ? { measurementContext: input.measurementContext } : {}),
         ...(input.toolProfileSnapshot ? { toolProfileSnapshot: input.toolProfileSnapshot } : {}),
         timezone: request.timezone, agent: { ...input.agentOptions, stage: input.scope.allowedToolNames.length ? "P3" : "P2", nativeSessionId: session.nativeSessionId, tools: input.scope.allowedToolNames,
-          autoCompaction: false, autoRetry: false, cacheWarming: "off", ...(input.contextContract ? {contextContract:input.contextContract} : {}) } });
+          autoCompaction: false, autoRetry: false, cacheWarming: "off", ...(input.contextContract ? {contextContract:input.contextContract} : {}),...(input.historyContract?{historyContract:input.historyContract}:{}) } });
       const result = this.db.query(`INSERT INTO runs(session_id,input_id,kind,instance_id,submission_operation_ref,submission_client_sequence,
         submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at)
         VALUES(?,NULL,'agent',?,?,?,?,'created','answer',?,?,?,?,?,?,?)`)
@@ -837,6 +934,73 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   finalizeAgent(runId: number, fact: FinalAgentFact): RunView {
     return this.finalize(runId, fact, fact.calls, "agent");
   }
+  confirmHistorySaved(change:NativeHistoryCommit) {if(!this.memory)fail('storage_read_failed');return this.memory.confirmCommitted(change);}
+  private answerReferences(row:RunRow, requireAvailable:boolean):number[] {
+    try {
+      const store=new SqliteToolStore(this.db),sources=new HistorySourceStore(this.db),catalog=new SqliteCatalogStore(this.db),scope=checked(RunScopeSchema,decoded(row.scope_json));
+      const ids=new Set(this.db.query<{id:number},[number]>('SELECT id FROM queries WHERE run_id=?').all(row.id).map(value=>value.id));
+      for(const input of this.inputsForRun(row.id))if(input.status==='consumed'&&input.runId===row.id&&input.sessionId===row.session_id&&input.nativeEntryId){
+        const frozen=this.inputs.content(this.inputs.required(input.id)).workspaceContext;
+        if(frozen.queryId!==null)ids.add(frozen.queryId);
+      }
+      const reads=this.db.query<{tool_name:string;args_json:string;result_json:string;delivery_json:string;native_tool_call_id:string},[number,number]>(`SELECT * FROM tool_calls WHERE run_id=? AND session_id=? AND status='succeeded'
+        AND tool_name IN ('read_query','read_query_page','list_query_evidence','read_query_evidence')`).all(row.id,row.session_id!);
+      for(const read of reads){
+        const name=read.tool_name as 'read_query'|'read_query_page'|'list_query_evidence'|'read_query_evidence',schemas=businessToolSchemas[name];
+        const args=checked(schemas.input as z.ZodType<Record<string,number>>,decoded(read.args_json));
+        const data=checked(schemas.output as z.ZodType<unknown>,decoded(read.result_json)) as {queryId?:number;resultHash?:string;items?:{queryId:number;resultHash:string}[]};
+        const delivery=checked(savedDeliverySchema,decoded(read.delivery_json));
+        // A successful tool row alone does not prove that this model consumed its result.
+        if(!delivery.sdkReturned||!delivery.nativeEntryId||!delivery.nextModelCallId||!delivery.consumedAt||delivery.consumptionEvidence!=='provider_input_verified')continue;
+        if(!delivery.message||delivery.message.isError||delivery.message.toolCallId!==read.native_tool_call_id||delivery.message.toolName!==name
+          ||!isDeepStrictEqual(delivery.message.details,data))fail('answer_evidence_invalid');
+        const entry=this.db.query<{entry_json:string},[number,string,number]>("SELECT entry_json FROM memories WHERE session_id=? AND native_entry_id=? AND run_id=? AND entry_type='message'").get(row.session_id!,delivery.nativeEntryId,row.id);
+        if(!entry||!isDeepStrictEqual((decoded(entry.entry_json) as {message:unknown}).message,delivery.message)
+          ||!this.db.query('SELECT id FROM model_calls WHERE run_id=? AND session_id=? AND call_id=?').get(row.id,row.session_id,delivery.nextModelCallId))fail('answer_evidence_invalid');
+        const queryId=name==='read_query_evidence'?store.readEvidence(args.evidenceId!)?.queryId:args.queryId;
+        if(!queryId||data.queryId!==undefined&&data.queryId!==queryId||data.items?.some(item=>item.queryId!==queryId))fail('answer_evidence_invalid');
+        const query=store.readQuery(queryId);
+        if(!query||data.resultHash!==undefined&&data.resultHash!==query.resultHash||data.items?.some(item=>item.resultHash!==query.resultHash))fail('answer_evidence_invalid');
+        ids.add(queryId);
+      }
+      for(const id of ids){
+        const query=store.readQuery(id),view=sources.query(id,1,1);
+        const source=this.db.query<{source:string},[number]>('SELECT source FROM queries WHERE id=?').get(id);
+        if(!query||query.sessionId!==row.session_id||query.batchIds.some(batch=>!scope.batchIds.includes(batch))
+          ||(query.source??'agent_tool')!==source?.source
+          ||scope.deviceIds!==null&&(query.scopeDeviceIds===null||query.scopeDeviceIds.some(device=>!scope.deviceIds!.includes(device)))
+          ||requireAvailable&&view.query.sourceAvailability!=='available')fail('answer_evidence_invalid');
+        const batches=catalog.readBatches(query.batchIds),references=requireAvailable?catalog.readSnapshotReferences(query.snapshotIds):[],events=requireAvailable&&query.eventIds.length?catalog.readChanges(query.batchIds,query.batchIds,query.scopeDeviceIds):[];
+        if(batches.length!==new Set(query.batchIds).size||requireAvailable&&(references.length!==new Set(query.snapshotIds).size
+          ||references.some(ref=>!query.batchIds.includes(ref.batchId)||query.scopeDeviceIds!==null&&!query.scopeDeviceIds.includes(ref.deviceId))
+          ||query.eventIds.some(id=>!events.some(event=>event.id===id&&query.batchIds.includes(event.oldBatchId)&&query.batchIds.includes(event.newBatchId)))))fail('answer_evidence_invalid');
+        const evidenceRows=store.listEvidence(id);
+        for(const evidence of evidenceRows){
+          if(evidence.resultHash!==query.resultHash||evidence.calculationVersion!==query.calculationVersion
+            ||evidence.snapshotIds.some(value=>!query.snapshotIds.includes(value))||evidence.eventIds.some(value=>!query.eventIds.includes(value))
+            ||evidence.filters!==undefined&&!isDeepStrictEqual(evidence.filters,query.params)
+            ||evidence.batchIds.some(id=>!batches.some(batch=>batch.id===id&&batch.sourceBundleId===evidence.sourceBundleId&&batch.materialVersion===evidence.materialVersion&&batch.sourceLockHash===evidence.sourceLockHash))
+            ||requireAvailable&&!isDeepStrictEqual([...new Set(evidence.sourceRowRefs)].sort(),[...new Set(references.filter(ref=>evidence.snapshotIds.includes(ref.id)).map(ref=>ref.sourceRowRef))].sort()))fail('answer_evidence_invalid');
+          const proof=sources.evidence(id,evidence.id,1,1);
+          if(requireAvailable&&proof.sourceAvailability!=='available')fail('answer_evidence_invalid');
+        }
+        if(query.batchIds.some(id=>!evidenceRows.some(value=>value.batchIds.includes(id)))||query.snapshotIds.some(id=>!evidenceRows.some(value=>value.snapshotIds.includes(id)))||query.eventIds.some(id=>!evidenceRows.some(value=>value.eventIds.includes(id))))fail('answer_evidence_invalid');
+      }
+      return [...ids].sort((a,b)=>a-b);
+    }catch{throw safeError('answer_evidence_invalid',undefined,{runId:row.id,sessionId:row.session_id??undefined});}
+  }
+  private validateFinalAnswer(row:RunRow,fact:FinalAgentFact):void {
+    const history=fact.history!;
+    type Entry={id:string;parentId:string|null;type:string;message?:{role:string;content:{type:string;text?:string}[];stopReason?:string}};
+    const assistant=(history.newEntries as Entry[]).findLast(entry=>entry.type==='message');
+    if(!assistant||assistant.message?.role!=='assistant'||!['stop','length'].includes(assistant.message.stopReason??'')
+      ||assistant.message.content.some(part=>part.type==='toolCall')||assistant.message.content.filter(part=>part.type==='text').map(part=>part.text).join('')!==fact.outputText||history.activeLeafId===null)fail('session_history_invalid');
+    const path=new Set<string>();let leaf:string|null=history.activeLeafId;
+    while(leaf!==null){if(path.has(leaf))fail('session_history_invalid');path.add(leaf);const entry=this.db.query<{parent_entry_id:string|null},[number,string]>('SELECT parent_entry_id FROM memories WHERE session_id=? AND native_entry_id=?').get(row.session_id!,leaf);if(!entry)fail('session_history_invalid');leaf=entry.parent_entry_id;}
+    if(!path.has(assistant.id)||!this.db.query('SELECT id FROM memories WHERE session_id=? AND native_entry_id=? AND run_id=?').get(row.session_id,assistant.id,row.id))fail('session_history_invalid');
+    if(row.input_id!==null){const input=this.inputs.required(row.input_id);if(input.status!=='consumed'||input.run_id!==row.id||input.session_id!==row.session_id||!input.native_entry_id||!path.has(input.native_entry_id)
+      ||!this.db.query("SELECT id FROM memories WHERE session_id=? AND native_entry_id=? AND run_id=? AND entry_type='message' AND json_extract(entry_json,'$.message.role')='user'").get(row.session_id,input.native_entry_id,row.id))fail('session_history_invalid');}
+  }
   private validateCleanup(previous: unknown, input: RunCleanupRecord): RunCleanupRecord {
     const next = checked(RunCleanupRecordSchema, input), old = RunCleanupRecordSchema.safeParse(previous);
     if (old.success) {
@@ -859,6 +1023,20 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     return this.transactions.immediate(() => {
       const row = this.row(runId);
       if (!row || row.kind !== kind) fail("state_conflict");
+      const history=kind==='agent'?(fact as FinalAgentFact).history:undefined;
+      const historyRequired=kind==='agent'&&checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.historyContract==='medclaw.history/p9-v1';
+      if(historyRequired&&fact.status==='completed'&&!history)fail('session_history_invalid');
+      if(history) {
+        if(history.sessionId!==row.session_id||history.runId!==runId)fail('access_denied');
+        if(this.isFinalSaved(runId,fact))return this.view(row);
+        if(!this.memory)fail('storage_write_failed');
+        if(historyRequired&&fact.status==='completed') {
+          const assistant=(history.newEntries as {id:string;type:string}[]).findLast(entry=>entry.type==='message');
+          if(!assistant||this.db.query('SELECT id FROM memories WHERE session_id=? AND native_entry_id=?').get(row.session_id,assistant.id))fail('session_history_invalid');
+        }
+        this.memory.commitInTransaction(history);
+        if(historyRequired&&fact.status==='completed')this.validateFinalAnswer(row,fact as FinalAgentFact);
+      }
       const calls = this.calls(runId);
       if (calls.length !== finalCalls.length || new Set(finalCalls.map(call => call.callId)).size !== finalCalls.length) fail("state_conflict");
       const cancelRequestedAt = fact.cancelRequestedAt ?? row.cancel_requested_at;
@@ -904,23 +1082,23 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         error_json=?,cleanup_json=?,usage_json=? WHERE id=?`)
         .run(terminal ? row.status : fact.status, row.output_text ?? fact.outputText, fact.stoppedAt, fact.endedAt, cancelRequestedAt,
           terminal ? row.error_json : json(error), json(cleanup), row.usage_json ?? json(usage), runId);
-      if (this.p3 && row.kind === "agent" && fact.status === "completed" && checked(agentConfigSchema, decoded(row.config_json), "storage_read_failed").agent.stage === "P3") {
+      if (this.p3 && row.kind === "agent" && fact.status === "completed" && (historyRequired||checked(agentConfigSchema, decoded(row.config_json), "storage_read_failed").agent.stage === "P3")) {
         const frozen = checked(RunScopeSchema, decoded(row.scope_json), "storage_read_failed");
         const queries = this.db.query<{ id: number; session_id: number; batch_ids_json: string; result_json: string }, [number]>(
           "SELECT id,session_id,batch_ids_json,result_json FROM queries WHERE run_id=? ORDER BY id").all(runId);
-        for (const query of queries) {
+        for (const query of historyRequired?[]:queries) {
           const batches = checked(z.array(PositiveIdSchema), decoded(query.batch_ids_json), "storage_read_failed");
           const result = checked(z.object({ scopeDeviceIds: z.array(PositiveIdSchema).nullable() }), decoded(query.result_json), "storage_read_failed");
           if (query.session_id !== row.session_id || batches.some(batch => !frozen.batchIds.includes(batch))
             || frozen.deviceIds !== null && (result.scopeDeviceIds === null || result.scopeDeviceIds.some(device => !frozen.deviceIds!.includes(device)))) fail("access_denied");
         }
-        const queryIds = queries.map(query => query.id), text = fact.outputText ?? "";
+        const queryIds = historyRequired?this.answerReferences(row,true):queries.map(query => query.id), text = fact.outputText ?? "";
         const priorAnswer = this.db.query<{ id: number; text: string; query_ids_json: string }, [number]>("SELECT id,text,query_ids_json FROM answers WHERE run_id=?").get(runId);
         if (priorAnswer) {
           if (priorAnswer.text !== text || !isDeepStrictEqual(decoded(priorAnswer.query_ids_json), queryIds)) fail("state_conflict");
         } else {
-          const saved = this.db.query("INSERT INTO answers(run_id,session_id,input_id,kind,text,query_ids_json,missing_slots_json,native_leaf_id,created_at) VALUES(?,?,?,'result',?,?,'[]',NULL,?)")
-            .run(runId, row.session_id, row.input_id, text, JSON.stringify(queryIds), fact.endedAt);
+          const saved = this.db.query("INSERT INTO answers(run_id,session_id,input_id,kind,text,query_ids_json,missing_slots_json,native_leaf_id,created_at) VALUES(?,?,?,'result',?,?,'[]',?,?)")
+            .run(runId, row.session_id, row.input_id, text, JSON.stringify(queryIds),history?.activeLeafId??null, fact.endedAt);
           this.db.query("INSERT INTO business_events(operation_ref,type,actor,session_id,run_id,details_json,occurred_at) VALUES(?,'answer_committed','agent',?,?,?,?)")
             .run(`answer:${runId}`, row.session_id, runId, JSON.stringify({ answerId: Number(saved.lastInsertRowid), queryIds }), fact.endedAt);
         }
@@ -944,6 +1122,26 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       || row.output_text !== fact.outputText || row.stopped_at !== fact.stoppedAt || row.ended_at !== fact.endedAt
       || row.cancel_requested_at !== (fact.cancelRequestedAt ?? null) || !isDeepStrictEqual(decoded(row.error_json), fact.error)
       || !isDeepStrictEqual(decoded(row.usage_json), fact.usage ?? null) || !isDeepStrictEqual(decoded(row.cleanup_json), expectedCleanup)) return false;
+    const historyRequired=row.kind==='agent'&&checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.historyContract==='medclaw.history/p9-v1';
+    if('calls' in fact&&fact.history&&(!this.memory||this.memory.confirmCommitted(fact.history)===null))return false;
+    if(historyRequired) {
+      if(fact.status==='completed') {
+        if(!('calls' in fact)||!fact.history)return false;
+        const answer=this.db.query<{id:number;session_id:number;input_id:number|null;native_leaf_id:string|null;text:string;query_ids_json:string},[number]>('SELECT * FROM answers WHERE run_id=?').get(runId);
+        let queryIds:number[];try{queryIds=this.answerReferences(row,false);}catch{return false;}
+        if(!answer||answer.session_id!==row.session_id||answer.input_id!==row.input_id||answer.native_leaf_id!==fact.history.activeLeafId||answer.text!==fact.outputText||!isDeepStrictEqual(decoded(answer.query_ids_json),queryIds))return false;
+        const activity=this.db.query<{details_json:string},[string]>("SELECT details_json FROM business_events WHERE operation_ref=? AND type='answer_committed' AND actor='agent'").get(`answer:${runId}`);
+        if(!activity||!isDeepStrictEqual(decoded(activity.details_json),{answerId:answer.id,queryIds}))return false;
+      }
+      const terminal=this.db.query<{payload_json:string},[number,string]>('SELECT payload_json FROM runtime_events WHERE run_id=? AND type=?').get(runId,`run_${fact.status}`);
+      if(!terminal)return false;
+      const parsed=RegisteredEventPayloadSchema.safeParse({type:`run_${fact.status}`,payload:decoded(terminal.payload_json)});
+      if(!parsed.success||!['run_completed','run_failed','run_cancelled'].includes(parsed.data.type))return false;
+      const payload=parsed.data.payload as {answerId:number|null;stopConfirmed:boolean|null;errorCode:string|null};
+      const answer=this.db.query<{id:number},[number]>('SELECT id FROM answers WHERE run_id=?').get(runId);
+      if(payload.answerId!==(answer?.id??null)||payload.errorCode!==(fact.error?.code??null)||fact.status==='completed'&&payload.stopConfirmed!==true)return false;
+      for(const input of this.inputsForRun(runId))if(input.status==='consumed'&&input.processingStatus!==fact.status)return false;
+    }
     if (this.p3 && row.kind === "agent" && fact.status === "completed" && checked(agentConfigSchema, decoded(row.config_json), "storage_read_failed").agent.stage === "P3") {
       const answer = this.db.query<{ text: string }, [number]>("SELECT text FROM answers WHERE run_id=?").get(runId);
       if (!answer || answer.text !== (fact.outputText ?? "")) return false;
@@ -1061,6 +1259,19 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   }
 
   verifyPriorContextFacts(runId: number) { id(runId); return this.inputRead(() => verifyPriorContextFacts(this.db,runId)); }
+  verifyPriorHistoryFacts(runId:number) {
+    id(runId);return this.inputRead(()=>this.db.transaction(()=>{
+      const row=this.row(runId);if(!row)fail('run_not_found');
+      if(row.kind!=='agent'||checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.historyContract!=='medclaw.history/p9-v1')return {requiredPersistenceComplete:true,unconfirmedItems:[] as string[]};
+      try {
+        if(!this.memory||row.session_id===null)fail('session_history_invalid');
+        const snapshot=this.memory.loadInTransaction(row.session_id),ids=new Set(snapshot.entries.map(value=>(value as {id:string}).id));
+        for(const input of this.inputsForRun(runId))if(input.status==='consumed'&&(!input.nativeEntryId||!ids.has(input.nativeEntryId)
+          ||!this.db.query("SELECT id FROM memories WHERE session_id=? AND run_id=? AND native_entry_id=? AND json_extract(entry_json,'$.message.role')='user'").get(row.session_id,runId,input.nativeEntryId)))fail('session_history_invalid');
+        return {requiredPersistenceComplete:true,unconfirmedItems:[] as string[]};
+      }catch{return {requiredPersistenceComplete:false,unconfirmedItems:['history_persistence']};}
+    }).deferred());
+  }
 
   read(request: z.input<typeof ReadRunRequestSchema>): ReadRunResult {
     const input = checked(ReadRunRequestSchema, request);
@@ -1107,10 +1318,11 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         const inputFacts = this.verifyPriorInputFacts(row.id,true,time);
         const facts = row.kind === 'agent' && this.p3 ? this.verifyPriorToolFacts(row.id, true, time) : null;
         const contextFacts = this.verifyPriorContextFacts(row.id);
+        const historyFacts = this.verifyPriorHistoryFacts(row.id);
         const cleanup = facts ? checked(RunCleanupRecordSchema, {
           contract: 'medclaw.run-cleanup/v1', executionStarted: prior.success ? prior.data.executionStarted : null,
-          stopConfirmed: facts.stopConfirmed, requiredPersistenceComplete: facts.requiredPersistenceComplete && inputFacts.requiredPersistenceComplete && contextFacts.requiredPersistenceComplete,
-          inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed, unconfirmedItems: [...facts.unconfirmedItems,...inputFacts.unconfirmedItems,...contextFacts.unconfirmedItems],
+          stopConfirmed: facts.stopConfirmed, requiredPersistenceComplete: facts.requiredPersistenceComplete && inputFacts.requiredPersistenceComplete && contextFacts.requiredPersistenceComplete && historyFacts.requiredPersistenceComplete,
+          inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed, unconfirmedItems: [...facts.unconfirmedItems,...inputFacts.unconfirmedItems,...contextFacts.unconfirmedItems,...historyFacts.unconfirmedItems],
           secondaryErrors: prior.success ? prior.data.secondaryErrors : [], verifiedAt: facts.stopConfirmed === true ? time : prior.success ? prior.data.verifiedAt : null,
           ...(prior.success && prior.data.budgetSummary !== undefined ? { budgetSummary: prior.data.budgetSummary } : {}),
         }) : { previousInstanceId: row.instance_id, oldProcessExited: true, observationGap: true };

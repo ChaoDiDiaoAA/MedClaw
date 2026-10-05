@@ -1,7 +1,7 @@
 import { ipcMain, shell, dialog, type BrowserWindow } from "electron";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
-import { createPublicMethodSchemas, publicMethodSchemas, PublicMethodSchema, DesktopSecretInputSchema, DesktopSecretDiscardSchema, DesktopImportDirectorySchema, isReadOnlyMethod, type PublicMethod, type PublicPayload, type PrivateCredentialFrame, type DiagnosticsView, type RuntimeNotice } from "../../../../packages/contracts/src/protocol.ts";
+import { createPublicMethodSchemas, publicMethodSchemas, publicOutputSchema, PublicMethodSchema, DesktopSecretInputSchema, DesktopSecretDiscardSchema, DesktopImportDirectorySchema, isReadOnlyMethod, type PublicMethod, type PublicPayload, type PrivateCredentialFrame, type DiagnosticsView, type RuntimeNotice } from "../../../../packages/contracts/src/protocol.ts";
 import { AppErrorSchema, OpaqueIdSchema, safeError, type Result } from "../../../../packages/contracts/src/error.ts";
 import { AuthLinkUrlSchema, type PublishedSettings } from "../../../../packages/contracts/src/model.ts";
 import { HostController } from "./host-controller.ts";
@@ -193,14 +193,14 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       const parsed = JSON.parse(JSON.stringify(schema.parse(payload))) as unknown;
       parsingPayload = false;
       if ((method === "import.preview" || method === "import.commit") && (parsed as { operationRef: string }).operationRef !== operationRef) throw new Error("state_conflict");
-      if (method === "model.request" || method === "model.diagnose" || method === "session.submit" || method === "session.create" || method === "session.rename" || method === "session.delete") {
+      if (method === "model.request" || method === "model.diagnose" || method === "session.submit" || method === "session.create" || method === "session.rename" || method === "session.delete" || method==='session.restoreCheckpoint'||method==='session.restore') {
         const old = operations.get(operationRef);
         if (old && (old.method !== method || !isDeepStrictEqual(old.payload, parsed))) throw new Error("state_conflict");
         operations.set(operationRef, { method, payload: parsed });
         if (operations.size > 100) operations.delete(operations.keys().next().value!);
       }
       const reply = await dispatch(method, parsed, operationRef); replyReceived = true;
-      const data = publicMethodSchemas[method].output.parse(reply);
+      const data = publicOutputSchema(method,parsed).parse(reply);
       return { ok: true, data };
     } catch (error) { const known = AppErrorSchema.safeParse(error); const safe = known.success ? known.data : safeError(error instanceof z.ZodError
       ? replyReceived && method ? isReadOnlyMethod(method) ? "host_protocol_mismatch" : "operation_result_unknown"

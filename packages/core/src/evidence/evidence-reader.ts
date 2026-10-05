@@ -1,4 +1,5 @@
-import { PositiveIdSchema } from "../../../contracts/src/error";
+import { PositiveIdSchema,OpaqueIdSchema,safeError,serviceResult } from "../../../contracts/src/error";
+import type { SessionStore } from '../../../contracts/src/session';
 import type { Evidence, PageInput, QueryContext, QueryRecord, QueryStore } from "../../../contracts/src/query";
 import { canonicalRequest } from '../../../contracts/src/run';
 import { CatalogService, pageItems } from "../data/catalog-service";
@@ -6,7 +7,14 @@ import { QueryService } from "../data/query-service";
 
 /** Reads submitted evidence and imported records; original files are never opened or regenerated. */
 export class EvidenceReader {
-  constructor(private readonly catalog: CatalogService, private readonly queries: QueryService, private readonly store: QueryStore) {}
+  constructor(private readonly catalog: CatalogService, private readonly queries: QueryService, private readonly store: QueryStore,
+    private readonly checkpoints?:Pick<SessionStore,'readCheckpointOperation'|'readSession'>) {}
+  readCheckpointOperation(input:{operationRef:string}) {
+    return serviceResult(()=>{OpaqueIdSchema.parse(input.operationRef);if(!this.checkpoints)throw safeError('storage_read_failed');
+      const saved=this.checkpoints.readCheckpointOperation(input.operationRef);if(!saved)return null;
+      const session=this.checkpoints.readSession(saved.receipt.sessionId);if(!session||session.kind!=='user')throw safeError('access_denied');return saved.receipt;
+    },'storage_read_failed',{operationRef:input.operationRef});
+  }
   list(input: PageInput & { queryId: number }, context: QueryContext) {
     const query = this.queries.read(input.queryId, context);
     const rows = this.store.listEvidence(input.queryId);

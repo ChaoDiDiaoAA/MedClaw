@@ -85,9 +85,10 @@ async function fixture(timeoutMs = 120000) {
   const waitForStart = new Promise<void>(resolve => { started = resolve; });
   const agent: AgentRuntimePort<ResolvedProviderSelection> & NativeSessionBindings = {
     toolNames: ['read_data_scope'],
-    allocate: () => ({ nativeSessionId: 'unused', bind: () => {}, discard: () => {} }),
-    read: () => ({ available: true, reason: null, leafId: null, messages: [], truncated: false }),
-    readMessages: () => { throw new Error('Unexpected fixture message read'); },
+    allocate: () => ({ nativeSessionId: 'unused', history:{header:{type:'session',version:3,id:'unused',timestamp:new Date().toISOString(),cwd:root},entries:[],activeLeafId:null}, bind: () => {}, discard: () => {} }),
+    read: async () => ({ available: true, reason: null, leafId: null,storageVersion:0, messages: [], truncated: false }),
+    readMessages: async () => { throw new Error('Unexpected fixture message read'); },
+    ensureLoaded:async()=>{},restore:async()=>{},readAvailability:()=>({availability:'ready',error:null}),
     describe: () => ({ requestedThinkingLevel: 'off', effectiveThinkingLevel: 'off' }),
     captureToolProfiles: scope => {
       expect(scope.allowedToolNames).toEqual(['read_data_scope']);

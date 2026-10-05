@@ -5,6 +5,8 @@ import { PublishedSettingsSchema } from "../../../packages/contracts/src/model.t
 import { AppErrorSchema, safeError, OpaqueIdSchema, type Result } from "../../../packages/contracts/src/error.ts";
 import { openDatabase, SCHEMA_VERSION } from "../../../packages/storage/src/database.ts";
 import { Repositories } from "../../../packages/storage/src/repositories.ts";
+import { SqliteMemoryStore } from '../../../packages/storage/src/memory-store.ts';
+import { validateNativeHistory } from '../../../packages/runtime-pi/src/memory-store.ts';
 import { describeDataSelection, queryRowKeys } from '../../../packages/storage/src/workspace-selection.ts';
 import { PiModelRuntime, CatalogStore, SDK_VERSION, installedSdkVersion, type ResolvedModel } from "../../../packages/runtime-pi/src/model-runtime.ts";
 import { BridgeCredentialStore } from "../../../packages/runtime-pi/src/credential-store.ts";
@@ -173,7 +175,8 @@ async function initialize(raw: unknown) {
   events = new EventService(new SqliteEventStore(database, transactions), transactions, () => new Date().toISOString(), notice,
     { readSnapshots: runId => agent?.readSnapshots(runId) ?? { streamConnection: null, snapshots: [], incomplete: false } },
     error => errorLog.add(error, { ...(error.runId ? { runId: error.runId } : {}) }), notice);
-  repositories = new Repositories(database, undefined, events, transactions);
+  const memory=new SqliteMemoryStore(database,validateNativeHistory,events,transactions);
+  repositories = new Repositories(database, undefined, events, transactions,memory);
   try { repositories.recoverInterrupted(config.instanceId, new Date().toISOString()); }
   catch { errorLog.add(safeError("storage_write_failed")); }
   const credentialStore = new BridgeCredentialStore(credentials);
@@ -183,7 +186,7 @@ async function initialize(raw: unknown) {
   await runtime.installCustom(settings.customProviders.map(p => p.definition));
   catalog = new SqliteCatalogStore(database); toolStore = new SqliteToolStore(database, events, transactions);
   const catalogService = new CatalogService(catalog);
-  queries = new QueryService(catalogService, toolStore); evidence = new EvidenceReader(catalogService, queries, toolStore);
+  queries = new QueryService(catalogService, toolStore); evidence = new EvidenceReader(catalogService, queries, toolStore,repositories);
   const recorder = new ToolRecorder(toolStore, (error, context) => application?.runs.failToolPersistence(context.runId, error));
   const configure = () => {
     const registry = new ToolRegistry(createBusinessTools({ catalog: catalogService, queries, evidence }));
@@ -198,7 +201,10 @@ async function initialize(raw: unknown) {
   };
   artifacts = new ArtifactStore(database, join(config.paths.dataRoot, 'artifacts'));
   contexts = new ContextService(new SqliteContextStore(database, events, transactions),artifacts);
-  agent = new PiAgentRuntime(runtime, config.paths.dataRoot, { ...configure(), recorder, configure },contexts);
+  agent = new PiAgentRuntime(runtime, config.paths.dataRoot, {store:memory,commitSync:change=>{
+    try{return transactions.immediate(()=>memory.commitInTransaction(change));}
+    catch(error){try{const proof=memory.confirmCommitted(change);if(proof)return proof;}catch{/* Read failure keeps the original write unconfirmed. */}throw error;}
+  }}, { ...configure(), recorder, configure },contexts);
   imports = new ImportService({ store: new SqliteImportStore(database), artifacts, instanceId: config.instanceId,
     resolveToken: async (fileToken, operationRef) => AbsolutePathSchema.parse(await credentials('file.resolve', { fileToken, operationRef })) });
   application = new Application(config.instanceId, settings, runtime, repositories,
@@ -208,8 +214,8 @@ async function initialize(raw: unknown) {
   application.runs.recoverInterrupted(true); // The writer lock proves that the previous owning process exited.
   sessions = new SessionService(config.instanceId, repositories, agent, (input, context) => application!.runs.submitAgent(input, context),
     () => application!.runs.activeHandle, sessionId => application!.runs.readInputControl(sessionId),
-    (inputId, context) => application!.runs.cancelInput(inputId, context), application.runs);
-  workspace = new WorkspaceService(repositories, artifacts);
+    (inputId, context) => application!.runs.cancelInput(inputId, context), application.runs,transactions);
+  workspace = new WorkspaceService(repositories, artifacts,()=>application!.runs.assertNoHistoryMutation());
   deletions=new DataDeletionService(new SqliteDataDeletionStore(database,repositories,()=>{if(application!.busy)throw new Error('runtime_busy');}),artifacts,config.instanceId);
   await sendRaw(`${JSON.stringify({ protocolVersion: HOST_PROTOCOL_VERSION, instanceId: config.instanceId, sdkVersion: actualVersion, schemaVersion: SCHEMA_VERSION, configVersion: settings.configVersion, dataRoot: config.paths.dataRoot })}\n`);
   runtimeLog.add("host_ready");
@@ -286,6 +292,9 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case "session.read": return unwrap(await sessions!.read(request.payload.sessionId));
     case "session.submit": return unwrap(await sessions!.submit(request.payload, request));
     case "session.messages.read": return unwrap(await sessions!.readMessages(request.payload));
+    case 'session.checkpoints.read': return unwrap(await sessions!.readCheckpoints(request.payload));
+    case 'session.restoreCheckpoint': return unwrap(await sessions!.restoreCheckpoint(request.payload,request));
+    case 'session.restore': return unwrap(await sessions!.restore(request.payload,request));
     case "session.readSubmission": return unwrap(await sessions!.readSubmission(request.payload));
     case "session.readInput": return unwrap(await sessions!.readInput(request.payload));
     case "session.listInputs": return unwrap(await sessions!.listInputs(request.payload));
@@ -299,7 +308,8 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case 'import.commit':
       if (request.operationRef !== request.payload.operationRef) throw new Error('invalid_argument');
       return unwrap(await imports.commit(request.payload));
-    case 'import.read': case 'evidence.readOperation': return unwrap(await imports.read(request.payload.operationRef));
+    case 'import.read':return unwrap(await imports.read(request.payload.operationRef));
+    case 'evidence.readOperation':return request.payload.kind==='import'?unwrap(await imports.read(request.payload.operationRef)):unwrap(await evidence.readCheckpointOperation(request.payload));
     case 'import.cancel': return unwrap(await imports.cancel(request.payload.operationRef));
     case 'import.recover': return unwrap(await imports.recover(request.payload.operationRef));
     case 'data.delete.preview':

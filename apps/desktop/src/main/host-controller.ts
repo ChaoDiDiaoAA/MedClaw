@@ -2,13 +2,14 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
+import type { z } from 'zod';
 import { OpaqueIdSchema, safeError, type AppError, type Result } from "@medclaw/contracts/error";
 import { SDK_VERSION, type HostView } from "@medclaw/contracts/model";
 import { HostStartupFailureReader, type HostStartupFailure } from '../../../../packages/logging/src/host-startup-failure';
 import {
   DATABASE_SCHEMA_VERSION, HOST_PROTOCOL_VERSION, MAX_FRAME_BYTES,
   HostHelloSchema, HostReadySchema, HostRequestSchema, PrivateCredentialFrameSchema, PrivateCredentialReplySchema,
-  encodeHostFrame, parseHostFrame, hostPrivateMethodSchemas, publicMethodSchemas, isReadOnlyMethod,
+  encodeHostFrame, parseHostFrame, hostPrivateMethodSchemas, publicOutputSchema, isReadOnlyMethod,
   type DesktopNotice, type HostHello, type HostPrivateMethod, type HostReady,
   type PrivateCredentialFrame, type PublicHostRequest,
 } from "@medclaw/contracts/protocol";
@@ -25,7 +26,7 @@ export interface HostControllerOptions {
   onExit?: (instanceId: string) => void;
 }
 type HostMethod = PublicHostRequest["method"] | HostPrivateMethod;
-type Pending = { method: HostMethod; operationRef: string; timer: ReturnType<typeof setTimeout>; resolve: (result: Result<unknown>) => void };
+type Pending = { method: HostMethod; operationRef: string; output:z.ZodType; timer: ReturnType<typeof setTimeout>; resolve: (result: Result<unknown>) => void };
 const waitForExit = async (exited: Promise<void>) => {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try { await Promise.race([exited, new Promise<void>(resolve => { timer = setTimeout(resolve, 10000); timer.unref(); })]); }
@@ -180,10 +181,7 @@ export class HostController {
       if (frame.kind === "reply") {
         const pending = this.pending.get(frame.requestId);
         if (!pending) { this.diagnostic(safeError("invalid_frame")); continue; }
-        const schema = pending.method in hostPrivateMethodSchemas
-          ? hostPrivateMethodSchemas[pending.method as HostPrivateMethod]
-          : publicMethodSchemas[pending.method as PublicHostRequest["method"]];
-        const result: Result<unknown> = frame.result.ok ? { ok: true, data: schema.output.parse(frame.result.data) } : frame.result;
+        const result: Result<unknown> = frame.result.ok ? { ok: true, data: pending.output.parse(frame.result.data) } : frame.result;
         this.settle(frame.requestId, result);
       } else if (frame.kind === "private" && "payload" in frame) {
         const child = this.child;
@@ -281,7 +279,8 @@ export class HostController {
     let pending: Pending;
     const reply = new Promise<Result<unknown>>(resolve => {
       const timer = setTimeout(() => this.settle(requestId, { ok: false, error: safeError(isReadOnlyMethod(method) ? "host_not_ready" : "operation_result_unknown", undefined, { operationRef }) }), 10000);
-      pending = { method, operationRef, timer, resolve };
+      const output=method in hostPrivateMethodSchemas?hostPrivateMethodSchemas[method as HostPrivateMethod].output:publicOutputSchema(method as PublicHostRequest['method'],frame.payload);
+      pending = { method, operationRef, output, timer, resolve };
       this.pending.set(requestId, pending);
     });
     void this.write(line, () => this.pending.get(requestId) === pending).catch(() => {

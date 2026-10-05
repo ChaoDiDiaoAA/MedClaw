@@ -1,8 +1,9 @@
-import { errorMessage, type Result } from "../../../../packages/contracts/src/error";
+import { errorMessage, safeError, type Result } from "../../../../packages/contracts/src/error";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { HostView, ModelChoice, ModelDirectoryView } from "../../../../packages/contracts/src/model";
 import type { ActiveRunView, RunView, RuntimeControlView } from "../../../../packages/contracts/src/run";
 import type { InputMode, SessionDetail, SessionInput } from "../../../../packages/contracts/src/session";
+import type { SessionCheckpoint, SessionCheckpointPage, SessionCheckpointReceipt, RestoreSessionCheckpointInput, RestoreSessionInput } from '../../../../packages/contracts/src/session';
 import type { WorkspaceChange, WorkspaceView } from "../../../../packages/contracts/src/workspace";
 import { sessionDisplayTitle, type SessionDraft } from "./session-list";
 import { ContextPanel } from "./context-panel";
@@ -26,6 +27,13 @@ export function NativeMessages(props: { host: HostView; sessionId: number | null
   const write = (value: View) => { viewRef.current = value; setView(value); };
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; generation.current++; referenceOrder.current++; }; }, []);
   useEffect(() => { referenceOrder.current++; setReference(null); if (props.visible && props.host.state === 'ready' && props.sessionId) void read(false); }, [key, props.revision]);
+  // Startup may read the current path before its separately requested Run arrives.
+  // Reconcile that Run against already verified pages without another history read.
+  useEffect(() => { if(view.key===key&&!current.loading&&!current.error&&current.pages.length) availability(current.pages,true); }, [key,props.requiredRunId,current.pages,current.loading,current.error,view.key]);
+  function availability(pages: SessionMessagePage[], available: boolean, unavailable = false) {
+    props.onAvailability?.({ available, unavailable: unavailable && pages.length === 0, hasPage: pages.length > 0, hasHistory: pages.some(value => value.items.length > 0 || value.hasMore), hasMore: pages.at(-1)?.hasMore ?? false,
+      runCovered: !!props.requiredRunId && pages.some(page => page.items.some(item => item.runId === props.requiredRunId || item.references.includes('run:' + props.requiredRunId))) });
+  }
   async function read(append: boolean) {
     if (!props.visible || props.host.state !== 'ready' || !props.sessionId || !props.host.instanceId) return;
     const old = viewRef.current.key === key ? viewRef.current : { key, sessionId: props.sessionId, pages: [], loading: false, error: null }, tail = old.pages.at(-1);
@@ -33,8 +41,6 @@ export function NativeMessages(props: { host: HostView; sessionId: number | null
     const leafId = append ? tail!.leafId : null, afterEntryId = append ? tail!.nextEntryId : null;
     const scope = { ...target.current, instanceId: props.host.instanceId, sessionId: props.sessionId, generation: ++generation.current, leafId, afterEntryId };
     const owns = () => mounted.current && target.current.key === scope.key && target.current.epoch === scope.epoch && generation.current === scope.generation;
-    const availability = (pages: SessionMessagePage[], available: boolean, unavailable = false) => props.onAvailability?.({ available, unavailable: unavailable && pages.length === 0, hasPage: pages.length > 0, hasHistory: pages.some(value => value.items.length > 0 || value.hasMore), hasMore: pages.at(-1)?.hasMore ?? false,
-      runCovered: !!props.requiredRunId && pages.some(page => page.items.some(item => item.runId === props.requiredRunId || item.references.includes('run:' + props.requiredRunId))) });
     referenceOrder.current++; setReference(null);
     write({ ...old, loading: true, error: null });
     try {
@@ -97,7 +103,7 @@ export function NativeMessages(props: { host: HostView; sessionId: number | null
   const seen = new Set<string>(), items = current.pages.flatMap(page => page.items).filter(item => { if (seen.has(item.nativeEntryId)) return false; seen.add(item.nativeEntryId); return !(props.excludeRunId && (item.runId === props.excludeRunId || item.references.includes('run:' + props.excludeRunId))); });
   return <section className="native-messages" data-testid={props.testId} aria-label="Native session messages">
     <div className="section-heading"><h3>Native memory · Session {props.sessionId ?? 'unavailable'}</h3><div className="actions"><button disabled={!props.visible || props.host.state !== 'ready' || !props.sessionId} onClick={() => void read(false)}>Refresh messages</button>{last?.hasMore && <button disabled={current.loading || !props.visible || props.host.state !== 'ready'} onClick={() => void read(true)}>Load more messages</button>}</div></div>
-    <p className="tiny muted">Messages in this app session. Run and Answer saving are separate facts.</p>
+    <p className="tiny muted">Messages at this session's selected history position. Run and Answer saving are separate facts.</p>
     {last?.hasMore && <p className="tiny evidence-gap">Native history page incomplete. Load more messages to read this leaf. Read the full saved output in Run details.</p>}
     {current.pages.length > 0 && view.key !== key && <p className="tiny evidence-gap">Last verified message page from the prior display connection. Current native history is being rechecked.</p>}
     {last && <p className="tiny message-origin">Native session <code>{last.nativeSessionId}</code> · Leaf <code>{last.leafId ?? 'None'}</code> · {last.source === 'native_memory' ? 'Native memory' : 'Saved history'}</p>}
@@ -116,11 +122,84 @@ export function NativeMessages(props: { host: HostView; sessionId: number | null
   </section>;
 }
 
+export function SessionCheckpoints(props:{host:HostView;session:SessionDetail|null;workspace:WorkspaceView|null;visible:boolean;blocked:boolean;
+  onResumeCheckpoint:(input:RestoreSessionCheckpointInput,operationRef:string)=>Promise<Result<SessionCheckpointReceipt>>;
+  onRestoreSession:(input:RestoreSessionInput)=>Promise<Result<SessionDetail>>;onHistoryVerified:(sessionId:number,operationRef?:string)=>Promise<void>}) {
+  const key=JSON.stringify([props.host.instanceId,props.host.state,props.session?.session.id,props.session?.session.nativeSessionId,props.session?.session.leafId,props.session?.session.storageVersion,props.visible]);
+  const identityKey=JSON.stringify([props.host.instanceId,props.host.state,props.session?.session.id,props.visible]);
+  const owner=useRef({key,epoch:0}),mounted=useRef(true),order=useRef(0),dialog=useRef<HTMLDialogElement>(null),cancel=useRef<HTMLButtonElement>(null),trigger=useRef<HTMLButtonElement|null>(null);
+  const action=useRef({key:identityKey,order:0});if(action.current.key!==identityKey)action.current={key:identityKey,order:action.current.order+1};
+  if(owner.current.key!==key){owner.current={key,epoch:owner.current.epoch+1};order.current++;}
+  const [page,setPage]=useState<{key:string;value:SessionCheckpointPage}|null>(null),[loading,setLoading]=useState(false),[message,setMessage]=useState<string|null>(null);
+  const [selected,setSelected]=useState<SessionCheckpoint|null>(null),[busy,setBusy]=useState(false);
+  type Pending={instance:string;input:RestoreSessionCheckpointInput;operationRef:string;receipt:SessionCheckpointReceipt|null;unknown:boolean};
+  const [pending,setPending]=useState<Pending|null>(null),pendingRef=useRef(pending);pendingRef.current=pending;
+  const current=page?.key===key?page.value:null,original=pending?.input.sessionId===props.session?.session.id?pending:null;
+  useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;order.current++;};},[]);
+  useEffect(()=>{setSelected(null);setLoading(false);if(props.visible&&props.host.state==='ready'&&props.session)void read(false);},[key]);
+  useEffect(()=>{setMessage(null);setBusy(false);},[identityKey]);
+  useEffect(()=>{if(selected){dialog.current?.showModal();cancel.current?.focus();}else if(dialog.current?.open)dialog.current.close();},[selected]);
+  function close(){setSelected(null);trigger.current?.focus();}
+  async function read(append:boolean){
+    if(!props.session||props.host.state!=='ready'||!props.visible)return;
+    const scope={...owner.current,order:++order.current},sessionId=props.session.session.id,after=append?current?.nextAnswerId:null;
+    const owns=()=>mounted.current&&scope.key===owner.current.key&&scope.epoch===owner.current.epoch&&scope.order===order.current;
+    setLoading(true);
+    try{const result=await window.medclaw.request('session.checkpoints.read',{sessionId,...(after?{afterAnswerId:after}:{}),limit:20});if(!owns())return;
+      if(!result.ok){setMessage('Saved turns could not be read. '+errorMessage(result.error));return;}
+      if(result.data.sessionId!==sessionId||result.data.storageVersion!==props.session.session.storageVersion){setMessage('History changed. Refresh this session before choosing a saved turn.');return;}
+      setPage({key:scope.key,value:{...result.data,items:append?[...current!.items,...result.data.items]:result.data.items}});
+    }catch{if(owns())setMessage('Saved turns could not be read. Read this session again.');}finally{if(owns())setLoading(false);}
+  }
+  async function resume(){
+    if(!selected||!props.session||!props.workspace||props.blocked||busy||original?.unknown||!props.host.instanceId)return;
+    if(!current)return;const scope={key:identityKey,order:++action.current.order},input={sessionId:props.session.session.id,targetLeafId:selected.nativeLeafId,expectedStorageVersion:current.storageVersion,expectedWorkspaceRevision:props.workspace.revision};
+    const attempt:Pending={instance:props.host.instanceId,input,operationRef:crypto.randomUUID(),receipt:null,unknown:false};pendingRef.current=attempt;setPending(attempt);close();setBusy(true);
+    let result:Result<SessionCheckpointReceipt>;try{result=await props.onResumeCheckpoint(input,attempt.operationRef);}catch{result={ok:false,error:safeError('operation_result_unknown')};}
+    if(!mounted.current||pendingRef.current?.operationRef!==attempt.operationRef)return;
+    const unknown=!result.ok&&['operation_result_unknown','resource_unavailable','stop_unconfirmed'].includes(result.error.code);
+    const next={...attempt,receipt:result.ok?result.data:null,unknown};pendingRef.current=next;setPending(next);
+    if(action.current.key===scope.key&&action.current.order===scope.order){setBusy(false);setMessage(result.ok?'History position saved. Continue with a new message.':result.error.reason==='session_restore_failed'?'History position saved. This session cannot continue yet.':unknown?'Restore result unconfirmed. Read the original restore before another action.':errorMessage(result.error));}
+  }
+  async function readOriginal(){
+    const attempt=pendingRef.current,instance=props.host.instanceId;if(!attempt||!instance||props.host.state!=='ready')return;
+    const scope={key:identityKey,order:++action.current.order},owns=()=>mounted.current&&action.current.key===scope.key&&action.current.order===scope.order&&pendingRef.current?.operationRef===attempt.operationRef;
+    setBusy(true);
+    try{const result=await window.medclaw.request('evidence.readOperation',{kind:'session_checkpoint',operationRef:attempt.operationRef});
+      if(!owns())return;
+      if(!result.ok){setMessage('Original restore could not be read. '+errorMessage(result.error));return;}
+      const receipt=result.data;
+      if(!receipt){if(instance!==attempt.instance){await props.onHistoryVerified(attempt.input.sessionId,attempt.operationRef);if(!owns())return;const next={...attempt,unknown:false};pendingRef.current=next;setPending(next);setMessage('Original restore not recorded in this Host. Review saved turns before a new action.');}else setMessage('The original restore is not recorded. Keep its identity and read it again, or restart Host to confirm absence.');return;}
+      if(!('targetLeafId' in receipt)||receipt.operationRef!==attempt.operationRef||receipt.sessionId!==attempt.input.sessionId||receipt.targetLeafId!==attempt.input.targetLeafId){setMessage('Original restore reply did not match its owner.');return;}
+      const next={...attempt,receipt,unknown:false};pendingRef.current=next;setPending(next);setMessage(`Original restore saved · Session ${receipt.sessionId} · Version ${receipt.storageVersion}.`);
+      await props.onHistoryVerified(attempt.input.sessionId,attempt.operationRef);
+    }catch{if(owns())setMessage('Original restore could not be read. Keep its identity and read it again.');}finally{if(owns())setBusy(false);}
+  }
+  async function repair(){
+    if(!props.session||props.blocked||busy||original?.unknown)return;const scope={key:identityKey,order:++action.current.order},owns=()=>mounted.current&&scope.key===action.current.key&&scope.order===action.current.order;setBusy(true);
+    try{const result=await props.onRestoreSession({sessionId:props.session.session.id,expectedLeafId:props.session.session.leafId});if(owns())setMessage(result.ok?'Session restored. Continue with a new message.':errorMessage(result.error));}
+    catch{if(owns())setMessage('Session restore unconfirmed. Refresh this session before continuing.');}finally{if(owns())setBusy(false);}
+  }
+  return <section className="native-messages" data-testid="session-checkpoints" aria-label="Saved turns">
+    <div className="section-heading"><h3>Saved turns</h3><button disabled={loading||!props.session||props.host.state!=='ready'} onClick={()=>void read(false)}>Refresh saved turns</button></div>
+    {loading&&<p role="status">Reading saved turns…</p>}{message&&<p role="status">{message}</p>}
+    {props.session?.runtime?.availability==='blocked'&&<p role="alert">This session cannot continue yet. Restore session before sending.</p>}
+    {current?.items.map(point=><article key={point.answerId}><p>Question: {point.questionSummary}</p><p>Answer: {point.answerSummary}</p><p className="tiny muted">{point.committedAt} · {point.isCurrentBranch?'Current branch':'Other branch'} · Run {point.runId}</p>{point.conditionSummary&&<p>{point.conditionSummary}</p>}
+      <button disabled={props.blocked||busy||!!original?.unknown} onClick={event=>{trigger.current=event.currentTarget;setSelected(point);}}>Resume from here · Run {point.runId}</button></article>)}
+    {current&&!current.items.length&&<p>No completed saved turns.</p>}{current?.hasMore&&<button disabled={loading} onClick={()=>void read(true)}>Load more saved turns</button>}
+    {original&&<p className="tiny">Original restore <code>{original.operationRef}</code>{original.receipt?' · Saved':''} <button disabled={busy||props.host.state!=='ready'} onClick={()=>void readOriginal()}>Read original restore</button></p>}
+    {props.session?.runtime?.availability==='blocked'&&<button disabled={props.blocked||busy||!!original?.unknown} onClick={()=>void repair()}>Restore session</button>}
+    <dialog ref={dialog} aria-labelledby="resume-title" onCancel={event=>{event.preventDefault();close();}}><h3 id="resume-title">Resume from this saved turn?</h3><p>Continue from the selected completed turn. Later branches, Queries and Answers remain saved. Your draft is kept. The next Send starts a new Run.</p><div className="actions"><button ref={cancel} onClick={close}>Cancel</button><button disabled={busy||props.blocked} onClick={()=>void resume()}>Resume from here</button></div></dialog>
+  </section>;
+}
+
 export function Chat(props: { visible: boolean; sessionId: number | null; onCreate: () => void; directory: ModelDirectoryView | null; directoryCurrent: boolean; directoryStatus?: DirectoryReadStatus; host: HostView; active: ActiveRunView | null; control: RuntimeControlView | null;
   run: RunView | null; preview: { text: string; truncated: boolean } | null; session: SessionDetail | null; draft: SessionDraft | null;
   events: RunEventProjectionState | null; onFinalSource: (source: 'native' | 'saved' | 'unavailable') => void;
   selecting: boolean; sending: boolean; runningTitle: string | null; onDraft: (patch: Partial<SessionDraft>) => void; onSend: () => void; onResend: () => void;
   onNewAttempt: (pending: NonNullable<SessionDraft['pending']>) => void;
+  onResumeCheckpoint:(input:RestoreSessionCheckpointInput,operationRef:string)=>Promise<Result<SessionCheckpointReceipt>>;
+  onRestoreSession:(input:RestoreSessionInput)=>Promise<Result<SessionDetail>>;onHistoryVerified:(sessionId:number,operationRef?:string)=>Promise<void>;
   onLookup: () => void; onStop: () => void; onModels: () => void; workspace: WorkspaceView | null; workspaceConfirmed: boolean; workspacePending?: boolean; workspaceRecovery?: 'verify' | 'restart' | null; onVerifyWorkspace?: () => void; onWorkspace: (change: WorkspaceChange) => Promise<boolean>;
   dataDefaults: { batchCount: number; referenceDate: string | null; timezone: string | null } | null;
   queueRun: RunView | null; queueRootInput: SessionInput | null; frozenInput?: SessionInput | null; frozenRunId?: number; inputs: InputQueueSnapshot | null; cancellingInputs: number[];
@@ -146,8 +225,14 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
   const models = props.directory?.models.filter(model => configuredProviders.has(model.provider) && model.input.includes("text") && model.maxTokens !== null) ?? [];
   const selectedModel = models.find(model => model.provider === choice?.provider && model.id === choice?.modelId);
   const choiceValue = selectedModel ? JSON.stringify([selectedModel.provider, selectedModel.id]) : "";
-  const run = props.run?.kind === "agent" && props.run.sessionId !== props.session?.session.id ? null : props.run;
-  const readingKey = props.sessionId === null ? null : `${props.sessionId}:${run?.id ?? 'history'}:chat`;
+  const candidateRun = props.run?.kind === "agent" && props.run.sessionId !== props.session?.session.id ? null : props.run;
+  // A complete, verified current path proves that a saved Run belongs elsewhere.
+  // Keep that Run available in details without appending its discarded branch to chat.
+  const offBranch = candidateRun?.kind === 'agent' && ['completed', 'failed', 'cancelled'].includes(candidateRun.status)
+    && candidateRun.cleanup?.requiredPersistenceComplete === true && currentAvailability?.hasPage
+    && !currentAvailability.hasMore && !currentAvailability.runCovered;
+  const run = offBranch ? null : candidateRun;
+  const readingKey = props.sessionId === null ? null : `${props.sessionId}:${candidateRun?.id ?? 'history'}:chat`;
   const inputControl = props.session?.session.inputControl, queueRun = props.queueRun, original = props.queueRootInput?.workspaceContext;
   const mode: InputMode = inputControl ? draft?.mode ?? 'send' : 'send';
   const label = mode === 'follow_up' ? 'Follow Up' : mode === 'steer' ? 'Steer' : 'Send';
@@ -159,7 +244,7 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
       || original.deviceIds.length > 0 && (!props.workspace.deviceIds.length || props.workspace.deviceIds.some(id => !original.deviceIds.includes(id))) ? 'The selected data exceeds the original Run scope. Wait and Send a new message.'
     : props.inputs?.items.some(input => input.targetRunId === queueRun.id && input.status === 'delivery_unknown') ? 'Input consumption is unconfirmed. Read the original Input or Stop its original Run.' : null;
   const commonReason = props.host.state !== "ready" ? "Waiting for Host to be ready" : props.selecting ? "Session selection is unconfirmed" : !props.session ? "Create or select a session"
-    : !props.session.history.available ? "This session cannot continue after a restart. Create a new session." : draft?.pending ? "Read the original submission first"
+    : !props.session.history.available ? "Saved history is unavailable. Read this session again or create a new session." : props.session.runtime?.availability==='blocked' ? 'This session cannot continue yet. Restore session before sending.' : draft?.pending ? "Read the original submission first"
     : currentAvailability?.available === false ? currentAvailability.unavailable ? 'Native message history is unavailable. Refresh messages or create a new session.' : 'Native message history read failed. Refresh messages before sending.'
     : !draft?.referenceDate ? "Enter a reference date in Message time context" : !draft.timezone.trim() ? "Enter a time zone in Message time context" : null;
   const sendReason = !props.directoryCurrent ? "Reload the model directory in Models" : !choice ? "Select a session model" : !model || !model.input.includes("text") ? "The session model is unavailable. Select another model."
@@ -247,8 +332,8 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
       {props.active && <span data-testid="running-session" className="status-chip">Running: {props.runningTitle ?? "Provider"} · Run {props.active.runId}</span>}</div>
     <div className="messages" data-testid="chat-scroll" ref={scroll} onScroll={rememberPosition} onWheel={markScrollIntent} onPointerDown={markScrollIntent} onPointerMove={event => { if (event.buttons) markScrollIntent(); }} onKeyDown={event => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) markScrollIntent(); }}>
       <div className="reading-width">
-        {!run && !currentAvailability?.hasHistory && currentAvailability?.available !== false && props.session?.history.available !== false && <div className="chat-empty"><span className="eyebrow">Session chat</span><h2>{props.session ? "Start a conversation" : "Create a session"}</h2><p>Each session keeps its context during this app session. Review the saved run for each message.</p><button className="primary" onClick={props.onModels}>Configure models</button></div>}
-        {props.sessionId && <NativeMessages host={props.host} sessionId={props.sessionId} nativeSessionId={props.session?.session.nativeSessionId} visible={props.visible} context="chat" revision={props.session?.session.leafId} testId="chat-native-messages" requiredRunId={run?.id} excludeRunId={run?.kind === 'agent' && events?.finalSource !== 'native' ? run.id : null} onCreate={props.onCreate} onChanged={() => setMessageRevision(value => value + 1)} onAvailability={value => setMessageAvailability({ ...value, epoch: availabilityEpoch })} />}
+        {!run && !currentAvailability?.hasHistory && currentAvailability?.available !== false && props.session?.history.available !== false && <div className="chat-empty"><span className="eyebrow">Session chat</span><h2>{props.session ? "Start a conversation" : "Create a session"}</h2><p>Each session keeps its saved history across restarts. Review the saved run for each message.</p><button className="primary" onClick={props.onModels}>Configure models</button></div>}
+        {props.sessionId && <NativeMessages host={props.host} sessionId={props.sessionId} nativeSessionId={props.session?.session.nativeSessionId} visible={props.visible} context="chat" revision={props.session?.session.leafId} testId="chat-native-messages" requiredRunId={candidateRun?.id} excludeRunId={run?.kind === 'agent' && events?.finalSource !== 'native' ? run.id : null} onCreate={props.onCreate} onChanged={() => setMessageRevision(value => value + 1)} onAvailability={value => setMessageAvailability({ ...value, epoch: availabilityEpoch })} />}
         {events && <div className="stream-display-status" data-testid="event-display-status" data-run-id={events.runId} data-cursor={events.cursor}><p className="tiny muted">Run {events.runId} display · {events.phase} · committed cursor {events.cursor}</p>{(events.finalSource === 'native' || events.finalSource === 'temporary') && <span className="status-chip" data-testid="run-save-status">{status}</span>}{events.error && <p role="alert" className="error-text">{events.error}</p>}{events.phase === 'disconnected' && <p role="status">Disconnected. Retaining verified facts; reconnect restores display.</p>}{events.snapshotsIncomplete && <p className="evidence-gap">Some temporary content is unavailable. Temporary text is not a saved history.</p>}</div>}
         {events?.finalSource === 'temporary' && <section data-testid="temporary-run-area" data-run-id={events.runId} aria-label="Temporary Run display">
           <div className="user-message"><span className="message-label">User</span><div>{run?.inputText}</div></div>
@@ -267,6 +352,7 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
             {props.preview?.truncated && <p className="muted">The live preview was truncated. Read the full saved output in Run details.</p>}
             {showRunBody && run.output.nextOffset !== null && !props.preview && <p className="muted">Showing {run.output.text.length} / {run.output.totalChars} characters. Read the full output in Run details.</p>}
             {run.error && <p role="alert" className="error-text">{errorMessage(run.error)}</p>}</article></>}
+        <SessionCheckpoints host={props.host} session={props.session} workspace={props.workspace} visible={props.visible} blocked={props.selecting||props.sending||!props.workspaceConfirmed||!!props.draft?.pending||props.control?.acceptingNewRuns!==true||props.host.state!=='ready'} onResumeCheckpoint={props.onResumeCheckpoint} onRestoreSession={props.onRestoreSession} onHistoryVerified={props.onHistoryVerified}/>
       </div>
     </div>
     {contentUpdated === readingKey && !following && <p className="tiny evidence-gap reading-update" data-testid="reading-content-updated">Content updated. Kept the nearest available message.</p>}

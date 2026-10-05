@@ -192,7 +192,6 @@ export function projectSessionMessages(manager: SessionManager, input: ReadSessi
     }
     for (const id of visiting) validated.add(id);
   }
-  if (leafId === null && entries.length) return unsupported(); // Only a validated legal resetLeaf position is unavailable.
   const chain = leafId === null ? [] : manager.getBranch(leafId);
   // Native index and entry snapshots must describe the same fixed path.
   let expectedId = leafId;

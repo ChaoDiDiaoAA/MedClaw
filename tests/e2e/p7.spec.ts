@@ -305,9 +305,9 @@ test('A13 nonempty saved selection restores once after explicit Host restart wit
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click(); await expect(page.getByTestId('confirmed-selection').last()).toContainText(view.data.page.rowKeys[0]!);
   expect(sql('SELECT * FROM workspace')[0]).toEqual(before); expect(physical).toBe(models); expect(sql('SELECT count(*) AS n FROM runs')[0].n).toBe(count);
   await page.getByRole('button', { name: 'Chat', exact: true }).click(); await input().fill('No automatic history resurrection');
-  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
   const detail = await page.evaluate(sessionId => window.medclaw.request('session.read', { sessionId }), original.sessionId);
-  expect(detail).toMatchObject({ ok: true, data: { history: { available: false } } });
+  expect(detail).toMatchObject({ ok: true, data: { history: { available: true },runtime:{availability:'unloaded'} } });
   save('A13-nonempty-restart', { old, host: await page.evaluate(() => window.medclaw.request('host.read', {})), before, workspace: sql('SELECT * FROM workspace'), detail, models, count });
 });
 

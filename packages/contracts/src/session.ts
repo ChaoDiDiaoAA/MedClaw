@@ -4,7 +4,7 @@ import { ModelChoiceSchema, ModelSelectionSchema, ReferenceDateSchema, TimezoneS
 import { RevisionSchema, WorkspaceViewSchema, WorkspaceContextSchema } from "./workspace";
 import type { WorkspaceView, WorkspaceChange, WorkspaceContext } from "./workspace";
 import { RunScopeSchema } from "./run";
-import type { AppError } from "./error";
+import type { AppError, Result } from "./error";
 import type { StoredOperation, RunHandle, RegisterAgentInput } from "./run";
 import type { ReadSessionMessagesInput, SessionMessagePage } from "./messages";
 
@@ -31,7 +31,7 @@ export const InputControlSchema = z.strictObject({ runId: PositiveIdSchema, acce
 export type InputControl = z.infer<typeof InputControlSchema>;
 export const SessionViewSchema = z.strictObject({
   ...metadataFields, nativeSessionId: OpaqueIdSchema, kind: z.literal("user"),
-  inputControl: InputControlSchema.nullable(), storageVersion: z.literal(0), leafId: OpaqueIdSchema.nullable(), nextSubmissionSequence: PositiveIdSchema,
+  inputControl: InputControlSchema.nullable(), storageVersion: RevisionSchema, leafId: OpaqueIdSchema.nullable(), nextSubmissionSequence: PositiveIdSchema,
 }).refine(session => (session.status === 'deleted') === (session.deletedAt !== null), 'Deletion time must match session lifecycle');
 export const NewSessionResultSchema = z.strictObject({ session: SessionViewSchema, workspace: WorkspaceViewSchema });
 export const ListSessionsRequestSchema = z.strictObject({ beforeSessionId: PositiveIdSchema.optional(), limit: z.number().int().min(1).max(50).default(20) });
@@ -40,12 +40,45 @@ export const BasicMessagePreviewSchema = z.strictObject({
   nativeEntryId: OpaqueIdSchema, role: z.enum(["user", "assistant"]), text: z.string().max(8192),
   totalChars: RevisionSchema, truncated: z.boolean(),
 });
+export const SessionRuntimeViewSchema = z.strictObject({ availability: z.enum(['unloaded', 'ready', 'blocked']), error: AppErrorSchema.nullable() })
+  .refine(value => value.availability === 'blocked' ? value.error !== null : value.error === null, 'Blocked instances require a safe error');
+export type SessionRuntimeView = z.infer<typeof SessionRuntimeViewSchema>;
 export const SessionDetailSchema = z.strictObject({
   session: SessionViewSchema, runningRunId: PositiveIdSchema.nullable(),
-  history: z.strictObject({ available: z.boolean(), reason: z.enum(["host_restart", "native_state_invalid"]).nullable(),
+  runtime:SessionRuntimeViewSchema,
+  history: z.strictObject({ available: z.boolean(), reason: z.enum(["host_restart", "native_state_invalid", "history_not_recorded"]).nullable(),
     messages: z.array(BasicMessagePreviewSchema).max(32), truncated: z.boolean() }),
 });
 export const InputModeSchema = z.enum(["send", "steer", "follow_up"]);
+export const ReadSessionCheckpointsInputSchema = z.strictObject({ sessionId: PositiveIdSchema, afterAnswerId: PositiveIdSchema.nullable().default(null), limit: PositiveIdSchema.max(100).default(50) });
+export const SessionCheckpointSchema = z.strictObject({ answerId: PositiveIdSchema, runId: PositiveIdSchema, nativeLeafId: OpaqueIdSchema, committedAt: TimestampSchema,
+  questionSummary: z.string().max(512), answerSummary: z.string().max(512), conditionSummary: z.null(), isCurrentBranch: z.boolean() });
+export const SessionCheckpointPageSchema = z.strictObject({ sessionId: PositiveIdSchema, storageVersion: RevisionSchema, items: z.array(SessionCheckpointSchema).max(100), nextAnswerId: PositiveIdSchema.nullable(), hasMore: z.boolean() })
+  .refine(page => page.hasMore ? page.items.length > 0 && page.nextAnswerId === page.items.at(-1)!.answerId : page.nextAnswerId === null, 'Checkpoint cursor must identify the last returned eligible answer');
+export const RestoreSessionCheckpointInputSchema = z.strictObject({ sessionId: PositiveIdSchema, targetLeafId: OpaqueIdSchema, expectedStorageVersion: RevisionSchema, expectedWorkspaceRevision: RevisionSchema });
+export const SessionCheckpointReceiptSchema = z.strictObject({ operationRef: OpaqueIdSchema, sessionId: PositiveIdSchema, targetLeafId: OpaqueIdSchema, storageVersion: RevisionSchema.positive(), workspaceRevision: RevisionSchema.positive(), committedAt: TimestampSchema });
+export const SessionCheckpointDetailsSchema = z.strictObject({ format: z.literal('medclaw.session-checkpoint/v1'), request: RestoreSessionCheckpointInputSchema,
+  before: z.strictObject({ leafId: OpaqueIdSchema.nullable(), storageVersion: RevisionSchema, workspaceRevision: RevisionSchema }), receipt: SessionCheckpointReceiptSchema })
+  .refine(value => value.request.sessionId === value.receipt.sessionId && value.request.targetLeafId === value.receipt.targetLeafId
+    && value.request.expectedStorageVersion === value.before.storageVersion && value.request.expectedWorkspaceRevision === value.before.workspaceRevision
+    && value.receipt.storageVersion === value.before.storageVersion + 1 && value.receipt.workspaceRevision === value.before.workspaceRevision + 1, 'Checkpoint receipt must match the original request and committed versions');
+export const RestoreSessionInputSchema = z.strictObject({ sessionId: PositiveIdSchema, expectedLeafId: OpaqueIdSchema.nullable() });
+export type ReadSessionCheckpointsInput = z.input<typeof ReadSessionCheckpointsInputSchema>;
+export type SessionCheckpoint = z.infer<typeof SessionCheckpointSchema>;
+export type SessionCheckpointPage = z.infer<typeof SessionCheckpointPageSchema>;
+export type RestoreSessionCheckpointInput = z.infer<typeof RestoreSessionCheckpointInputSchema>;
+export type SessionCheckpointReceipt = z.infer<typeof SessionCheckpointReceiptSchema>;
+export type SessionCheckpointDetails = z.infer<typeof SessionCheckpointDetailsSchema>;
+export type RestoreSessionInput = z.infer<typeof RestoreSessionInputSchema>;
+/** Opaque locked-version native data; validated with public SDK types at runtime-pi. */
+export const NATIVE_HISTORY_FORMAT = 'pi-session/3;pi-sdk/0.87.1';
+export interface NativeHistorySnapshot { sessionId: number; nativeSessionId: string; header: unknown; entries: unknown[]; activeLeafId: string | null; storageVersion: number }
+export interface NativeHistoryCommit { sessionId: number; runId: number | null; expectedStorageVersion: number; header: unknown; newEntries: unknown[]; activeLeafId: string | null }
+export interface MemoryStore {
+  load(sessionId: number): Promise<Result<NativeHistorySnapshot>>;
+  commit(change: NativeHistoryCommit): Promise<Result<{ storageVersion: number }>>;
+  listEntries(sessionId: number, afterSequence: number, limit: number): Promise<Result<unknown[]>>;
+}
 export const InputStatusSchema = z.enum(["queued", "consumed", "failed", "cancelled", "delivery_unknown"]);
 export const InputProcessingStatusSchema = z.enum(["pending", "completed", "failed", "cancelled"]);
 const submissionFields = {
@@ -140,19 +173,27 @@ export type BasicMessagePreview = z.infer<typeof BasicMessagePreviewSchema>;
 export type SubmitInput = z.infer<typeof SubmitInputSchema>;
 export type SubmitResult = z.infer<typeof SubmitResultSchema>;
 export type ReadSubmissionRequest = z.infer<typeof ReadSubmissionRequestSchema>;
-export type NativeSessionPreview = SessionDetail["history"] & { leafId: string | null };
+export type NativeSessionPreview = SessionDetail["history"] & { leafId: string | null;storageVersion:number };
+export type InitialNativeHistory = Pick<NativeHistorySnapshot,'header'|'entries'|'activeLeafId'>;
 export type NativeSessionBindings = {
-  allocate: () => { nativeSessionId: string; bind: (sessionId: number) => void; discard: () => void };
-  read: (sessionId: number) => NativeSessionPreview;
-  readMessages: (input: ReadSessionMessagesInput) => SessionMessagePage;
+  allocate: () => { nativeSessionId: string; history:InitialNativeHistory; bind: (sessionId: number) => void; discard: () => void };
+  read: (sessionId: number) => Promise<NativeSessionPreview>;
+  readMessages: (input: ReadSessionMessagesInput) => Promise<SessionMessagePage>;
+  ensureLoaded: (sessionId:number)=>Promise<void>;
+  restore: (sessionId:number)=>Promise<void>;
+  readAvailability: (sessionId:number)=>SessionRuntimeView;
 };
 /** Product persistence port; native SDK objects stay in the Host's adapter. */
 export interface SessionStore extends Pick<InputStore, "readInput" | "listInputs"> {
-  createSession(input: NewSessionInput, operationRef: string, nativeSessionId: string, time: string): NewSessionResult;
+  createSession(input: NewSessionInput, operationRef: string, nativeSessionId: string, time: string, initialHistory:InitialNativeHistory): NewSessionResult;
   selectSession(input: SelectSessionInput, time: string): WorkspaceView;
   renameSession(input: RenameSessionInput, operationRef: string, time: string): SessionManagementReceipt;
   deleteSession(input: DeleteSessionInput, operationRef: string, time: string): SessionManagementReceipt;
   readManagementOperation(input: ReadManagementOperationInput): SessionManagementReceipt | null;
+  readCheckpoints(input:ReadSessionCheckpointsInput):SessionCheckpointPage;
+  restoreCheckpointInTransaction(input:RestoreSessionCheckpointInput,operationRef:string,time:string):SessionCheckpointReceipt;
+  readCheckpointOperation(operationRef:string):{request:RestoreSessionCheckpointInput;receipt:SessionCheckpointReceipt}|null;
+  assertHistoryMutationAllowed(sessionId:number):void;
   readSession(sessionId: number): SessionView | null;
   listSessions(input: { beforeSessionId?: number; limit?: number }): SessionPage;
   readWorkspace(): WorkspaceView;
@@ -160,6 +201,6 @@ export interface SessionStore extends Pick<InputStore, "readInput" | "listInputs
   findOperation(operationRef: string): StoredOperation | null;
   findSubmission(input: ReadSubmissionRequest): SubmitResult | null;
   readMessageInputLinks(sessionId: number, nativeEntryIds: readonly string[]): Map<string, { inputId: number; runId: number }>;
-  readMessageLinks(sessionId: number, nativeEntryIds: readonly string[]): Map<string, { runId: number; toolCallRef: string; references: string[] }>;
+  readMessageLinks(sessionId: number, nativeEntryIds: readonly string[]): Map<string, { runId: number; toolCallRef: string | null; references: string[] }>;
   active(): RunHandle | null;
 }

@@ -1,3 +1,4 @@
+import { sqliteHistory,nativeHistoryFixture } from '../fixtures/p9-memory';
 import { toWorkspaceContext } from '../../packages/contracts/src/workspace';
 import { expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
@@ -82,7 +83,7 @@ test('agent_run_start_event_failure_prevents_model_request',async()=>{
   const credentials=new InMemoryCredentialStore();await credentials.modify('p',async()=>({type:'api_key',key:'fixture'}));
   const runtime=await PiModelRuntime.create({credentials,modelsStore:new InMemoryModelsStore()});
   await runtime.installCustom([{providerId:'p',name:'fixture',api:'openai-completions',baseUrl:provider.url,models:[{id:'m',name:'fixture',input:['text'],reasoning:false,contextWindow:32000,maxTokens:100,outputLimitConfirmed:true,pricingKnown:false,cost:null}]}]);
-  const resolved=await runtime.resolve(f.plan.originalSubmitInput.model,'1',null,DEFAULT_REQUEST_POLICY),agent=new PiAgentRuntime(runtime,nativeRoot);agent.allocate().bind(1);
+  const resolved=await runtime.resolve(f.plan.originalSubmitInput.model,'1',null,DEFAULT_REQUEST_POLICY),history=nativeHistoryFixture(),agent=new PiAgentRuntime(runtime,nativeRoot,history.history);history.bind(agent,1);
   const r=f.repos.acceptInput(f.plan);f.setFailure('run_started');
   const observation=await agent.execute({runId:r.runId!,sessionId:1,text:'hello',resolved,agentOptions:agent.describe(resolved),signal:new AbortController().signal,deadlineAt:performance.now()+10000},{startCall:time=>new ModelCallRecorder(f.repos,r.runId!,'main',time),preview:()=>{},nativeTerminal:()=>{}});
   expect(observation.lastOutcome?.error?.code).toBe('storage_write_failed');expect(provider.requests).toHaveLength(0);

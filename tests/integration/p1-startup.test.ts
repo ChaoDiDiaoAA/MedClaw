@@ -37,9 +37,9 @@ test('LF schema 3 upgrades under the current checkout without rewriting old chec
     const db = openDatabase(path);
     try {
       expect(db.query('SELECT * FROM schema_migrations WHERE version<=3 ORDER BY version').all()).toEqual(markers);
-      expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }]);
+      expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, {version:9}]);
       expect(db.query('SELECT * FROM sessions').all()).toEqual(sessions.map(session => ({
-        ...session as Record<string, unknown>, metadata_json: '{"titleOrigin":"user"}', metadata_revision: 0, deleted_at: null,
+        ...session as Record<string, unknown>, metadata_json: '{"titleOrigin":"user"}', metadata_revision: 0, deleted_at: null,native_header_json:null,current_leaf_id:null,history_format_version:null,
       })));
       expect(db.query('SELECT active_session_id,revision FROM workspace').get()).toEqual({ active_session_id: 1, revision: 7 });
       expect(db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });

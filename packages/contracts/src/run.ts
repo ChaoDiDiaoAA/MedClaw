@@ -5,7 +5,7 @@ import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } fro
 import { AgentPolicySchema, BudgetSummarySchema, MeasurementContextSchema, ModelSelectionSchema, ReferenceDateSchema, RequestPolicySchema, TimezoneSchema, ToolProfileSnapshotSchema } from "./model";
 import type { AppError } from "./error";
 import type { AgentPolicy, BudgetSummary, DiagnoseRequest, MeasurementContext, ModelSelection, ProviderAccepted, ProviderRequest, RequestPolicy, ToolProfileSnapshot } from "./model";
-import type { NewSessionInput, NewSessionResult, SubmitInput, SubmitResult, SessionStore, InputStore, InputAdapterPort, InputSettlementProof, InputControl, RenameSessionInput, DeleteSessionInput, SessionManagementReceipt } from "./session";
+import type { NewSessionInput, NewSessionResult, SubmitInput, SubmitResult, SessionStore, InputStore, InputAdapterPort, InputSettlementProof, InputControl, RenameSessionInput, DeleteSessionInput, SessionManagementReceipt, NativeHistoryCommit } from "./session";
 import type { WorkspaceView, WorkspaceContext } from "./workspace";
 import { StoredToolConfigurationSchema, type ToolConfiguration } from './tool-config';
 import { RuntimeConfigurationSchema, type RuntimeConfiguration } from './runtime-config';
@@ -56,6 +56,7 @@ const runFields = {
 export const ProviderRunViewSchema = z.strictObject({ ...runFields, kind: z.literal("provider"), sessionId: z.null(),
   goal: z.enum(["answer", "verify"]), calls: z.array(ModelCallViewSchema).max(1) });
 export const AgentRunViewSchema = z.strictObject({ ...runFields, inputId: PositiveIdSchema.nullable(), kind: z.literal("agent"), sessionId: PositiveIdSchema,
+  answerNativeLeafId: OpaqueIdSchema.nullable().default(null),
   clientSequence: PositiveIdSchema, nativeSessionId: OpaqueIdSchema, goal: z.literal("answer"),
   calls: z.array(ModelCallViewSchema).max(50), nextCallOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
   control: z.strictObject({
@@ -170,6 +171,7 @@ export interface FinalProviderFact {
 }
 interface AgentStartCommon {
   contextContract?: 'medclaw.context/v1';
+  historyContract?: 'medclaw.history/p9-v1';
   sessionId: number; text: string; model: ModelSelection; policy: RequestPolicy; goal: "answer";
   workspace: WorkspaceView; scope: RunScope; referenceDate: string; timezone: string; timeoutMs: number; agentOptions: P2AgentOptions;
   agentPolicy?: AgentPolicy;
@@ -181,8 +183,14 @@ interface AgentStartCommon {
 export type AgentStartFields = AgentStartCommon & ({ inputId: null; submission: { operationRef: string; originalSubmitInput: SubmitInput } } | { inputId: number; submission: null });
 export type StartRunInput<Resolved> = AgentStartFields & { resolved: Resolved };
 export type RegisterAgentInput = AgentStartFields & { instanceId: string; createdAt: string };
-export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[]; budgetSummary?: BudgetSummary; inputSettlement?: InputSettlementProof };
+export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[]; budgetSummary?: BudgetSummary; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit };
 export type AgentRuntimePort<Resolved> = {
+  readonly historyContract?: 'medclaw.history/p9-v1';
+  hasPendingHistoryPersistence?: (runId: number) => boolean;
+  retryHistoryPersistence?: (runId: number) => void;
+  readFinalHistory?: (runId:number)=>NativeHistoryCommit;
+  acknowledgeHistorySaved?: (change: NativeHistoryCommit, storageVersion: number) => void;
+  releaseHistoryFacts?: (runId: number) => void;
   readonly contextContract?: 'medclaw.context/v1';
   hasPendingContextPersistence?: (runId: number) => boolean;
   retryContextPersistence?: (runId: number) => void;
@@ -204,12 +212,13 @@ export type AgentRuntimePort<Resolved> = {
     callbacks: { stream?: (snapshot: StreamSnapshot) => void; startCall: (time: string, context?: StartCallContext) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
       fatal?: (error: AppError) => void; inputStore?: InputStore; admissionClosed?: () => void }) => Promise<AgentExecutionObservation>;
 };
-export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord; inputSettlement?: InputSettlementProof };
+export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit };
 export type StoredOperation = ProviderOperation
   | { method: "session.create"; operationRef: string; originalRequest: NewSessionInput; result: NewSessionResult }
   | { method: "session.submit"; operationRef: string; originalRequest: SubmitInput; result: SubmitResult }
   | { method: "session.rename"; operationRef: string; originalRequest: RenameSessionInput; result: SessionManagementReceipt }
-  | { method: "session.delete"; operationRef: string; originalRequest: DeleteSessionInput; result: SessionManagementReceipt };
+  | { method: "session.delete"; operationRef: string; originalRequest: DeleteSessionInput; result: SessionManagementReceipt }
+  | { method: "session.restoreCheckpoint"; operationRef:string; originalRequest:import('./session').RestoreSessionCheckpointInput;result:import('./session').SessionCheckpointReceipt };
 export function canonicalRequest(value: unknown): string {
   const ordered = (item: unknown): unknown => Array.isArray(item) ? item.map(ordered)
     : item !== null && typeof item === "object" ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, val]) => [key, ordered(val)])) : item;
@@ -225,7 +234,9 @@ export interface ProviderRunStore {
   active(): RunHandle | null;
 }
 export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputStore {
+  confirmHistorySaved?(change:NativeHistoryCommit):{storageVersion:number}|null;
   verifyPriorContextFacts?(runId: number): { requiredPersistenceComplete: boolean; unconfirmedItems: string[] };
+  verifyPriorHistoryFacts?(runId: number): { requiredPersistenceComplete: boolean; unconfirmedItems: string[] };
   freezeAgentScope(workspace: WorkspaceView, toolNames: readonly string[]): RunScope;
   registerAgent(input: RegisterAgentInput): SubmitResult;
   finalizeAgent(runId: number, fact: FinalAgentFact): RunView;

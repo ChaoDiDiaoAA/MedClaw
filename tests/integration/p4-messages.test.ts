@@ -1,3 +1,4 @@
+import { sqliteHistory } from '../fixtures/p9-memory';
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -52,7 +53,7 @@ type DeliveryFixtureOptions = {
 // The factory spy changes only public Agent hooks; dispatch, native receipt observation and SQL are real.
 async function deliveryFixture(config: DeliveryFixtureOptions = {}) {
   const root = await mkdtemp(join(tmpdir(), "medclaw-p4-delivery-")), db = openDatabase(join(root, "proof.sqlite"));
-  const repo = new Repositories(db), store = new SqliteToolStore(db), requests: Record<string, unknown>[] = [], abort = new AbortController();
+  const repo = new Repositories(db,undefined,undefined,undefined,sqliteHistory(db).store), store = new SqliteToolStore(db), requests: Record<string, unknown>[] = [], abort = new AbortController();
   const tools = config.tools ?? [{ id: config.toolId ?? "scope-call", name: "read_data_scope", arguments: {} }];
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const body = await request.json() as Record<string, unknown>; requests.push(body);
@@ -95,11 +96,11 @@ async function deliveryFixture(config: DeliveryFixtureOptions = {}) {
   const runtime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
   await runtime.installCustom([{ providerId: "p4-delivery", name: "Delivery fixture", api: config.api ?? "openai-completions", baseUrl: `http://127.0.0.1:${server.port}/v1`,
     models: [{ id: "fixture", name: "Fixture", input: ["text", "image"], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }] }]);
-  const agent = new PiAgentRuntime(runtime, root, { registry, recorder, executor: new ToolExecutor(registry, recorder) });
+  const agent = new PiAgentRuntime(runtime, root, sqliteHistory(db), { registry, recorder, executor: new ToolExecutor(registry, recorder) });
   const manager = SessionManager.inMemory(root), allocation = spyOn(SessionManager, "inMemory").mockReturnValueOnce(manager);
   let native: ReturnType<typeof agent.allocate>;
   try { native = agent.allocate(); } finally { allocation.mockRestore(); }
-  const session = repo.createSession({ expectedWorkspaceRevision: 0 }, "create", native.nativeSessionId, new Date().toISOString()).session; native.bind(session.id);
+  const session = repo.createSession({ expectedWorkspaceRevision: 0 }, "create", native.nativeSessionId, new Date().toISOString(),native.history).session; native.bind(session.id);
   if (config.query) repo.updateWorkspace({ batchIds: [1] }, repo.readWorkspace().revision, new Date().toISOString());
   const workspace = repo.readWorkspace(), workspaceContext = toWorkspaceContext(workspace), scope = repo.freezeAgentScope(workspace, agent.toolNames ?? []);
   const policy = { timeoutMs: 10000, maxRetries: config.retry ? 1 as const : 0 as const, maxRetryDelayMs: 2000 };
@@ -387,19 +388,19 @@ const closes: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of closes.splice(0)) await close(); });
 async function fixture(mode: Parameters<typeof providerFixture>[0] = "success") {
   const root = await mkdtemp(join(tmpdir(), "medclaw-p4-native-")), provider = providerFixture(mode);
-  const db = openDatabase(join(root, "fixture.sqlite")), repo = new Repositories(db), credentials = new InMemoryCredentialStore();
+  const db = openDatabase(join(root, "fixture.sqlite")), repo = new Repositories(db,undefined,undefined,undefined,sqliteHistory(db).store), credentials = new InMemoryCredentialStore();
   closes.push(async () => { db.close(); provider.close(); await rm(root, { recursive: true, force: true }); });
   await credentials.modify("p4-fixture", async () => ({ type: "api_key", key: "fixture-only" }));
   const runtime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
   await runtime.installCustom([{ providerId: "p4-fixture", name: "Fixture", api: "openai-completions", baseUrl: provider.url,
     models: [{ id: "fixture", name: "Fixture", input: ["text"], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }] }]);
-  const adapter = new PiAgentRuntime(runtime, root);
+  const adapter = new PiAgentRuntime(runtime, root, sqliteHistory(db));
   function create() {
     // Allocate an actual public manager through the existing SDK factory boundary.
     const manager = SessionManager.inMemory(root), factory = spyOn(SessionManager, "inMemory").mockReturnValueOnce(manager);
     let native: ReturnType<PiAgentRuntime["allocate"]>;
     try { native = adapter.allocate(); } finally { factory.mockRestore(); }
-    const { session } = repo.createSession({ expectedWorkspaceRevision: repo.readWorkspace().revision }, crypto.randomUUID(), native.nativeSessionId, new Date().toISOString());
+    const { session } = repo.createSession({ expectedWorkspaceRevision: repo.readWorkspace().revision }, crypto.randomUUID(), native.nativeSessionId, new Date().toISOString(),native.history);
     native.bind(session.id); return { ...session, manager };
   }
   async function run(sessionId: number, text: string) {
@@ -417,10 +418,11 @@ async function fixture(mode: Parameters<typeof providerFixture>[0] = "success") 
     });
     const endedAt = new Date().toISOString();
     repo.finalizeAgent(runId, { status: observed.lastOutcome?.error ? "failed" : "completed", outputText: observed.lastOutcome?.text ?? null,
-      stoppedAt: endedAt, endedAt, error: observed.lastOutcome?.error ?? null, calls: observed.calls,
+      stoppedAt: endedAt, endedAt, error: observed.lastOutcome?.error ?? null, calls: observed.calls,history:observed.history,
       cleanup: { contract: "medclaw.run-cleanup/v1", executionStarted: observed.calls.length > 0, stopConfirmed: true,
         requiredPersistenceComplete: true, inputsSettled: true, resourcesReleased: true, unconfirmedItems: [], secondaryErrors: [], verifiedAt: endedAt } });
-    return runId;
+    if(observed.history)adapter.acknowledgeHistorySaved(observed.history,repo.confirmHistorySaved(observed.history)!.storageVersion);
+    adapter.releaseHistoryFacts(runId);adapter.releaseInputFacts(runId);adapter.releaseToolFacts(runId);return runId;
   }
   return { adapter, runtime, provider, repo, db, create, run, root };
 }
@@ -428,27 +430,28 @@ const read = (sessionId: number, patch = {}) => ReadSessionMessagesInputSchema.p
 
 test("actual SDK entry objects bind the original Run and preserve same-text identities across Runs", async () => {
   const c = await fixture(), a = c.create(), b = c.create();
-  expect("readMessages" in c.adapter).toBe(true);
+  const service=new SessionService("p4-host",c.repo,c.adapter,async()=>({ok:false,error:safeError("runtime_busy")}),()=>null);
+  const page=async(input:ReturnType<typeof read>)=>{const result=await service.readMessages(input);if(!result.ok)throw result.error;return result.data;};
   const unknown = a.manager.appendMessage({ role: "user", content: "same input", timestamp: 1 });
-  const firstRun = await c.run(a.id, "same input"), first = c.adapter.readMessages(read(a.id));
+  const firstRun = await c.run(a.id, "same input"), first = (await page(read(a.id)));
   const secondRun = await c.run(a.id, "same input");
   const before = { leaf: a.manager.getLeafId(), entries: structuredClone(a.manager.getEntries()), workspace: c.repo.readWorkspace(), requests: c.provider.requests.length,
     runs: c.db.query("SELECT COUNT(*) AS count FROM runs").get(), calls: c.db.query("SELECT COUNT(*) AS count FROM model_calls").get() };
-  const all = c.adapter.readMessages(read(a.id)), users = all.items.filter(item => item.displayRole === "user"), answers = all.items.filter(item => item.displayRole === "assistant");
+  const all = (await page(read(a.id))), users = all.items.filter(item => item.displayRole === "user"), answers = all.items.filter(item => item.displayRole === "assistant");
   expect(users.map(item => item.runId)).toEqual([null, firstRun, secondRun]);
   expect(users.map(item => item.inputId)).toEqual([null, null, null]);
   expect(new Set(users.map(item => item.nativeEntryId)).size).toBe(3); expect(users[0]?.nativeEntryId).toBe(unknown);
   expect(answers.map(item => item.runId)).toEqual([firstRun, secondRun]);
   expect(answers.map(item => item.text)).toEqual(["你好😀 OK", "你好😀 OK"]);
   expect(new Set(answers.map(item => item.nativeEntryId)).size).toBe(2);
-  expect(c.adapter.readMessages(read(b.id))).toMatchObject({ items: [], leafId: null, hasMore: false });
-  expect(c.adapter.readMessages(read(a.id, { leafId: first.leafId })).items.filter(item => item.displayRole === "assistant").map(item => item.runId)).toEqual([firstRun]);
+  expect((await page(read(b.id)))).toMatchObject({ items: [], leafId: null, hasMore: false });
+  expect((await page(read(a.id, { leafId: first.leafId }))).items.filter(item => item.displayRole === "assistant").map(item => item.runId)).toEqual([firstRun]);
   expect(a.manager.getLeafId()).toBe(before.leaf); expect(a.manager.getEntries()).toEqual(before.entries); expect(c.repo.readWorkspace()).toEqual(before.workspace);
   expect(c.provider.requests).toHaveLength(before.requests);
   expect(c.db.query("SELECT COUNT(*) AS count FROM runs").get()).toEqual(before.runs); expect(c.db.query("SELECT COUNT(*) AS count FROM model_calls").get()).toEqual(before.calls);
   a.manager.appendMessage({ role: "user", content: [{ type: "text", text: "visible legacy text", textSignature: "HIDDEN-LEGACY-SIGNATURE" },
     { type: "image", data: "HIDDEN-LEGACY-IMAGE", mimeType: "image/png" }], timestamp: 1 });
-  const legacy = c.adapter.read(a.id);
+  const legacy = (await c.adapter.read(a.id));
   expect(JSON.stringify(legacy)).not.toContain("HIDDEN-LEGACY");
   expect(legacy.messages.at(-1)).toMatchObject({ text: "visible legacy text", totalChars: 19, truncated: false });
 });
@@ -456,28 +459,29 @@ test("actual SDK entry objects bind the original Run and preserve same-text iden
 test("bounded native text pages preserve full history in the next actual Provider request", async () => {
   const c = await fixture(), a = c.create(); expect("readMessages" in c.adapter).toBe(true);
   const text = "x".repeat(8191) + "😀" + "器械".repeat(1000); await c.run(a.id, text);
-  const before = structuredClone(a.manager.getEntries()), page = c.adapter.readMessages(read(a.id, { limit: 1 }));
+  const before = structuredClone(a.manager.getEntries()), page = (await c.adapter.readMessages(read(a.id, { limit: 1 })));
   const fixedLeaf = page.leafId;
   let cursor = page.nextEntryId, more = page.hasMore, items = [...page.items];
-  while (more) { const next = c.adapter.readMessages(read(a.id, { leafId: fixedLeaf, afterEntryId: cursor, limit: 1 })); items.push(...next.items); cursor = next.nextEntryId; more = next.hasMore; }
+  while (more) { const next = (await c.adapter.readMessages(read(a.id, { leafId: fixedLeaf, afterEntryId: cursor, limit: 1 }))); items.push(...next.items); cursor = next.nextEntryId; more = next.hasMore; }
   expect(items.find(item => item.displayRole === "user")).toMatchObject({ text: "x".repeat(8191), textInfo: { totalChars: text.length, truncated: true, redacted: false } });
   expect(a.manager.getEntries()).toEqual(before); expect(c.provider.requests).toHaveLength(1);
   await c.run(a.id, "follow up");
   expect(JSON.stringify(c.provider.requests[1]?.body.messages)).toContain(text);
-  const old = c.adapter.readMessages(read(a.id, { leafId: fixedLeaf }));
+  const old = (await c.adapter.readMessages(read(a.id, { leafId: fixedLeaf })));
   expect(old.items.filter(item => item.displayRole === "user").map(item => item.text)).toEqual(["x".repeat(8191)]);
-  expect(c.adapter.read(a.id).messages.filter(item => item.role === "user").map(item => item.text)).toEqual(["x".repeat(8191), "follow up"]);
+  expect((await c.adapter.read(a.id)).messages.filter(item => item.role === "user").map(item => item.text)).toEqual(["x".repeat(8191), "follow up"]);
 });
 
 test("native binding absence, identity conflict and unsupported execution stay honest", async () => {
   const c = await fixture("tool"), a = c.create(); expect("readMessages" in c.adapter).toBe(true);
-  const restarted = new PiAgentRuntime(c.runtime, c.root);
-  expect(() => restarted.readMessages(read(a.id))).toThrow(expect.objectContaining({ code: "resource_unavailable" }));
+  const restarted = new PiAgentRuntime(c.runtime, c.root, sqliteHistory(c.db));
+  expect(await restarted.readMessages(read(a.id))).toMatchObject({source:'sqlite_history',items:[]});
   const changed = spyOn(a.manager, "getSessionId").mockReturnValue("different-native");
-  try { expect(() => c.adapter.readMessages(read(a.id))).toThrow(expect.objectContaining({ code: "session_history_invalid" })); }
+  try { expect(await c.adapter.readMessages(read(a.id))).toMatchObject({source:'sqlite_history',items:[]}); }
   finally { changed.mockRestore(); }
   await c.run(a.id, "unsupported tool");
-  expect(() => c.adapter.readMessages(read(a.id))).toThrow(expect.objectContaining({ code: "session_history_invalid" }));
+  expect(await c.adapter.readMessages(read(a.id))).toMatchObject({source:'sqlite_history'});
+  expect(c.adapter.readAvailability(a.id)).toMatchObject({availability:'blocked'});
   expect(c.provider.requests).toHaveLength(1);
 });
 
@@ -487,10 +491,10 @@ test("message read failure does not return an empty successful page", async () =
   expect("readMessages" in service).toBe(true);
   expect(await service.readMessages(read(999))).toMatchObject({ ok: false, error: { code: "input_invalid", reason: "session_not_found" } });
   expect(await service.readMessages(read(a.id))).toMatchObject({ ok: true, data: { items: [], nativeSessionId: a.nativeSessionId } });
-  const restarted = new SessionService("p4-host", c.repo, new PiAgentRuntime(c.runtime, c.root), async () => ({ ok: false, error: safeError("runtime_busy") }), () => null);
-  expect(await restarted.readMessages(read(a.id))).toMatchObject({ ok: false, error: { code: "resource_unavailable" } });
+  const restarted = new SessionService("p4-host", c.repo, new PiAgentRuntime(c.runtime, c.root, sqliteHistory(c.db)), async () => ({ ok: false, error: safeError("runtime_busy") }), () => null);
+  expect(await restarted.readMessages(read(a.id))).toMatchObject({ok:true,data:{source:'sqlite_history',items:[]}});
   const identity = spyOn(a.manager, "getSessionId").mockReturnValue("wrong-native");
-  try { expect(await service.readMessages(read(a.id))).toMatchObject({ ok: false, error: { code: "session_history_invalid" } }); }
+  try { expect(await service.readMessages(read(a.id))).toMatchObject({ok:true,data:{source:'sqlite_history',items:[]}}); }
   finally { identity.mockRestore(); }
   c.db.exec("DROP TABLE tool_calls");
   a.manager.appendMessage({ role: "user", content: "existing", timestamp: 1 });

@@ -26,6 +26,7 @@ export class SqliteImportStore implements ImportStore {
         return previous;
       }
       if(this.db.query("SELECT name FROM sqlite_schema WHERE name='data_deletions'").get()&&this.db.query('SELECT id FROM data_deletions WHERE operation_ref=?').get(request.operationRef))throw new Error('state_conflict');
+      if(this.db.query("SELECT name FROM sqlite_schema WHERE name='business_events'").get()&&this.db.query("SELECT id FROM business_events WHERE operation_ref=? AND type='session_checkpoint_restored'").get(request.operationRef))throw new Error('state_conflict');
       const prior = request.priorOperationRef ? this.read(request.priorOperationRef) : null;
       if (request.priorOperationRef && !prior) throw new Error('operation_not_found');
       const now = new Date().toISOString();

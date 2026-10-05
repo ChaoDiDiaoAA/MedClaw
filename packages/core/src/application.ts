@@ -45,6 +45,7 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
   }
   cancelOperation(operationRef: string) { const pending = this.refreshes.get(operationRef); pending?.abort(); return { cancelRequested: !!pending, settled: !pending }; }
   async prepareConfig(token: string, input: PublishedSettings) {
+    this.runs.assertNoHistoryMutation();
     if (this.prepared && this.prepared.token === token && isDeepStrictEqual(this.prepared.candidate, input)) return { prepared: true as const, selection: (await this.directory()).selection };
     if (this.prepared || this.closing) throw new Error("runtime_busy");
     const candidate = PublishedSettingsSchema.parse(input);
@@ -125,6 +126,7 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
   cancelAuth(id: string) { const login = this.logins.get(id); if (!login) throw new Error("auth_attempt_not_found"); login.abort.abort(); return { cancelRequested: !login.view.endedAt, settled: !!login.view.endedAt }; }
   async authStatus(providerId: string, id?: string) { const login = id ? this.logins.get(id) : [...this.logins.values()].reverse().find(l => l.view.providerId === providerId); if (id && (!login || login.view.providerId !== providerId)) throw new Error("auth_attempt_not_found"); return { auth: await this.runtime.authStatus(providerId), attempt: login ? { ...login.view } : null }; }
   async shutdown() {
+    this.runs.assertNoHistoryMutation();
     this.closing = true;
     this.refreshes.forEach(a => a.abort()); this.logins.forEach(l => l.abort.abort());
     await Promise.all([...this.logins.values()].map(l => l.task));

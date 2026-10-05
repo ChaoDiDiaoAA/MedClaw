@@ -1,3 +1,4 @@
+import { sqliteHistory } from '../fixtures/p9-memory';
 import { expect, test } from 'bun:test';
 import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
 import { RunScopeSchema } from '../../packages/contracts/src/run';
@@ -47,7 +48,7 @@ test('production PiAgentRuntime executes business and native tools in one frozen
     return new Response(`data: ${JSON.stringify({ id: 'fixture', model: 'fixture', choices: [{ index: 0, delta, finish_reason: requests.length === 1 ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
   } });
   try {
-    const repo = new Repositories(db), store = new SqliteToolStore(db);
+    const repo = new Repositories(db,undefined,undefined,undefined,sqliteHistory(db).store), store = new SqliteToolStore(db);
     const registry = new ToolRegistry([{
       name: 'read_data_scope', version: '1.0.0', label: 'Read scope', description: 'Read the accepted scope.',
       inputSchema: RunScopeSchema.pick({}), outputSchema: RunScopeSchema.pick({ batchIds: true }), effect: 'READ', executionMode: 'parallel',
@@ -60,8 +61,8 @@ test('production PiAgentRuntime executes business and native tools in one frozen
     await runtime.installCustom([{ providerId: 'p3-runtime', name: 'Runtime fixture', api: 'openai-completions', baseUrl: `http://127.0.0.1:${server.port}/v1`,
       models: [{ id: 'fixture', name: 'Fixture', input: ['text'], reasoning: false, contextWindow: 32768, maxTokens: 1024,
         outputLimitConfirmed: true, pricingKnown: false, cost: null }] }]);
-    const agent = new PiAgentRuntime(runtime, root, { registry, recorder, executor });
-    const native = agent.allocate(), session = repo.createSession({ expectedWorkspaceRevision: 0 }, 'create', native.nativeSessionId, new Date().toISOString()).session;
+    const agent = new PiAgentRuntime(runtime, root, sqliteHistory(db), { registry, recorder, executor });
+    const native = agent.allocate(), session = repo.createSession({ expectedWorkspaceRevision: 0 }, 'create', native.nativeSessionId, new Date().toISOString(),native.history).session;
     native.bind(session.id);
     const workspace = repo.readWorkspace(), scope = repo.freezeAgentScope(workspace, agent.toolNames ?? []);
     const request = SubmitInputSchema.parse({ sessionId: session.id, clientSequence: 1, text: 'Read my scope and write a proof file.', mode: 'send',
@@ -192,7 +193,7 @@ test('production PiAgentRuntime closes recovery only after actual delivery of th
     db.query(`INSERT INTO snapshots(id,batch_id,device_id,device_name,category,region,price_cents,currency,unit,status,manufacturer,distributor,
       source_row_ref,source_refs_json,field_origins_json)
       VALUES(1,1,1,?,'Fixture','浙江',100,'CNY','件','active','Fixture manufacturer','Fixture distributor','1:1',?,'{}')`).run('Device '.repeat(1000), sources);
-    const repo = new Repositories(db), store = new SqliteToolStore(db), catalog = new CatalogService(new SqliteCatalogStore(db));
+    const repo = new Repositories(db,undefined,undefined,undefined,sqliteHistory(db).store), store = new SqliteToolStore(db), catalog = new CatalogService(new SqliteCatalogStore(db));
     const queries = new QueryService(catalog, store), evidence = new EvidenceReader(catalog, queries, store);
     const registry = new ToolRegistry(createBusinessTools({ catalog, queries, evidence }));
     const recorder = new ToolRecorder(store), executor = new ToolExecutor(registry, recorder);
@@ -201,8 +202,8 @@ test('production PiAgentRuntime closes recovery only after actual delivery of th
     const runtime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
     await runtime.installCustom([{ providerId: 'production-recovery', name: 'Recovery fixture', api: 'openai-completions', baseUrl: `http://127.0.0.1:${server.port}/v1`,
       models: [{ id: 'fixture', name: 'Fixture', input: ['text'], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null }] }]);
-    agent = new PiAgentRuntime(runtime, root, { registry, recorder, executor });
-    const native = agent.allocate(), session = repo.createSession({ expectedWorkspaceRevision: 0 }, 'create', native.nativeSessionId, createdAt).session;
+    agent = new PiAgentRuntime(runtime, root, sqliteHistory(db), { registry, recorder, executor });
+    const native = agent.allocate(), session = repo.createSession({ expectedWorkspaceRevision: 0 }, 'create', native.nativeSessionId, createdAt,native.history).session;
     native.bind(session.id);
     repo.updateWorkspace({ batchIds: [1] }, repo.readWorkspace().revision, createdAt);
     const workspace = repo.readWorkspace(), scope = repo.freezeAgentScope(workspace, agent.toolNames ?? []);
@@ -258,7 +259,7 @@ test.each(['request-before-commit', 'request-after-commit', 'result', 'delivery'
   } });
   let app: Application<ResolvedModel> | undefined;
   try {
-    const repo = new Repositories(db), store = new SqliteToolStore(db), registry = new ToolRegistry([]), notices: RuntimeNotice[] = [];
+    const repo = new Repositories(db,undefined,undefined,undefined,sqliteHistory(db).store), store = new SqliteToolStore(db), registry = new ToolRegistry([]), notices: RuntimeNotice[] = [];
     const originalRequest = store.request.bind(store), originalTransition = store.transition.bind(store), originalDelivery = store.recordDelivery.bind(store);
     const originalConsumption = store.recordConsumption.bind(store);
     let originalEvidence: Parameters<typeof store.recordConsumption> | undefined;
@@ -291,9 +292,9 @@ test.each(['request-before-commit', 'request-after-commit', 'result', 'delivery'
     const settings = PublishedSettingsSchema.parse({ schemaVersion: 'medclaw.settings/p1-v1', configVersion: '1', model: { provider: 'p3-save', modelId: 'fixture' },
       customProviders: [{ definition, credentialRef: null }], credentialRefs: {}, requestPolicy: policy,
       ui: { navCollapsed: false, detailOpen: false, detailTab: 'conditions' }, previous: null, rollbackFromVersion: null });
-    const agent = new PiAgentRuntime(runtime, root, { registry, recorder, executor: new ToolExecutor(registry, recorder) });
+    const agent = new PiAgentRuntime(runtime, root, sqliteHistory(db), { registry, recorder, executor: new ToolExecutor(registry, recorder) });
     app = new Application('instance', settings, runtime, repo, (_context, action) => action(), (runId, kind, time) => new ModelCallRecorder(repo, runId, kind, time), notice => notices.push(notice), undefined, agent);
-    const native = agent.allocate(), session = repo.createSession({ expectedWorkspaceRevision: 0 }, 'create', native.nativeSessionId, new Date().toISOString()).session; native.bind(session.id);
+    const native = agent.allocate(), session = repo.createSession({ expectedWorkspaceRevision: 0 }, 'create', native.nativeSessionId, new Date().toISOString(),native.history).session; native.bind(session.id);
     const input = SubmitInputSchema.parse({ sessionId: session.id, clientSequence: 1, text: 'Write the proof once.', mode: 'send', expectedRevision: 1, expectedBatchIds: [], expectedQueryId: null,
       model: { provider: 'p3-save', modelId: 'fixture', expectedConfigVersion: '1' }, referenceDate: '2026-01-01', timezone: 'Asia/Shanghai' });
     const accepted = await app.runs.submitAgent(input, { instanceId: 'instance', operationRef: 'send' });
