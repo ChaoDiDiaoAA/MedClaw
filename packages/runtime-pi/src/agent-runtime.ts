@@ -10,9 +10,10 @@ import { canonicalRequest, type RunScope } from '../../contracts/src/run';
 import { SDK_VERSION, type MeasurementContext } from '../../contracts/src/model';
 import { RunControl } from '../../core/src/runtime/run-control';
 import { buildToolProfiles, TOOL_PROFILE_RULES } from '../../core/src/tools/tool-profile';
-import { safeError } from "../../contracts/src/error";
+import { safeError, type AppError } from "../../contracts/src/error";
 import { type AgentExecutionObservation, type AgentRuntimePort, type FinalCallFact, type ProviderOutcome } from "../../contracts/src/run";
-import type { NativeSessionBindings, NativeSessionPreview, InputAdapterPort, InputSettlementProof } from "../../contracts/src/session";
+import type { NativeSessionBindings, NativeSessionPreview, InputAdapterPort, InputSettlementProof, MemoryStore, NativeHistoryCommit, NativeHistorySnapshot, SessionRuntimeView } from "../../contracts/src/session";
+import { PiMemoryAdapter, projectSavedMessages, restoreNativeManager, nativeHistoryJSON } from './memory-store';
 import { PiInputAdapter } from './input-adapter';
 import { outcomeOf, type PiModelRuntime, type ResolvedModel } from "./model-runtime";
 import { createPiNativeTools, createPiToolDefinitions, observePiToolDelivery, createPiRunControlBinding, createFrozenToolContextFactory } from "./pi-tool-adapter";
@@ -31,10 +32,9 @@ import { AppErrorSchema } from '../../contracts/src/error';
 type ExecutionInput = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[0];
 type Callbacks = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[1];
 type RunTools = { registry: ToolRegistry; executor: ToolExecutor };
-type Binding = { manager: SessionManager; nativeSessionId: string; entryRuns: Map<string, number>; session?: AgentSession; toolSignature?: string; lastRunId?: number; bindTools?: () => () => void; available: boolean; execution?: { input: ExecutionInput; callbacks: Callbacks; toolCalls: Set<string>;
+type Binding = { manager: SessionManager; nativeSessionId: string; memory?:PiMemoryAdapter; assembling?:boolean; entryRuns: Map<string, number>; session?: AgentSession; toolSignature?: string; lastRunId?: number; bindTools?: () => () => void; available: boolean; execution?: { input: ExecutionInput; callbacks: Callbacks; toolCalls: Set<string>;
   observers: Promise<void>[]; facts: (FinalCallFact | null)[]; lastOutcome: ProviderOutcome | null; unsupported: boolean;
   registrationFailed: boolean; currentModelCallId: string | null; abort: () => void; control: RunControl; tools?: RunTools; toolContexts: Map<string, ToolExecutionContext>; toolOrigins: Map<string, { callId: string; snapshot: ContextSnapshot }> } };
-const unavailable = (reason: "host_restart" | "native_state_invalid"): NativeSessionPreview => ({ available: false, reason, leafId: null, messages: [], truncated: false });
 const unobservedFailure = (code: string): ProviderOutcome => ({ sdkStopReason: "pending", text: "", responseModel: null, callState: "failed",
   usage: { inputTokens: null, outputTokens: null, cost: null, costCurrency: null, source: null, unavailableReason: "call_not_observed" }, error: safeError(code) });
 
@@ -42,6 +42,9 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
   private readonly eventAdapter = new EventAdapter();
   readSnapshots(runId: number) { return this.eventAdapter.readSnapshots(runId); }
   private readonly sessions = new Map<number, Binding>();
+  private readonly blocked = new Map<number,AppError>();
+  private readonly loading = new Map<number,Promise<void>>();
+  readonly historyContract='medclaw.history/p9-v1' as const;
   private readonly controls = new Map<number, RunControl>();
   private readonly toolContexts = new Map<number, Map<string, ToolExecutionContext>>();
   private readonly inputs = new Map<number, PiInputAdapter>();
@@ -66,6 +69,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
   releaseInputFacts(runId: number) { const adapter = this.inputs.get(runId); if (this.inputPersistencePending(runId)) throw safeError('storage_write_failed'); adapter?.dispose(); this.inputs.delete(runId); this.inputStartFailures.delete(runId); }
   readonly toolNames?: readonly string[];
   constructor(private readonly runtime: PiModelRuntime, private readonly dataRoot: string,
+    private readonly history:{store:MemoryStore;commitSync:(change:NativeHistoryCommit)=>{storageVersion:number}},
     private readonly tools?: RunTools & { recorder: ToolRecorder; configure?: (configuration: ToolConfiguration) => RunTools }, private readonly contexts?: ContextService) {
     if (!isAbsolute(dataRoot)) throw new Error("invalid_argument");
     if (contexts) this.contextContract = CONTEXT_CONTRACT;
@@ -92,28 +96,88 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
   allocate() {
     const manager = SessionManager.inMemory(this.dataRoot);
     const binding: Binding = { manager, nativeSessionId: manager.getSessionId(), entryRuns: new Map(), available: true }; let published = false, discarded = false;
-    return { nativeSessionId: binding.manager.getSessionId(), bind: (sessionId: number) => {
+    return { nativeSessionId: binding.manager.getSessionId(), history:{header:structuredClone(manager.getHeader()),entries:[],activeLeafId:null}, bind: (sessionId: number) => {
       if (discarded || published || this.sessions.has(sessionId)) throw new Error("state_conflict");
+      this.attachMemory(sessionId,binding,{sessionId,nativeSessionId:binding.nativeSessionId,header:manager.getHeader(),entries:[],activeLeafId:null,storageVersion:1});
       this.sessions.set(sessionId, binding); published = true;
     }, discard: () => { if (!published) discarded = true; } };
   }
-  read(sessionId: number): NativeSessionPreview {
-    const binding = this.sessions.get(sessionId);
-    if (!binding) return unavailable("host_restart");
-    if (!binding.available) return unavailable("native_state_invalid");
-    const messages = binding.manager.getBranch().flatMap(entry => {
+  async read(sessionId: number): Promise<NativeSessionPreview> {
+    const loaded=await this.history.store.load(sessionId);if(!loaded.ok)throw loaded.error;
+    const manager=restoreNativeManager(loaded.data,this.dataRoot);
+    const messages = manager.getBranch().flatMap(entry => {
       if (entry.type !== "message" || entry.message.role !== "user" && entry.message.role !== "assistant") return [];
       const preview = projectMessageText(entry.message);
       return [{ nativeEntryId: entry.id, role: entry.message.role, text: preview.text ?? "", truncated: preview.truncated, totalChars: preview.totalChars ?? 0 }];
     });
-    return { available: true, reason: null, leafId: binding.manager.getLeafId(), messages: messages.slice(-32), truncated: messages.length > 32 };
+    return { available: true, reason: null, storageVersion:loaded.data.storageVersion,leafId: loaded.data.activeLeafId, messages: messages.slice(-32), truncated: messages.length > 32 };
   }
-  readMessages(input: ReadSessionMessagesInput): SessionMessagePage {
-    const binding = this.sessions.get(input.sessionId);
-    if (!binding) throw safeError("resource_unavailable");
-    if (!binding.available || binding.manager.getSessionId() !== binding.nativeSessionId) throw safeError("session_history_invalid");
-    return projectSessionMessages(binding.manager, input, binding.entryRuns);
+  async readMessages(input: ReadSessionMessagesInput): Promise<SessionMessagePage> {
+    const loaded=await this.history.store.load(input.sessionId);if(!loaded.ok)throw loaded.error;
+    return projectSavedMessages(loaded.data,input,this.dataRoot);
   }
+  readAvailability(sessionId:number):SessionRuntimeView {
+    const error=this.blocked.get(sessionId);if(error)return {availability:'blocked',error};
+    const binding=this.sessions.get(sessionId);
+    if(binding&&!binding.available)return {availability:'blocked',error:safeError('native_state_invalid')};
+    return {availability:binding?'ready':'unloaded',error:null};
+  }
+  async ensureLoaded(sessionId:number):Promise<void> {
+    const available=this.readAvailability(sessionId);if(available.availability==='blocked')throw available.error;
+    if(available.availability==='ready')return;
+    await this.rebuild(sessionId);
+  }
+  async restore(sessionId:number):Promise<void> {await this.rebuild(sessionId);}
+  private async rebuild(sessionId:number):Promise<void> {
+    if(this.loading.has(sessionId))return this.loading.get(sessionId)!;
+    const task=this.rebuildNow(sessionId);this.loading.set(sessionId,task);
+    try{await task;}finally{if(this.loading.get(sessionId)===task)this.loading.delete(sessionId);}
+  }
+  private async rebuildNow(sessionId:number):Promise<void> {
+    let candidate:Binding|undefined;
+    try {
+      const old=this.sessions.get(sessionId);
+      if(old) {
+        if(old.execution||old.session&&(!old.session.isIdle||old.session.agent.hasQueuedMessages()))throw safeError('stop_unconfirmed');
+        const runId=old.lastRunId;
+        if(runId!==undefined&&(this.inputs.has(runId)||this.inputStartFailures.has(runId)||this.controls.has(runId)||this.toolContexts.has(runId)||this.toolPersistencePending(runId)||this.hasPendingContextPersistence(runId)))throw safeError('stop_unconfirmed');
+        old.memory?.dispose();old.session?.dispose();this.sessions.delete(sessionId);
+      }
+      const loaded=await this.history.store.load(sessionId);if(!loaded.ok)throw loaded.error;
+      const snapshot=loaded.data,manager=restoreNativeManager(snapshot,this.dataRoot);
+      candidate={manager,nativeSessionId:snapshot.nativeSessionId,entryRuns:new Map(),available:true,assembling:true};
+      this.attachMemory(sessionId,candidate,snapshot);
+      const context=manager.buildSessionContext();
+      if(context.messages.length)await this.assemble(candidate,context.model ? this.runtime.native.getModel(context.model.provider,context.model.modelId) : undefined,false);
+      if(nativeHistoryJSON(manager.getHeader())!==nativeHistoryJSON(snapshot.header)||nativeHistoryJSON(manager.getEntries())!==nativeHistoryJSON(snapshot.entries)||manager.getLeafId()!==snapshot.activeLeafId)throw safeError('session_history_invalid');
+      candidate.assembling=false;this.sessions.set(sessionId,candidate);this.blocked.delete(sessionId);
+    }catch(native) {
+      let error=AppErrorSchema.safeParse(native).success ? native as AppError : safeError('session_history_unavailable',undefined,{reason:'session_restore_failed'});
+      if(candidate?.session&&!candidate.session.isIdle)error=safeError('stop_unconfirmed');
+      else candidate?.session?.dispose();
+      this.blocked.set(sessionId,error);throw error;
+    }
+  }
+  private attachMemory(sessionId:number,binding:Binding,snapshot:NativeHistorySnapshot):void {
+    binding.memory=new PiMemoryAdapter(binding.manager,{snapshot,getRunId:()=>binding.execution?.input.runId??null,
+      commitSync:change=>{if(binding.assembling)throw safeError('session_history_invalid');return this.history.commitSync(change);},
+      onFailure:error=>{binding.available=false;this.blocked.set(sessionId,error);binding.execution?.callbacks.fatal?.(error);binding.execution?.abort();}});
+  }
+  private historyBinding(runId:number):Binding {
+    const binding=[...this.sessions.values()].find(binding=>binding.execution?.input.runId===runId||binding.lastRunId===runId);
+    if(!binding?.memory)throw safeError('state_conflict');return binding;
+  }
+  hasPendingHistoryPersistence(runId:number):boolean {
+    const binding=[...this.sessions.values()].find(binding=>binding.execution?.input.runId===runId||binding.lastRunId===runId);
+    return binding?.memory?.persistencePending(runId)??false;
+  }
+  retryHistoryPersistence(runId:number):void {this.historyBinding(runId).memory!.retryPersistence(runId);}
+  readFinalHistory(runId:number):NativeHistoryCommit {const binding=this.historyBinding(runId);if(binding.execution||binding.session&&!binding.session.isIdle)throw safeError('stop_unconfirmed');return binding.memory!.freezeFinal(runId);}
+  acknowledgeHistorySaved(change:NativeHistoryCommit,storageVersion:number):void {
+    if(change.runId===null)throw safeError('state_conflict');const binding=this.historyBinding(change.runId);
+    if(this.sessions.get(change.sessionId)!==binding)throw safeError('access_denied');binding.memory!.acknowledgeSaved(change as Parameters<PiMemoryAdapter['acknowledgeSaved']>[0],storageVersion);
+  }
+  releaseHistoryFacts(runId:number):void {this.historyBinding(runId).memory!.releaseFinal(runId);}
 
   private contextFor(execution: NonNullable<Binding['execution']>, nativeToolCallId: string, sdkSignal?: AbortSignal): ToolExecutionContext {
     try { return createFrozenToolContextFactory((id, signal) => {
@@ -136,7 +200,8 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     catch (error) { execution.callbacks.fatal?.(safeError('state_conflict')); execution.abort(); throw error; }
   }
 
-  private async prepare(binding: Binding, resolved: ResolvedModel) {
+  private async prepare(binding:Binding,resolved:ResolvedModel) {await this.assemble(binding,resolved.model,true);}
+  private async assemble(binding: Binding, model:ResolvedModel['model']|undefined, applyModel:boolean) {
     const workdir = () => {
       if (!binding.execution) throw new Error("state_conflict");
       return join(this.dataRoot, "runtime", String(binding.execution.input.runId), "work", "scratch");
@@ -149,7 +214,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     const native = this.tools ? createPiNativeTools(workdir, this.tools.recorder, getContext, {}, getControl) : null;
     const registry = { get: (name: string) => binding.execution!.tools!.registry.get(name) };
     const executor = { execute: (...args: Parameters<ToolExecutor['execute']>) => binding.execution!.tools!.executor.execute(...args) };
-    const definitions = this.tools ? [...createPiToolDefinitions(binding.execution!.tools!.registry, executor, getContext, getControl), ...native!.definitions] : [];
+    const definitions = this.tools ? [...createPiToolDefinitions(binding.execution?.tools?.registry??this.tools.registry, executor, getContext, getControl), ...native!.definitions] : [];
     const signature = JSON.stringify({ tools: definitions.map(({ name, description, parameters, executionMode }) => ({ name, description, parameters, executionMode })) });
     if (!binding.session || binding.toolSignature !== signature) {
       if (binding.session && (!binding.session.isIdle || binding.lastRunId !== undefined && this.tools?.recorder.persistencePending(binding.lastRunId))) throw new Error('state_conflict');
@@ -166,12 +231,12 @@ Use the returned interpretation to report requestedDate and requestedTime, actua
 State whether the basis counts snapshot records, device identifiers deduplicated by data scope, or change events. These counts are not physical units or inventory. Without a reliable stock quantity field, stock quantity is unknown; a pricing unit does not provide stock quantity. When status is omitted, include all statuses and say so; do not silently restrict results to active devices.
 as_of (latest snapshot) selects the latest allowed batch per data scope before the exclusive cutoff; it is not cumulative history. Never sum counts across dates or batches and call them distinct devices. Compare device sets or claim changes only when evidence supports them: equal counts do not prove the same scoped set of identifiers.`
             : "你是 MedClaw 医疗器械数据助手。当前阶段仅进行对话，没有工具和业务数据访问能力。"), appendSystemPrompt: [] });
-        await resourceLoader.reload(); binding.execution!.control.checkActive();
+        await resourceLoader.reload(); binding.execution?.control.checkActive();
         const { session } = await createAgentSession({ cwd: this.dataRoot, agentDir: join(this.dataRoot, "runtime", "pi"), modelRuntime: this.runtime.native,
-          model: resolved.model, thinkingLevel: "off", ...(this.tools ? {} : { noTools: "all" as const }), tools: [...(this.toolNames ?? [])],
+          model, ...(applyModel?{thinkingLevel:"off" as const}:{}), ...(this.tools ? {} : { noTools: "all" as const }), tools: [...(this.toolNames ?? [])],
           customTools: definitions, resourceLoader, sessionManager: binding.manager, settingsManager });
         candidate = session;
-        binding.execution!.control.checkActive();
+        binding.execution?.control.checkActive();
         let bindTools: Binding['bindTools'];
         if (this.tools) {
           const bindControl = createPiRunControlBinding(session, registry, this.tools.recorder, getContext, getControl);
@@ -193,6 +258,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           let snapshot: ContextSnapshot | undefined, admission;
           const candidates: { context: ToolExecutionContext; receipt: ToolSdkDelivery; nativeRef?: NativeContextRef }[] = [];
           try {
+            binding.memory!.flushBeforeRequest();
             if (this.hasPendingContextPersistence(input.runId)) throw safeError('storage_write_failed');
             if (this.contexts && !(CONTEXT_HTTP_APIS as readonly string[]).includes(model.api)) throw safeError('context_delivery_unsupported');
             if (this.tools && input.scope && input.referenceDate && input.timezone
@@ -307,18 +373,18 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           execution.observers.push(observed);
           return stream;
         };
-        await session.setModel(resolved.model, { persist: false });
-        binding.execution!.control.checkActive();
-        session.setThinkingLevel("off", { persist: false });
+        if(applyModel) {
+          await session.setModel(model!, { persist: false });binding.execution!.control.checkActive();session.setThinkingLevel("off", { persist: false });
+        }
         binding.session?.dispose();
         binding.session = session;
         binding.bindTools = bindTools;
         binding.toolSignature = signature;
         candidate = undefined;
       } catch (error) { candidate?.dispose(); throw error; }
-    } else {
+    } else if(applyModel) {
       binding.execution!.control.checkActive();
-      await binding.session.setModel(resolved.model, { persist: false });
+      await binding.session.setModel(model!, { persist: false });
       binding.execution!.control.checkActive();
       binding.session.setThinkingLevel("off", { persist: false });
     }
@@ -410,6 +476,6 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         terminal();
       } finally { unsubscribe?.(); unsubscribeTools?.(); unsubscribeMessages?.(); input.signal.removeEventListener("abort", abort); binding.lastRunId = input.runId; binding.execution = undefined; }
     }
-    return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []), budgetSummary: control.summary(), ...(inputSettlement ? { inputSettlement } : {}) };
+    return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []), budgetSummary: control.summary(), history:binding.memory!.freezeFinal(input.runId), ...(inputSettlement ? { inputSettlement } : {}) };
   }
 }

@@ -3,13 +3,14 @@ import { WorkspaceChangeSchema, RevisionSchema, type WorkspaceChange, type Works
 
 export class WorkspaceService {
   constructor(private readonly store: WorkspaceStore,
-    private readonly artifacts?: { inspectManagedImport(id: number): Promise<ManagedImportInspection> }) {}
+    private readonly artifacts?: { inspectManagedImport(id: number): Promise<ManagedImportInspection> },private readonly assertWritable:()=>void=()=>{}) {}
   read() { return serviceResult(() => this.store.readWorkspace(), "storage_read_failed"); }
   update(change: WorkspaceChange, expectedRevision: number) {
-    return serviceResult(() => this.store.updateWorkspace(WorkspaceChangeSchema.parse(change), RevisionSchema.parse(expectedRevision), new Date().toISOString()), "storage_write_failed");
+    return serviceResult(() => {this.assertWritable();return this.store.updateWorkspace(WorkspaceChangeSchema.parse(change), RevisionSchema.parse(expectedRevision), new Date().toISOString());}, "storage_write_failed");
   }
   restore() {
     return serviceResult<WorkspaceView>(async () => {
+      this.assertWritable();
       const original = this.store.inspectWorkspace();
       const invalid: number[] = [];
       for (const id of new Set(original.artifactIds)) {
@@ -21,6 +22,7 @@ export class WorkspaceService {
       const checked = this.store.inspectWorkspace(invalid);
       if (checked.state.revision !== original.state.revision || checked.fingerprint !== original.fingerprint)
         throw safeError('state_conflict', undefined, {reason:'workspace_revision_mismatch'});
+      this.assertWritable();
       const saved = this.store.commitWorkspaceRestore(original.state.revision, original.fingerprint, checked.candidate, new Date().toISOString());
       return checked.notices.length ? {...saved,notices:checked.notices} : saved;
     }, "storage_read_failed");

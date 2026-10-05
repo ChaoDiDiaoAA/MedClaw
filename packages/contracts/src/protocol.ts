@@ -20,11 +20,12 @@ import { StoredToolConfigurationSchema, normalizeToolConfiguration } from './too
 import { RuntimeConfigurationSchema, normalizeRuntimeConfiguration, projectRuntimePolicies } from './runtime-config';
 import { ReadSessionMessagesInputSchema, SessionMessagePageSchema } from "./messages";
 import { ReadContextInputSchema, ContextReadResultSchema } from './context';
+import { ReadSessionCheckpointsInputSchema, RestoreSessionCheckpointInputSchema, SessionCheckpointPageSchema, SessionCheckpointReceiptSchema, RestoreSessionInputSchema } from './session';
 
 import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, EventSubscribeResultSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema } from './event';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p8-v1" as const;
-export const DATABASE_SCHEMA_VERSION = 8 as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p9-v1" as const;
+export const DATABASE_SCHEMA_VERSION = 9 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
@@ -132,6 +133,9 @@ export const publicMethodSchemas = {
   "session.list": { input: ListSessionsRequestSchema, output: SessionPageSchema },
   "session.read": { input: z.strictObject({ sessionId: PositiveIdSchema }), output: SessionDetailSchema.nullable() },
   "session.messages.read": { input: ReadSessionMessagesInputSchema, output: SessionMessagePageSchema },
+  "session.checkpoints.read": { input: ReadSessionCheckpointsInputSchema, output: SessionCheckpointPageSchema },
+  "session.restoreCheckpoint": { input: RestoreSessionCheckpointInputSchema, output: SessionCheckpointReceiptSchema },
+  "session.restore": { input: RestoreSessionInputSchema, output: SessionDetailSchema },
   "session.submit": { input: SubmitInputSchema, output: SubmitResultSchema },
   "session.readInput": { input: ReadInputRequestSchema, output: SessionInputSchema.nullable() },
   "session.listInputs": { input: ListInputsRequestSchema, output: SessionInputPageSchema },
@@ -156,7 +160,7 @@ export const publicMethodSchemas = {
   "import.read": { input: ImportReferenceSchema, output: ImportOperationSchema.nullable() },
   "import.cancel": { input: ImportReferenceSchema, output: ImportOperationSchema },
   "import.recover": { input: ImportReferenceSchema, output: ImportOperationSchema },
-  "evidence.readOperation": { input: z.strictObject({ kind: z.literal("import"), operationRef: OpaqueIdSchema }), output: ImportOperationSchema.nullable() },
+  "evidence.readOperation": { input: z.discriminatedUnion('kind', [z.strictObject({ kind: z.literal('import'), operationRef: OpaqueIdSchema }), z.strictObject({ kind: z.literal('session_checkpoint'), operationRef: OpaqueIdSchema })]), output: z.union([ImportOperationSchema, SessionCheckpointReceiptSchema]).nullable() },
   "evidence.readArtifact": { input: z.strictObject({ artifactId: PositiveIdSchema }), output: ArtifactSchema.nullable() },
   "run.control.read": { input: EmptyPayloadSchema, output: RuntimeControlViewSchema },
   "run.active": { input: EmptyPayloadSchema, output: ActiveRunViewSchema.nullable() },
@@ -193,6 +197,11 @@ export function createPublicMethodSchemas() {
 export type PublicPayload<M extends PublicMethod> = z.input<(typeof publicMethodSchemas)[M]["input"]>;
 export type ParsedPublicPayload<M extends PublicMethod> = z.output<(typeof publicMethodSchemas)[M]["input"]>;
 export type PublicReturn<M extends PublicMethod> = z.output<(typeof publicMethodSchemas)[M]["output"]>;
+/** The operation-read result is selected by its trusted request, not by whichever union arm happens to parse. */
+export function publicOutputSchema(method:PublicMethod,payload:unknown):z.ZodType {
+  if(method==='evidence.readOperation'){const input=publicMethodSchemas[method].input.parse(payload);return input.kind==='import'?ImportOperationSchema.nullable():SessionCheckpointReceiptSchema.nullable();}
+  return publicMethodSchemas[method].output;
+}
 export const PublicMethodSchema = z.enum(Object.keys(publicMethodSchemas) as [PublicMethod, ...PublicMethod[]]);
 export function parsePublicPayload<M extends PublicMethod>(method: M, payload: unknown): ParsedPublicPayload<M>;
 export function parsePublicPayload(method: string, payload: unknown): unknown;
@@ -256,6 +265,9 @@ export const PublicHostRequestSchema = z.discriminatedUnion("method", [
   hostRequest("session.list", publicMethodSchemas["session.list"].input),
   hostRequest("session.read", publicMethodSchemas["session.read"].input),
   hostRequest("session.messages.read", publicMethodSchemas["session.messages.read"].input),
+  hostRequest("session.checkpoints.read", publicMethodSchemas["session.checkpoints.read"].input),
+  hostRequest("session.restoreCheckpoint", publicMethodSchemas["session.restoreCheckpoint"].input),
+  hostRequest("session.restore", publicMethodSchemas["session.restore"].input),
   hostRequest("session.submit", publicMethodSchemas["session.submit"].input),
   hostRequest("session.readInput", publicMethodSchemas["session.readInput"].input),
   hostRequest("session.listInputs", publicMethodSchemas["session.listInputs"].input),

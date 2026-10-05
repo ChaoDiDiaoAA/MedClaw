@@ -18,7 +18,7 @@ test('schema6 migration preserves original identity and JSON, initializes only p
   insert.run(1,'native-1','old-1','{ "expectedWorkspaceRevision": 0 }',JSON.stringify({session:{id:1,title:'新会话 1',nativeSessionId:'native-1',kind:'user',status:'active',storageVersion:0,leafId:null,nextSubmissionSequence:1},workspace:{revision:1,sessionId:1,materialVersion:null,batchRefs:[],deviceIds:[],queryId:null,activeView:'data',selection:null}}),'新会话 1','{ "other": "字节😀" }',at,at);
   insert.run(2,'native-2','old-2','{}','{"session":{"id":2,"title":"original"}}','新会话 2','{"other":42}',at,at);
   const old=db.query<Record<string,unknown>,[]>('SELECT * FROM sessions ORDER BY id').all(),markers=db.query('SELECT * FROM schema_migrations').all();db.close();db=openDatabase(path);
-  expect(SCHEMA_VERSION).toBe(8);const rows=db.query<Record<string,unknown>,[]>('SELECT * FROM sessions ORDER BY id').all();
+  expect(SCHEMA_VERSION).toBe(9);const rows=db.query<Record<string,unknown>,[]>('SELECT * FROM sessions ORDER BY id').all();
   for(const [i,row] of rows.entries()){for(const [key,value] of Object.entries(old[i]!))if(key!=='metadata_json')expect(row[key]).toEqual(value);expect(row.metadata_revision).toBe(0);expect(row.deleted_at).toBeNull();}
   expect(JSON.parse(String(rows[0]!.metadata_json))).toEqual({other:'字节😀',titleOrigin:'default'});expect(JSON.parse(String(rows[1]!.metadata_json))).toEqual({other:42,titleOrigin:'user'});
   expect(db.query('SELECT * FROM schema_migrations WHERE version<=5').all()).toEqual(markers);expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});

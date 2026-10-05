@@ -120,7 +120,7 @@ test('P3 production Host imports through Main tokens, freezes trusted scope and 
       expect(view.items[0]).toMatchObject({ inputPreview: 'query_current_devices: arguments omitted', resultPreview: 'query_current_devices: saved result succeeded', nativeOutputTruncated: null });
       expect(JSON.stringify(view)).not.toContain('813');
       expect({ run: db.query('SELECT * FROM runs').all(), query: db.query('SELECT * FROM queries').all(), evidence: db.query('SELECT * FROM query_evidence').all(), answer: db.query('SELECT * FROM answers').all(), tool: db.query('SELECT * FROM tool_calls').all() }).toEqual(original);
-      expect(db.query('SELECT native_leaf_id FROM answers').all()).toEqual([{ native_leaf_id: null }]);
+      expect(db.query('SELECT native_leaf_id FROM answers').all()).toEqual([{ native_leaf_id: expect.any(String) }]);
       expect(f.requests).toHaveLength(2);
     } finally { db.close(); }
     renameSync(f.source, `${f.source}-moved`);

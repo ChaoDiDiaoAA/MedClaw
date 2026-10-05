@@ -7,6 +7,7 @@ import type { DesktopNotice, DesktopSecretInput, DesktopSecretInputResult, Publi
 import type { ActiveRunView, RunView, RuntimeControlView } from "../../../../packages/contracts/src/run";
 import { RenameSessionInputSchema, DeleteSessionInputSchema, type NewSessionInput, type SessionDetail, type SessionInput, type SessionView, type SubmitInput, type SubmitResult, type SessionManagementReceipt, type SessionMetadataView, type RenameSessionInput, type DeleteSessionInput } from "../../../../packages/contracts/src/session";
 import type { WorkspaceChange, WorkspaceView } from "../../../../packages/contracts/src/workspace";
+import type { RestoreSessionCheckpointInput, RestoreSessionInput, SessionCheckpointReceipt } from '../../../../packages/contracts/src/session';
 import { Sidebar } from "./sidebar";
 import { SessionList, sessionDisplayTitle, newSessionDraft, selectSessionModelDraft, acceptSubmissionDraft, type SessionDraft, type SessionManagementEditor } from "./session-list";
 import { Chat } from "./chat";
@@ -74,7 +75,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   const creation = useRef<{ operationRef: string; input: NewSessionInput; model: ModelChoice | null } | null>(null);
   const directoryRead = useRef(0), activeRead = useRef(0), detailsButton = useRef<HTMLButtonElement>(null);
   const workspaceChangeBusy = useRef(false);
-  const workspaceMutation = useRef<{ instance: string | null; kind: 'create' | 'select' | 'update' | 'restore' } | { instance: string; kind: 'delete' | 'batch-delete'; operationRef: string } | null>(null);
+  const workspaceMutation = useRef<{ instance: string | null; kind: 'create' | 'select' | 'update' | 'restore' } | { instance: string; kind: 'delete' | 'batch-delete'; operationRef: string } | {instance:string;kind:'checkpoint';operationRef:string;input:RestoreSessionCheckpointInput} | null>(null);
   const confirmedWorkspace = useRef(false), unknownWorkspaceInstance = useRef<string | null>(null), restoredInstance = useRef<string | null>(null);
   const successfulRestoreInstance = useRef<string | null>(null);
   const [workspaceRecovery, setWorkspaceRecovery] = useState<'verify' | 'restart' | null>(null);
@@ -263,6 +264,31 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       setError(errorMessage(result.error));
     }
   }, [applyWorkspace]);
+  async function refreshHistory(sessionId:number,operationRef?:string) {
+    const instance=hostRef.current.instanceId;
+    await Promise.all([readSession(sessionId),readActive(),readWorkspace(),refreshInputs(sessionId,true)]);
+    if(instance===hostRef.current.instanceId&&workspaceMutation.current?.kind==='checkpoint'&&workspaceMutation.current.operationRef===operationRef){workspaceMutation.current=null;setSelecting(false);}
+  }
+  async function resumeCheckpoint(input:RestoreSessionCheckpointInput,operationRef:string):Promise<Result<SessionCheckpointReceipt>> {
+    const instance=hostRef.current.instanceId;
+    if(!instance||hostRef.current.state!=='ready'||workspaceMutation.current||!confirmedWorkspace.current||workspaceRef.current?.sessionId!==input.sessionId
+      ||workspaceRef.current.revision!==input.expectedWorkspaceRevision||detailsRef.current[input.sessionId]?.session.storageVersion!==input.expectedStorageVersion)return {ok:false,error:safeError('state_conflict')};
+    workspaceMutation.current={instance,kind:'checkpoint',operationRef,input};setSelecting(true);
+    sessionReadOrder.current.set(input.sessionId,(sessionReadOrder.current.get(input.sessionId)??0)+1);
+    let result:Result<SessionCheckpointReceipt>;
+    try{result=await window.medclaw.request('session.restoreCheckpoint',input,operationRef);}catch{result={ok:false,error:safeError('operation_result_unknown')};}
+    if(instance!==hostRef.current.instanceId)return {ok:false,error:safeError('operation_result_unknown')};
+    // Read the current selection independently. A historical Receipt never owns Workspace.
+    if(result.ok||result.error.code!=='operation_result_unknown')await refreshHistory(input.sessionId,operationRef);
+    return result;
+  }
+  async function restoreSession(input:RestoreSessionInput):Promise<Result<SessionDetail>> {
+    const instance=hostRef.current.instanceId;
+    if(!instance||hostRef.current.state!=='ready'||workspaceMutation.current||workspaceRef.current?.sessionId!==input.sessionId)return {ok:false,error:safeError('state_conflict')};
+    workspaceMutation.current={instance,kind:'restore'};setSelecting(true);
+    try{return await window.medclaw.request('session.restore',input,crypto.randomUUID());}
+    finally{if(instance===hostRef.current.instanceId){await refreshHistory(input.sessionId);if(workspaceMutation.current?.kind==='restore'){workspaceMutation.current=null;setSelecting(false);}}}
+  }
   const restoreWorkspace = useCallback(async () => {
     const instance = hostRef.current.instanceId;
     if (!instance || hostRef.current.state !== 'ready' || workspaceMutation.current || unknownWorkspaceInstance.current === instance) return;
@@ -658,6 +684,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
         session={currentDetail} draft={draft} selecting={selecting || !workspaceConfirmed} sending={sending !== null && sending === current} runningTitle={runningSession ? sessionDisplayTitle(runningSession) : null}
         queueRun={queueRun} queueRootInput={queueRootInput} frozenInput={frozenInput} frozenRunId={frozenRun?.id} inputs={current ? inputQueue.snapshots[current] ?? null : null} cancellingInputs={cancellingInputs}
         onRefreshInputs={() => { if (current) void refreshInputs(current, true); }} onMoreInputs={() => { if (current) void readInputPage(current, 'more'); }} onCancelInput={original => void cancelInput(original)}
+        onResumeCheckpoint={resumeCheckpoint} onRestoreSession={restoreSession} onHistoryVerified={refreshHistory}
         onDraft={patch => { if (current) editDraft(current, patch); }} onUseForSession={useForSession} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onNewAttempt={pending => { if (current) startNewAttempt({ instanceId: host.instanceId, sessionId: current, pending }); }} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} /></section>
       <section className="page-content" hidden={page !== "data"}><DataWorkspace host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} onDeleteCommit={commitDataDeletion} onDeleteResult={confirmDataDeletion} catalog={catalog} batches={catalog?.batches ?? []} onRefresh={page => void readCatalog(page)} onUpdate={updateWorkspace} onError={setError} /></section>
       <section className="page-content" hidden={page !== "queries"}><QueryHistory visible={page === "queries"} requestedQuery={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} active={active} onUpdate={updateWorkspace} onError={setError} /></section>

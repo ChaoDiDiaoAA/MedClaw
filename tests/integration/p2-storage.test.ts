@@ -39,11 +39,11 @@ function makeSession(repo: Repositories, op = "create-1", native = "native-1") {
   return repo.createSession({ expectedWorkspaceRevision: repo.readWorkspace().revision }, op, native, time).session.id;
 }
 
-test("latest database preserves P2 tables alongside P3, verifies eight migrations and has no FK violations", () => {
+test("latest database preserves P2 tables alongside P3, verifies nine migrations and has no FK violations", () => {
   const db = open();
   expect(db.query("SELECT name FROM pragma_table_list WHERE schema='main' AND name NOT LIKE 'sqlite_%' ORDER BY name").all())
-    .toEqual(["answers", "artifacts", "batches", "business_events", "catalog_state", "change_events", "context_deliveries", "context_snapshots", "data_deletions", "devices", "imports", "model_calls", "queries", "query_evidence", "runs", "runtime_events", "schema_migrations", "session_inputs", "sessions", "snapshots", "tool_calls", "workspace"].map(name => ({ name })));
-  expect(db.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }]);
+    .toEqual(["answers", "artifacts", "batches", "business_events", "catalog_state", "change_events", "context_deliveries", "context_snapshots", "data_deletions", "devices", "imports", "memories", "model_calls", "queries", "query_evidence", "runs", "runtime_events", "schema_migrations", "session_inputs", "sessions", "snapshots", "tool_calls", "workspace"].map(name => ({ name })));
+  expect(db.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }]);
   expect(db.query("SELECT COUNT(*) AS n FROM pragma_table_list WHERE schema='main' AND name NOT LIKE 'sqlite_%' AND strict<>1").get()).toEqual({ n: 0 });
   expect(db.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
   expect(db.query("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
@@ -83,7 +83,7 @@ test("001 upgrades without changing any existing field, JSON byte or unknown usa
   expect(db.query("SELECT * FROM model_calls ORDER BY id").all()).toEqual(calls);
   expect(db.query("SELECT * FROM sessions").all()).toEqual([]);
   db.close(); handles.pop();
-  expect(open(path).query("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({ n: 8 });
+  expect(open(path).query("SELECT COUNT(*) AS n FROM schema_migrations").get()).toEqual({ n: 9 });
 });
 
 test("a late migration fault rolls back to the original valid 001 file", () => {

@@ -1,3 +1,4 @@
+import { sqliteHistory } from '../fixtures/p9-memory';
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -39,11 +40,12 @@ async function setup(beforeCommit?: () => void) {
   const bindings = {
     allocate: () => {
       allocated++; const nativeSessionId = `native-${allocated}`;
-      return { nativeSessionId, bind: (sessionId: number) => previews.set(sessionId, { available: true, reason: null, leafId: null, messages: [], truncated: false }),
+      return { nativeSessionId, history:{header:{type:'session',version:3,id:nativeSessionId,timestamp:new Date().toISOString(),cwd:root},entries:[],activeLeafId:null}, bind: (sessionId: number) => previews.set(sessionId, { available: true, reason: null, leafId: null, messages: [], truncated: false }),
         discard: () => { discarded++; } };
     },
-    read: (sessionId: number) => previews.get(sessionId) ?? { available: false, reason: "host_restart" as const, leafId: null, messages: [], truncated: false },
-    readMessages: () => { throw new Error("Unexpected fixture message read"); },
+    read: async (sessionId: number) => ({...(previews.get(sessionId) ?? { available: false, reason: "host_restart" as const, leafId: null, messages: [], truncated: false }),storageVersion:1}),
+    readMessages: async () => { throw new Error("Unexpected fixture message read"); },
+    ensureLoaded:async()=>{},restore:async()=>{},readAvailability:()=>({availability:'ready' as const,error:null}),
   };
   const delegate = async (_input: SubmitInput): Promise<Result<SubmitResult>> => { delegated++; return { ok: false, error: safeError("state_conflict", undefined, { reason: "runtime_busy" }) }; };
   const service = new modules[0].SessionService("host-1", repo, bindings, delegate, () => active);
@@ -137,7 +139,7 @@ function closedInputSource(runId: number): InputSettlementProof {
 
 async function runtimeSetup(mode: Parameters<typeof providerFixture>[0] = "success", beforeCommit?: () => void, credentialScope: CredentialScope = (_context, action) => action()) {
   const root = mkdtempSync(join(tmpdir(), "medclaw-p2-app-"));
-  const fixture = providerFixture(mode), db = openDatabase(join(root, "db.sqlite")), repo = new Repositories(db, beforeCommit);
+  const fixture = providerFixture(mode), db = openDatabase(join(root, "db.sqlite")), repo = new Repositories(db, beforeCommit,undefined,undefined,sqliteHistory(db).store);
   const credentials = new InMemoryCredentialStore(); await credentials.modify("p2-fixture", async () => ({ type: "api_key", key: "fixture-only" }));
   const modelRuntime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
   const definition = { providerId: "p2-fixture", name: "Fixture", api: "openai-completions", baseUrl: fixture.url,
@@ -146,7 +148,7 @@ async function runtimeSetup(mode: Parameters<typeof providerFixture>[0] = "succe
   const settings = PublishedSettingsSchema.parse({ schemaVersion: "medclaw.settings/p1-v1", configVersion: "1", model: { provider: "p2-fixture", modelId: "fixture" },
     customProviders: [{ definition, credentialRef: null }], credentialRefs: {}, requestPolicy: { timeoutMs: 1000, maxRetries: 0, maxRetryDelayMs: 2000 },
     ui: { navCollapsed: false, detailOpen: false, detailTab: "conditions" }, previous: null, rollbackFromVersion: null });
-  const adapter = new PiAgentRuntime(modelRuntime, root), notices: RuntimeNotice[] = [];
+  const adapter = new PiAgentRuntime(modelRuntime, root, sqliteHistory(db)), notices: RuntimeNotice[] = [];
   const app = new Application("host-1", settings, modelRuntime, repo, credentialScope,
     (runId, kind, time) => new ModelCallRecorder(repo, runId, kind, time), notice => notices.push(notice), undefined, adapter);
   shutdowns.push(async () => { try { await app.shutdown(); } finally { db.close(); fixture.close(); rmSync(root, { recursive: true, force: true }); } });

@@ -1,3 +1,4 @@
+import { sqliteHistory } from '../fixtures/p9-memory';
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -126,15 +127,15 @@ async function setup(mode: Parameters<typeof providerFixture>[0] = "success") {
   const module = await import("../../packages/runtime-pi/src/agent-runtime").catch(() => null);
   expect(module).not.toBeNull(); if (!module) throw new Error("P2 native adapter is missing");
   const root = await mkdtemp(join(tmpdir(), "medclaw-p2-native-")), fixture = providerFixture(mode);
-  const db = openDatabase(join(root, "db.sqlite")), repo = new Repositories(db), credentials = new InMemoryCredentialStore();
+  const db = openDatabase(join(root, "db.sqlite")), history=sqliteHistory(db),repo = new Repositories(db,undefined,undefined,undefined,history.store), credentials = new InMemoryCredentialStore();
   await credentials.modify("p2-fixture", async () => ({ type: "api_key", key: "fixture-only" }));
   const runtime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
   await runtime.installCustom([{ providerId: "p2-fixture", name: "Fixture", api: "openai-completions", baseUrl: fixture.url,
     models: ["fixture", "other"].map(id => ({ id, name: id, input: ["text"], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null })) }]);
-  const adapter = new module.PiAgentRuntime(runtime, root);
+  const adapter = new module.PiAgentRuntime(runtime, root, history);
   closers.push(async () => { db.close(); fixture.close(); await rm(root, { recursive: true, force: true }); });
   function create() {
-    const native = adapter.allocate(), created = repo.createSession({ expectedWorkspaceRevision: repo.readWorkspace().revision }, crypto.randomUUID(), native.nativeSessionId, new Date().toISOString());
+    const native = adapter.allocate(), created = repo.createSession({ expectedWorkspaceRevision: repo.readWorkspace().revision }, crypto.randomUUID(), native.nativeSessionId, new Date().toISOString(),native.history);
     native.bind(created.session.id); return created.session;
   }
   async function run(sessionId: number, text: string, modelId = "fixture", signal = new AbortController().signal, maxRetries: 0 | 1 = 0) {
@@ -154,9 +155,11 @@ async function setup(mode: Parameters<typeof providerFixture>[0] = "success") {
     const endedAt = new Date().toISOString(), status = signal.aborted ? "cancelled" : observed.lastOutcome?.error ? "failed" : "completed";
     if (signal.aborted) repo.requestCancel(runId, endedAt);
     repo.finalizeAgent(runId, { status, outputText: observed.lastOutcome?.text ?? null, stoppedAt: endedAt, endedAt,
-      error: status === "failed" ? observed.lastOutcome?.error ?? null : null, calls: observed.calls,
+      error: status === "failed" ? observed.lastOutcome?.error ?? null : null, calls: observed.calls,history:observed.history,
       cleanup: { contract: "medclaw.run-cleanup/v1", executionStarted: observed.calls.length > 0, stopConfirmed: true,
         requiredPersistenceComplete: true, inputsSettled: true, resourcesReleased: true, unconfirmedItems: [], secondaryErrors: [], verifiedAt: endedAt } });
+    if(observed.history){adapter.acknowledgeHistorySaved(observed.history,repo.confirmHistorySaved(observed.history)!.storageVersion);adapter.releaseHistoryFacts(runId);}
+    adapter.releaseInputFacts(runId);adapter.releaseToolFacts(runId);
     return { runId, observed, previews, terminals, resolved };
   }
   return { root, fixture, db, repo, credentials, runtime, adapter, create, run };
@@ -169,7 +172,7 @@ test("actual native A→B→A requests preserve A history and never include B hi
   const requests = c.fixture.requests.map(r => JSON.stringify(r.body.messages));
   expect(requests[0]).toContain("A-only-first"); expect(requests[1]).not.toContain("A-only-first");
   expect(requests[2]).toContain("A-only-first"); expect(requests[2]).toContain("A-only-second"); expect(requests[2]).not.toContain("B-only-first");
-  const aMessages = c.adapter.read(a.id).messages, bMessages = c.adapter.read(b.id).messages;
+  const aMessages = (await c.adapter.read(a.id)).messages, bMessages = (await c.adapter.read(b.id)).messages;
   expect(aMessages.filter(m => m.role === "user").map(m => m.text)).toEqual(["A-only-first", "A-only-second"]);
   expect(bMessages.filter(m => m.role === "user").map(m => m.text)).toEqual(["B-only-first"]);
   expect(new Set([...aMessages, ...bMessages].map(m => m.nativeEntryId)).size).toBe(aMessages.length + bMessages.length);
@@ -177,8 +180,8 @@ test("actual native A→B→A requests preserve A history and never include B hi
 
 test("switching A model preserves its native history and leaves B model/history intact", async () => {
   const c = await setup(), a = c.create(), b = c.create();
-  await c.run(a.id, "A-first"); await c.run(b.id, "B-first"); const beforeB = c.adapter.read(b.id);
-  await c.run(a.id, "A-other-model", "other"); expect(c.adapter.read(b.id)).toEqual(beforeB);
+  await c.run(a.id, "A-first"); await c.run(b.id, "B-first"); const beforeB = (await c.adapter.read(b.id));
+  await c.run(a.id, "A-other-model", "other"); expect((await c.adapter.read(b.id))).toEqual(beforeB);
   await c.run(b.id, "B-second");
   expect(c.fixture.requests.map(r => r.body.model)).toEqual(["fixture", "fixture", "other", "fixture"]);
   expect(JSON.stringify(c.fixture.requests[2]!.body.messages)).toContain("A-first");
@@ -215,14 +218,15 @@ test("cancellation awaits native idle and records the real logical-call outcome"
 test("full user input remains in native history/request while basic preview is bounded", async () => {
   const c = await setup(), a = c.create(), text = "器械😀".repeat(30000); await c.run(a.id, text);
   expect(JSON.stringify(c.fixture.requests[0]!.body.messages)).toContain(text);
-  const user = c.adapter.read(a.id).messages.find(m => m.role === "user");
+  const user = (await c.adapter.read(a.id)).messages.find(m => m.role === "user");
   expect(user).toMatchObject({ totalChars: text.length, truncated: true }); expect(user!.text.length).toBeLessThanOrEqual(8192);
 });
 
-test("a new Host adapter cannot silently recreate an old native history", async () => {
+test("a new Host adapter reads committed history without executing or loading an instance", async () => {
   const c = await setup(), a = c.create(); await c.run(a.id, "old history");
-  const module = await import("../../packages/runtime-pi/src/agent-runtime"), restarted = new module.PiAgentRuntime(c.runtime, c.root);
-  expect(restarted.read(a.id)).toEqual({ available: false, reason: "host_restart", leafId: null, messages: [], truncated: false });
+  const module = await import("../../packages/runtime-pi/src/agent-runtime"), restarted = new module.PiAgentRuntime(c.runtime, c.root, sqliteHistory(c.db));
+  expect((await restarted.read(a.id))).toMatchObject({ available:true,reason:null,storageVersion:c.repo.readSession(a.id)!.storageVersion });
+  expect(restarted.readAvailability(a.id).availability).toBe('unloaded');
   expect(c.repo.readSession(a.id)?.nativeSessionId).toBe(a.nativeSessionId);
   expect(c.fixture.requests).toHaveLength(1);
 });
@@ -231,7 +235,10 @@ test("SDK error responses yield honest usage and only fixed product errors", asy
   const c = await setup("unauthorized"), a = c.create(), result = await c.run(a.id, "error");
   expect(result.observed.nativeIdle).toBe(true); expect(result.observed.calls).toHaveLength(1);
   expect(result.observed.calls[0]).toMatchObject({ state: "failed", sdkStopReason: "error", inputTokens: null, cost: null, error: { code: "provider_request_failed" } });
-  expect(JSON.stringify([result.observed, c.adapter.read(a.id), c.repo.read({ runId: result.runId })])).not.toContain("fixture-secret-do-not-project");
+  const {history, ...publicObservation} = result.observed;
+  // Complete native history is an internal persistence contract, never a renderer projection.
+  expect(JSON.stringify(history)).toContain("fixture-secret-do-not-project");
+  expect(JSON.stringify([publicObservation, (await c.adapter.read(a.id)), c.repo.read({ runId: result.runId })])).not.toContain("fixture-secret-do-not-project");
   expect(c.fixture.requests).toHaveLength(1);
 });
 
@@ -239,7 +246,8 @@ test("unexpected tool response aborts instead of running tools or another model 
   const c = await setup("tool"), a = c.create(), result = await c.run(a.id, "no tools");
   expect(c.fixture.requests).toHaveLength(1); expect(result.observed.calls).toHaveLength(1);
   expect(result.observed.lastOutcome?.error?.code).toBe("agent_response_unsupported");
-  expect(c.adapter.read(a.id).reason).toBe("native_state_invalid");
+  expect(c.adapter.readAvailability(a.id)).toMatchObject({availability:'blocked',error:{code:'native_state_invalid'}});
+  expect((await c.adapter.read(a.id)).available).toBe(true);
 });
 
 test("a native stream setup exception still closes the registered logical call without invented SDK outcome", async () => {

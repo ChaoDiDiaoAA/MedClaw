@@ -79,7 +79,7 @@ test('M01/M10/M12 real Host management keeps original receipts across later rena
     expect(f.sql('SELECT count(*) AS n FROM business_events WHERE type IN (\'session_renamed\',\'session_deleted\')')).toEqual([{ n: 4 }]);
     expect(f.service.requests).toHaveLength(0);
     const oldInstance = f.host.read().instanceId!;
-    expect(await f.host.restart(oldInstance)).toMatchObject({ state: 'ready', schemaVersion: 8 });
+    expect(await f.host.restart(oldInstance)).toMatchObject({ state: 'ready', schemaVersion:9 });
     expect(await f.host.request('session.readManagementOperation', { operationRef: 'rename-a' }, undefined, undefined, oldInstance)).toMatchObject({ ok: false, error: { code: 'host_interrupted' } });
     expect(unwrap(await f.host.request('session.readManagementOperation', { operationRef: 'rename-a' }))).toEqual(first);
     expect(SessionDetailSchema.parse(unwrap(await f.host.request('session.read', { sessionId: a.session.id }))).session.status).toBe('deleted');

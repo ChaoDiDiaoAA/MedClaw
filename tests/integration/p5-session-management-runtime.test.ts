@@ -1,3 +1,4 @@
+import { sqliteHistory } from '../fixtures/p9-memory';
 import { afterEach, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -44,13 +45,13 @@ function provider() {
   return { url: `http://127.0.0.1:${server.port}/v1`, requests, requested: requested.promise, release: gate.release, close: () => server.stop(true) };
 }
 async function fixture() {
-  const root = mkdtempSync(join(tmpdir(), 'medclaw-session-management-runtime-')), db = openDatabase(join(root, 'app.sqlite')), repo = new Repositories(db);
+  const root = mkdtempSync(join(tmpdir(), 'medclaw-session-management-runtime-')), db = openDatabase(join(root, 'app.sqlite')), repo = new Repositories(db,undefined,undefined,undefined,sqliteHistory(db).store);
   const http = provider(), credentials = new InMemoryCredentialStore();
   await credentials.modify('p5-management', async () => ({ type: 'api_key', key: 'fixture-only' }));
   const model = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() }); await model.installCustom([definition(http.url)]);
   const settings = PublishedSettingsSchema.parse({ schemaVersion: 'medclaw.settings/p1-v1', configVersion: '1', model: null, customProviders: [], credentialRefs: {},
     requestPolicy: { timeoutMs: 10000, maxRetries: 0, maxRetryDelayMs: 2000 }, previous: null, rollbackFromVersion: null });
-  const agent = new PiAgentRuntime(model, root);
+  const agent = new PiAgentRuntime(model, root, sqliteHistory(db));
   const app = new Application('management-host', settings, model, repo, (_context, action) => action(),
     (runId, kind, at) => new ModelCallRecorder(repo, runId, kind, at), () => {}, () => {}, agent);
   const context = (operationRef: string) => ({ instanceId: 'management-host', operationRef });

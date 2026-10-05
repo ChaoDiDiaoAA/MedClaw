@@ -99,20 +99,20 @@ test("actual slow Host streams to A while viewing B; busy Send and Stop keep the
   } finally { await c.close(); }
 }, 30000);
 
-test("Host restart keeps metadata and original acceptance but cannot restore P2 history", async () => {
+test("Host restart keeps metadata, original acceptance and P9 committed history without replay", async () => {
   const c = await setup();
   try {
     const a = await c.create(), original = await c.input(a.session.id, "before-restart");
     const accepted = unwrap(await c.host.request("session.submit", original, "original")); await c.idle();
     const old = c.host.read().instanceId!; expect(await c.host.restart(old)).toMatchObject({ state: "ready", error: null });
     expect(c.host.read().instanceId).not.toBe(old);
-    expect(await c.host.request("session.messages.read", { sessionId: a.session.id })).toMatchObject({ ok: false, error: { code: "resource_unavailable" } });
-    expect(SessionDetailSchema.parse(unwrap(await c.host.request("session.read", { sessionId: a.session.id })))).toMatchObject({ session: { id: a.session.id, leafId: null }, history: { available: false, reason: "host_restart", messages: [] } });
+    expect(await c.host.request("session.messages.read", { sessionId: a.session.id })).toMatchObject({ok:true,data:{source:'sqlite_history'}});
+    expect(SessionDetailSchema.parse(unwrap(await c.host.request("session.read", { sessionId: a.session.id })))).toMatchObject({ session: { id: a.session.id, leafId: expect.any(String) },runtime:{availability:'unloaded'}, history: { available: true, reason:null } });
     expect(unwrap(await c.host.request("session.submit", original, "original"))).toEqual(accepted);
-    expect(await c.host.request("session.submit", await c.input(a.session.id, "cannot resume"), "new-old-session")).toMatchObject({ ok: false, error: { code: "session_history_invalid" } });
     expect(c.service.requests).toHaveLength(1);
+    unwrap(await c.host.request("session.submit",await c.input(a.session.id,'resume as new Run'),'new-old-session'));await c.idle();expect(c.service.requests).toHaveLength(2);
     const b = await c.create(); unwrap(await c.host.request("session.submit", await c.input(b.session.id, "new-process-session"), "new-session")); await c.idle();
-    expect(c.service.requests).toHaveLength(2);
+    expect(c.service.requests).toHaveLength(3);
   } finally { await c.close(); }
 }, 30000);
 
@@ -179,7 +179,7 @@ test("message reads keep session, workspace, run and provider facts unchanged th
       const snapshot = () => ({ sessions: db.query("SELECT * FROM sessions").all(), runs: db.query("SELECT * FROM runs").all(), calls: db.query("SELECT * FROM model_calls").all(), tools: db.query("SELECT * FROM tool_calls").all(), queries: db.query("SELECT * FROM queries").all(), answers: db.query("SELECT * FROM answers").all(), migrations: db.query("SELECT * FROM schema_migrations").all() });
       const facts = snapshot();
       const page = SessionMessagePageSchema.parse(unwrap(await c.host.request("session.messages.read", { sessionId: a.session.id })));
-      expect(page).toMatchObject({ sessionId: a.session.id, nativeSessionId: a.session.nativeSessionId, leafId: native.session.leafId, source: "native_memory", hasMore: false });
+      expect(page).toMatchObject({ sessionId: a.session.id, nativeSessionId: a.session.nativeSessionId, leafId: native.session.leafId, source: "sqlite_history", hasMore: false });
       expect(page.items.filter(item => item.displayRole === "user")).toMatchObject([{ text: "saved message", runId: accepted.runId, inputId: accepted.inputId }]);
       expect(await c.host.request("session.messages.read", { sessionId: b.session.id })).toMatchObject({ ok: true, data: { items: [], leafId: null } });
       expect(await c.host.request("session.messages.read", { sessionId: 999 })).toMatchObject({ ok: false, error: { code: "input_invalid", reason: "session_not_found" } });
@@ -255,11 +255,13 @@ test("confirmed Host interruption settles queued and consumed inputs without rep
     expect(page.items.map(input => [input.id, input.status, input.processingStatus])).toEqual([[prior.inputId, 'consumed', 'cancelled'], [priorQueued.inputId, 'cancelled', 'cancelled'], [accepted.inputId, 'consumed', 'failed'], [queued.inputId, 'delivery_unknown', 'failed']]);
     expect(unwrap(await c.host.request('session.readSubmission', { sessionId: a.session.id, clientSequence: follow.clientSequence }))).toEqual(queued);
     expect(unwrap(await c.host.request('session.submit', follow, 'interrupted-follow-up'))).toEqual(queued);
-    expect(SessionDetailSchema.parse(unwrap(await c.host.request('session.read', { sessionId: a.session.id })))).toMatchObject({ history: { available: false, reason: 'host_restart', messages: [] } });
-    expect(await c.host.request('session.submit', await c.input(a.session.id, 'cannot resume interrupted source'), 'new-after-interruption')).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
+    expect(SessionDetailSchema.parse(unwrap(await c.host.request('session.read', { sessionId: a.session.id })))).toMatchObject({runtime:{availability:'unloaded'},history:{available:true,reason:null}});
+    expect(c.service.requests).toHaveLength(2); // Recovery itself never executes the old inputs.
+    const fresh=sendResult(unwrap(await c.host.request('session.submit', await c.input(a.session.id, 'explicit new Run after interruption'), 'new-after-interruption')));
+    expect(fresh.runId).not.toBe(accepted.runId);await until(()=>c.service.requests.length===3);
     const db = new Database(c.host.paths.databasePath, { readonly: true });
-    try { expect(db.query('SELECT COUNT(*) AS n FROM runs').get()).toEqual({ n: 2 }); expect(db.query('SELECT COUNT(*) AS n FROM model_calls').get()).toEqual({ n: 2 }); expect(db.query('SELECT COUNT(*) AS n FROM session_inputs').get()).toEqual({ n: 4 }); }
+    try { expect(db.query('SELECT COUNT(*) AS n FROM runs').get()).toEqual({ n: 3 }); expect(db.query('SELECT COUNT(*) AS n FROM model_calls').get()).toEqual({ n: 3 }); expect(db.query('SELECT COUNT(*) AS n FROM session_inputs').get()).toEqual({ n: 5 }); }
     finally { db.close(); }
-    expect(c.service.requests).toHaveLength(2);
+    expect(c.service.requests).toHaveLength(3);
   } finally { await c.close(); }
 }, 30000);

@@ -6,6 +6,7 @@ import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsMana
 import { createAssistantMessageEventStream, InMemoryCredentialStore, InMemoryModelsStore, type AssistantMessage } from '@earendil-works/pi-ai';
 import { PiModelRuntime } from '../../packages/runtime-pi/src/model-runtime';
 import { PiAgentRuntime } from '../../packages/runtime-pi/src/agent-runtime';
+import { nativeHistoryFixture } from '../fixtures/p9-memory';
 import type { StreamSnapshot, MessageStreamSnapshot } from '../../packages/contracts/src/event';
 import { providerFixture } from '../fixtures/p1-provider';
 
@@ -22,7 +23,7 @@ async function model(baseUrl = 'http://127.0.0.1:1/v1') {
 }
 test('real provider Agent execution emits original call identity and clears snapshots after idle', async () => {
   const fixture = providerFixture(); closers.push(async () => fixture.close());
-  const c = await model(fixture.url), runtime = new PiAgentRuntime(c.runtime, c.root); runtime.allocate().bind(7);
+  const c = await model(fixture.url),memory=nativeHistoryFixture(), runtime = new PiAgentRuntime(c.runtime, c.root,memory.history); memory.bind(runtime,7);
   const seen: StreamSnapshot[] = []; let live: unknown;
   const observed = await runtime.execute({ runId: 41, sessionId: 7, text: 'hello', resolved: c.resolved, agentOptions: runtime.describe(c.resolved), signal: new AbortController().signal, deadlineAt: performance.now() + 10000 }, {
     startCall: () => ({ callId: 'original-call', finish: (outcome, endedAt) => ({ callId: 'original-call', state: outcome.callState, responseModel: outcome.responseModel, sdkStopReason: outcome.sdkStopReason === 'pending' ? null : outcome.sdkStopReason, endedAt, durationMs: 1, ...outcome.usage, usageSource: outcome.usage.source, error: outcome.error }) }),
@@ -30,6 +31,7 @@ test('real provider Agent execution emits original call identity and clears snap
     stream: snapshot => { seen.push(snapshot); live = runtime.readSnapshots?.(41); throw new Error('page display failure'); },
   });
   expect(observed.lastOutcome?.callState).toBe('completed');
+  memory.saveFinal(runtime,observed);runtime.releaseToolFacts(41);
   expect(seen.some(s => s.type === 'message.snapshot' && s.modelCallId === 'original-call' && s.blocks.some(b => b.text.includes('你好😀')))).toBe(true);
   expect(live).toMatchObject({ incomplete: false });
   expect(runtime.readSnapshots?.(41)).toEqual({ streamConnection: null, snapshots: [], incomplete: false });

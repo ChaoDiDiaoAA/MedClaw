@@ -188,7 +188,7 @@ test("running A can be browsed from B without losing B draft or retargeting Stop
   await expect(input()).toHaveValue("B remains unsent"); await expect(page.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
   await select(1); await expect(page.getByText("Cancelled and saved", { exact: true })).toBeVisible(); expect(requests).toHaveLength(before + 1);
 });
-test("terminal and old-instance Agent notices cannot replace saved text; Host restart cannot resume history", async () => {
+test("terminal and old-instance Agent notices cannot replace saved text; restart restores history before an explicit new Send", async () => {
   const result = await page.evaluate(async () => { const h = await window.medclaw.request("host.read", {}), s = await window.medclaw.request("session.read", { sessionId: 1 }); return { h, s }; });
   if (!result.h.ok || !result.s.ok) throw new Error("facts unavailable");
   const run = await page.evaluate(() => window.medclaw.request("run.read", { recent: true, sessionId: 1, limit: 1 }));
@@ -210,7 +210,8 @@ test("terminal and old-instance Agent notices cannot replace saved text; Host re
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
   await expect(page.getByTestId("saved-output")).toHaveText(text); await expect(page.getByTestId("run-output")).toHaveCount(0); await expect(page.getByTestId('temporary-run-area')).toHaveCount(0); await expect(page.getByTestId('chat-native-messages')).not.toContainText('late text');
   const restarted = await page.evaluate(instanceId => window.medclaw.request("host.restart", { expectedInstanceId: instanceId }), result.h.data.instanceId!); expect(restarted.ok).toBe(true);
-  await expect(page.getByText("This session cannot continue after a restart. Create a new session.", { exact: true })).toBeVisible(); await expect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
+  await expect(page.getByTestId('chat-native-messages')).toContainText('Saved history');
+  await input().fill('explicit new message after restart');await expect(page.getByRole('button',{name:'Send',exact:true})).toBeEnabled();
   await page.getByRole("button", { name: "Close run details", exact: true }).click();
 });
 

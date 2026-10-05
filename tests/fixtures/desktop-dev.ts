@@ -9,7 +9,7 @@ import { canonicalRequest } from '../../packages/contracts/src/run';
 export const projectRoot = resolve(import.meta.dirname, '../..');
 export const bunExecutable = process.env.MEDCLAW_BUN_EXECUTABLE ?? execFileSync('bun', ['-e', 'process.stdout.write(process.execPath)'], { encoding: 'utf8' }).trim();
 
-export async function launchActualDev(temporary: string, dataRoot: string, importDirectory?: string, beforePageAcquisition?: () => void): Promise<{ page: Page; browser: Browser; child: ChildProcess; close(): Promise<void> }> {
+export async function launchActualDev(temporary: string, dataRoot: string, importDirectory?: string, beforePageAcquisition?: () => void, controlledHostEntry?: string): Promise<{ page: Page; browser: Browser; child: ChildProcess; close(): Promise<void> }> {
   mkdirSync(temporary, { recursive: true });
   const listener = createServer();
   await new Promise<void>(resolve => listener.listen(0, '127.0.0.1', resolve));
@@ -21,6 +21,7 @@ export async function launchActualDev(temporary: string, dataRoot: string, impor
   // This observes the ordinary launcher. It does not replace app.whenReady,
   // create a Host wrapper, register a provider, or alter readiness decisions.
   writeFileSync(observer, `if(process.versions.electron){
+    ${controlledHostEntry ? `process.env.MEDCLAW_HOST_ENTRY=${JSON.stringify(controlledHostEntry)};` : ''}
     const Module=require('module'), original=Module._load;let observed=false;
     Module._load=function(name,...rest){const value=original.call(this,name,...rest);
       if(name==='electron'&&value.app&&!observed){observed=true;

@@ -53,7 +53,7 @@ export class PiInputAdapter implements InputAdapterPort {
     };
     this.sessionInstalled = { prompt: rejectUncontrolled, steer: rejectUncontrolled, followUp: rejectUncontrolled };
     session.prompt = this.sessionInstalled.prompt; session.steer = this.sessionInstalled.steer; session.followUp = this.sessionInstalled.followUp;
-    this.originals = { prompt: agent.prompt.bind(agent), steer: agent.steer.bind(agent), followUp: agent.followUp.bind(agent), append: manager.appendMessage.bind(manager) };
+    this.originals = { prompt: agent.prompt.bind(agent), steer: agent.steer.bind(agent), followUp: agent.followUp.bind(agent), append: manager.appendMessage };
     session.setSteeringMode('one-at-a-time'); session.setFollowUpMode('one-at-a-time');
     this.installed = {
       prompt: (input: string | Message | Message[]) => {
@@ -74,7 +74,7 @@ export class PiInputAdapter implements InputAdapterPort {
       append: message => {
         const record = this.objects.get(message);
         let entryId: string;
-        try { entryId = this.originals.append(message); }
+        try { entryId = this.originals.append.call(manager,message); }
         catch (error) { if (record) this.markUnknown(record, 'append_failed'); else if (message.role === 'user') this.block(); throw error; }
         if (record) {
           if (record.removed || record.entryId && record.entryId !== entryId) { this.block(); return entryId; }

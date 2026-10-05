@@ -7,6 +7,7 @@ import { createAssistantMessageEventStream, InMemoryCredentialStore, InMemoryMod
 import { PiModelRuntime } from '../../packages/runtime-pi/src/model-runtime';
 import { PiAgentRuntime } from '../../packages/runtime-pi/src/agent-runtime';
 import { ModelCallRecorder } from '../../packages/runtime-pi/src/model-call-recorder';
+import { nativeHistoryFixture } from '../fixtures/p9-memory';
 import type { InputStore } from '../../packages/contracts/src/session';
 
 const closers: (() => Promise<void>)[] = [];
@@ -151,13 +152,14 @@ test('nested Hook submission cannot borrow the outer input identity', async () =
 });
 
 test('known root failing before SDK preparation returns not-dispatched source proof', async () => {
-  const c = await setup(); const runtime = new PiAgentRuntime(c.runtime, c.root); runtime.allocate().bind(7);
+  const c = await setup(),memory=nativeHistoryFixture(); const runtime = new PiAgentRuntime(c.runtime, c.root,memory.history); memory.bind(runtime,7);
   const abort = new AbortController(); abort.abort(); const facts: string[] = [];
   const store = { recordInputFailure: (_id, fact) => { facts.push(fact.proof.reason); } } as Pick<InputStore, 'recordInputFailure'> as InputStore;
   const observed = await runtime.execute({ runId: 41, sessionId: 7, inputId: 1, text: 'same', resolved: c.resolved, agentOptions: runtime.describe(c.resolved), signal: abort.signal, deadlineAt: performance.now() + 10000 }, {
     startCall: () => { throw new Error('no call allowed'); }, preview: () => {}, nativeTerminal: () => {}, inputStore: store,
   });
   expect(facts).toEqual(['start_failed']);
+  memory.saveFinal(runtime,observed);runtime.releaseInputFacts(41);runtime.releaseToolFacts(41);
   expect(observed.inputSettlement).toMatchObject({ runId: 41, admissionClosed: true, preflightSettled: true, nativeIdle: true, nativeQueuesEmpty: true, pendingPersistence: false, unconfirmedInputIds: [] });
 });
 
@@ -187,7 +189,7 @@ test('Stop during drain-before-start waits for idle before publishing any remova
 });
 
 test('actual PiAgentRuntime quarantines native append corruption while known entry save retry preserves history', async () => {
-  const c = await setup(), runtime = new PiAgentRuntime(c.runtime, c.root); runtime.allocate().bind(7);
+  const c = await setup(),memory=nativeHistoryFixture(), runtime = new PiAgentRuntime(c.runtime, c.root,memory.history);
   let rejectSave = false, nativeStreams = 0;
   const consumption: { inputId: number; nativeEntryId: string }[] = [], failureReasons: string[] = [];
   const store: InputStore = {
@@ -208,18 +210,19 @@ test('actual PiAgentRuntime quarantines native append corruption while known ent
   const corruptAppend = spyOn(SessionManager.prototype, 'appendMessage').mockImplementation(function(this: SessionManager, message) {
     if (message.role === 'user') throw new Error('native-append-corruption'); return originalAppend.call(this, message);
   });
-  try { const observed = await execute(7, 41, 1); expect(observed.nativeIdle).toBe(true); expect(observed.inputSettlement?.unconfirmedInputIds).toEqual([1]); }
+  memory.bind(runtime,7);
+  try { const observed = await execute(7, 41, 1); expect(observed.nativeIdle).toBe(true); expect(observed.inputSettlement?.unconfirmedInputIds).toEqual([1]);memory.saveFinal(runtime,observed); }
   finally { corruptAppend.mockRestore(); }
   expect(failureReasons).toEqual(['append_failed']); runtime.releaseInputFacts(41); runtime.releaseToolFacts(41);
-  expect(runtime.read(7)).toMatchObject({ available: false, reason: 'native_state_invalid' });
+  expect(runtime.readAvailability(7)).toMatchObject({ availability:'blocked' });expect(await runtime.read(7)).toMatchObject({available:true});
   const before = nativeStreams; await expect(execute(7, 42, 2)).rejects.toThrow('session_history_invalid'); expect(nativeStreams).toBe(before);
-  runtime.allocate().bind(8); expect((await execute(8, 43, 3)).nativeIdle).toBe(true); runtime.releaseInputFacts(43); runtime.releaseToolFacts(43);
-  expect(runtime.read(8).available).toBe(true);
+  memory.bind(runtime,8);const completed=await execute(8,43,3);expect(completed.nativeIdle).toBe(true);memory.saveFinal(runtime,completed); runtime.releaseInputFacts(43); runtime.releaseToolFacts(43);
+  expect((await runtime.read(8)).available).toBe(true);
   rejectSave = true; const pending = await execute(8, 44, 4);
-  expect(pending.inputSettlement?.pendingPersistence).toBe(true); expect(runtime.read(8).available).toBe(true);
-  const users = runtime.read(8).messages.filter(message => message.role === 'user'); const entry = users.at(-1)!.nativeEntryId;
+  expect(pending.inputSettlement?.pendingPersistence).toBe(true); expect((await runtime.read(8)).available).toBe(true);
+  const users = (await runtime.read(8)).messages.filter(message => message.role === 'user'); const entry = users.at(-1)!.nativeEntryId;
   rejectSave = false; runtime.retryInputPersistence(44); expect(runtime.inputPersistencePending(44)).toBe(false);
   expect(consumption.find(fact => fact.inputId === 4)?.nativeEntryId).toBe(entry);
-  runtime.releaseInputFacts(44); runtime.releaseToolFacts(44);
-  expect(runtime.read(8).available).toBe(true); expect((await execute(8, 45, 5)).nativeIdle).toBe(true); runtime.releaseInputFacts(45); runtime.releaseToolFacts(45);
+  memory.saveFinal(runtime,pending);runtime.releaseInputFacts(44); runtime.releaseToolFacts(44);
+  expect((await runtime.read(8)).available).toBe(true);const next=await execute(8,45,5);expect(next.nativeIdle).toBe(true);memory.saveFinal(runtime,next); runtime.releaseInputFacts(45); runtime.releaseToolFacts(45);
 });
