@@ -238,6 +238,9 @@ export interface ProviderRunStore {
   active(): RunHandle | null;
 }
 export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputStore {
+  confirmCompactionSaved?(change:NativeHistoryCommit|null,fact:import('./session').CompactionReceipt|import('./session').CompactionSaveFact):number|null;
+  verifyPriorCompactionFacts?(runId:number):{requiredPersistenceComplete:boolean;unconfirmedItems:string[]};
+  finishAutoCompaction?(operationRef:string,runId:number,error:AppError,endedAt:string):void;
   confirmHistorySaved?(change:NativeHistoryCommit):{storageVersion:number}|null;
   verifyPriorContextFacts?(runId: number): { requiredPersistenceComplete: boolean; unconfirmedItems: string[] };
   verifyPriorHistoryFacts?(runId: number): { requiredPersistenceComplete: boolean; unconfirmedItems: string[] };
@@ -258,7 +261,8 @@ export interface ModelCallRecorderPort {
   readonly callId?: string;
   finish(outcome: ProviderOutcome, endedAt: string): FinalCallFact;
 }
-export type ModelCallStarter = (runId: number, kind: "main" | "diagnostic", time: string, context?: StartCallContext) => ModelCallRecorderPort;
+export type ModelCallStarter = ((runId: number, kind: "main" | "diagnostic", time: string, context?: StartCallContext) => ModelCallRecorderPort)
+  & {forCompaction?:(owner:import('./session').CompactionCallOwner,time:string)=>ModelCallRecorderPort};
 
 /** Pi initializes omitted usage fields to zero; zero alone does not establish usage or free pricing. */
 export function safeUsage(value: unknown, pricingKnown: boolean): UsageView {

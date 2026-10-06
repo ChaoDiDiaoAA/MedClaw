@@ -13,7 +13,8 @@ import type { QueryExecutionContext } from '../../../contracts/src/query';
 import type { RunScope } from '../../../contracts/src/run';
 import { normalizeToolConfiguration } from '../../../contracts/src/tool-config';
 import { normalizeRuntimeConfiguration, projectRuntimePolicies } from '../../../contracts/src/runtime-config';
-import type { StreamSnapshot } from '../../../contracts/src/event';
+import type { StreamSnapshot, WriteTransactions } from '../../../contracts/src/event';
+import type { AutoCompactionCallbacks, CompactionCallOwner } from '../../../contracts/src/session';
 import { toWorkspaceContext } from '../../../contracts/src/workspace';
 
 type Execution = { handle: RunHandle; operationRef: string; abort: AbortController; nativeTerminal: boolean; cause: "user" | "deadline" | "shutdown" | null;
@@ -39,7 +40,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     private readonly store: RuntimeRunStore, private readonly credentials: CredentialScope, private readonly startCall: ModelCallStarter,
     private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void,
     private readonly agent: (AgentRuntimePort<Resolved> & NativeSessionBindings) | undefined, private readonly modelControlBusy: () => boolean,
-    private readonly stream?: (snapshot: StreamSnapshot) => void) {}
+    private readonly stream?: (snapshot: StreamSnapshot) => void,private readonly transactions?:WriteTransactions) {}
   get activeHandle(): RunHandle | null { return this.execution?.handle ?? null; }
   get persistencePending() { return this.execution?.pendingSave ?? this.recoveries.size > 0; }
   get stopPending() { return !!this.execution?.cause && !this.execution.stopped; }
@@ -383,6 +384,27 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     this.deadline(execution, input.timeoutMs);
     const deadlineAt = execution.deadlineAt!;
     let entered = false;
+    const owners=new Map<string,Omit<CompactionCallOwner,'ordinal'>>(),callOwners=new Map<string,CompactionCallOwner>(),revisions=new Map<string,number>();
+    const compaction:AutoCompactionCallbacks={
+      begin:(reason,time)=>{
+        this.checkActive(execution);const session=this.store.readSession(input.sessionId);if(!session)throw safeError('session_not_found');
+        const operationRef=crypto.randomUUID();owners.set(operationRef,{operationRef,sessionId:input.sessionId,runId:execution.handle.runId,source:'auto',reason,model:input.model,baseStorageVersion:session.storageVersion,baseLeafId:session.leafId});
+        return operationRef;
+      },
+      startCall:(operationRef,time,ordinal)=>{
+        this.checkActive(execution);const owner=owners.get(operationRef);if(!owner||!this.startCall.forCompaction)throw safeError('state_conflict');
+        const bound={...owner,ordinal},recorder=this.startCall.forCompaction(bound,time);if(!recorder.callId)throw safeError('state_conflict');callOwners.set(recorder.callId,bound);return recorder;
+      },
+      finishCall:(_operationRef,fact)=>{const owner=callOwners.get(fact.callId);if(!owner)throw safeError('state_conflict');this.store.finishCompactionCall(owner,fact);},
+      save:(change,fact)=>{
+        if(!this.transactions)throw safeError('state_conflict');
+        try{return this.transactions.immediate(()=>this.store.commitCompactionInTransaction(change,fact));}
+        catch(error){try{const version=this.store.confirmCompactionSaved?.(change,fact);if(version!=null)return version;}catch{}this.checkpoint(execution,safeError('storage_write_failed'));execution.abort.abort();throw error;}
+      },
+      failed:(operationRef,error,time)=>{try{this.store.finishAutoCompaction?.(operationRef,execution.handle.runId,error,time);}catch{this.checkpoint(execution,safeError('storage_write_failed'));}
+        this.checkpoint(execution,error);execution.abort.abort();},
+      progress:(operationRef,phase)=>{const revision=(revisions.get(operationRef)??0)+1;revisions.set(operationRef,revision);try{this.notice({type:'compaction.progress',sessionId:input.sessionId,operationRef,runId:execution.handle.runId,revision,phase});}catch{}},
+    };
     try {
       const observed = await this.credentials({ purpose: "runtime", operationRef: execution.operationRef, credentialRef: input.model.credentialRef }, () => {
         if (input.inputId !== null) this.store.beginInputDelivery(input.inputId, this.instanceId, now());
@@ -394,7 +416,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         startCall: (time,context) => this.startCall(execution.handle.runId, "main", time,context), preview: text => this.preview(execution, text),
         stream: snapshot => { if (snapshot.runId !== execution.handle.runId || snapshot.sessionId !== execution.handle.sessionId) return;
           try { this.stream?.(structuredClone(snapshot)); } catch { try { this.report(safeError('preview_delivery_failed')); } catch {} } },
-        inputStore: this.store, admissionClosed: () => { execution.acceptingInputs = false; },
+        inputStore: this.store, admissionClosed: () => { execution.acceptingInputs = false; },compaction,
         fatal: error => { this.checkpoint(execution, error); execution.abort.abort(); },
         nativeTerminal: outcome => { execution.nativeTerminal = true; if (outcome.error && !execution.cause) this.checkpoint(execution, outcome.error); },
       }); });
@@ -410,7 +432,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       execution.fact = { status: this.status(execution, outcome), outputText: outcome?.text ?? null, stoppedAt: execution.executionStarted === false ? null : endedAt, endedAt: execution.failureAt ?? endedAt,
         cancelRequestedAt: execution.cancelAt, error: this.terminalError(execution, outcome), calls: observed.calls,
         usage: outcome?.usageDetails ?? (outcome ? { source: outcome.usage.source, unavailableReason: outcome.usage.unavailableReason } : null), cleanup: this.cleanup(execution, true),
-        ...(observed.inputSettlement ? { inputSettlement: observed.inputSettlement } : {}),...(observed.history?{history:observed.history}:{}) };
+        ...(observed.inputSettlement ? { inputSettlement: observed.inputSettlement } : {}),...(observed.history?{history:observed.history}:{}),...(observed.compactions?{compactions:observed.compactions}:{}) };
     } catch {
       if (entered) this.checkpoint(execution, safeError("stop_unconfirmed"));
       else {

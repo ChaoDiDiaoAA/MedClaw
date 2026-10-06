@@ -23,7 +23,7 @@ function protect<T>(action: () => T, fallback: string): T {
   try { return action(); } catch (error) { if (error instanceof Error && error.name === 'SQLiteError') fail(fallback); throw error; }
 }
 type SnapshotRow = { id: number; run_id: number; session_id: number; input_id: number | null; sequence: number; snapshot_json: string; created_at: string };
-type CallRow = { id: number; call_id: string; run_id: number; session_id: number | null; input_id: number | null; kind: string; state: string; model_json: string };
+type CallRow = { id: number; call_id: string; run_id: number | null; session_id: number | null; input_id: number | null; kind: string; state: string; model_json: string };
 type RunRow = { id: number; session_id: number | null; kind: string; status: string; config_json: string; scope_json: string; cleanup_json: string | null; reference_date: string; timezone: string };
 type Material = { ref: Omit<ContextRef, 'channel'>; source: ContextSource; provenance: 'public' | 'synthetic' | 'synthetic-derived' | null; fieldOrigins: unknown; value: unknown };
 
@@ -155,6 +155,8 @@ export class SqliteContextStore implements ContextStore {
       if ('callId' in input) {
         selectedCallId = input.callId;
         const call = this.db.query<CallRow,[string]>('SELECT * FROM model_calls WHERE call_id=?').get(input.callId); if (!call) fail('run_not_found');
+        if (call.kind === 'compaction') return checked(ContextReadResultSchema,{kind:'not_recorded',runId:call.run_id,sessionId:call.session_id,callId:call.call_id,reason:'not_applicable'});
+        if (call.run_id === null) fail('storage_read_failed');
         const run = this.run(call.run_id), model = JSON.parse(call.model_json);
         if (run.kind !== 'agent' || call.kind !== 'main') return {kind:'not_recorded' as const,runId:run.id,sessionId:run.session_id,callId:call.call_id,reason:'not_applicable' as const};
         if (!model.context) { if (JSON.parse(run.config_json).agent?.contextContract === 'medclaw.context/v1') fail('storage_read_failed'); return {kind:'not_recorded' as const,runId:run.id,sessionId:run.session_id,callId:call.call_id,reason:'pre_p8' as const}; }
@@ -165,7 +167,7 @@ export class SqliteContextStore implements ContextStore {
       } else row = this.db.query<SnapshotRow,[number]>('SELECT * FROM context_snapshots WHERE id=?').get(input.snapshotId);
       if (!row) fail('resource_unavailable');
       const snapshot = this.snapshot(row), run = this.run(row.run_id), cleanup = run.cleanup_json ? JSON.parse(run.cleanup_json) : null;
-      const calls = this.db.query<CallRow & {snapshot_id:number;delivered_at:string;session_id:number},[number]>('SELECT c.*,d.snapshot_id,d.delivered_at FROM context_deliveries d JOIN model_calls c ON c.id=d.model_call_id WHERE d.snapshot_id=? ORDER BY d.id').all(row.id);
+      const calls = this.db.query<CallRow & {snapshot_id:number;delivered_at:string;session_id:number;run_id:number},[number]>('SELECT c.*,d.snapshot_id,d.delivered_at FROM context_deliveries d JOIN model_calls c ON c.id=d.model_call_id WHERE d.snapshot_id=? ORDER BY d.id').all(row.id);
       const deliveries = calls.map(call => this.delivery(call,call));
       const saved = selectedCallId === null ? deliveries.length > 0 : deliveries.some(delivery => delivery.callId === selectedCallId);
       if (observed && !saved) fail('storage_read_failed');
@@ -185,7 +187,7 @@ export function verifyPriorContextFacts(db: Database, runId: number) {
     const cleanup = run.cleanup_json ? JSON.parse(run.cleanup_json) : null;
     const priorGap = cleanup?.unconfirmedItems?.some((item: string) => item.startsWith('context_')) ?? false;
     const contexts = new SqliteContextStore(db), unconfirmedItems: string[] = [];
-    const calls = db.query<CallRow,[number]>('SELECT * FROM model_calls WHERE run_id=? ORDER BY id').all(runId);
+    const calls = db.query<CallRow,[number]>("SELECT * FROM model_calls WHERE run_id=? AND kind<>'compaction' ORDER BY id").all(runId);
     for (const call of calls) {
       const read = contexts.read({callId:call.call_id}); if (read.kind !== 'snapshot') fail('storage_read_failed');
       const context = checked(ModelCallContextSchema,JSON.parse(call.model_json).context);

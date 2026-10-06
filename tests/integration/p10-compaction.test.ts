@@ -6,14 +6,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase, SCHEMA_VERSION } from '../../packages/storage/src/database';
 import { seedWorkspaceQueries } from '../fixtures/p7-workspace';
-import { memoryAt, memoryNativeFixture } from '../fixtures/p9-memory';
+import { memoryAt, memoryNativeFixture, memoryAssistant, sqliteHistory } from '../fixtures/p9-memory';
 import { contextModel } from '../fixtures/p8-context';
 import { Repositories } from '../../packages/storage/src/repositories';
 import { SqliteWriteTransactions } from '../../packages/storage/src/write-transactions';
-import type { CompactionReceipt, CompactionCallOwner } from '../../packages/contracts/src/session';
-import type { FinalCallFact } from '../../packages/contracts/src/run';
+import type { CompactionReceipt, CompactionCallOwner, CompactionSaveFact } from '../../packages/contracts/src/session';
+import { canonicalRequest, type FinalCallFact } from '../../packages/contracts/src/run';
 import { DEFAULT_REQUEST_POLICY } from '../../packages/contracts/src/model';
 import { toWorkspaceContext } from '../../packages/contracts/src/workspace';
+import { SqliteContextStore } from '../../packages/storage/src/context-store';
 
 function schema9() {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p10-')), path = join(root, 'app.sqlite'), db = new Database(path, { strict: true });
@@ -129,6 +130,7 @@ test('p10 each actual summary has a separately durable call; owner, ordinal, dup
     const owner: CompactionCallOwner = {operationRef:'manual',sessionId:1,runId:null,source:'manual',reason:'manual',model:contextModel,baseStorageVersion:1,baseLeafId:null,ordinal:1};
     expect(()=>start.call(repos,{callId:'invalid',owner:{...owner,ordinal:2},startedAt:memoryAt})).toThrow();
     start.call(repos,{callId:'first',owner,startedAt:memoryAt});
+    expect(new SqliteContextStore(db).read({callId:'first'})).toEqual({kind:'not_recorded',runId:null,sessionId:1,callId:'first',reason:'not_applicable'});
     const fact: FinalCallFact = {callId:'first',state:'completed',responseModel:'fixture',sdkStopReason:'stop',endedAt:memoryAt,durationMs:3,inputTokens:10,outputTokens:2,cost:null,costCurrency:null,usageSource:'provider',unavailableReason:'pricing_unknown',error:null};
     const finish = Reflect.get(repos,'finishCompactionCall'); finish.call(repos,owner,fact); finish.call(repos,owner,fact);
     expect(()=>finish.call(repos,owner,{...fact,inputTokens:20})).toThrow('state_conflict');
@@ -164,4 +166,92 @@ for (const buffered of [false,true]) test(`p10 ${buffered ? 'buffered' : 'direct
     config.agent.autoCompaction = false; db.query('UPDATE runs SET config_json=? WHERE id=?').run(JSON.stringify(config),accepted.runId!);
     expect(()=>repos.read({runId:accepted.runId!})).toThrow('storage_read_failed');
   } finally {db.close();rmSync(root,{recursive:true,force:true});}
+});
+
+function savedCompactionFixture(source:'manual'|'auto',candidate=false) {
+  const root=mkdtempSync(join(tmpdir(),'medclaw-p10-atomic-')),db=openDatabase(join(root,'app.sqlite')),history=sqliteHistory(db),tx=SqliteWriteTransactions.forDatabase(db),repos=new Repositories(db,undefined,undefined,tx,history.store),native=memoryNativeFixture();
+  repos.createSession({expectedWorkspaceRevision:0},'create',native.header.id,memoryAt,{header:native.header,entries:[],activeLeafId:null});
+  history.commitSync({sessionId:1,runId:null,expectedStorageVersion:1,header:native.header,newEntries:native.entries,activeLeafId:native.activeLeafId});
+  const frozen={model:contextModel,baseStorageVersion:2,baseLeafId:native.activeLeafId,settings:{enabled:true,reserveTokens:256,keepRecentTokens:128},budget:{maxModelCalls:4,timeoutMs:5000},instanceId:'host',startedAt:memoryAt};
+  let runId:number|null=null;
+  if(source==='manual')repos.acceptCompaction({sessionId:1,expectedStorageVersion:2,model:{provider:contextModel.provider,modelId:contextModel.modelId,expectedConfigVersion:'1'}},'compact',frozen);
+  else {
+    const workspace=toWorkspaceContext(repos.readWorkspace()),scope=repos.freezeAgentScope(workspace,[]);
+    runId=repos.registerAgent({sessionId:1,inputId:null,text:'ENGINEERING',model:contextModel,policy:DEFAULT_REQUEST_POLICY,goal:'answer',workspace,scope,referenceDate:'2026-10-05',timezone:'Asia/Shanghai',timeoutMs:DEFAULT_REQUEST_POLICY.timeoutMs,
+      agentOptions:{requestedThinkingLevel:'off',effectiveThinkingLevel:'off',compaction:{contract:'medclaw.compaction/v1',...frozen.settings}},historyContract:'medclaw.history/p9-v1',instanceId:'host',createdAt:memoryAt,
+      submission:{operationRef:'run',originalSubmitInput:{sessionId:1,clientSequence:1,mode:'send',text:'ENGINEERING',expectedRevision:workspace.revision,expectedBatchIds:[],expectedQueryId:null,model:{provider:contextModel.provider,modelId:contextModel.modelId,expectedConfigVersion:'1'},referenceDate:'2026-10-05',timezone:'Asia/Shanghai'}}}).runId;
+  }
+  const reason=source==='manual'?'manual' as const:candidate?'threshold' as const:'overflow' as const;
+  let answerId:string|null=null;
+  if(candidate){repos.startCall(runId!,'main','main',memoryAt);native.manager.appendMessage({role:'user',content:'ENGINEERING',timestamp:3});answerId=native.manager.appendMessage(memoryAssistant('ENGINEERING final answer'));}
+  const summaryFacts:FinalCallFact[]=[];
+  for(const ordinal of [1,2]) {
+    const owner:CompactionCallOwner={operationRef:'compact',sessionId:1,runId,source,reason,model:contextModel,baseStorageVersion:2,baseLeafId:native.activeLeafId,ordinal};
+    repos.startCompactionCall({owner,callId:`summary-${ordinal}`,startedAt:memoryAt});
+    const callFact:FinalCallFact={callId:`summary-${ordinal}`,state:'completed',responseModel:'fixture',sdkStopReason:'stop',endedAt:memoryAt,durationMs:1,inputTokens:10,outputTokens:2,cost:null,costCurrency:null,usageSource:'provider',unavailableReason:'pricing_unknown',error:null};
+    repos.finishCompactionCall(owner,callFact);summaryFacts.push(callFact);
+  }
+  const nativeEntryId=native.manager.appendCompaction('ENGINEERING preserved summary',native.userId,123,{references:['query:12']});
+  const change={sessionId:1,runId,expectedStorageVersion:2,header:native.header,newEntries:native.manager.getEntries().slice(native.entries.length),activeLeafId:nativeEntryId};
+  const fact:CompactionReceipt|CompactionSaveFact=source==='auto'?{operationRef:'compact',sessionId:1,runId:runId!,reason:candidate?'threshold':'overflow',nativeEntryId,firstKeptEntryId:native.userId,tokensBefore:123,estimatedTokensAfter:12,baseStorageVersion:2,callIds:['summary-1','summary-2']}:
+    {contract:'medclaw.compaction/v1',operationRef:'compact',sessionId:1,runId:null,reason:'manual',status:'completed',nativeGenerated:true,nativeSaved:true,nativeEntryId,firstKeptEntryId:native.userId,tokensBefore:123,estimatedTokensAfter:12,
+      baseStorageVersion:2,storageVersion:3,activeLeafId:nativeEntryId,callIds:['summary-1','summary-2'],continuationEligibleAtCommit:true,cancelRequestedAt:null,stoppedAt:memoryAt,finishedAt:memoryAt,noOpReason:null,error:null};
+  return {db,root,repos,history,tx,native,change,fact,nativeEntryId,runId,answerId,summaryFacts,close:()=>{db.close();rmSync(root,{recursive:true,force:true});}};
+}
+
+for(const source of ['manual','auto'] as const)test(`p10 ${source} compaction commits original bytes, call links and completion evidence in one idempotent transaction`,()=>{
+  const f=savedCompactionFixture(source);
+  try {
+    const before=['sessions','memories','model_calls','business_events','runtime_events'].map(table=>f.db.query(`SELECT * FROM ${table}`).all());
+    f.db.exec("CREATE TEMP TRIGGER reject_compaction BEFORE UPDATE ON model_calls BEGIN SELECT RAISE(ABORT,'ENGINEERING rollback'); END;");
+    expect(()=>f.tx.immediate(()=>f.repos.commitCompactionInTransaction(f.change,f.fact))).toThrow();
+    expect(['sessions','memories','model_calls','business_events','runtime_events'].map(table=>f.db.query(`SELECT * FROM ${table}`).all())).toEqual(before);
+    f.db.exec('DROP TRIGGER reject_compaction');
+    expect(f.tx.immediate(()=>f.repos.commitCompactionInTransaction(f.change,f.fact))).toBe(3);
+    const count=f.db.query('SELECT * FROM runtime_events').all().length;
+    expect(f.tx.immediate(()=>f.repos.commitCompactionInTransaction(f.change,f.fact))).toBe(3);expect(f.db.query('SELECT * FROM runtime_events').all()).toHaveLength(count);
+    const calls=f.db.query<{model_json:string},[]>('SELECT model_json FROM model_calls ORDER BY id').all();
+    expect(calls.map(call=>JSON.parse(call.model_json).compaction)).toMatchObject([{nativeEntryId:f.nativeEntryId,savedStorageVersion:3},{nativeEntryId:f.nativeEntryId,savedStorageVersion:3}]);
+    expect(f.db.query<{entry_json:string},[string]>('SELECT entry_json FROM memories WHERE native_entry_id=?').get(f.nativeEntryId)?.entry_json).toBe(canonicalRequest(f.change.newEntries[0]));
+    expect(f.db.query('SELECT id FROM answers').all()).toEqual([]);
+    if('contract' in f.fact)expect(f.repos.readCompactionOperation({sessionId:1,operationRef:'compact'})?.receipt).toEqual(f.fact);
+    else expect(f.db.query("SELECT type FROM runtime_events WHERE type='compaction_completed'").all()).toEqual([{type:'compaction_completed'}]);
+    const later={...f.change,expectedStorageVersion:3,newEntries:[],activeLeafId:f.native.userId};f.history.commitSync(later);
+    expect(f.tx.immediate(()=>f.repos.commitCompactionInTransaction(f.change,f.fact))).toBe(3);
+  } finally {f.close();}
+});
+
+test('p10 threshold compaction and the genuine final candidate commit with Answer and Run; a lost result is proven without another history version',()=>{
+  const f=savedCompactionFixture('auto',true);
+  try {
+    const fact:import('../../packages/contracts/src/run').FinalAgentFact={status:'completed',outputText:'ENGINEERING final answer',stoppedAt:memoryAt,endedAt:memoryAt,cancelRequestedAt:null,error:null,
+      calls:[{...f.summaryFacts[0]!,callId:'main'},...f.summaryFacts],history:f.change,compactions:[f.fact as CompactionSaveFact],
+      cleanup:{contract:'medclaw.run-cleanup/v1',executionStarted:true,stopConfirmed:true,requiredPersistenceComplete:true,inputsSettled:true,resourcesReleased:true,unconfirmedItems:[],secondaryErrors:[],verifiedAt:memoryAt}};
+    const prefix=f.db.query('SELECT * FROM memories').all();
+    f.db.exec("CREATE TEMP TRIGGER fail_answer BEFORE INSERT ON answers BEGIN SELECT RAISE(ABORT,'ENGINEERING final failure'); END;");
+    expect(()=>f.repos.finalizeAgent(f.runId!,fact)).toThrow();expect(f.db.query('SELECT * FROM memories').all()).toEqual(prefix);
+    expect(f.db.query("SELECT id FROM runtime_events WHERE type='compaction_completed'").all()).toEqual([]);expect(f.db.query('SELECT id FROM answers').all()).toEqual([]);
+    f.db.exec('DROP TRIGGER fail_answer');f.repos.finalizeAgent(f.runId!,fact);
+    expect(f.db.query('SELECT text,native_leaf_id FROM answers').get()).toEqual({text:fact.outputText,native_leaf_id:f.nativeEntryId});
+    expect(f.db.query("SELECT type FROM runtime_events WHERE type IN ('history_saved','compaction_completed','run_completed') ORDER BY id").all()).toEqual([{type:'history_saved'},{type:'compaction_completed'},{type:'run_completed'}]);
+    expect(f.repos.isFinalSaved(f.runId!,fact)).toBe(true);expect(f.repos.finalizeAgent(f.runId!,fact)).toMatchObject({status:'completed'});
+    expect(f.repos.readSession(1)?.storageVersion).toBe(3);expect(f.db.query('SELECT id FROM answers').all()).toHaveLength(1);
+    const verify=Reflect.get(f.repos,'verifyPriorCompactionFacts');expect(verify).toBeDefined();expect(verify.call(f.repos,f.runId!)).toEqual({requiredPersistenceComplete:true,unconfirmedItems:[]});
+    f.db.query("DELETE FROM runtime_events WHERE type='compaction_completed'").run();expect(f.repos.isFinalSaved(f.runId!,fact)).toBe(false);
+    expect(verify.call(f.repos,f.runId!)).toMatchObject({requiredPersistenceComplete:false,unconfirmedItems:expect.arrayContaining(['compaction_persistence'])});
+  } finally {f.close();}
+});
+
+test('p10 unfinished automatic compaction is an independent recovery gap; a proven summary failure preserves completed calls without inventing P8 snapshots',()=>{
+  const f=savedCompactionFixture('auto');
+  try {
+    f.db.query("UPDATE runs SET config_json=json_set(config_json,'$.agent.contextContract','medclaw.context/v1') WHERE id=?").run(f.runId!);
+    expect(f.repos.verifyPriorContextFacts(f.runId!)).toEqual({requiredPersistenceComplete:true,unconfirmedItems:[]});
+    expect(f.repos.verifyPriorCompactionFacts(f.runId!)).toMatchObject({requiredPersistenceComplete:false,unconfirmedItems:expect.arrayContaining(['compaction_operation_unconfirmed'])});
+    f.repos.finishAutoCompaction('compact',f.runId!,{code:'compaction_failed',message:'Engineering failure',category:'runtime',retryable:false,reason:'compaction_model_failed'},memoryAt);
+    expect(f.repos.verifyPriorCompactionFacts(f.runId!)).toEqual({requiredPersistenceComplete:true,unconfirmedItems:[]});
+    expect(f.db.query('SELECT state,input_tokens FROM model_calls').all()).toEqual([{state:'completed',input_tokens:10},{state:'completed',input_tokens:10}]);
+    expect(f.db.query('SELECT id FROM context_snapshots').all()).toEqual([]);
+    expect(()=>f.tx.immediate(()=>f.repos.commitCompactionInTransaction(f.change,f.fact))).toThrow('state_conflict');
+  } finally {f.close();}
 });

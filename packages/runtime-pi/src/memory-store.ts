@@ -4,6 +4,7 @@ import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, safe
 import { RevisionSchema } from '../../contracts/src/workspace';
 import { canonicalRequest } from '../../contracts/src/run';
 import type { NativeHistorySnapshot, NativeHistoryCommit } from '../../contracts/src/session';
+import type { NativeHistoryContext } from '../../contracts/src/context';
 import type { ReadSessionMessagesInput, SessionMessagePage } from '../../contracts/src/messages';
 import { projectSessionMessages } from './messages';
 export { NATIVE_HISTORY_FORMAT } from '../../contracts/src/session';
@@ -124,6 +125,7 @@ export class PiMemoryAdapter {
   private disposed=false;
   private reported=false;
   private lastAcknowledgement:{identity:string;storageVersion:number}|null=null;
+  private compaction:string|null=null;
   constructor(private readonly manager:SessionManager,private readonly options:MemoryOptions) {
     this.saved=validateNativeHistory(options.snapshot);this.observed=this.snapshot();
     if(nativeHistoryJSON(this.saved)!==nativeHistoryJSON(this.observed))invalid();
@@ -164,7 +166,7 @@ export class PiMemoryAdapter {
     if(current.entries.length<from||nativeHistoryJSON(current.header)!==nativeHistoryJSON(this.observed.header)
       ||nativeHistoryJSON(current.entries.slice(0,from))!==nativeHistoryJSON(this.observed.entries))invalid();
     this.observed=current;
-    if(this.pending)return;
+    if(this.pending||this.compaction)return;
     for(let i=from;i<current.entries.length;i++) {
       const entry=current.entries[i]!;
       if(this.heldFrom!==null&&entry.type==='message'&&['user','toolResult','assistant'].includes(entry.message.role)) {
@@ -186,8 +188,44 @@ export class PiMemoryAdapter {
     catch(error){this.pending??=change;this.failure(error);throw error;}
   }
   flushBeforeRequest():void {
-    if(this.pending)throw safeError('storage_write_failed');
+    if(this.pending||this.compaction)throw safeError('storage_write_failed');
     this.persist(this.observed.entries,this.observed.activeLeafId);this.heldFrom=null;
+  }
+  beginCompaction(operationRef:string):void {
+    OpaqueIdSchema.parse(operationRef);
+    if(this.pending||this.final)throw safeError('storage_write_failed');
+    if(this.compaction&&this.compaction!==operationRef)throw safeError('state_conflict');
+    this.compaction=operationRef;
+  }
+  readCompactionCommit(operationRef:string):PiHistoryCommit {
+    if(this.compaction!==operationRef||this.pending)throw safeError('storage_write_failed');
+    return this.change(this.observed.entries,this.observed.activeLeafId);
+  }
+  acknowledgeCompaction(change:PiHistoryCommit,storageVersion:number):void {
+    if(!this.compaction)throw safeError('state_conflict');
+    this.acknowledgeSaved(change,storageVersion);
+    this.compaction=null;
+  }
+  readSavedContext():NativeHistoryContext {
+    const branch=restoreNativeManager(this.saved,this.manager.getHeader()!.cwd).getBranch();
+    return {contract:'medclaw.native-history-context/v1',leafId:this.saved.activeLeafId,storageVersion:this.saved.storageVersion,
+      compactionEntryIds:branch.filter(entry=>entry.type==='compaction').map(entry=>entry.id)};
+  }
+  isSavedInputOnBranch(nativeEntryId:string,text:string):boolean {
+    const branch=restoreNativeManager(this.saved,this.manager.getHeader()!.cwd).getBranch();
+    const entry=branch.find(entry=>entry.id===nativeEntryId);
+    if(entry?.type!=='message'||entry.message.role!=='user')return false;
+    const content=entry.message.content,original=typeof content==='string'?content:content.filter(part=>part.type==='text').map(part=>part.text).join('');
+    return original===text&&!branch.some(entry=>entry.type==='context_edit'&&entry.targetId===nativeEntryId);
+  }
+  isSavedSummarizedInput(nativeEntryId:string):boolean {
+    const manager=restoreNativeManager(this.saved,this.manager.getHeader()!.cwd),branch=manager.getBranch();
+    const input=branch.findIndex(entry=>entry.id===nativeEntryId);
+    if(input<0||branch.some(entry=>entry.type==='context_edit'&&entry.targetId===nativeEntryId))return false;
+    const latest=branch.findLastIndex(entry=>entry.type==='compaction');
+    if(latest<0)return false;
+    const compaction=branch[latest]!;
+    return compaction.type==='compaction'&&input<branch.findIndex(entry=>entry.id===compaction.firstKeptEntryId);
   }
   freezeFinal(runId:number):PiHistoryCommit {
     PositiveIdSchema.parse(runId);
@@ -210,6 +248,7 @@ export class PiMemoryAdapter {
     if(storageVersion!==this.saved.storageVersion+(change.newEntries.length||change.activeLeafId!==this.saved.activeLeafId?1:0)
       ||nativeHistoryJSON(next.entries)!==nativeHistoryJSON(this.observed.entries.slice(0,next.entries.length)))invalid();
     this.saved=next;this.lastAcknowledgement={identity,storageVersion};
+    if(this.compaction&&nativeHistoryJSON(next.entries)===nativeHistoryJSON(this.observed.entries)&&next.activeLeafId===this.observed.activeLeafId)this.compaction=null;
     if(this.heldFrom!==null&&this.heldFrom<next.entries.length)this.heldFrom=null;
   }
   persistencePending(runId:number):boolean {return this.pending?.runId===runId;}
@@ -220,7 +259,7 @@ export class PiMemoryAdapter {
   }
   dispose():void {
     if(this.disposed)return;
-    if(this.pending||this.heldFrom!==null||this.final)throw safeError('storage_write_failed');
+    if(this.pending||this.heldFrom!==null||this.final||this.compaction)throw safeError('storage_write_failed');
     for(const [method,{wrapped}]of this.wrappers)if(this.manager[method]!==wrapped)throw safeError('state_conflict');
     for(const [method,{original}]of this.wrappers)Reflect.set(this.manager,method,original);
     this.disposed=true;

@@ -7,6 +7,7 @@ import type { NativeSessionBindings } from "../../contracts/src/session";
 import { RuntimeService } from "./runtime/runtime-service";
 import { AppErrorSchema, safeError, type AppError } from "../../contracts/src/error.ts";
 import type { EventService } from './events/event-service.ts';
+import type { WriteTransactions } from '../../contracts/src/event';
 
 type Login = { view: AuthAttemptView; abort: AbortController; pending?: { id: string; allowedIds: string[] | null; resolve: (value: string) => void; reject: (reason: unknown) => void }; task: Promise<void> };
 const now = () => new Date().toISOString();
@@ -17,9 +18,9 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
   private prepared: { token: string; candidate: PublishedSettings; old: PublishedSettings; changedRuntime: boolean } | null = null;
   private lastCommit: { token: string; version: string } | null = null;
   private closing = false;
-  constructor(readonly instanceId: string, private settings: PublishedSettings, readonly runtime: ModelRuntimePort<Resolved>, readonly repositories: RuntimeRunStore, private readonly scope: CredentialScope, startCall: ModelCallStarter, private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void = () => {}, agent?: AgentRuntimePort<Resolved> & NativeSessionBindings, events?: Pick<EventService, 'notifyStream'>) {
+  constructor(readonly instanceId: string, private settings: PublishedSettings, readonly runtime: ModelRuntimePort<Resolved>, readonly repositories: RuntimeRunStore, private readonly scope: CredentialScope, startCall: ModelCallStarter, private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void = () => {}, agent?: AgentRuntimePort<Resolved> & NativeSessionBindings, events?: Pick<EventService, 'notifyStream'>,transactions?:WriteTransactions) {
     this.runs = new RuntimeService(instanceId, () => this.settings, runtime, repositories, scope, startCall, notice, report, agent,
-      () => this.closing || this.prepared !== null || this.refreshes.size > 0 || [...this.logins.values()].some(login => !login.view.endedAt), snapshot => events?.notifyStream(snapshot));
+      () => this.closing || this.prepared !== null || this.refreshes.size > 0 || [...this.logins.values()].some(login => !login.view.endedAt), snapshot => events?.notifyStream(snapshot),transactions);
   }
   get config() { return this.settings; }
   get busy() { return this.runs.busy; }

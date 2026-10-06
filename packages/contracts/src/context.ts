@@ -40,7 +40,8 @@ export const ReadContextInputSchema = z.union([z.strictObject({ snapshotId: Posi
 export type ReadContextInput = z.infer<typeof ReadContextInputSchema>;
 export const ContextReadResultSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('snapshot'), snapshot: ContextSnapshotSchema, deliveries: z.array(ContextDeliverySchema).max(1000), selectedCallId: OpaqueIdSchema.nullable(), evidence: z.enum(['saved', 'unconfirmed', 'persistence_gap']) }).refine(result => result.deliveries.every(delivery => delivery.snapshotId === result.snapshot.id && delivery.runId === result.snapshot.runId && delivery.sessionId === result.snapshot.sessionId), 'Delivery owner mismatch'),
-  z.strictObject({ kind: z.literal('not_recorded'), runId: PositiveIdSchema, sessionId: PositiveIdSchema.nullable(), callId: OpaqueIdSchema, reason: z.enum(['pre_p8', 'not_applicable']) }),
+  z.strictObject({ kind: z.literal('not_recorded'), runId: PositiveIdSchema.nullable(), sessionId: PositiveIdSchema.nullable(), callId: OpaqueIdSchema, reason: z.enum(['pre_p8', 'not_applicable']) })
+    .refine(value => value.runId !== null || value.reason === 'not_applicable' && value.sessionId !== null, 'A missing Run is only valid for an inapplicable session call'),
 ]).refine(result => new TextEncoder().encode(JSON.stringify(result)).byteLength <= CONTEXT_READ_BYTES, 'Context result exceeds byte limit');
 export type ContextReadResult = z.infer<typeof ContextReadResultSchema>;
 export const PrepareContextInputSchema = z.strictObject({ runId: PositiveIdSchema, sessionId: PositiveIdSchema, inputId: PositiveIdSchema, nativeEntryId: OpaqueIdSchema, workspaceContext: WorkspaceContextSchema, scope: RunScopeSchema, runtimeFeedback: z.string(), nativeRefs: z.array(NativeContextRefSchema).max(1000), createdAt: TimestampSchema });

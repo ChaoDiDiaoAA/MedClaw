@@ -14,7 +14,7 @@ import { ModelCallContextSchema, type StartCallContext } from '../../contracts/s
 import type { EventWriter, RegisteredEventDraft, RegisteredEventPayload } from '../../contracts/src/event';
 import { RegisteredEventPayloadSchema } from '../../contracts/src/event';
 import { NATIVE_HISTORY_FORMAT, InputContentSchema, type NativeHistoryCommit, type InitialNativeHistory, type PreparedInput, type InputStore, type InputCancelProof, type InputSettlementProof, type ReadInputRequest, type ListInputsRequest } from "../../contracts/src/session";
-import { CompactSessionInputSchema, ReadCompactionInputSchema, FrozenCompactionSchema, StoredCompactionOperationSchema, CompactionReceiptSchema, CompactionCallOwnerSchema, CompactionCallMetadataSchema,
+import { CompactSessionInputSchema, ReadCompactionInputSchema, FrozenCompactionSchema, StoredCompactionOperationSchema, CompactionReceiptSchema, CompactionSaveFactSchema, CompactionCallOwnerSchema, CompactionCallMetadataSchema,
   type CompactSessionInput, type ReadCompactionInput, type FrozenCompaction, type StoredCompactionOperation, type CompactionCallOwner, type CompactionReceipt, type CompactionSaveFact } from '../../contracts/src/session';
 import { SqliteToolStore } from "./tool-store";
 import { SqliteCatalogStore } from './catalog-store';
@@ -376,22 +376,133 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   }
   commitCompactionInTransaction(change: NativeHistoryCommit | null, inputFact: CompactionReceipt | CompactionSaveFact): number {
     this.transactions.assertActive();
-    const receipt = checked(CompactionReceiptSchema,inputFact);
-    if (change || receipt.reason !== 'manual' || receipt.nativeSaved) fail('invalid_argument');
-    const operation = this.readCompactionOperation({sessionId:receipt.sessionId,operationRef:receipt.operationRef});
-    if (!operation || operation.frozen.baseStorageVersion !== receipt.baseStorageVersion || operation.cancelRequestedAt !== receipt.cancelRequestedAt) fail('state_conflict');
-    if (operation.receipt) { if (!isDeepStrictEqual(operation.receipt,receipt)) fail('state_conflict'); return this.readSession(receipt.sessionId)!.storageVersion; }
-    const calls = this.db.query<{call_id:string;state:string;model_json:string},[string]>("SELECT * FROM model_calls WHERE kind='compaction' AND json_extract(model_json,'$.compaction.operationRef')=? ORDER BY id").all(receipt.operationRef);
-    if (!isDeepStrictEqual(calls.map(row=>row.call_id),receipt.callIds) || calls.some(row=>row.state === 'started')) fail('storage_write_failed');
+    const fact='contract' in inputFact?checked(CompactionReceiptSchema,inputFact):checked(CompactionSaveFactSchema,inputFact);
+    const manual='contract' in fact?fact:null, saved=manual?manual.nativeSaved:true;
+    if(manual&&manual.reason!=='manual'||saved&&!change||!saved&&change)fail('invalid_argument');
+    const operation=manual?this.readCompactionOperation({sessionId:fact.sessionId,operationRef:fact.operationRef}):null;
+    if(manual&&(!operation||operation.frozen.baseStorageVersion!==fact.baseStorageVersion||operation.cancelRequestedAt!==manual.cancelRequestedAt))fail('state_conflict');
+    const confirmed=this.confirmCompactionSaved(change,fact);
+    if(confirmed!==null)return confirmed;
+    if(operation?.receipt)fail('state_conflict');
+    const calls=this.compactionCalls(fact.operationRef);
+    this.validateCompactionCalls(calls,fact);
+    if(calls.some(call=>checked(CompactionCallMetadataSchema,(decoded(call.model_json) as {compaction:unknown}).compaction,'storage_read_failed').operationEndedAt!==null))fail('state_conflict');
+    let version=fact.baseStorageVersion;
+    if(saved) {
+      if(!this.memory||change!.sessionId!==fact.sessionId||change!.runId!==fact.runId||change!.expectedStorageVersion!==fact.baseStorageVersion)fail('state_conflict');
+      const entry=change!.newEntries.find(value=>(value as {id:string}).id===fact.nativeEntryId) as {type:string;firstKeptEntryId:string;tokensBefore:number}|undefined;
+      if(!entry||entry.type!=='compaction'||entry.firstKeptEntryId!==fact.firstKeptEntryId||entry.tokensBefore!==fact.tokensBefore)fail('session_history_invalid');
+      if(!manual) {
+        const run=this.row(fact.runId!);
+        if(!run||run.kind!=='agent'||run.session_id!==fact.sessionId||!['created','running'].includes(run.status))fail('state_conflict');
+      }
+      version=this.memory.commitInTransaction(change!).storageVersion;
+      if(manual&&(manual.storageVersion!==version||manual.activeLeafId!==change!.activeLeafId))fail('state_conflict');
+    } else if(this.readSession(fact.sessionId)!.storageVersion!==fact.baseStorageVersion)fail('state_conflict');
+    const endedAt=manual?.finishedAt??new Date().toISOString();
     for (const call of calls) {
       const model = decoded(call.model_json) as {compaction:unknown}, metadata = checked(CompactionCallMetadataSchema,model.compaction,'storage_read_failed');
       if (metadata.nativeEntryId || metadata.savedStorageVersion) fail('state_conflict');
-      this.db.query('UPDATE model_calls SET model_json=? WHERE call_id=?').run(JSON.stringify({...model,compaction:{...metadata,operationEndedAt:receipt.finishedAt,operationError:receipt.error}}),call.call_id);
+      this.db.query('UPDATE model_calls SET model_json=? WHERE call_id=?').run(JSON.stringify({...model,compaction:{...metadata,nativeEntryId:saved?fact.nativeEntryId:null,savedStorageVersion:saved?version:null,operationEndedAt:endedAt,operationError:manual?.error??null}}),call.call_id);
     }
-    this.db.query("INSERT INTO business_events(operation_ref,type,actor,session_id,details_json,occurred_at) VALUES(?,'session_compaction_finished','user',?,?,?)")
-      .run(receipt.operationRef,receipt.sessionId,canonicalRequest({contract:'medclaw.compaction/v1',receipt}),receipt.finishedAt);
+    if(manual)this.db.query("INSERT INTO business_events(operation_ref,type,actor,session_id,details_json,occurred_at) VALUES(?,'session_compaction_finished','user',?,?,?)")
+      .run(fact.operationRef,fact.sessionId,canonicalRequest({contract:'medclaw.compaction/v1',receipt:manual}),endedAt);
+    else this.event(this.row(fact.runId!)!,{type:'compaction_completed',payload:{contract:'medclaw.event/v1',operationRef:fact.operationRef,reason:fact.reason as 'threshold'|'overflow',nativeEntryId:fact.nativeEntryId!,firstKeptEntryId:fact.firstKeptEntryId!,storageVersion:version,tokensBefore:fact.tokensBefore!,estimatedTokensAfter:fact.estimatedTokensAfter}},endedAt,'pi');
     this.beforeCommit?.();
-    return this.readSession(receipt.sessionId)!.storageVersion;
+    return version;
+  }
+  private compactionCalls(operationRef:string) {
+    return this.db.query<CallRow&{run_id:number|null;session_id:number},[string]>("SELECT * FROM model_calls WHERE kind='compaction' AND json_extract(model_json,'$.compaction.operationRef')=? ORDER BY id").all(operationRef);
+  }
+  private validateCompactionCalls(calls:ReturnType<Repositories['compactionCalls']>,fact:CompactionReceipt|CompactionSaveFact):void {
+    if(!isDeepStrictEqual(calls.map(call=>call.call_id),fact.callIds)||calls.some(call=>call.state==='started'||call.run_id!==fact.runId||call.session_id!==fact.sessionId))fail('storage_write_failed');
+    calls.forEach((call,index)=>{
+      this.call(call);
+      const marker=checked(CompactionCallMetadataSchema,(decoded(call.model_json) as {compaction:unknown}).compaction,'storage_read_failed');
+      if(marker.ordinal!==index+1||marker.reason!==fact.reason||marker.baseStorageVersion!==fact.baseStorageVersion||(marker.source==='manual')!==(fact.reason==='manual'))fail('state_conflict');
+    });
+  }
+  /** Full original proof; a later active leaf does not erase a committed compaction. */
+  confirmCompactionSaved(change:NativeHistoryCommit|null,fact:CompactionReceipt|CompactionSaveFact):number|null {
+    return this.db.transaction(()=>this.compactionProof(change,fact)).deferred();
+  }
+  private compactionProof(change:NativeHistoryCommit|null,fact:CompactionReceipt|CompactionSaveFact):number|null {
+    const manual='contract' in fact?fact:null,calls=this.compactionCalls(fact.operationRef);
+    if(manual) {
+      const operation=this.readCompactionOperation({sessionId:fact.sessionId,operationRef:fact.operationRef});
+      if(!operation?.receipt)return null;
+      if(!isDeepStrictEqual(operation.receipt,manual))fail('state_conflict');
+      this.validateCompactionCalls(calls,fact);
+      if(!manual.nativeSaved) {
+        if(calls.some(call=>{const marker=checked(CompactionCallMetadataSchema,(decoded(call.model_json) as {compaction:unknown}).compaction,'storage_read_failed');return marker.operationEndedAt!==manual.finishedAt||!isDeepStrictEqual(marker.operationError,manual.error)||marker.nativeEntryId!==null;}))return null;
+        return manual.baseStorageVersion;
+      }
+    } else if(!calls.length)return null;
+    const markers=calls.map(call=>checked(CompactionCallMetadataSchema,(decoded(call.model_json) as {compaction:unknown}).compaction,'storage_read_failed'));
+    const version=markers[0]?.savedStorageVersion;
+    if(version==null||markers.some(marker=>marker.nativeEntryId!==fact.nativeEntryId||marker.savedStorageVersion!==version||marker.operationEndedAt===null))return null;
+    this.validateCompactionCalls(calls,fact);
+    if(manual&&manual.storageVersion!==version)return null;
+    const row=this.db.query<{entry_json:string;run_id:number|null},[number,string]>("SELECT entry_json,run_id FROM memories WHERE session_id=? AND native_entry_id=? AND entry_type='compaction'").get(fact.sessionId,fact.nativeEntryId!);
+    if(!row||row.run_id!==fact.runId)return null;
+    const entry=decoded(row.entry_json) as {firstKeptEntryId:string;tokensBefore:number};
+    if(entry.firstKeptEntryId!==fact.firstKeptEntryId||entry.tokensBefore!==fact.tokensBefore)return null;
+    const original=change?.newEntries.find(value=>(value as {id:string}).id===fact.nativeEntryId);
+    if(original&&canonicalRequest(original)!==canonicalRequest(entry))return null;
+    if(!this.memory)return null;
+    const snapshot=this.memory.loadInTransaction(fact.sessionId);
+    if(snapshot.storageVersion<version)return null;
+    if(original&&manual) {
+      if(change!.sessionId!==fact.sessionId||change!.runId!==null||change!.expectedStorageVersion+1!==version||change!.activeLeafId!==manual.activeLeafId||canonicalRequest(change!.header)!==canonicalRequest(snapshot.header))return null;
+      for(const value of change!.newEntries) {
+        const saved=this.db.query<{entry_json:string;run_id:number|null},[number,string]>('SELECT entry_json,run_id FROM memories WHERE session_id=? AND native_entry_id=?').get(fact.sessionId,(value as {id:string}).id);
+        if(!saved||saved.run_id!==null||canonicalRequest(decoded(saved.entry_json))!==canonicalRequest(value))return null;
+      }
+    } else if(original&&this.memory.confirmCommitted(change!)?.storageVersion!==version)return null;
+    if(!manual) {
+      const events=this.db.query<{payload_json:string;source:string;source_connection:string|null;source_sequence:number|null;tool_call_id:number|null},[number,number,string]>("SELECT * FROM runtime_events WHERE type='compaction_completed' AND run_id=? AND session_id=? AND json_extract(payload_json,'$.operationRef')=?").all(fact.runId!,fact.sessionId,fact.operationRef);
+      const expected={contract:'medclaw.event/v1',operationRef:fact.operationRef,reason:fact.reason,nativeEntryId:fact.nativeEntryId,firstKeptEntryId:fact.firstKeptEntryId,storageVersion:version,tokensBefore:fact.tokensBefore,estimatedTokensAfter:fact.estimatedTokensAfter};
+      if(events.length!==1||events[0]!.source!=='pi'||events[0]!.source_connection!==null||events[0]!.source_sequence!==null||events[0]!.tool_call_id!==null||!isDeepStrictEqual(decoded(events[0]!.payload_json),expected))return null;
+    }
+    return version;
+  }
+  verifyPriorCompactionFacts(runId:number):{requiredPersistenceComplete:boolean;unconfirmedItems:string[]} {
+    id(runId);
+    return this.inputRead(()=>{
+      const groups=this.db.query<{operation_ref:string},[number]>("SELECT DISTINCT json_extract(model_json,'$.compaction.operationRef') AS operation_ref FROM model_calls WHERE run_id=? AND kind='compaction'").all(runId);
+      const gaps=new Set<string>();
+      for(const group of groups) {
+        const calls=this.compactionCalls(group.operation_ref),markers=calls.map(call=>checked(CompactionCallMetadataSchema,(decoded(call.model_json) as {compaction:unknown}).compaction,'storage_read_failed'));
+        if(calls.some(call=>call.state==='started'||call.ended_at===null))gaps.add('compaction_call_unknown');
+        if(markers.some(marker=>marker.operationEndedAt===null))gaps.add('compaction_operation_unconfirmed');
+        const marker=markers[0]!;
+        if(marker.nativeEntryId===null) {if(markers.some(marker=>marker.operationError===null))gaps.add('compaction_operation_unconfirmed');continue;}
+        const entry=this.db.query<{entry_json:string},[number,string]>("SELECT entry_json FROM memories WHERE session_id=? AND native_entry_id=? AND entry_type='compaction'").get(calls[0]!.session_id,marker.nativeEntryId);
+        const events=this.db.query<{payload_json:string},[number,string]>("SELECT payload_json FROM runtime_events WHERE run_id=? AND type='compaction_completed' AND json_extract(payload_json,'$.operationRef')=?").all(runId,group.operation_ref);
+        if(!entry||events.length!==1){gaps.add('compaction_persistence');continue;}
+        const parsed=RegisteredEventPayloadSchema.safeParse({type:'compaction_completed',payload:decoded(events[0]!.payload_json)});
+        if(!parsed.success||parsed.data.type!=='compaction_completed'){gaps.add('compaction_persistence');continue;}
+        const native=decoded(entry.entry_json) as {firstKeptEntryId:string;tokensBefore:number};
+        const fact:CompactionSaveFact={operationRef:group.operation_ref,sessionId:calls[0]!.session_id,runId,reason:marker.reason as 'threshold'|'overflow',nativeEntryId:marker.nativeEntryId,firstKeptEntryId:native.firstKeptEntryId,
+          tokensBefore:native.tokensBefore,estimatedTokensAfter:parsed.data.payload.estimatedTokensAfter,baseStorageVersion:marker.baseStorageVersion,callIds:calls.map(call=>call.call_id)};
+        if(this.confirmCompactionSaved(null,fact)===null)gaps.add('compaction_persistence');
+      }
+      return {requiredPersistenceComplete:gaps.size===0,unconfirmedItems:[...gaps]};
+    });
+  }
+  finishAutoCompaction(operationRef:string,runId:number,error:AppError,endedAt:string):void {
+    id(runId);checked(OpaqueIdSchema,operationRef);checked(AppErrorSchema,error);timestamp(endedAt);
+    this.inputWrite(()=>{
+      const run=this.row(runId);if(!run||run.kind!=='agent')fail('state_conflict');
+      const calls=this.compactionCalls(operationRef);
+      if(calls.some(call=>call.run_id!==runId||call.session_id!==run.session_id||call.state==='started'))fail('storage_write_failed');
+      for(const call of calls) {
+        const model=decoded(call.model_json) as {compaction:unknown},marker=checked(CompactionCallMetadataSchema,model.compaction);
+        if(marker.source!=='auto')fail('state_conflict');
+        if(marker.operationError!==null){if(!isDeepStrictEqual(marker.operationError,error))fail('state_conflict');continue;}
+        this.db.query('UPDATE model_calls SET model_json=? WHERE call_id=?').run(JSON.stringify({...model,compaction:{...marker,operationEndedAt:marker.operationEndedAt??endedAt,operationError:error}}),call.call_id);
+      }
+    });
   }
 
   findOperation(operationRef: string): StoredOperation | null {
@@ -1155,7 +1266,13 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
           const assistant=(history.newEntries as {id:string;type:string}[]).findLast(entry=>entry.type==='message');
           if(!assistant||this.db.query('SELECT id FROM memories WHERE session_id=? AND native_entry_id=?').get(row.session_id,assistant.id))fail('session_history_invalid');
         }
-        this.memory.commitInTransaction(history);
+        const compactions=(fact as FinalAgentFact).compactions??[];
+        const pending=compactions.filter(compaction=>this.compactionCalls(compaction.operationRef).some(call=>checked(CompactionCallMetadataSchema,(decoded(call.model_json) as {compaction:unknown}).compaction).nativeEntryId===null));
+        // A second native frame must first cross the same save barrier as a continuation.
+        if(pending.length>1)fail('state_conflict');
+        if(pending.length)this.commitCompactionInTransaction(history,pending[0]!);
+        else this.memory.commitInTransaction(history);
+        for(const compaction of compactions)if(compaction!==pending[0]&&this.confirmCompactionSaved(history,compaction)===null)fail('storage_write_failed');
         if(historyRequired&&fact.status==='completed')this.validateFinalAnswer(row,fact as FinalAgentFact);
       }
       const calls = this.calls(runId);
@@ -1198,7 +1315,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
             finalCall.usageSource, finalCall.unavailableReason, json(finalCall.error), runId, finalCall.callId);
         if (result.changes !== 1) fail("state_conflict");
       }
-      if (cleanup && 'contract' in cleanup && cleanup.requiredPersistenceComplete && !this.verifyPriorContextFacts(runId).requiredPersistenceComplete) fail('storage_write_failed');
+      if (cleanup && 'contract' in cleanup && cleanup.requiredPersistenceComplete && (!this.verifyPriorContextFacts(runId).requiredPersistenceComplete||!this.verifyPriorCompactionFacts(runId).requiredPersistenceComplete)) fail('storage_write_failed');
       this.db.query(`UPDATE runs SET status=?,output_text=?,stopped_at=COALESCE(stopped_at,?),ended_at=COALESCE(ended_at,?),cancel_requested_at=?,
         error_json=?,cleanup_json=?,usage_json=? WHERE id=?`)
         .run(terminal ? row.status : fact.status, row.output_text ?? fact.outputText, fact.stoppedAt, fact.endedAt, cancelRequestedAt,
@@ -1245,6 +1362,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       || !isDeepStrictEqual(decoded(row.usage_json), fact.usage ?? null) || !isDeepStrictEqual(decoded(row.cleanup_json), expectedCleanup)) return false;
     const historyRequired=row.kind==='agent'&&checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.historyContract==='medclaw.history/p9-v1';
     if('calls' in fact&&fact.history&&(!this.memory||this.memory.confirmCommitted(fact.history)===null))return false;
+    if('calls' in fact&&fact.compactions?.some(compaction=>this.confirmCompactionSaved(fact.history??null,compaction)===null))return false;
     if(historyRequired) {
       if(fact.status==='completed') {
         if(!('calls' in fact)||!fact.history)return false;
