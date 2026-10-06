@@ -196,7 +196,25 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       return config.agent.resources ? this.checkedResources(config.agent.resources, row.session_id!, config.selection.configVersion) : null;
     });
   }
-  readResourceEvidence(runId: number, page: number, pageSize: number): { items: ResourceEvidence[]; totalRows: number } {
+  readResourceOrigins(sessionId: number, nativeEntryIds: readonly string[]): ResourceEvidence[] {
+    id(sessionId); if (nativeEntryIds.length > 1000) fail('resource_too_large');
+    const entries = new Set(nativeEntryIds), runs = new Set<number>();
+    for (const entry of entries) {
+      checked(OpaqueIdSchema, entry);
+      const row = this.db.query<{run_id:number|null}, [number,string]>('SELECT run_id FROM memories WHERE session_id=? AND native_entry_id=?').get(sessionId, entry);
+      if (row?.run_id !== null && row?.run_id !== undefined) runs.add(row.run_id);
+    }
+    const facts: ResourceEvidence[] = [];
+    for (const runId of runs) {
+      for (let page = 1; ; page++) {
+        const result = this.readResourceEvidence(runId, page, 100, false);
+        facts.push(...result.items.filter(f => f.nativeEntryId !== null && entries.has(f.nativeEntryId)));
+        if (page * 100 >= result.totalRows) break;
+      }
+    }
+    return facts;
+  }
+  readResourceEvidence(runId: number, page: number, pageSize: number, includeDeliveries = true): { items: ResourceEvidence[]; totalRows: number } {
     id(runId); id(page); id(pageSize); if (pageSize > 100 || !Number.isSafeInteger(page * pageSize)) fail('invalid_argument');
     return this.inputRead(() => {
       const run = this.row(runId); if (!run) fail('run_not_found');
@@ -235,7 +253,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       }
       const calls = this.db.query<{ call_id: string; model_json: string; delivered_at: string }, [number, number]>(`SELECT c.call_id,c.model_json,d.delivered_at FROM model_calls c JOIN context_deliveries d ON d.model_call_id=c.id
         WHERE c.run_id=? AND c.session_id=? AND c.kind='main' ORDER BY c.id`).all(runId, run.session_id!);
-      for (const call of calls) {
+      for (const call of includeDeliveries ? calls : []) {
         const context = checked(ModelCallContextSchema, (decoded(call.model_json) as { context: unknown }).context, 'storage_read_failed');
         const observation = context.observation?.resources; if (!observation) continue;
         if (call.delivered_at !== context.observation!.observedAt) fail('storage_read_failed');

@@ -1,5 +1,6 @@
-import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, type AgentSession } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, formatSkillsForPrompt, SessionManager, SettingsManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { clampThinkingLevel } from "@earendil-works/pi-ai/compat";
+import { getSystemMessageText } from '@earendil-works/pi-ai';
 import { performance } from "node:perf_hooks";
 import { isAbsolute, join } from "node:path";
 import { mkdir } from "node:fs/promises";
@@ -23,7 +24,8 @@ import type { ToolExecutor } from "../../core/src/tools/executor";
 import type { ToolRecorder } from "../../core/src/tools/recorder";
 import type { ToolExecutionContext, ToolSdkDelivery } from "../../contracts/src/tool";
 import type { ReadSessionMessagesInput, SessionMessagePage } from "@medclaw/contracts/messages";
-import { matchProviderToolReceipts, sameToolReceipt, projectMessageText, projectSessionMessages, matchProviderContext, contextMessageText } from "./messages";
+import { matchProviderToolReceipts, matchProviderResources, sameToolReceipt, projectMessageText, projectSessionMessages, matchProviderContext, contextMessageText, type ExpectedResource } from "./messages";
+import { CallResourceContextSchema, type CallResourceContext } from '../../contracts/src/resources';
 import { EventAdapter } from './event-adapter';
 import { CONTEXT_CONTRACT, CONTEXT_HTTP_APIS, type ContextSnapshot, type ModelCallContext, type RegisterContextDeliveryInput, type NativeContextRef } from '../../contracts/src/context';
 import type { ContextService } from '../../core/src/context/context-service';
@@ -229,7 +231,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
       return this.contextFor(binding.execution, nativeToolCallId, sdkSignal);
     };
     const getControl = () => binding.execution?.control;
-    const native = this.tools ? createPiNativeTools(workdir, this.tools.recorder, getContext, {}, getControl) : null;
+    const native = this.tools ? createPiNativeTools(workdir, this.tools.recorder, getContext, {}, getControl, () => binding.execution?.input.resources) : null;
     const registry = { get: (name: string) => binding.execution!.tools!.registry.get(name) };
     const executor = { execute: (...args: Parameters<ToolExecutor['execute']>) => binding.execution!.tools!.executor.execute(...args) };
     const definitions = this.tools ? [...createPiToolDefinitions(binding.execution?.tools?.registry??this.tools.registry, executor, getContext, getControl), ...native!.definitions] : [];
@@ -283,11 +285,46 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           const fail = (error: unknown) => { const known = AppErrorSchema.safeParse(error); callbacks.fatal?.(known.success ? known.data : safeError(error instanceof Error ? error.message : 'internal_error')); execution.abort(); };
           let snapshot: ContextSnapshot | undefined, admission:ReturnType<RunControl['admitModelCall']>,messages:typeof context.messages;
           const candidates: { context: ToolExecutionContext; receipt: ToolSdkDelivery; nativeRef?: NativeContextRef }[] = [];
+          const resourceExpected: ExpectedResource[] = [];
+          let resourceContext: CallResourceContext | undefined;
           try {
             if (input.resources) await verifyRunResourceFiles(join(this.dataRoot, 'runtime', String(input.runId), 'work', 'scratch'), input.resources);
             binding.compaction?.beforeMainRequest();
             binding.memory!.flushBeforeRequest();
             if (this.hasPendingContextPersistence(input.runId)) throw safeError('storage_write_failed');
+            if (this.toolPersistencePending(input.runId)) throw safeError('storage_write_failed');
+            if (input.resources) {
+              if (!callbacks.inputStore?.readResourceOrigins) throw safeError('state_conflict');
+              const branch = binding.manager.getBranch(), compaction = branch.findLast(e => e.type === 'compaction');
+              const kept = compaction?.type === 'compaction' ? branch.slice(branch.findIndex(e => e.id === compaction.firstKeptEntryId)) : branch;
+              const entries = kept.filter(e => e.type === 'message' && (e.message.role === 'user' || e.message.role === 'toolResult'));
+              if (entries.length > 1000) throw safeError('resource_unavailable', undefined, {reason:'resource_too_large'});
+              const facts = callbacks.inputStore.readResourceOrigins(input.sessionId, entries.map(e => e.id));
+              let after = -1, userIndex = 0, toolIndex = 0;
+              for (const message of context.messages) {
+                if (message.role !== 'user' && message.role !== 'toolResult') continue;
+                const text = contextMessageText(message.content), ordinal = message.role === 'user' ? userIndex++ : toolIndex++;
+                const index = entries.findIndex((e, i) => i > after && e.type === 'message' && e.message.role === message.role
+                  && e.message.timestamp === message.timestamp && canonicalRequest(e.message.content) === canonicalRequest(message.content)
+                  && (message.role !== 'toolResult' || e.message.role === 'toolResult' && e.message.toolCallId === message.toolCallId));
+                if (index < 0) continue;
+                after = index; const entry = entries[index]!;
+                for (const f of facts.filter(f => f.nativeEntryId === entry.id)) {
+                  if (text === null || f.contentHash !== createHash('sha256').update(f.kind === 'native_read' ? canonicalRequest(message.content) : text).digest('hex')) throw safeError('storage_read_failed');
+                  resourceExpected.push({text,...(message.role === 'user' ? {userIndex:ordinal} : {toolIndex:ordinal}),
+                    fact:{resourceRef:f.resourceRef,originRunId:f.originRunId,file:f.file,inputId:f.inputId,nativeEntryId:f.nativeEntryId,toolCallId:f.toolCallId,
+                      contentHash:f.contentHash,coverage:f.coverage,kind:f.kind === 'native_read' ? 'native_read' : f.resourceRef.kind === 'prompt' ? 'prompt_expansion' : 'skill_expansion'}});
+                }
+              }
+              for (const skill of resourceLoader.getSkills().skills.filter(s => !s.disableModelInvocation)) {
+                const text = /  <skill>[\s\S]*?  <\/skill>/.exec(formatSkillsForPrompt([skill]))?.[0];
+                const ref = input.resources.available.find(s => s.ref.kind === 'skill' && skill.filePath === join(workdir(), 'resources', 'skills', s.ref.id, s.ref.version, 'SKILL.md'))?.ref;
+                if (!text || !ref || !session.systemPrompt.includes(text) || !context.messages.some(m => m.role === 'system' && getSystemMessageText(m).includes(text))) throw safeError('resource_unavailable', undefined, {reason:'resource_snapshot_invalid'});
+                resourceExpected.push({text,fact:{resourceRef:ref,originRunId:input.runId,file:null,inputId:null,nativeEntryId:null,toolCallId:null,
+                  contentHash:createHash('sha256').update(text).digest('hex'),coverage:'index',kind:'skill_index'}});
+              }
+              resourceContext = CallResourceContextSchema.parse({expected:resourceExpected.map(e => e.fact),payload:null});
+            }
             if (this.contexts && !(CONTEXT_HTTP_APIS as readonly string[]).includes(model.api)) throw safeError('context_delivery_unsupported');
             if (this.tools && input.scope && input.referenceDate && input.timezone
               && binding.manager.getSessionId() === binding.nativeSessionId) {
@@ -325,10 +362,10 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
             binding.compaction?.checkRequestCapacity(messages);
           } catch (error) { fail(error); throw error; }
           let recorder;
-          try { recorder = callbacks.startCall(new Date().toISOString(), snapshot ? {snapshotId:snapshot.id,inputId:snapshot.inputId!,nativeHistory:binding.memory!.readSavedContext()} : undefined); if(snapshot && !recorder.callId) throw safeError('state_conflict'); }
+          try { recorder = callbacks.startCall(new Date().toISOString(), snapshot ? {snapshotId:snapshot.id,inputId:snapshot.inputId!,nativeHistory:binding.memory!.readSavedContext(),...(resourceContext ? {resources:resourceContext} : {})} : undefined); if(snapshot && !recorder.callId) throw safeError('state_conflict'); }
           catch (error) { execution.registrationFailed = true; fail(error); throw error; }
           execution.currentModelCallId = recorder.callId ?? null;
-          const callContext: ModelCallContext | undefined = snapshot ? {contract:'medclaw.context-call/v1',snapshotId:snapshot.id,inputId:snapshot.inputId!,observation:null,responseStatus:null,payloadVerified:null,nativeHistory:binding.memory!.readSavedContext()} : undefined;
+          const callContext: ModelCallContext | undefined = snapshot ? {contract:'medclaw.context-call/v1',snapshotId:snapshot.id,inputId:snapshot.inputId!,observation:null,responseStatus:null,payloadVerified:null,nativeHistory:binding.memory!.readSavedContext(),...(resourceContext ? {resources:structuredClone(resourceContext)} : {})} : undefined;
           const finish = (outcome: ProviderOutcome) => ({...recorder.finish(outcome,new Date().toISOString()),...(callContext ? {context:structuredClone(callContext)} : {})});
           const index = execution.facts.push(null) - 1;
           let stream;
@@ -345,6 +382,10 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
                 if (snapshot && callContext) {
                   callContext.payloadVerified = matchProviderContext(model.api,effective,snapshot);
                   if (!callContext.payloadVerified) { const error = safeError('context_payload_mismatch'); fail(error); throw error; }
+                  if (callContext.resources) {
+                    try {callContext.resources.payload = matchProviderResources(effective, model.api, resourceExpected);}
+                    catch(error) {fail(error);throw error;}
+                  }
                 }
                 const receipts = recorder.callId ? matchProviderToolReceipts(model.api, effective, candidates.map(candidate => candidate.receipt)) : [];
                 matched = candidates.filter(candidate => receipts.includes(candidate.receipt));
@@ -361,7 +402,8 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
                   if (snapshot && callContext && recorder.callId) {
                     receipt = {runId:input.runId,sessionId:input.sessionId,inputId:snapshot.inputId!,callId:recorder.callId,snapshotId:snapshot.id,
                       observation:{contract:'medclaw.context-observation/v1',api:model.api as typeof CONTEXT_HTTP_APIS[number],transport:model.api === 'bedrock-converse-stream' ? 'aws-event-stream' : 'sse',observedAt:new Date().toISOString(),httpStatus:response.status,projectionHash:snapshot.projectionHash,feedbackHash:snapshot.feedbackHash,
-                        verifiedNativeRefs:observedCandidates.flatMap(candidate => candidate.nativeRef ? [{kind:candidate.nativeRef.kind,id:candidate.nativeRef.id,contentHash:candidate.nativeRef.contentHash}] : [])}};
+                        verifiedNativeRefs:observedCandidates.flatMap(candidate => candidate.nativeRef ? [{kind:candidate.nativeRef.kind,id:candidate.nativeRef.id,contentHash:candidate.nativeRef.contentHash}] : []),
+                        ...(callContext.resources?.payload ? {resources:structuredClone(callContext.resources.payload)} : {})}};
                   }
                 }
                 let callbackError: unknown;

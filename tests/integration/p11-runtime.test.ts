@@ -29,12 +29,12 @@ import { ResourceCatalogueSchema, resourceRefKey } from '../../packages/contract
 import { parseSkillBlock } from '@earendil-works/pi-coding-agent';
 import { sqliteHistory } from '../fixtures/p9-memory';
 
-async function fixture(respond?: (index: number) => Promise<Record<string, unknown>> | Record<string, unknown>) {
+async function fixture(respond?: (index: number, payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>) {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p11-runtime-')), author = join(root, 'author'); cpSync(resolve('resources'), author, { recursive: true });
   const db = openDatabase(join(root, 'app.sqlite')), requests: Record<string, unknown>[] = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     requests.push(await request.json() as Record<string, unknown>);
-    const delta = await respond?.(requests.length) ?? { role: 'assistant', content: 'ENGINEERING response; no quality claim.' };
+    const delta = await respond?.(requests.length, requests.at(-1)!) ?? { role: 'assistant', content: 'ENGINEERING response; no quality claim.' };
     return new Response(`data: ${JSON.stringify({ id: 'fixture', model: 'fixture', choices: [{ index: 0, delta, finish_reason: 'tool_calls' in delta ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
   } });
   const credentials = new InMemoryCredentialStore(); await credentials.modify('p11-fixture', async () => ({ type: 'api_key', key: 'engineering' }));
@@ -55,7 +55,7 @@ async function fixture(respond?: (index: number) => Promise<Record<string, unkno
   const request = (text: string): SubmitInput => SubmitInputSchema.parse({ sessionId: 1, clientSequence: repos.readSession(1)!.nextSubmissionSequence, mode: 'send', text, expectedRevision: repos.readWorkspace().revision, expectedBatchIds: [], expectedQueryId: null, model: { provider: 'p11-fixture', modelId: 'fixture', expectedConfigVersion: app.config.configVersion }, referenceDate: '2026-10-06', timezone: 'Asia/Shanghai' });
   const settle = async () => { for (let i = 0; i < 2000 && app.runs.busy; i++) await Bun.sleep(2); expect(app.runs.busy).toBe(false); };
   const content = (id: number) => InputContentSchema.parse(JSON.parse(db.query<{ content_json: string }, [number]>('SELECT content_json FROM session_inputs WHERE id=?').get(id)!.content_json));
-  return { root, author, db, requests, errors, app, agent, repos, contexts, source, prompt: ref(prompt), skill: ref(skill), request, settle, content,
+  return { root, author, db, requests, errors, app, agent, repos, contexts, source, toolStore, recorder, prompt: ref(prompt), skill: ref(skill), request, settle, content,
     close: async () => { await app.runs.shutdown(); server.stop(true); db.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
@@ -236,6 +236,44 @@ test('p11 actual SDK capture checks receipt budget before native dispatch and pr
     expect(f.content(exact.data.inputId).nativeInput?.text).toBe(text); expect(f.requests).toHaveLength(1);
   } finally { await f.close(); }
 }, 15000);
+
+test('p11 real native progressive reads keep SDK results and independently save read and HTTP delivery identities', async () => {
+  const f = await fixture((index, payload) => {
+    const system = (payload.messages as {role:string;content:string}[]).find(m => m.role === 'system')!.content;
+    const path = /<location>(.*?)<\/location>/.exec(system)![1]!;
+    const input = index === 1 ? {path} : index === 2 ? {path: path.replace('SKILL.md', 'references/facts-and-assumptions.md'), offset: 1, limit: 1}
+      : index === 3 ? {path: path.replace('SKILL.md', 'references/facts-and-assumptions.md')} : {};
+    return index < 5 ? {role:'assistant',tool_calls:[{index:0,id:`p11read${index}`,type:'function',function:{name:index < 4 ? 'read' : 'read_data_scope',arguments:JSON.stringify(input)}}]}
+      : {role:'assistant',content:'ENGINEERING final, no model quality claim'};
+  });
+  try {
+    const result = await f.app.runs.submitAgent(f.request('progressive read'), {instanceId:'host',operationRef:'progressive-read'});
+    if (!result.ok || !result.data.runId) throw new Error('No Run'); await f.settle();
+    expect(f.repos.read({runId:result.data.runId})).toMatchObject({kind:'one',run:{status:'completed'}});
+    expect(f.errors).toEqual([]); expect(f.requests).toHaveLength(5);
+    const facts = (await f.app.resources!.list({source:'run',runId:result.data.runId,evidencePageSize:100})).evidence;
+    expect(facts.filter(e => e.kind === 'native_read').map(e => e.coverage).sort()).toEqual(['complete','complete','partial']);
+    const tools = f.db.query<{delivery_json:string}, []>('SELECT delivery_json FROM tool_calls ORDER BY id').all().map(r => JSON.parse(r.delivery_json));
+    const frozen = f.repos.readRunResources(result.data.runId)!.available.find(s => s.ref.kind === 'skill')!;
+    expect(tools[0].message.content).toEqual([{type:'text',text:frozen.files.find(s => s.file === 'SKILL.md')!.content}]);
+    expect(tools[0].message.details).toBeUndefined(); expect(tools[3].resourceRead).toBeUndefined();
+    for (const read of facts.filter(e => e.kind === 'native_read')) expect(facts.some(e => e.kind === 'provider_delivery' && e.toolCallId === read.toolCallId && e.nativeEntryId === read.nativeEntryId)).toBe(true);
+    expect(facts.some(e => e.kind === 'provider_delivery' && e.coverage === 'index' && e.file === null)).toBe(true);
+  } finally {await f.close();}
+},15000);
+
+test('p11 equal Prompt expansions in successive Runs each retain their original native entry and origin Run', async () => {
+  const f = await fixture(); try {
+    const runs: number[] = [];
+    for (const operationRef of ['origin-one','origin-two']) {
+      const result = await f.app.runs.submitAgent(f.request('identical text'), {instanceId:'host',operationRef});
+      if (!result.ok || !result.data.runId) throw new Error('No Run'); runs.push(result.data.runId); await f.settle();
+    }
+    const facts = (await f.app.resources!.list({source:'run',runId:runs[1]!,evidencePageSize:100})).evidence.filter(e => e.kind === 'provider_delivery' && e.resourceRef.kind === 'prompt');
+    expect(facts.map(e => e.originRunId).sort()).toEqual(runs); expect(new Set(facts.map(e => e.nativeEntryId)).size).toBe(2);
+    expect(f.errors).toEqual([]);
+  } finally {await f.close();}
+},15000);
 
 test('p11 resource capture rechecks the published configuration before creating any Run or Input', async () => {
   const f = await fixture(); let release!: () => void, entered!: () => void;

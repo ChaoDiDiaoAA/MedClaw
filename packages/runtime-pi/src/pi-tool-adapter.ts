@@ -11,6 +11,12 @@ import { ToolExecutor } from "../../core/src/tools/executor";
 import type { ToolRecorder } from "../../core/src/tools/recorder";
 import type { RunControl } from '../../core/src/runtime/run-control';
 import type { ToolControlObservation } from '../../contracts/src/model';
+import { resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { canonicalRequest } from '../../contracts/src/run';
+import type { FrozenRunResources } from '../../contracts/src/resources';
+import { verifyRunResourceFiles } from './resource-loader';
+import { contextMessageText } from './messages';
 
 export type ToolContextFactory = (nativeToolCallId: string, signal?: AbortSignal) => ToolExecutionContext;
 
@@ -269,7 +275,7 @@ export function createPiRunControlBinding(session: AgentSession, registry: Pick<
   });
 }
 
-type NativeRecorder = Pick<ToolRecorder, "blocked" | "request" | "start" | "finish" | "read" | "recordDelivery" | "failPersistence">;
+type NativeRecorder = Pick<ToolRecorder, "blocked" | "request" | "start" | "finish" | "read" | "recordDelivery" | "recordResourceRead" | "failPersistence">;
 const nativeResult = z.custom<AgentToolResult<unknown>>(value => {
   const candidate = z.object({ content: z.array(z.union([
     z.object({ type: z.literal('text'), text: z.string() }).passthrough(),
@@ -295,6 +301,7 @@ export function createPiNativeTools(
   getContext: ToolContextFactory,
   options: ToolsOptions = {},
   getControl?: () => RunControl | undefined,
+  getResources?: () => FrozenRunResources | undefined,
 ): { definitions: PiToolDefinition[]; bind(session: AgentSession): () => void } {
   const getWorkdir = typeof workdir === "string" ? () => workdir : workdir;
   // A session may register tools before its first Run exists. Actual I/O always uses the trusted ctx.cwd below.
@@ -379,6 +386,24 @@ export function createPiNativeTools(
   return { definitions, bind(boundSession) {
     session = boundSession;
     const attempts = new Map<string, unknown>();
+    const saveRead = async (context: ToolExecutionContext, message: ToolResultMessage) => {
+      const frozen = getResources?.(), input = attempts.get(message.toolCallId);
+      if (!frozen || message.toolName !== 'read' || message.isError || !input || typeof input !== 'object' || !('path' in input) || typeof input.path !== 'string') return;
+      const requested = resolve(getWorkdir(), input.path);
+      for (const snapshot of frozen.available) for (const file of snapshot.files) {
+        const path = resolve(getWorkdir(), 'resources', snapshot.ref.kind === 'skill' ? 'skills' : 'prompts', snapshot.ref.id, snapshot.ref.version, file.file);
+        if (requested !== path) continue;
+        await verifyRunResourceFiles(getWorkdir(), frozen);
+        const args = input as {offset?:number;limit?:number}, lines = file.content.split('\n'), start = Math.max(0, (args.offset ?? 1) - 1);
+        const selected = lines.slice(start, args.limit === undefined ? undefined : start + args.limit), text = contextMessageText(message.content);
+        const truncation = message.details && typeof message.details === 'object' && 'truncation' in message.details ? message.details.truncation as {outputLines?:number} : null;
+        const provedLines = truncation?.outputLines ?? selected.length, prefix = selected.slice(0, provedLines).join('\n');
+        const coverage = start === 0 && selected.length === lines.length && text === file.content ? 'complete'
+          : prefix.length > 0 && (text === prefix || text?.startsWith(prefix + '\n\n[')) ? 'partial' : 'unknown';
+        recorder.recordResourceRead(context, {resourceRef:snapshot.ref,file:file.file,fileHash:file.sha256,
+          returnedContentHash:createHash('sha256').update(canonicalRequest(message.content)).digest('hex'),coverage,observedAt:new Date().toISOString()});
+      }
+    };
     const unsubscribe = boundSession.agent.subscribe(async (event, signal) => {
       if (event.type === "agent_end") attempts.clear();
       if (event.type === "tool_execution_start" && byName.has(event.toolName)) attempts.set(event.toolCallId, structuredClone(event.args));
@@ -415,11 +440,13 @@ export function createPiNativeTools(
         const entry = boundSession.sessionManager.getEntries().findLast(entry => entry.type === "message" && entry.message === event.message);
         if (recorder.blocked(context) && entry) {
           recorder.recordDelivery(context, entry.id, ToolSdkDeliverySchema.parse(wireValue(event.message)));
+          await saveRead(context, event.message);
           return;
         }
         if (!record || !finished(record) || record.name !== tool.name || !entry || !attempts.has(event.message.toolCallId)
           || !isDeepStrictEqual(record.input, preparedNativeInput(tool, attempts.get(event.message.toolCallId)).input)) throw fatal(context);
         if (!record.sdkReturned) recorder.recordDelivery(context, entry.id, ToolSdkDeliverySchema.parse(wireValue(event.message)));
+        await saveRead(context, event.message);
       } catch (native) { throw fatal(context, native); }
       finally { attempts.delete(event.message.toolCallId); }
     });
