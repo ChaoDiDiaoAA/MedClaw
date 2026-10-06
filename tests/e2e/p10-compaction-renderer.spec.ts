@@ -58,3 +58,21 @@ test('p10 a saved receipt with an acknowledgement gap still exposes original exp
   await expect.poll(async()=>(await requests(page,'session.restore')).length).toBe(1);expect((await requests(page,'session.restore'))[0]!.input).toEqual({sessionId:1,expectedLeafId:'saved-1'});
   expect(await requests(page,'session.compact')).toHaveLength(1);
 });
+
+test('p10 slow original reads survive polling and a notice schedules one follow-up refresh',async({page})=>{
+  await page.goto(url);await page.clock.install();await page.clock.pauseAt(new Date());await page.getByRole('button',{name:'Compact context',exact:true}).click();
+  const command=(await requests(page,'session.compact'))[0]!;
+  await reply(page,'session.compact',{ok:true,data:view(command.operationRef)});
+  await expect.poll(async()=>(await requests(page,'session.compaction.read')).length).toBe(1);
+  await page.clock.runFor(1600);expect(await requests(page,'session.compaction.read')).toHaveLength(1);
+  await page.getByRole('button',{name:'Read original compaction',exact:true}).click();
+  await notice(page,{type:'compaction.progress',instanceId:'HostA',sessionId:1,operationRef:command.operationRef,runId:null,revision:3,phase:'saving'});
+  expect(await requests(page,'session.compaction.read')).toHaveLength(1);
+  await reply(page,'session.compaction.read',{ok:true,data:view(command.operationRef)});
+  await expect.poll(async()=>(await requests(page,'session.compaction.read')).length).toBe(2);
+  await page.clock.runFor(1600);expect(await requests(page,'session.compaction.read')).toHaveLength(2);
+  await reply(page,'session.compaction.read',{ok:true,data:view(command.operationRef,'completed',true)});
+  await expect(page.getByTestId('session-compaction')).toContainText('Compaction · completed');await expect(page.getByRole('button',{name:'Compact context',exact:true})).toBeEnabled();
+  expect(await page.evaluate(()=>Reflect.get(globalThis,'__verified').filter((item:{operationRef:string})=>item.operationRef===Reflect.get(globalThis,'__pending')[0].operationRef).length)).toBe(2);
+  await page.clock.runFor(1600);expect(await requests(page,'session.compaction.read')).toHaveLength(2);
+});

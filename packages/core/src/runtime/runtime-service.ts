@@ -190,7 +190,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       });});}
       catch(error){if(entered)throw error;task.observed={nativeIdle:true,nativeGenerated:false,change:null,result:{nativeEntryId:null,firstKeptEntryId:null,tokensBefore:null,estimatedTokensAfter:null,callIds:[],noOpReason:null,error:safeError('credential_read_failed')}};}
       task.nativeIdle=task.observed.nativeIdle;
-      this.saveManualCompaction(task);
+      await this.saveManualCompaction(task);
     });
     if(this.historyMutation?.operationRef===context.operationRef){this.historyMutation.request=canonicalRequest(request);this.historyMutation.accepted=receipt;}
     const settled=running.then(()=>{
@@ -238,9 +238,9 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       await task.task;
       for(const [callId,pending]of task.pendingCalls){this.store.finishCompactionCall(pending.owner,pending.fact);task.pendingCalls.delete(callId);}
       const receipt=this.store.readCompactionOperation({sessionId,operationRef:task.operation.operationRef})?.receipt;
-      if(receipt?.nativeSaved)this.saveManualCompaction(task);
+      if(receipt?.nativeSaved)await this.saveManualCompaction(task);
       else {
-        task.error??=safeError('storage_write_failed');this.saveManualCompaction(task,true);
+        task.error??=safeError('storage_write_failed');await this.saveManualCompaction(task,true);
         if(!this.agent?.discardCompactionForRestore)throw safeError('state_conflict');
         await this.agent.discardCompactionForRestore({sessionId,operationRef:task.operation.operationRef,nativeIdle:true,nativeQueuesEmpty:true,observersSettled:true,requiredCallFactsSaved:true});
       }
@@ -249,7 +249,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     try{return await this.withHistoryMutation(operationRef,sessionId,action);}
     finally{if(task?.released&&this.manual!==task)this.manualProgress(task,'finished');}
   }
-  private saveManualCompaction(task:ManualExecution,forRestore=false):void {
+  private async saveManualCompaction(task:ManualExecution,forRestore=false):Promise<void> {
     if(!task.nativeIdle||!task.observed)throw safeError('stop_unconfirmed');
     if(task.pendingCalls.size)throw safeError('storage_write_failed');
     const operation=this.store.readCompactionOperation({sessionId:task.operation.request.sessionId,operationRef:task.operation.operationRef})!,observed=task.observed;
@@ -257,7 +257,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       const receipt=operation.receipt,change=receipt.nativeSaved?observed.change:null,version=this.store.confirmCompactionSaved?.(change,receipt);
       if(version==null)throw safeError('storage_write_failed');
       if(forRestore)return;
-      this.agent!.acknowledgeCompactionSaved!(receipt.sessionId,receipt.operationRef,change,version);task.operation=operation;task.released=true;if(task.timer)clearTimeout(task.timer);return;
+      await this.agent!.acknowledgeCompactionSaved!(receipt.sessionId,receipt.operationRef,change,version);task.operation=operation;task.released=true;if(task.timer)clearTimeout(task.timer);return;
     }
     const cancelled=operation.cancelRequestedAt!==null,save=observed.nativeGenerated&&!cancelled&&!forRestore,error=task.error??observed.result.error;
     const eligible=save&&!error||!!observed.result.noOpReason&&!cancelled&&!error;
@@ -271,7 +271,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     try{version=this.transactions!.immediate(()=>this.store.commitCompactionInTransaction(change,receipt));}
     catch(native){const proof=this.store.confirmCompactionSaved?.(change,receipt);if(proof==null)throw native;version=proof;}
     if(forRestore)return;
-    this.agent!.acknowledgeCompactionSaved!(receipt.sessionId,receipt.operationRef,change,version);
+    await this.agent!.acknowledgeCompactionSaved!(receipt.sessionId,receipt.operationRef,change,version);
     task.operation=this.store.readCompactionOperation({sessionId:receipt.sessionId,operationRef:receipt.operationRef})!;
     task.released=true;if(task.timer)clearTimeout(task.timer);
   }
@@ -757,7 +757,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       if(!manual.nativeIdle||!manual.observed)throw safeError('stop_unconfirmed');
       for(const [callId,pending]of manual.pendingCalls){this.store.finishCompactionCall(pending.owner,pending.fact);manual.pendingCalls.delete(callId);}
       // Closing needs durable facts and stop proof; no subsequent SDK request will use this binding.
-      this.saveManualCompaction(manual,true);if(manual.timer)clearTimeout(manual.timer);manual.released=true;if(this.manual===manual)this.manual=null;
+      await this.saveManualCompaction(manual,true);if(manual.timer)clearTimeout(manual.timer);manual.released=true;if(this.manual===manual)this.manual=null;
     }
     if (execution) { execution.acceptingInputs = false; execution.stopEpoch++; }
     if (execution && !execution.nativeTerminal && !execution.cause) { execution.cause = "shutdown"; execution.abort.abort(); }

@@ -25,9 +25,11 @@ export class CompactionAdapter {
   private readonly frames:Frame[]=[];
   private readonly observers:Promise<void>[]=[];
   private admitted=0;
+  private manualNoOp=false;
   constructor(private readonly session:AgentSession,private readonly manager:SessionManager,private readonly memory:PiMemoryAdapter,
     private readonly source:Source,private readonly original:Stream) {}
   get isSummarizing():boolean{return this.frame!==null&&!this.frame.ended;}
+  get hasManualNoOp():boolean{return this.manualNoOp;}
   get operationRef():string|null{return this.source.kind==='manual'?this.source.input.operationRef:this.frame?.operationRef??null;}
   private checkActive():void {
     this.source.input.signal.throwIfAborted();
@@ -164,6 +166,7 @@ export class CompactionAdapter {
     await this.session.waitForIdle();await this.settle();
     if(!this.session.isIdle||this.session.agent.hasQueuedMessages())throw safeError('stop_unconfirmed');
     const frame=this.frame,result=frame?.result;
+    this.manualNoOp=!!noOpReason&&!frame?.callIds.length&&!result;
     return {nativeGenerated:result!==null&&result!==undefined,nativeIdle:true,change:result?this.memory.readCompactionCommit(this.source.input.operationRef):null,
       result:{nativeEntryId:frame?.nativeEntryId??null,firstKeptEntryId:result?.firstKeptEntryId??null,tokensBefore:result?.tokensBefore??null,estimatedTokensAfter:result?.estimatedTokensAfter??null,
         callIds:frame?[...frame.callIds]:[],noOpReason,error:noOpReason?null:error??frame?.error??null}};

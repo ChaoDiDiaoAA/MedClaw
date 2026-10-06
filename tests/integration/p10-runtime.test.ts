@@ -18,10 +18,11 @@ import { memoryAssistant, memoryAt, sqliteHistory } from '../fixtures/p9-memory'
 import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
 import type { CompactionCallOwner, CompactionOperationView } from '../../packages/contracts/src/session';
 import type { ModelCallStarter } from '../../packages/contracts/src/run';
+import { safeError } from '../../packages/contracts/src/error';
 
 const cleanup:(()=>Promise<void>)[]=[];
 afterEach(async()=>{for(const close of cleanup.splice(0))await close();});
-async function fixture(rich=true,hold=false,credentialFails=false,automatic?:'threshold'|'overflow'|'success_overflow'|'pre_threshold'|'length'|'second_overflow'|'summary_failure',largeSummary=false) {
+async function fixture(rich:boolean|'short'=true,hold=false,credentialFails=false,automatic?:'threshold'|'overflow'|'success_overflow'|'pre_threshold'|'length'|'second_overflow'|'summary_failure',largeSummary=false) {
   const root=mkdtempSync(join(tmpdir(),'medclaw-p10-runtime-')),db=openDatabase(join(root,'app.sqlite')),tx=SqliteWriteTransactions.forDatabase(db),requests:unknown[]=[],scopes:unknown[]=[];
   let release!:()=>void;const waiting=new Promise<void>(resolve=>{release=resolve;});
   let mainCalls=0,summaryCalls=0;
@@ -33,11 +34,11 @@ async function fixture(rich=true,hold=false,credentialFails=false,automatic?:'th
     return new Response(`data: ${JSON.stringify({id:'ENGINEERING',model:'fixture',choices:[{index:0,delta:{role:'assistant',content:main?'ENGINEERING main answer':largeSummary?'ENGINEERING '.repeat(2000):'ENGINEERING summary Shanghai approved active'},finish_reason:main&&automatic==='length'&&mainCalls===1?'length':'stop'}],usage:{prompt_tokens:tokens,completion_tokens:2,total_tokens:tokens+2}})}\n\ndata: [DONE]\n\n`,{headers:{'content-type':'text/event-stream'}});}});
   const credentials=new InMemoryCredentialStore();await credentials.modify('p10-fixture',async()=>({type:'api_key',key:'ENGINEERING'}));
   const runtime=await PiModelRuntime.create({credentials,modelsStore:new InMemoryModelsStore()});
-  await runtime.installCustom([{providerId:'p10-fixture',name:'ENGINEERING',api:'openai-completions',baseUrl:`http://127.0.0.1:${server.port}/v1`,models:[{id:'fixture',name:'ENGINEERING',reasoning:false,input:['text'],contextWindow:4096,maxTokens:128,outputLimitConfirmed:true,pricingKnown:false,cost:null}]}]);
+  await runtime.installCustom([{providerId:'p10-fixture',name:'ENGINEERING',api:'openai-completions',baseUrl:`http://127.0.0.1:${server.port}/v1`,models:[{id:'fixture',name:'ENGINEERING',reasoning:false,input:['text'],contextWindow:rich==='short'?32768:4096,maxTokens:128,outputLimitConfirmed:true,pricingKnown:false,cost:null}]}]);
   const history=sqliteHistory(db),repo=new Repositories(db,undefined,undefined,tx,history.store),contexts=new SqliteContextStore(db),contextService=new ContextService(contexts,{inspectManagedImport:async()=>({status:'valid'})}),agent=new PiAgentRuntime(runtime,root,history,undefined,contextService);
-  const describe=agent.describe.bind(agent);spyOn(agent,'describe').mockImplementation(resolved=>({...describe(resolved),compaction:{contract:'medclaw.compaction/v1',enabled:!!automatic,reserveTokens:256,keepRecentTokens:128}}));
+  const describe=agent.describe.bind(agent);if(rich!=='short')spyOn(agent,'describe').mockImplementation(resolved=>({...describe(resolved),compaction:{contract:'medclaw.compaction/v1',enabled:!!automatic,reserveTokens:256,keepRecentTokens:128}}));
   const manager=SessionManager.inMemory(root);manager.appendModelChange('p10-fixture','fixture');manager.appendThinkingLevelChange('off');
-  if(rich)for(let index=0;index<6;index++){manager.appendMessage({role:'user',content:`ENGINEERING ${index} ${'x'.repeat(160)}`,timestamp:index*2+1});const assistant={...memoryAssistant('y'.repeat(160),'fixture'),provider:'p10-fixture',timestamp:index*2+2};if(automatic==='pre_threshold'&&index===5)assistant.usage={...assistant.usage,input:3950,totalTokens:3950};manager.appendMessage(assistant);}
+  if(rich)for(let index=0;index<(rich==='short'?1:6);index++){manager.appendMessage({role:'user',content:rich==='short'?'ENGINEERING Hello':`ENGINEERING ${index} ${'x'.repeat(160)}`,timestamp:index*2+1});const assistant={...memoryAssistant(rich==='short'?'ENGINEERING Hello':'y'.repeat(160),'fixture'),provider:'p10-fixture',timestamp:index*2+2};if(automatic==='pre_threshold'&&index===5)assistant.usage={...assistant.usage,input:3950,totalTokens:3950};manager.appendMessage(assistant);}
   repo.createSession({expectedWorkspaceRevision:0},'create',manager.getSessionId(),memoryAt,{header:manager.getHeader(),entries:[],activeLeafId:null});
   history.commitSync({sessionId:1,runId:null,expectedStorageVersion:1,header:manager.getHeader(),newEntries:manager.getEntries(),activeLeafId:manager.getLeafId()});
   const settings=PublishedSettingsSchema.parse({schemaVersion:'medclaw.settings/p1-v1',configVersion:'1',model:{provider:'p10-fixture',modelId:'fixture'},customProviders:[],credentialRefs:{},requestPolicy:{timeoutMs:10000,maxRetries:0,maxRetryDelayMs:2000},previous:null,rollbackFromVersion:null});
@@ -46,12 +47,12 @@ async function fixture(rich=true,hold=false,credentialFails=false,automatic?:'th
   const sessions=new SessionService('host',repo,agent,(input,context)=>app.runs.submitAgent(input,context),()=>app.runs.activeHandle,()=>null,undefined,app.runs,tx);
   cleanup.push(async()=>{release();try{await app.shutdown();}catch{}server.stop(true);db.close();rmSync(root,{recursive:true,force:true});});
   const request={sessionId:1,expectedStorageVersion:2,model:{provider:'p10-fixture',modelId:'fixture',expectedConfigVersion:'1'}};
-  return {root,db,repo,agent,app,sessions,requests,scopes,request,release,runtime,describe,contexts};
+  return {root,db,repo,agent,app,sessions,requests,scopes,request,release,runtime,describe,contexts,history};
 }
 async function waitFor(condition:()=>boolean) {for(let attempt=0;attempt<400;attempt++){if(condition())return;await Bun.sleep(5);}throw new Error('Engineering condition did not settle');}
 async function terminal(f:Awaited<ReturnType<typeof fixture>>,operationRef:string):Promise<CompactionOperationView> {
   let view:CompactionOperationView|null=null;
-  for(let attempt=0;attempt<400;attempt++){const read=await Reflect.get(f.sessions,'readCompaction').call(f.sessions,{sessionId:1,operationRef});if(!read.ok)throw read.error;view=read.data;if(view?.receipt&&!f.app.busy)return view;await Bun.sleep(5);}
+  for(let attempt=0;attempt<400;attempt++){const read=await Reflect.get(f.sessions,'readCompaction').call(f.sessions,{sessionId:1,operationRef});if(!read.ok)throw read.error;view=read.data;if(view?.receipt&&view.phase==='finished'&&!f.app.busy)return view;await Bun.sleep(5);}
   throw new Error(`Engineering manual task did not finish: ${JSON.stringify(view)}`);
 }
 
@@ -66,6 +67,35 @@ for(const rich of [true,false])test(`p10 manual ${rich?'summary':'no-op'} is acc
   expect(f.db.query('SELECT run_id,session_id,input_id,kind,state FROM model_calls').all()).toEqual(rich?[{run_id:null,session_id:1,input_id:null,kind:'compaction',state:'completed'}]:[]);
   expect((await compact.call(f.sessions,{...f.request,expectedStorageVersion:3},context)).ok).toBe(false);
   expect((await Reflect.get(f.sessions,'readCompaction').call(f.sessions,{sessionId:2,operationRef:'manual'}))).toMatchObject({ok:false,error:{code:'access_denied'}});
+});
+
+for(const lostCommit of [false,true])test(`p10 short-history native no-op releases occupancy with unchanged history${lostCommit?' after a lost committed return':''}`,async()=>{
+  const f=await fixture('short'),saved=await f.history.store.load(1),commit=f.repo.commitCompactionInTransaction.bind(f.repo);
+  if(!saved.ok)throw saved.error;
+  if(lostCommit){const tx=SqliteWriteTransactions.forDatabase(f.db),immediate=tx.immediate.bind(tx);let committed=false;
+    spyOn(f.repo,'commitCompactionInTransaction').mockImplementation((...args)=>{const result=commit(...args);committed=true;return result;});
+    spyOn(tx,'immediate').mockImplementation(action=>{const result=immediate(action);if(committed){committed=false;throw new Error('ENGINEERING no-op committed return lost');}return result;});}
+  expect(await f.sessions.compact(f.request,{instanceId:'host',operationRef:'short'})).toMatchObject({ok:true});
+  expect(await terminal(f,'short')).toMatchObject({status:'no_op',nativeGenerated:false,nativeSaved:false,canContinue:true,receipt:{noOpReason:'nothing_to_compact',callIds:[],baseStorageVersion:2}});
+  expect(await f.history.store.load(1)).toEqual(saved);expect(f.requests).toHaveLength(0);expect(f.db.query('SELECT id FROM runs').all()).toEqual([]);
+  const workspace=f.repo.readWorkspace(),accepted=await f.sessions.submit({sessionId:1,mode:'send',clientSequence:1,text:'ENGINEERING continue',expectedRevision:workspace.revision,expectedBatchIds:[],expectedQueryId:null,model:f.request.model,referenceDate:'2026-10-06',timezone:'Asia/Shanghai'},{instanceId:'host',operationRef:'after-short'});
+  expect(accepted).toMatchObject({ok:true});if(!accepted.ok||!accepted.data.runId)throw new Error('ENGINEERING root not accepted');await waitFor(()=>!f.app.busy);
+  expect(f.repo.read({runId:accepted.data.runId})).toMatchObject({kind:'one',run:{status:'completed'}});expect(f.requests).toHaveLength(1);expect(JSON.stringify(f.requests[0])).toContain('ENGINEERING Hello');
+});
+
+for(const gap of ['receipt','load'] as const)test(`p10 short-history no-op ${gap} failure keeps its original hold until explicit restore without replay`,async()=>{
+  const f=await fixture('short'),saved=await f.history.store.load(1);if(!saved.ok)throw saved.error;
+  const load=f.history.store.load.bind(f.history.store);let blocked=true;
+  if(gap==='receipt')f.db.exec("CREATE TEMP TRIGGER fail_short_receipt BEFORE INSERT ON business_events WHEN NEW.type='session_compaction_finished' BEGIN SELECT RAISE(ABORT,'ENGINEERING no-op receipt unavailable'); END;");
+  else {const acknowledge=f.agent.acknowledgeCompactionSaved.bind(f.agent);spyOn(f.agent,'acknowledgeCompactionSaved').mockImplementation((...args)=>{spyOn(f.history.store,'load').mockImplementation(sessionId=>blocked?Promise.resolve({ok:false,error:safeError('storage_read_failed')}):load(sessionId));return acknowledge(...args);});}
+  expect(await f.sessions.compact(f.request,{instanceId:'host',operationRef:'short-gap'})).toMatchObject({ok:true});
+  await waitFor(()=>f.app.runs.readLatestCompaction(1)?.phase==='blocked');expect(f.app.busy).toBe(true);expect(f.requests).toHaveLength(0);
+  expect(await load(1)).toEqual(saved);
+  if(gap==='receipt')expect(f.repo.readCompactionOperation({sessionId:1,operationRef:'short-gap'})?.receipt).toBeNull();
+  else expect(f.repo.readCompactionOperation({sessionId:1,operationRef:'short-gap'})?.receipt).toMatchObject({status:'no_op'});
+  blocked=false;if(gap==='receipt')f.db.exec('DROP TRIGGER fail_short_receipt');
+  expect(await f.sessions.restore({sessionId:1,expectedLeafId:saved.data.activeLeafId},{instanceId:'host',operationRef:'restore-short'})).toMatchObject({ok:true});
+  expect(f.app.busy).toBe(false);expect(await load(1)).toEqual(saved);expect(f.requests).toHaveLength(0);
 });
 
 test('p10 cancelling a pending manual summary preserves one original cancel request and the occupancy until SDK idle',async()=>{

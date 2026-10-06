@@ -447,10 +447,20 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
     if(binding.manual?.operationRef!==operationRef&&binding.compaction?.operationRef!==operationRef)throw safeError('state_conflict');
     binding.session?.abortCompaction();
   }
-  acknowledgeCompactionSaved(sessionId:number,operationRef:string,change:NativeHistoryCommit|null,storageVersion:number):void {
-    const binding=this.sessions.get(sessionId);if(!binding||binding.manual||binding.execution||binding.session&&!binding.session.isIdle)throw safeError('stop_unconfirmed');
+  async acknowledgeCompactionSaved(sessionId:number,operationRef:string,change:NativeHistoryCommit|null,storageVersion:number):Promise<void> {
+    const binding=this.sessions.get(sessionId);if(!binding||binding.manual||binding.execution||binding.session&&(!binding.session.isIdle||binding.session.agent.hasQueuedMessages()))throw safeError('stop_unconfirmed');
     if(binding.memory!.compactionOperationRef!==operationRef){if(!binding.memory!.compactionOperationRef&&!change&&binding.memory!.readSavedContext().storageVersion===storageVersion)return;throw safeError('state_conflict');}
     const original=binding.memory!.readCompactionCommit(operationRef);
+    if(!change&&binding.compaction?.hasManualNoOp) {
+      if(storageVersion!==binding.memory!.readSavedContext().storageVersion||original.newEntries.some(entry=>entry.type!=='model_change'&&entry.type!=='thinking_level_change'))throw safeError('storage_write_failed');
+      await binding.compaction.settle();
+      const loaded=await this.history.store.load(sessionId);if(!loaded.ok)throw loaded.error;
+      const manager=restoreNativeManager(loaded.data,this.dataRoot),candidate:Binding={manager,nativeSessionId:loaded.data.nativeSessionId,entryRuns:new Map(),available:true};
+      this.attachMemory(sessionId,candidate,loaded.data);
+      // Core already confirmed the original receipt; discard only idle no-op setup, keeping SQLite unchanged.
+      binding.memory!.discardUncommittedForRestore({sessionId,operationRef,nativeIdle:true,nativeQueuesEmpty:true,observersSettled:true,requiredCallFactsSaved:true,persistentSnapshot:loaded.data});
+      binding.session?.dispose();this.sessions.set(sessionId,candidate);this.blocked.delete(sessionId);return;
+    }
     if(change&&nativeHistoryJSON(change)!==nativeHistoryJSON(original)||!change&&(original.newEntries.length||original.activeLeafId!==binding.memory!.readSavedContext().leafId))throw safeError('storage_write_failed');
     binding.memory!.acknowledgeCompaction(original,storageVersion);binding.compaction=undefined;
   }
