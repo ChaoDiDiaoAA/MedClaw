@@ -173,6 +173,8 @@ export interface FinalProviderFact {
 }
 interface AgentStartCommon {
   resources?: import('./resources').FrozenRunResources;
+  inputPlan?: import('./resources').ResourceInputPlan;
+  nativeReceiptLimitBytes?: number;
   contextContract?: 'medclaw.context/v1';
   historyContract?: 'medclaw.history/p9-v1';
   sessionId: number; text: string; model: ModelSelection; policy: RequestPolicy; goal: "answer";
@@ -215,6 +217,7 @@ export type AgentRuntimePort<Resolved> = {
   describe: (resolved: Resolved) => P2AgentOptions;
   execute: (input: { runId: number; sessionId: number; inputId?: number | null; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number;
     resources?: import('./resources').FrozenRunResources; inputPlan?: import('./resources').ResourceInputPlan;
+    nativeReceiptLimitBytes?: number;
     workspaceContext?: WorkspaceContext; scope?: RunScope; referenceDate?: string; timezone?: string; agentPolicy?: AgentPolicy; runtimeConfiguration?: RuntimeConfiguration; toolConfiguration?: ToolConfiguration; measurementContext?: MeasurementContext; toolProfileSnapshot?: ToolProfileSnapshot },
     callbacks: { stream?: (snapshot: StreamSnapshot) => void; startCall: (time: string, context?: StartCallContext) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
       fatal?: (error: AppError) => void; inputStore?: InputStore; admissionClosed?: () => void; compaction?: import('./session').AutoCompactionCallbacks }) => Promise<AgentExecutionObservation>;

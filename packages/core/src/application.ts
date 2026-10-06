@@ -24,7 +24,7 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
   constructor(readonly instanceId: string, private settings: PublishedSettings, readonly runtime: ModelRuntimePort<Resolved>, readonly repositories: RuntimeRunStore, private readonly scope: CredentialScope, startCall: ModelCallStarter, private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void = () => {}, private readonly agent?: AgentRuntimePort<Resolved> & NativeSessionBindings, events?: Pick<EventService, 'notifyStream'>,transactions?:WriteTransactions, resourceSource?:ResourceSource) {
     this.resources = resourceSource ? new ResourceService(() => this.settings, repositories, resourceSource, () => agent?.toolNames ?? []) : null;
     this.runs = new RuntimeService(instanceId, () => this.settings, runtime, repositories, scope, startCall, notice, report, agent,
-      () => this.closing || this.prepared !== null || this.refreshes.size > 0 || [...this.logins.values()].some(login => !login.view.endedAt), snapshot => events?.notifyStream(snapshot),transactions);
+      () => this.closing || this.prepared !== null || this.refreshes.size > 0 || [...this.logins.values()].some(login => !login.view.endedAt), snapshot => events?.notifyStream(snapshot),transactions,this.resources ?? undefined);
   }
   get config() { return this.settings; }
   get busy() { return this.runs.busy; }

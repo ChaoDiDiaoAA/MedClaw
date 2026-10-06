@@ -150,8 +150,7 @@ function checkedFrozen(raw: FrozenRunResources) {
 }
 export async function verifyRunResourceFiles(workdir: string, raw: FrozenRunResources): Promise<void> {
   const frozen = checkedFrozen(raw); if (!frozen.available.length) return;
-  const root = await managedPath(workdir, 'resources');
-  try { for (const snapshot of frozen.available) if (treeHash(snapshot, await filesFor(root, snapshot)) !== snapshot.ref.treeHash) fail('resource_snapshot_invalid'); }
+  try { const root = await managedPath(workdir, 'resources'); for (const snapshot of frozen.available) if (treeHash(snapshot, await filesFor(root, snapshot)) !== snapshot.ref.treeHash) fail('resource_snapshot_invalid'); }
   catch (error) { if (reason(error) === 'resource_path_invalid') fail('resource_path_invalid'); fail('resource_snapshot_invalid'); }
 }
 export async function materializeRunResources(runId: number, workdir: string, raw: FrozenRunResources): Promise<{ skillPaths: string[]; promptPaths: string[]; signature: string }> {

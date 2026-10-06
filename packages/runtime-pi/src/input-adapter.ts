@@ -1,7 +1,12 @@
-import type { AgentSession, SessionManager } from '@earendil-works/pi-coding-agent';
-import { safeError, type AppError } from '../../contracts/src/error';
+import { parseSkillBlock, type AgentSession, type SessionManager } from '@earendil-works/pi-coding-agent';
+import { AppErrorSchema, safeError, type AppError } from '../../contracts/src/error';
 import type { InputAdapterPort, InputBinding, InputCancelProof, InputControl, InputSettlementProof, InputStore } from '../../contracts/src/session';
 import type { WorkspaceContext } from '../../contracts/src/workspace';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+import { NativeInputReceiptSchema, RESOURCE_LIMITS, resourceRefKey, type FrozenRunResources, type NativeInputReceipt } from '../../contracts/src/resources';
+import { contextMessageText } from './messages';
+import { verifyRunResourceFiles } from './resource-loader';
 
 type Message = Parameters<AgentSession['agent']['steer']>[0];
 type Failure = Parameters<InputStore['recordInputFailure']>[1];
@@ -18,7 +23,7 @@ export interface PiInputAdapterCallbacks {
   nativeStateInvalid?(): void;
   admissionClosed(): void;
 }
-type Record = { input: InputBinding; message?: Message; started: boolean; entryId?: string; appendOrder?: number; removed?: Removal; unknown: boolean; failed: boolean };
+type Record = { input: InputBinding; message?: Message; nativeInput?: NativeInputReceipt; started: boolean; entryId?: string; appendOrder?: number; removed?: Removal; unknown: boolean; failed: boolean };
 function latch<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; }
 
 /** Composes public Pi methods. Pi retains exclusive ownership of its scheduling loop. */
@@ -44,7 +49,7 @@ export class PiInputAdapter implements InputAdapterPort {
   private readonly sessionInstalled: Pick<AgentSession, 'prompt' | 'steer' | 'followUp'>;
   private readonly unsubscribe: () => void;
 
-  constructor(private readonly session: AgentSession, private readonly manager: SessionManager, private readonly callbacks: PiInputAdapterCallbacks) {
+  constructor(private readonly session: AgentSession, private readonly manager: SessionManager, private readonly callbacks: PiInputAdapterCallbacks, private readonly resources?: { frozen: FrozenRunResources; workdir: string }) {
     const agent = session.agent;
     this.sessionOriginals = { prompt: session.prompt.bind(session), steer: session.steer.bind(session), followUp: session.followUp.bind(session) };
     const rejectUncontrolled = () => {
@@ -80,7 +85,7 @@ export class PiInputAdapter implements InputAdapterPort {
           if (record.removed || record.entryId && record.entryId !== entryId) { this.block(); return entryId; }
           record.entryId = entryId;
           const order = record.appendOrder ??= ++this.appendOrder;
-          const fact: Consumption = { sessionId: record.input.sessionId, runId: record.input.targetRunId, nativeEntryId: entryId, at: new Date().toISOString() };
+          const fact: Consumption = { sessionId: record.input.sessionId, runId: record.input.targetRunId, nativeEntryId: entryId, at: new Date().toISOString(), ...(record.nativeInput ? { nativeInput: record.nativeInput } : {}) };
           this.save(`consumed:${record.input.inputId}`, () => {
             this.callbacks.consumed(record.input, fact);
             if (order >= this.confirmedOrder) {
@@ -127,8 +132,8 @@ export class PiInputAdapter implements InputAdapterPort {
     try { operation(); this.pendingSaves.delete(key); }
     catch { this.pendingSaves.set(key, operation); this.closeAdmission(); this.callbacks.fatal(safeError('storage_write_failed')); }
   }
-  private failure(record: Record, proof: Failure['proof']) {
-    const fact: Failure = { sessionId: record.input.sessionId, targetRunId: record.input.targetRunId, at: new Date().toISOString(), error: safeError(proof.kind === 'delivery_unknown' ? 'input_delivery_unknown' : proof.reason === 'hook_handled' ? 'input_hook_handled' : 'input_invalid'), proof };
+  private failure(record: Record, proof: Failure['proof'], error?: AppError) {
+    const fact: Failure = { sessionId: record.input.sessionId, targetRunId: record.input.targetRunId, at: new Date().toISOString(), error: error ?? safeError(proof.kind === 'delivery_unknown' ? 'input_delivery_unknown' : proof.reason === 'hook_handled' ? 'input_hook_handled' : 'input_invalid'), proof };
     this.save(`failure:${record.input.inputId}`, () => this.callbacks.failed(record.input, fact));
   }
   private markUnknown(record: Record, reason: Extract<Failure['proof'], { kind: 'delivery_unknown' }>['reason']) {
@@ -140,6 +145,22 @@ export class PiInputAdapter implements InputAdapterPort {
     const record = scope.record;
     if (!this.accepting || scope.epoch !== this.epoch || record.input.stopEpoch !== 0) { record.failed = true; throw safeError('input_invalid'); }
     if (messages.length !== 1 || messages[0]!.role !== 'user' || scope.count++) { this.markUnknown(record, 'delivery_unconfirmed'); throw safeError('input_delivery_unknown'); }
+    if (record.input.inputPlan) {
+      const text = contextMessageText(messages[0]!.content), plan = record.input.inputPlan;
+      const reject = (): never => { throw safeError('resource_unavailable', undefined, { reason: 'resource_expansion_failed' }); };
+      if (text === null || !this.resources || this.resources.frozen.sessionId !== record.input.sessionId) reject();
+      if (plan.kind === 'plain') { if (text !== plan.dispatchText) reject(); }
+      else {
+        const snapshot = this.resources!.frozen.available.find(s => resourceRefKey(s.ref) === resourceRefKey(plan.resourceRef!)); if (!snapshot) reject();
+        const location = join(this.resources!.workdir, 'resources', snapshot!.entry);
+        if (plan.kind === 'skill') { const block = parseSkillBlock(text!); if (!block || block.name !== snapshot!.name || block.location !== location) reject(); }
+        else if (!this.session.promptTemplates.some(p => p.name === snapshot!.name && p.filePath === location) || text === plan.dispatchText) reject();
+      }
+      const receipt = NativeInputReceiptSchema.safeParse({ text, sha256: createHash('sha256').update(text!).digest('hex') });
+      const limit = record.input.nativeReceiptLimitBytes ?? RESOURCE_LIMITS.nativeReceiptBytes;
+      if (!receipt.success || !Number.isSafeInteger(limit) || limit < 0 || Buffer.byteLength(JSON.stringify(receipt.data), 'utf8') > limit) throw safeError('resource_unavailable', undefined, { reason: 'resource_too_large' });
+      record.nativeInput = receipt.data;
+    } else if (this.resources) throw safeError('state_conflict');
     record.message = messages[0]!; this.objects.set(record.message, record); return record;
   }
   private acceptDispatch(record: Record) {
@@ -160,14 +181,18 @@ export class PiInputAdapter implements InputAdapterPort {
       const dispatch = latch<void>(); this.scope = { record, epoch: this.epoch, count: 0, dispatch };
       let task: Promise<void>;
       try {
-        task = input.mode === 'send' ? this.sessionOriginals.prompt(input.text, { expandPromptTemplates: false })
-          : input.mode === 'steer' ? this.sessionOriginals.steer(input.text) : this.sessionOriginals.followUp(input.text);
+        if (this.resources) await verifyRunResourceFiles(this.resources.workdir, this.resources.frozen);
+        const text = input.inputPlan?.dispatchText ?? input.text;
+        task = input.mode === 'send' ? this.sessionOriginals.prompt(text, { expandPromptTemplates: !!input.inputPlan })
+          : input.mode === 'steer' ? this.sessionOriginals.steer(text) : this.sessionOriginals.followUp(text);
       } catch (error) { task = Promise.reject(error); }
       // Completion of a handled/rejected preflight also releases the short latch.
       const observed = task.then(() => {
         if (!record.message && !record.failed && !record.unknown) { record.failed = true; this.failure(record, { kind: 'not_consumed', reason: 'hook_handled' }); }
-      }, () => {
-        if (!record.message && !record.unknown) { record.failed = true; this.failure(record, { kind: 'not_consumed', reason: 'dispatch_rejected' }); }
+      }, error => {
+        const known = AppErrorSchema.safeParse(error);
+        if (!record.message && !record.unknown) { record.failed = true; this.failure(record, { kind: 'not_consumed', reason: 'dispatch_rejected' }, known.success ? known.data : undefined); }
+        if (known.success) { this.closeAdmission(); this.callbacks.fatal(known.data); }
         else if (!record.entryId && !record.unknown) this.markUnknown(record, 'delivery_unconfirmed');
       }).finally(() => dispatch.resolve());
       this.longTasks.add(observed); void observed.finally(() => this.longTasks.delete(observed));
