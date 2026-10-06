@@ -55,9 +55,9 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
     requireHost();
     return settings.synchronize();
   };
-  const publish = async (expected: string, patch: Parameters<MainSettings["publish"]>[1], kind: "model" | "custom" | "policy" | "ui" | "rollback", targetConfigVersion?: string, coordination: Pick<PublishOptions, "beforeWrite" | "onUnpublished"> = {}) => {
+  const publish = async (expected: string, patch: Parameters<MainSettings["publish"]>[1], kind: "model" | "custom" | "policy" | "ui" | "rollback" | 'resources', targetConfigVersion?: string, coordination: Pick<PublishOptions, "beforeWrite" | "onUnpublished"> = {}) => {
     const result = await settings.publish(expected, patch, { kind, ...(targetConfigVersion ? { targetConfigVersion } : {}), ...coordination,
-      beforeWrite: async candidate => { await coordination.beforeWrite?.(candidate); if (kind !== "ui") await checkSelectionAuth(candidate.model); },
+      beforeWrite: async candidate => { await coordination.beforeWrite?.(candidate); if (kind !== "ui" && kind !== 'resources') await checkSelectionAuth(candidate.model); },
     });
     if (kind !== "ui") options.notify({ type: "config.changed", configVersion: result.configVersion });
     return result;
@@ -111,6 +111,17 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
         const dir = await request("model.read", {}) as { selection: unknown }; return { configVersion: s.configVersion, selection: dir.selection };
       }
       case "model.policy.update": { await synchronize(); const p = raw as PublicPayload<'model.policy.update'>; const s = await publish(p.expectedConfigVersion, { ...(p.policy ? { requestPolicy: p.policy } : {}), ...(p.agentPolicy ? { agentPolicy: p.agentPolicy } : {}), ...(p.runtimeConfiguration ? { runtimeConfiguration: p.runtimeConfiguration } : {}), ...(p.toolConfiguration ? { toolConfiguration: p.toolConfiguration } : {}) }, "policy"); return { configVersion: s.configVersion, policy: s.requestPolicy, agentPolicy: s.agentPolicy, runtimeConfiguration: s.runtimeConfiguration, toolConfiguration: s.toolConfiguration }; }
+      case 'resources.list': case 'resources.read': {
+        const p = raw as PublicPayload<'resources.list' | 'resources.read'>;
+        if (p.source === 'selection') await synchronize(); else requireHost();
+        return request(method, raw, operationRef);
+      }
+      case 'resources.select': {
+        const current = await synchronize(), p = raw as PublicPayload<'resources.select'>;
+        const resources = { bySession: { ...current.resources?.bySession, [String(p.sessionId)]: p.selection } };
+        const published = await publish(p.expectedConfigVersion, { resources }, 'resources');
+        return { sessionId: p.sessionId, configVersion: published.configVersion, selection: published.resources!.bySession[String(p.sessionId)]! };
+      }
       case "model.config.rollback": {
         await synchronize(); const p = raw as { expectedConfigVersion: string; targetConfigVersion: string };
         if (!(await request("run.control.read", {}) as { acceptingNewRuns: boolean }).acceptingNewRuns) throw new Error("runtime_busy");

@@ -8,17 +8,21 @@ import { RuntimeService } from "./runtime/runtime-service";
 import { AppErrorSchema, safeError, type AppError } from "../../contracts/src/error.ts";
 import type { EventService } from './events/event-service.ts';
 import type { WriteTransactions } from '../../contracts/src/event';
+import { ResourceService } from './resources/resource-service';
+import type { ResourceSource } from '../../contracts/src/resources';
 
 type Login = { view: AuthAttemptView; abort: AbortController; pending?: { id: string; allowedIds: string[] | null; resolve: (value: string) => void; reject: (reason: unknown) => void }; task: Promise<void> };
 const now = () => new Date().toISOString();
 export class Application<Resolved extends ResolvedProviderSelection = ResolvedProviderSelection> {
   readonly runs: RuntimeService<Resolved>;
+  readonly resources: ResourceService | null;
   private refreshes = new Map<string, AbortController>();
   private logins = new Map<string, Login>();
   private prepared: { token: string; candidate: PublishedSettings; old: PublishedSettings; changedRuntime: boolean } | null = null;
   private lastCommit: { token: string; version: string } | null = null;
   private closing = false;
-  constructor(readonly instanceId: string, private settings: PublishedSettings, readonly runtime: ModelRuntimePort<Resolved>, readonly repositories: RuntimeRunStore, private readonly scope: CredentialScope, startCall: ModelCallStarter, private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void = () => {}, agent?: AgentRuntimePort<Resolved> & NativeSessionBindings, events?: Pick<EventService, 'notifyStream'>,transactions?:WriteTransactions) {
+  constructor(readonly instanceId: string, private settings: PublishedSettings, readonly runtime: ModelRuntimePort<Resolved>, readonly repositories: RuntimeRunStore, private readonly scope: CredentialScope, startCall: ModelCallStarter, private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void = () => {}, private readonly agent?: AgentRuntimePort<Resolved> & NativeSessionBindings, events?: Pick<EventService, 'notifyStream'>,transactions?:WriteTransactions, resourceSource?:ResourceSource) {
+    this.resources = resourceSource ? new ResourceService(() => this.settings, repositories, resourceSource, () => agent?.toolNames ?? []) : null;
     this.runs = new RuntimeService(instanceId, () => this.settings, runtime, repositories, scope, startCall, notice, report, agent,
       () => this.closing || this.prepared !== null || this.refreshes.size > 0 || [...this.logins.values()].some(login => !login.view.endedAt), snapshot => events?.notifyStream(snapshot),transactions);
   }
@@ -50,12 +54,17 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
     if (this.prepared && this.prepared.token === token && isDeepStrictEqual(this.prepared.candidate, input)) return { prepared: true as const, selection: (await this.directory()).selection };
     if (this.prepared || this.closing) throw new Error("runtime_busy");
     const candidate = PublishedSettingsSchema.parse(input);
+    const oldResources = this.settings.resources?.bySession ?? {}, newResources = candidate.resources?.bySession ?? {};
+    const changedResourceSessions = [...new Set([...Object.keys(oldResources), ...Object.keys(newResources)])].filter(id => !isDeepStrictEqual(oldResources[id], newResources[id]));
+    if (changedResourceSessions.length && candidate.configVersion !== this.settings.configVersion && candidate.previous?.configVersion !== this.settings.configVersion) throw new Error('config_conflict');
     const changedRuntime = !isDeepStrictEqual(candidate.customProviders.map(p => p.definition), this.settings.customProviders.map(p => p.definition));
     const changedBindings = !isDeepStrictEqual(candidate.credentialRefs, this.settings.credentialRefs) || !isDeepStrictEqual(candidate.customProviders.map(p => p.credentialRef), this.settings.customProviders.map(p => p.credentialRef));
     if (changedRuntime || changedBindings || candidate.rollbackFromVersion !== null) this.assertIdle();
     const old = this.settings;
     this.prepared = { token, candidate, old, changedRuntime };
     try {
+      if (changedResourceSessions.length && !this.resources) throw new Error('resource_unavailable');
+      for (const id of changedResourceSessions) await this.resources!.validateSelection(Number(id), newResources[id] ?? { prompt: null, skills: [] }, this.agent?.toolNames ?? []);
       if (changedRuntime) await this.runtime.installCustom(candidate.customProviders.map(p => p.definition));
       const changedSelection = !isDeepStrictEqual(candidate.model, old.model) || !isDeepStrictEqual(candidate.requestPolicy, old.requestPolicy);
       const selected = changedSelection || changedRuntime || changedBindings || candidate.rollbackFromVersion !== null ? candidate.model : null;
