@@ -1,4 +1,5 @@
 import { performance } from 'node:perf_hooks';
+import { createHash } from 'node:crypto';
 import { safeError, type AppError } from '../../../contracts/src/error';
 import { createToolControlObservation, type AgentPolicy, type BudgetSummary, type MeasurementContext, type ToolControlObservation, type ToolProfileSnapshot } from '../../../contracts/src/model';
 import { canonicalRequest, type RunScope, type RuntimeBudgetView } from '../../../contracts/src/run';
@@ -21,6 +22,7 @@ type Failure = { code: string; stage: string; recordId: number | null; queryId: 
 type Attempt = {
   name: string;
   raw: unknown;
+  hookInput?: { value: unknown };
   prepared?: string;
   allowed: boolean;
   observation: ToolControlObservation;
@@ -130,6 +132,15 @@ export class RunControl {
     }) });
     if (!allowed) this.toolAdmissionsRejected++;
   }
+  recordHookInput(id: string, before: unknown, after: unknown): void {
+    const attempt = this.attempts.get(id);
+    if (!attempt) throw new Error('state_conflict');
+    attempt.hookInput = { value: structuredClone(after) };
+    const hash = (value: unknown) => createHash('sha256').update(canonicalRequest(value)).digest('hex');
+    const beforeSha256 = hash(before), afterSha256 = hash(after);
+    this.updateObservation(id, { hookInput: { beforeSha256, afterSha256, changed: beforeSha256 !== afterSha256 } });
+  }
+  readHookInput(id: string): { value: unknown } | null { return structuredClone(this.attempts.get(id)?.hookInput ?? null); }
   admitToolCall(id: string, name: string, prepared: unknown): AppError | null {
     if (!this.attempts.has(id)) this.observeToolAttempt(id, name, prepared);
     const attempt = this.attempts.get(id)!;

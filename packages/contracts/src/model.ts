@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { AppErrorSchema, ConfigVersionSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } from "./error";
 import { ResourceSettingsSchema } from './resources';
+import { ExtensionSettingsSchema } from './extensions';
+import { ResourceHashSchema } from './resources';
 export { ConfigVersionSchema } from './error';
 import type { AppError } from "./error";
 import type { ProviderOutcome } from "./run";
@@ -71,6 +73,8 @@ export const ToolProfileSnapshotSchema = z.strictObject({
 export const ToolValidationStatusSchema = z.enum(['passed', 'failed', 'not_applicable', 'not_reached', 'unknown']);
 export const ToolAdmissionStatusSchema = z.enum(['passed', 'blocked', 'failed', 'not_reached', 'unknown']);
 export const ToolControlObservationSchema = z.strictObject({
+  hookInput: z.strictObject({ beforeSha256: ResourceHashSchema, afterSha256: ResourceHashSchema, changed: z.boolean() })
+    .refine(value => value.changed === (value.beforeSha256 !== value.afterSha256)).optional(),
   version: z.literal('medclaw.tool-control/v1'),
   admission: z.strictObject({
     status: ToolAdmissionStatusSchema,
@@ -201,6 +205,7 @@ export const SettingsSnapshotObjectSchema = z.strictObject({
   runtimeConfiguration: RuntimeConfigurationSchema.optional(),
   toolConfiguration: StoredToolConfigurationSchema.optional(),
   resources: ResourceSettingsSchema.optional(),
+  extensions: ExtensionSettingsSchema.optional(),
   ui: DesktopDisplayPreferencesSchema.default(DEFAULT_DISPLAY_PREFERENCES),
 }).refine(settings => new Set(settings.customProviders.map(provider => provider.definition.providerId)).size === settings.customProviders.length, "Duplicate custom provider ID");
 function normalizeSettings<T extends z.infer<typeof SettingsSnapshotObjectSchema>>(settings: T, context: z.RefinementCtx) {

@@ -21,7 +21,7 @@ const diagnostic = (resourceRef: ResourceRef | null, code: ResourceDiagnosticRea
 const refOf = ({ kind, id, version, treeHash }: ResourceRef): ResourceRef => ({ kind, id, version, treeHash });
 
 /** Same lstat/realpath boundary as managed artifacts, with bounded opened-file reads. */
-async function managedPath(root: string, file = '') {
+export async function managedPath(root: string, file = '') {
   if (file && !ResourceFileSchema.safeParse(file).success) fail('resource_path_invalid');
   const stat = await lstat(root); if (!stat.isDirectory() || stat.isSymbolicLink()) fail('resource_path_invalid');
   const canonicalRoot = await realpath(root); let path = root;
@@ -33,7 +33,7 @@ async function managedPath(root: string, file = '') {
   }
   return path;
 }
-async function readText(root: string, file: string, limit = RESOURCE_LIMITS.fileBytes): Promise<ResourceFileSnapshot> {
+export async function readText(root: string, file: string, limit = RESOURCE_LIMITS.fileBytes): Promise<ResourceFileSnapshot> {
   const path = await managedPath(root, file), before = await lstat(path);
   if (!before.isFile()) fail('resource_path_invalid'); if (before.size > limit) fail('resource_too_large');
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));

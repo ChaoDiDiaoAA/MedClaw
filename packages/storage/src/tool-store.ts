@@ -405,8 +405,13 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   findQuery(callRef: string): QueryRecord | null {
     return protect(() => { const row = this.db.query<QueryRow, [string]>("SELECT * FROM queries WHERE call_ref=?").get(callRef); return row ? this.query(row) : null; }, "storage_read_failed");
   }
-  readQuery(queryId: number): QueryRecord | null {
-    return protect(() => { id(queryId); const row = this.db.query<QueryRow, [number]>("SELECT * FROM queries WHERE id=?").get(queryId); return row ? this.query(row) : null; }, "storage_read_failed");
+  readQuery(queryId: number, sessionId?: number): QueryRecord | null {
+    return protect(() => {
+      id(queryId);if(sessionId!==undefined)id(sessionId);
+      const row = sessionId===undefined?this.db.query<QueryRow,[number]>("SELECT * FROM queries WHERE id=?").get(queryId)
+        :this.db.query<QueryRow,[number,number]>("SELECT * FROM queries WHERE id=? AND session_id=?").get(queryId,sessionId);
+      return row ? this.query(row) : null;
+    }, "storage_read_failed");
   }
   private evidence(row: EvidenceRow): Evidence {
     const parsed = EvidenceSchema.safeParse({ id: row.id, queryId: row.query_id, batchIds: decode(row.batch_ids_json), snapshotIds: decode(row.snapshot_ids_json),

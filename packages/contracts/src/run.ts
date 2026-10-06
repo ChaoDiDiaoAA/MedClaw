@@ -9,6 +9,7 @@ import type { NewSessionInput, NewSessionResult, SubmitInput, SubmitResult, Sess
 import type { WorkspaceView, WorkspaceContext } from "./workspace";
 import { StoredToolConfigurationSchema, type ToolConfiguration } from './tool-config';
 import { RuntimeConfigurationSchema, type RuntimeConfiguration } from './runtime-config';
+import { ExtensionAssemblyProofSchema } from './extensions';
 
 export const RunStatusSchema = z.enum(["created", "running", "completed", "failed", "cancelled"]);
 export const SdkStopReasonSchema = z.enum(["stop", "length", "toolUse", "error", "aborted", "deferred"]);
@@ -43,6 +44,8 @@ export const RunCleanupRecordSchema = z.strictObject({
   unconfirmedItems: z.array(z.string().min(1).max(64).regex(/^[a-z][a-z0-9_.:-]*$/)).max(32),
   secondaryErrors: z.array(AppErrorSchema).max(32), verifiedAt: TimestampSchema.nullable(),
   budgetSummary: BudgetSummarySchema.nullable().optional(),
+  extensions: ExtensionAssemblyProofSchema.optional(),
+  extensionReleaseBasis: z.enum(['not_loaded','owner_process_exited']).optional(),
 });
 export const RunCleanupSummarySchema = RunCleanupRecordSchema.omit({ contract: true, unconfirmedItems: true, secondaryErrors: true }).extend({
   unconfirmedCount: z.number().int().min(0).max(32), secondaryErrorCount: z.number().int().min(0).max(32),
@@ -172,6 +175,7 @@ export interface FinalProviderFact {
   cleanup?: RunCleanupRecord | { oldProcessExited?: boolean; observationGap?: boolean; previousInstanceId?: string; errors?: AppError[] } | null;
 }
 interface AgentStartCommon {
+  extensions?: import('./extensions').FrozenRunExtensions;
   resources?: import('./resources').FrozenRunResources;
   inputPlan?: import('./resources').ResourceInputPlan;
   nativeReceiptLimitBytes?: number;
@@ -188,8 +192,13 @@ interface AgentStartCommon {
 export type AgentStartFields = AgentStartCommon & ({ inputId: null; submission: { operationRef: string; originalSubmitInput: SubmitInput } } | { inputId: number; submission: null });
 export type StartRunInput<Resolved> = AgentStartFields & { resolved: Resolved };
 export type RegisterAgentInput = AgentStartFields & { instanceId: string; createdAt: string };
-export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[]; budgetSummary?: BudgetSummary; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit; compactions?: import('./session').CompactionSaveFact[] };
+export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[]; budgetSummary?: BudgetSummary; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit; compactions?: import('./session').CompactionSaveFact[]; extensions?: import('./extensions').ExtensionAssemblyProof };
 export type AgentRuntimePort<Resolved> = {
+  validateExtensions?: (sessionId: number, settings: import('./model').PublishedSettings) => Promise<void>;
+  freezeExtensions?: (sessionId: number, settings: import('./model').PublishedSettings) => Promise<import('./extensions').FrozenRunExtensions>;
+  readExtensionDescriptor?: () => Promise<import('./extensions').ExtensionDescriptor | null>;
+  readExtensionCleanup?: (runId: number) => import('./extensions').ExtensionAssemblyProof | null;
+  executeExtensionCommand?: (input: import('./extensions').ExtensionsCommandInput) => Promise<import('./extensions').ExtensionStatus>;
   compact?: (input: import('./session').CompactionExecutionInput<Resolved>, callbacks: import('./session').CompactionCallbacks) => Promise<import('./session').NativeCompactionObservation>;
   abortCompaction?: (sessionId: number, operationRef: string) => void;
   acknowledgeCompactionSaved?:(sessionId:number,operationRef:string,change:NativeHistoryCommit|null,storageVersion:number)=>void|Promise<void>;
@@ -216,11 +225,14 @@ export type AgentRuntimePort<Resolved> = {
   readBudget?: (runId: number) => RuntimeBudgetView | null;
   describe: (resolved: Resolved) => P2AgentOptions;
   execute: (input: { runId: number; sessionId: number; inputId?: number | null; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number;
+    instanceId?: string;
+    extensions?: import('./extensions').FrozenRunExtensions;
     resources?: import('./resources').FrozenRunResources; inputPlan?: import('./resources').ResourceInputPlan;
     nativeReceiptLimitBytes?: number;
     workspaceContext?: WorkspaceContext; scope?: RunScope; referenceDate?: string; timezone?: string; agentPolicy?: AgentPolicy; runtimeConfiguration?: RuntimeConfiguration; toolConfiguration?: ToolConfiguration; measurementContext?: MeasurementContext; toolProfileSnapshot?: ToolProfileSnapshot },
     callbacks: { stream?: (snapshot: StreamSnapshot) => void; startCall: (time: string, context?: StartCallContext) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
-      fatal?: (error: AppError) => void; inputStore?: InputStore; admissionClosed?: () => void; compaction?: import('./session').AutoCompactionCallbacks }) => Promise<AgentExecutionObservation>;
+      fatal?: (error: AppError) => void; extensionProof?: (proof: import('./extensions').ExtensionAssemblyProof) => void;
+      inputStore?: InputStore; admissionClosed?: () => void; compaction?: import('./session').AutoCompactionCallbacks }) => Promise<AgentExecutionObservation>;
 };
 export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit; compactions?: import('./session').CompactionSaveFact[] };
 export type StoredOperation = ProviderOperation
@@ -245,6 +257,7 @@ export interface ProviderRunStore {
   active(): RunHandle | null;
 }
 export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputStore {
+  readRunExtensions?(runId: number): import('./extensions').FrozenRunExtensions | null;
   readRunResources?(runId: number): import('./resources').FrozenRunResources | null;
   readResourceEvidence?(runId: number, page: number, pageSize: number): { items: import('./resources').ResourceEvidence[]; totalRows: number };
   confirmCompactionSaved?(change:NativeHistoryCommit|null,fact:import('./session').CompactionReceipt|import('./session').CompactionSaveFact):number|null;

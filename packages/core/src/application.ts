@@ -10,6 +10,8 @@ import type { EventService } from './events/event-service.ts';
 import type { WriteTransactions } from '../../contracts/src/event';
 import { ResourceService } from './resources/resource-service';
 import type { ResourceSource } from '../../contracts/src/resources';
+import { ExtensionsReadResultSchema, type ExtensionsReadResult } from '../../contracts/src/protocol';
+import { ExtensionsReadInputSchema, ExtensionsCommandInputSchema, type ExtensionsReadInput, type ExtensionsCommandInput } from '../../contracts/src/extensions';
 
 type Login = { view: AuthAttemptView; abort: AbortController; pending?: { id: string; allowedIds: string[] | null; resolve: (value: string) => void; reject: (reason: unknown) => void }; task: Promise<void> };
 const now = () => new Date().toISOString();
@@ -30,6 +32,39 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
   get busy() { return this.runs.busy; }
   get persistencePending() { return this.runs.persistencePending; }
   get stopPending() { return this.runs.stopPending; }
+  private extensionSession(sessionId: number) {
+    const session=this.repositories.readSession(sessionId);
+    if(!session)throw safeError('input_invalid',undefined,{reason:'session_not_found'});
+    if(session.kind!=='user')throw safeError('access_denied');
+    if(session.deletedAt!==null)throw safeError('input_invalid',undefined,{reason:'session_deleted'});
+    return session;
+  }
+  async readExtensions(value: ExtensionsReadInput): Promise<ExtensionsReadResult> {
+    const input=ExtensionsReadInputSchema.parse(value);
+    if(input.source==='selection') {
+      this.extensionSession(input.sessionId);
+      let available=null; const diagnostics:AppError[]=[];
+      try {available=await this.agent?.readExtensionDescriptor?.()??null;} catch {diagnostics.push(safeError('extension_unavailable',undefined,{sessionId:input.sessionId}));}
+      const run=this.runs.activeHandle;
+      const live=run?.sessionId===input.sessionId?this.agent?.readExtensionCleanup?.(run.runId)??null:null;
+      return ExtensionsReadResultSchema.parse({source:'selection',sessionId:input.sessionId,configVersion:this.settings.configVersion,
+        selection:this.settings.extensions?.bySession[String(input.sessionId)]??{extension:null},available,live,diagnostics});
+    }
+    const result=this.repositories.read({runId:input.runId});
+    if(result.kind!=='one'||!result.run||result.run.kind!=='agent')throw safeError('run_not_found');
+    const run=result.run, frozen=this.repositories.readRunExtensions?.(run.id)??null;
+    const summary=frozen?{...frozen,source:frozen.source?{manifest:frozen.source.manifest,files:frozen.source.files.map(({file,bytes,sha256})=>({file,bytes,sha256}))}:null}:null;
+    return ExtensionsReadResultSchema.parse({source:'run',runId:run.id,sessionId:run.sessionId,evidence:frozen?'recorded':'not_recorded',frozen:summary,
+      assembly:this.agent?.readExtensionCleanup?.(run.id)??run.cleanup?.extensions??null,cleanup:run.cleanup});
+  }
+  async executeExtensionCommand(value: ExtensionsCommandInput) {
+    const input=ExtensionsCommandInputSchema.parse(value); this.extensionSession(input.sessionId);
+    const run=this.runs.activeHandle;
+    if(input.instanceId!==this.instanceId)throw safeError('access_denied');
+    if(this.closing||this.prepared||this.stopPending||!run||run.runId!==input.runId||run.sessionId!==input.sessionId
+      ||!this.runs.readInputControl(input.sessionId)?.acceptingInputs||!this.agent?.executeExtensionCommand)throw safeError('state_conflict');
+    return this.agent.executeExtensionCommand(input);
+  }
   private assertIdle() { if (this.closing || this.busy || this.prepared || this.refreshes.size || [...this.logins.values()].some(l => !l.view.endedAt)) throw new Error("runtime_busy"); }
   private async credentialScope<T>(provider: string, operationRef: string, credentialRef: string | null, fn: () => Promise<T>, purpose: "auth" | "runtime" | "rollback" = "runtime", authAttemptId?: string) {
     return this.scope({ purpose, operationRef, credentialRef, ...(authAttemptId ? { authAttemptId } : {}) }, fn);
@@ -56,13 +91,18 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
     const candidate = PublishedSettingsSchema.parse(input);
     const oldResources = this.settings.resources?.bySession ?? {}, newResources = candidate.resources?.bySession ?? {};
     const changedResourceSessions = [...new Set([...Object.keys(oldResources), ...Object.keys(newResources)])].filter(id => !isDeepStrictEqual(oldResources[id], newResources[id]));
-    if (changedResourceSessions.length && candidate.configVersion !== this.settings.configVersion && candidate.previous?.configVersion !== this.settings.configVersion) throw new Error('config_conflict');
+    const oldExtensions=this.settings.extensions?.bySession??{},newExtensions=candidate.extensions?.bySession??{};
+    const changedExtensionSessions=[...new Set([...Object.keys(oldExtensions),...Object.keys(newExtensions)])].filter(id=>!isDeepStrictEqual(oldExtensions[id],newExtensions[id]));
+    if ((changedResourceSessions.length||changedExtensionSessions.length) && candidate.configVersion !== this.settings.configVersion && candidate.previous?.configVersion !== this.settings.configVersion) throw new Error('config_conflict');
+    if(changedExtensionSessions.length)this.assertIdle();
     const changedRuntime = !isDeepStrictEqual(candidate.customProviders.map(p => p.definition), this.settings.customProviders.map(p => p.definition));
     const changedBindings = !isDeepStrictEqual(candidate.credentialRefs, this.settings.credentialRefs) || !isDeepStrictEqual(candidate.customProviders.map(p => p.credentialRef), this.settings.customProviders.map(p => p.credentialRef));
     if (changedRuntime || changedBindings || candidate.rollbackFromVersion !== null) this.assertIdle();
     const old = this.settings;
     this.prepared = { token, candidate, old, changedRuntime };
     try {
+      if(changedExtensionSessions.length&&!this.agent?.validateExtensions)throw safeError('extension_unavailable');
+      for(const id of changedExtensionSessions){this.extensionSession(Number(id));await this.agent!.validateExtensions!(Number(id),candidate);}
       if (changedResourceSessions.length && !this.resources) throw new Error('resource_unavailable');
       for (const id of changedResourceSessions) await this.resources!.validateSelection(Number(id), newResources[id] ?? { prompt: null, skills: [] }, this.agent?.toolNames ?? []);
       if (changedRuntime) await this.runtime.installCustom(candidate.customProviders.map(p => p.definition));

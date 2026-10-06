@@ -30,6 +30,8 @@ import { ImportService } from '../../../packages/core/src/data/import-service.ts
 import { EvidenceReader } from '../../../packages/core/src/evidence/evidence-reader.ts';
 import { createBusinessTools } from '../../../packages/core/src/tools/tools.ts';
 import { ToolRegistry } from '../../../packages/core/src/tools/registry.ts';
+import type { AnyToolDefinition } from '../../../packages/contracts/src/tool';
+import type { ToolConfiguration } from '../../../packages/contracts/src/tool-config';
 import { ToolRecorder } from '../../../packages/core/src/tools/recorder.ts';
 import { ToolExecutor } from '../../../packages/core/src/tools/executor.ts';
 import { RunScopeSchema, canonicalRequest, type ModelCallStarter } from '../../../packages/contracts/src/run.ts';
@@ -190,8 +192,8 @@ async function initialize(raw: unknown) {
   const catalogService = new CatalogService(catalog);
   queries = new QueryService(catalogService, toolStore); evidence = new EvidenceReader(catalogService, queries, toolStore,repositories);
   const recorder = new ToolRecorder(toolStore, (error, context) => application?.runs.failToolPersistence(context.runId, error));
-  const configure = () => {
-    const registry = new ToolRegistry(createBusinessTools({ catalog: catalogService, queries, evidence }));
+  const configure = (_configuration?:ToolConfiguration,extraDefinitions:readonly AnyToolDefinition[]=[]) => {
+    const registry = new ToolRegistry([...createBusinessTools({ catalog: catalogService, queries, evidence }),...extraDefinitions]);
     const executor = new ToolExecutor(registry, recorder, {
       findCommittedQuery: context => {
         const saved = toolStore.findQuery(`${context.runId}:${context.nativeToolCallId}`);
@@ -206,7 +208,7 @@ async function initialize(raw: unknown) {
   agent = new PiAgentRuntime(runtime, config.paths.dataRoot, {store:memory,commitSync:change=>{
     try{return transactions.immediate(()=>memory.commitInTransaction(change));}
     catch(error){try{const proof=memory.confirmCommitted(change);if(proof)return proof;}catch{/* Read failure keeps the original write unconfirmed. */}throw error;}
-  }}, { ...configure(), recorder, configure },contexts);
+  }}, { ...configure(), recorder, configure },contexts,resolve(import.meta.dir, '../../../resources/extensions'));
   imports = new ImportService({ store: new SqliteImportStore(database), artifacts, instanceId: config.instanceId,
     resolveToken: async (fileToken, operationRef) => AbsolutePathSchema.parse(await credentials('file.resolve', { fileToken, operationRef })) });
   application = new Application(config.instanceId, settings, runtime, repositories,
@@ -276,6 +278,8 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case 'context.read': return unwrap(contexts.read(request.payload));
     case 'resources.list': return app.resources!.list(request.payload);
     case 'resources.read': return app.resources!.read(request.payload);
+    case 'extensions.read': return app.readExtensions(request.payload);
+    case 'extensions.command': return app.executeExtensionCommand(request.payload);
     case 'event.read': return unwrap(events!.read(request.payload));
     case 'event.subscribe': {
       const input = request.payload;

@@ -12,6 +12,7 @@ import { SqliteWriteTransactions } from './write-transactions';
 import { verifyPriorContextFacts } from './context-store';
 import { ModelCallContextSchema, ContextSnapshotBodySchema, type StartCallContext } from '../../contracts/src/context';
 import { FrozenRunResourcesSchema, ResourceEvidenceSchema, ResourceReadFactSchema, resourceRefKey, type FrozenRunResources, type ResourceEvidence } from '../../contracts/src/resources';
+import { FrozenRunExtensionsSchema, type FrozenRunExtensions } from '../../contracts/src/extensions';
 import type { EventWriter, RegisteredEventDraft, RegisteredEventPayload } from '../../contracts/src/event';
 import { RegisteredEventPayloadSchema } from '../../contracts/src/event';
 import { NATIVE_HISTORY_FORMAT, InputContentSchema, type NativeHistoryCommit, type InitialNativeHistory, type PreparedInput, type InputStore, type InputCancelProof, type InputSettlementProof, type ReadInputRequest, type ListInputsRequest } from "../../contracts/src/session";
@@ -73,6 +74,7 @@ const agentConfigSchema = z.strictObject({ selection: ModelSelectionSchema, poli
   toolProfileSnapshot: ToolProfileSnapshotSchema.optional(),
   referenceDate: z.string(), timezone: z.string(), agent: P2AgentOptionsSchema.extend({ stage: z.enum(["P2", "P3"]), nativeSessionId: OpaqueIdSchema,
     resources: FrozenRunResourcesSchema.optional(),
+    extensions: FrozenRunExtensionsSchema.optional(),
     tools: z.array(z.string()), autoCompaction: z.boolean(), autoRetry: z.literal(false), cacheWarming: z.literal("off"), contextContract: z.literal('medclaw.context/v1').optional(),historyContract:z.literal('medclaw.history/p9-v1').optional() }) })
   .refine(config => config.agent.autoCompaction === (config.agent.compaction?.enabled ?? false), 'Frozen compaction configuration mismatch');
 const commonConfigSchema = z.object({ selection: ModelSelectionSchema, policy: RequestPolicySchema });
@@ -196,6 +198,27 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       return config.agent.resources ? this.checkedResources(config.agent.resources, row.session_id!, config.selection.configVersion) : null;
     });
   }
+  private checkedExtensions(value: unknown, sessionId: number, configVersion: string): FrozenRunExtensions {
+    const frozen = checked(FrozenRunExtensionsSchema, value, 'storage_read_failed');
+    if (frozen.sessionId !== sessionId || frozen.configVersion !== configVersion) fail('storage_read_failed');
+    if (frozen.source) {
+      const { manifest, files } = frozen.source;
+      for (const file of files) if (createHash('sha256').update(file.content).digest('hex') !== file.sha256) fail('storage_read_failed');
+      if (!isDeepStrictEqual(decoded(files.find(file => file.file === 'manifest.json')!.content), manifest)) fail('storage_read_failed');
+      const metadata = { id: manifest.id, version: manifest.version, sdkVersion: manifest.sdkVersion,
+        files: files.map(({ file, bytes, sha256 }) => ({ file, bytes, sha256 })).sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0) };
+      if (createHash('sha256').update(canonicalRequest(metadata)).digest('hex') !== frozen.selection.extension!.treeHash) fail('storage_read_failed');
+    }
+    return frozen;
+  }
+  readRunExtensions(runId: number): FrozenRunExtensions | null {
+    id(runId); return this.inputRead(() => {
+      const row = this.row(runId); if (!row) fail('run_not_found');
+      if (row.kind !== 'agent') return null;
+      const config = checked(agentConfigSchema, decoded(row.config_json), 'storage_read_failed');
+      return config.agent.extensions ? this.checkedExtensions(config.agent.extensions, row.session_id!, config.selection.configVersion) : null;
+    });
+  }
   readResourceOrigins(sessionId: number, nativeEntryIds: readonly string[]): ResourceEvidence[] {
     id(sessionId); if (nativeEntryIds.length > 1000) fail('resource_too_large');
     const entries = new Set(nativeEntryIds), runs = new Set<number>();
@@ -290,6 +313,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if(plan.execution.mode==='send'){
         if(this.active())fail('runtime_busy');const run=plan.execution.run;
         const resources = run.resources ? this.checkedResources(run.resources, session.id, run.model.configVersion) : null;
+        if (run.extensions) this.checkedExtensions(run.extensions, session.id, run.model.configVersion);
         if(!!resources!==!!content.resourceInputPlan || content.resourceInputPlan?.resourceRef && !resources!.available.some(s=>resourceRefKey(s.ref)===resourceRefKey(content.resourceInputPlan!.resourceRef!)))fail('invalid_argument');
         const expectedScope = { ...this.freezeAgentScope(workspace,run.scope.allowedToolNames), allowedResourceRefs: resources?.available.map(s=>resourceRefKey(s.ref)) ?? [] };
         if(run.sessionId!==session.id||run.goal!=='answer'||run.text!==content.text||run.referenceDate!==content.referenceDate||run.timezone!==content.timezone||run.timeoutMs!==run.policy.timeoutMs||!isDeepStrictEqual(toWorkspaceContext(run.workspace),frozenWorkspace)||!isDeepStrictEqual(run.scope,content.scope)||!isDeepStrictEqual(run.model,content.model)||!isDeepStrictEqual(expectedScope,run.scope))fail('invalid_argument');
@@ -305,7 +329,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const inputId=Number(saved.lastInsertRowid);
       if(plan.execution.mode==='send'){
         const run=plan.execution.run;checked(OpaqueIdSchema,run.instanceId);timestamp(run.createdAt);
-        const config=checked(agentConfigSchema,{selection:run.model,policy:run.policy,referenceDate:run.referenceDate,timezone:run.timezone,...(run.agentPolicy?{agentPolicy:run.agentPolicy}:{}),...(run.runtimeConfiguration?{runtimeConfiguration:run.runtimeConfiguration}:{}),...(run.toolConfiguration?{toolConfiguration:run.toolConfiguration}:{}),...(run.measurementContext?{measurementContext:run.measurementContext}:{}),...(run.toolProfileSnapshot?{toolProfileSnapshot:run.toolProfileSnapshot}:{}),agent:{...run.agentOptions,stage:run.scope.allowedToolNames.length?'P3':'P2',nativeSessionId:session.nativeSessionId,tools:run.scope.allowedToolNames,autoCompaction:run.agentOptions.compaction?.enabled??false,autoRetry:false,cacheWarming:'off',...(run.resources?{resources:run.resources}:{}),...(run.contextContract?{contextContract:run.contextContract}:{}),...(run.historyContract?{historyContract:run.historyContract}:{})}});
+        const config=checked(agentConfigSchema,{selection:run.model,policy:run.policy,referenceDate:run.referenceDate,timezone:run.timezone,...(run.agentPolicy?{agentPolicy:run.agentPolicy}:{}),...(run.runtimeConfiguration?{runtimeConfiguration:run.runtimeConfiguration}:{}),...(run.toolConfiguration?{toolConfiguration:run.toolConfiguration}:{}),...(run.measurementContext?{measurementContext:run.measurementContext}:{}),...(run.toolProfileSnapshot?{toolProfileSnapshot:run.toolProfileSnapshot}:{}),agent:{...run.agentOptions,stage:run.scope.allowedToolNames.length?'P3':'P2',nativeSessionId:session.nativeSessionId,tools:run.scope.allowedToolNames,autoCompaction:run.agentOptions.compaction?.enabled??false,autoRetry:false,cacheWarming:'off',...(run.resources?{resources:run.resources}:{}),...(run.extensions?{extensions:run.extensions}:{}),...(run.contextContract?{contextContract:run.contextContract}:{}),...(run.historyContract?{historyContract:run.historyContract}:{})}});
         const r=this.db.query("INSERT INTO runs(session_id,input_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at) VALUES(?,?,'agent',?,NULL,NULL,NULL,'created','answer',?,?,?,?,?,?,?)").run(session.id,inputId,run.instanceId,content.text,JSON.stringify(config),JSON.stringify(run.scope),JSON.stringify(frozenWorkspace),run.referenceDate,run.timezone,run.createdAt);target=Number(r.lastInsertRowid);
         this.db.query('UPDATE session_inputs SET target_run_id=? WHERE id=? AND target_run_id IS NULL').run(target,inputId);
         this.runLifecycle(this.row(target)!, 'run_created', run.createdAt);
@@ -1203,6 +1227,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         || !isDeepStrictEqual(this.freezeAgentScope(workspace, input.scope.allowedToolNames), input.scope) || input.model.provider !== request.model.provider
         || input.model.modelId !== request.model.modelId || input.model.configVersion !== request.model.expectedConfigVersion) fail("invalid_argument");
       checked(OpaqueIdSchema, input.instanceId);
+      if (input.extensions) this.checkedExtensions(input.extensions, session.id, input.model.configVersion);
       const config = checked(agentConfigSchema, { selection: input.model, policy: input.policy, referenceDate: request.referenceDate,
         ...(input.agentPolicy ? { agentPolicy: input.agentPolicy } : {}),
         ...(input.runtimeConfiguration ? { runtimeConfiguration: input.runtimeConfiguration } : {}),
@@ -1210,7 +1235,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         ...(input.measurementContext ? { measurementContext: input.measurementContext } : {}),
         ...(input.toolProfileSnapshot ? { toolProfileSnapshot: input.toolProfileSnapshot } : {}),
         timezone: request.timezone, agent: { ...input.agentOptions, stage: input.scope.allowedToolNames.length ? "P3" : "P2", nativeSessionId: session.nativeSessionId, tools: input.scope.allowedToolNames,
-          autoCompaction: input.agentOptions.compaction?.enabled ?? false, autoRetry: false, cacheWarming: "off", ...(input.contextContract ? {contextContract:input.contextContract} : {}),...(input.historyContract?{historyContract:input.historyContract}:{}) } });
+          autoCompaction: input.agentOptions.compaction?.enabled ?? false, autoRetry: false, cacheWarming: "off", ...(input.extensions?{extensions:input.extensions}:{}), ...(input.contextContract ? {contextContract:input.contextContract} : {}),...(input.historyContract?{historyContract:input.historyContract}:{}) } });
       const result = this.db.query(`INSERT INTO runs(session_id,input_id,kind,instance_id,submission_operation_ref,submission_client_sequence,
         submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at)
         VALUES(?,NULL,'agent',?,?,?,?,'created','answer',?,?,?,?,?,?,?)`)
@@ -1368,15 +1393,39 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     if(row.input_id!==null){const input=this.inputs.required(row.input_id);if(input.status!=='consumed'||input.run_id!==row.id||input.session_id!==row.session_id||!input.native_entry_id||!path.has(input.native_entry_id)
       ||!this.db.query("SELECT id FROM memories WHERE session_id=? AND native_entry_id=? AND run_id=? AND entry_type='message' AND json_extract(entry_json,'$.message.role')='user'").get(row.session_id,input.native_entry_id,row.id))fail('session_history_invalid');}
   }
-  private validateCleanup(previous: unknown, input: RunCleanupRecord): RunCleanupRecord {
+  private validateCleanup(row: RunRow, input: RunCleanupRecord): RunCleanupRecord {
+    const previous = decoded(row.cleanup_json);
     const next = checked(RunCleanupRecordSchema, input), old = RunCleanupRecordSchema.safeParse(previous);
     if (old.success) {
       if (next.budgetSummary == null && old.data.budgetSummary != null) next.budgetSummary = old.data.budgetSummary;
+      if (!next.extensions && old.data.extensions) next.extensions = old.data.extensions;
+      if(old.data.extensionReleaseBasis){
+        if(next.extensionReleaseBasis&&next.extensionReleaseBasis!==old.data.extensionReleaseBasis)fail('state_conflict');
+        next.extensionReleaseBasis=old.data.extensionReleaseBasis;
+      }
+      if (old.data.extensions && next.extensions) {
+        const before = old.data.extensions, after = next.extensions;
+        if (before.assemblyId !== after.assemblyId || before.loadedAt !== null && before.loadedAt !== after.loadedAt
+          || before.state === 'disposed' && after.state !== 'disposed' || before.state === 'load_failed' && !['load_failed', 'disposed'].includes(after.state)
+          || before.state === 'active' && !['active', 'disposed'].includes(after.state)
+          || before.disposedAt !== null && before.disposedAt !== after.disposedAt
+          || Object.keys(before.hookCounts).some(key => after.hookCounts[key as keyof typeof after.hookCounts] < before.hookCounts[key as keyof typeof before.hookCounts])
+          || before.diagnostics.some(error => !after.diagnostics.some(item => isDeepStrictEqual(item, error)))) fail('state_conflict');
+      }
       for (const key of ["executionStarted", "stopConfirmed", "requiredPersistenceComplete", "inputsSettled", "resourcesReleased"] as const) {
         if (old.data[key] === true && next[key] !== true || key === "executionStarted" && old.data[key] === false && next[key] !== false) fail("state_conflict");
       }
       if (old.data.verifiedAt && (!next.verifiedAt || Date.parse(next.verifiedAt) < Date.parse(old.data.verifiedAt))) fail("state_conflict");
       if (old.data.secondaryErrors.some(error => !next.secondaryErrors.some(item => isDeepStrictEqual(item, error)))) fail("state_conflict");
+    }
+    const selectedExtension=this.readRunExtensions(row.id)?.selection.extension;
+    if(next.extensionReleaseBasis&&(!selectedExtension||next.extensions||next.extensionReleaseBasis==='not_loaded'&&(next.executionStarted!==false||this.calls(row.id).length)))fail('state_conflict');
+    if (next.resourcesReleased===true && selectedExtension && !next.extensions&&!next.extensionReleaseBasis) fail('state_conflict');
+    if (next.extensions) {
+      const proof = next.extensions, frozen = this.readRunExtensions(row.id);
+      if (proof.instanceId !== row.instance_id || proof.sessionId !== row.session_id || proof.runId !== row.id
+        || !frozen?.selection.extension || !isDeepStrictEqual(proof.ref, frozen.selection.extension)
+        || next.resourcesReleased === true && !proof.resourcesReleased) fail('state_conflict');
     }
     return next;
   }
@@ -1424,7 +1473,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         if(this.inputs.hasInputsForRun(runId)){if(!proof)fail('state_conflict');this.inputs.settleRunInputs(runId,fact.status,fact.endedAt,proof);}
         if(cleanup&&'contract'in cleanup)cleanup={...cleanup,inputsSettled:!this.inputs.hasPendingInputsForRun(runId)};
       }
-      if (cleanup && "contract" in cleanup) cleanup = this.validateCleanup(decoded(row.cleanup_json), cleanup);
+      if (cleanup && "contract" in cleanup) cleanup = this.validateCleanup(row, cleanup);
       else if (terminal && !isDeepStrictEqual(decoded(row.cleanup_json), cleanup)) fail("state_conflict");
       for (const original of calls) {
         const incoming = finalCalls.find(call => call.callId === original.callId);
@@ -1540,7 +1589,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const terminal = row.status !== "created" && row.status !== "running";
       if (terminal && (row.status !== "failed" || !isDeepStrictEqual(decoded(row.error_json), error))) fail("state_conflict");
       if(this.p5&&cleanup.inputsSettled&&this.inputs.hasPendingInputsForRun(runId))fail('state_conflict');
-      const checkedCleanup = this.validateCleanup(decoded(row.cleanup_json), cleanup);
+      const checkedCleanup = this.validateCleanup(row, cleanup);
       if (checkedCleanup.requiredPersistenceComplete && (!this.verifyPriorContextFacts(runId).requiredPersistenceComplete||!this.verifyPriorCompactionFacts(runId).requiredPersistenceComplete)) fail('storage_write_failed');
       this.db.query("UPDATE runs SET status='failed',error_json=?,ended_at=COALESCE(ended_at,?),cleanup_json=? WHERE id=?")
         .run(json(error), time, json(checkedCleanup), runId);
@@ -1556,7 +1605,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if (!row) fail("run_not_found");
       if(this.p5&&cleanup.inputsSettled&&this.inputs.hasPendingInputsForRun(runId))fail('state_conflict');
       if (cleanup.requiredPersistenceComplete && (!this.verifyPriorContextFacts(runId).requiredPersistenceComplete||!this.verifyPriorCompactionFacts(runId).requiredPersistenceComplete)) fail('storage_write_failed');
-      const checkedCleanup = this.validateCleanup(decoded(row.cleanup_json), cleanup);
+      const checkedCleanup = this.validateCleanup(row, cleanup);
       this.db.query("UPDATE runs SET cleanup_json=? WHERE id=?").run(json(checkedCleanup), runId);
       this.beforeCommit?.();
     });
@@ -1694,11 +1743,18 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         const facts = row.kind === 'agent' && this.p3 ? this.verifyPriorToolFacts(row.id, true, time) : null;
         const contextFacts = this.verifyPriorContextFacts(row.id);
         const historyFacts = this.verifyPriorHistoryFacts(row.id);
+        const extension=prior.success?prior.data.extensions:undefined;
+        const exitedExtension=extension?{...extension,state:'disposed' as const,resourcesReleased:true,disposedAt:extension.disposedAt??time}:undefined;
+        const extensionReleaseBasis=!extension&&this.readRunExtensions(row.id)?.selection.extension
+          ?(prior.success?prior.data.extensionReleaseBasis:undefined)??'owner_process_exited' as const:undefined;
+        const extensionReleased=!this.readRunExtensions(row.id)?.selection.extension||!!exitedExtension||!!extensionReleaseBasis;
         const cleanup = facts ? checked(RunCleanupRecordSchema, {
           contract: 'medclaw.run-cleanup/v1', executionStarted: prior.success ? prior.data.executionStarted : null,
           stopConfirmed: facts.stopConfirmed, requiredPersistenceComplete: facts.requiredPersistenceComplete && inputFacts.requiredPersistenceComplete && contextFacts.requiredPersistenceComplete && historyFacts.requiredPersistenceComplete,
-          inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed, unconfirmedItems: [...facts.unconfirmedItems,...inputFacts.unconfirmedItems,...contextFacts.unconfirmedItems,...historyFacts.unconfirmedItems],
-          secondaryErrors: prior.success ? prior.data.secondaryErrors : [], verifiedAt: facts.stopConfirmed === true ? time : prior.success ? prior.data.verifiedAt : null,
+          inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed===true&&extensionReleased, unconfirmedItems: [...facts.unconfirmedItems,...inputFacts.unconfirmedItems,...contextFacts.unconfirmedItems,...historyFacts.unconfirmedItems,...(extensionReleased?[]:['resources','extension_cleanup'])],
+          ...(exitedExtension?{extensions:exitedExtension}:{}),
+          ...(extensionReleaseBasis?{extensionReleaseBasis}:{}),
+          secondaryErrors: prior.success ? prior.data.secondaryErrors : [], verifiedAt: facts.stopConfirmed === true&&extensionReleased ? time : null,
           ...(prior.success && prior.data.budgetSummary !== undefined ? { budgetSummary: prior.data.budgetSummary } : {}),
         }) : { previousInstanceId: row.instance_id, oldProcessExited: true, observationGap: true };
         if (row.kind === "provider") this.db.query("UPDATE model_calls SET state='failed',error_json=?,unavailable_reason='host_interrupted' WHERE run_id=? AND state='started'")

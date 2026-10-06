@@ -37,36 +37,9 @@ import { parseSkillBlock } from '@earendil-works/pi-coding-agent';
 import { sqliteHistory } from '../fixtures/p9-memory';
 import { restoreNativeManager } from '../../packages/runtime-pi/src/memory-store';
 
-async function fixture(respond?: (index: number, payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>) {
-  const root = mkdtempSync(join(tmpdir(), 'medclaw-p11-runtime-')), author = join(root, 'author'); cpSync(resolve('resources'), author, { recursive: true });
-  const db = openDatabase(join(root, 'app.sqlite')), requests: Record<string, unknown>[] = [];
-  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
-    requests.push(await request.json() as Record<string, unknown>);
-    const delta = await respond?.(requests.length, requests.at(-1)!) ?? { role: 'assistant', content: 'ENGINEERING response; no quality claim.' };
-    return new Response(`data: ${JSON.stringify({ id: 'fixture', model: 'fixture', choices: [{ index: 0, delta, finish_reason: 'tool_calls' in delta ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
-  } });
-  const credentials = new InMemoryCredentialStore(); await credentials.modify('p11-fixture', async () => ({ type: 'api_key', key: 'engineering' }));
-  const runtime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
-  const definition = { providerId: 'p11-fixture', name: 'Engineering', api: 'openai-completions', baseUrl: `http://127.0.0.1:${server.port}/v1`, models: [{ id: 'fixture', name: 'Engineering', input: ['text' as const], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true as const, pricingKnown: false, cost: null }] };
-  await runtime.installCustom([definition]);
-  const history = sqliteHistory(db), repos = new Repositories(db, undefined, undefined, undefined, history.store), contexts = new SqliteContextStore(db);
-  const catalog = new CatalogService(new SqliteCatalogStore(db)), toolStore = new SqliteToolStore(db), queries = new QueryService(catalog, toolStore), evidence = new EvidenceReader(catalog, queries, toolStore);
-  const registry = new ToolRegistry(createBusinessTools({ catalog, queries, evidence })), errors: unknown[] = [], recorder = new ToolRecorder(toolStore, (error,context) => {errors.push(error);app.runs.failToolPersistence(context.runId,error);});
-  const agent = new PiAgentRuntime(runtime, root, history, { registry, recorder, executor: new ToolExecutor(registry, recorder) }, new ContextService(contexts, { inspectManagedImport: async () => ({ status: 'valid' as const }) }));
-  const allocated = agent.allocate(); repos.createSession({ expectedWorkspaceRevision: 0 }, 'create-a', allocated.nativeSessionId, new Date().toISOString(), allocated.history); allocated.bind(1);
-  const catalogue = ResourceCatalogueSchema.parse(JSON.parse(readFileSync(join(author, 'catalog.json'), 'utf8'))), prompt = catalogue.definitions.find(r => r.kind === 'prompt')!, skill = catalogue.definitions.find(r => r.kind === 'skill')!;
-  const ref = ({ kind, id, version, treeHash }: typeof prompt) => ({ kind, id, version, treeHash });
-  const config = PublishedSettingsSchema.parse({ schemaVersion: 'medclaw.settings/p1-v1', configVersion: '1', model: { provider: 'p11-fixture', modelId: 'fixture' }, customProviders: [{ definition, credentialRef: null }], credentialRefs: {}, previous: null, rollbackFromVersion: null,
-    requestPolicy: { timeoutMs: 15000, maxRetries: 0, maxRetryDelayMs: 2000 }, resources: { bySession: { '1': { prompt: ref(prompt), skills: [ref(skill)] } } } });
-  const source = createResourceSource(author);
-  const starter=Object.assign((...args:Parameters<ModelCallStarter>)=>new ModelCallRecorder(repos,...args),{forCompaction:(owner:CompactionCallOwner,time:string)=>ModelCallRecorder.forCompaction(repos,owner,time)});
-  const app = new Application('host', config, runtime, repos, async (_context, action) => action(), starter, () => {}, error => errors.push(error), agent, undefined, SqliteWriteTransactions.forDatabase(db), source);
-  const request = (text: string): SubmitInput => SubmitInputSchema.parse({ sessionId: 1, clientSequence: repos.readSession(1)!.nextSubmissionSequence, mode: 'send', text, expectedRevision: repos.readWorkspace().revision, expectedBatchIds: [], expectedQueryId: null, model: { provider: 'p11-fixture', modelId: 'fixture', expectedConfigVersion: app.config.configVersion }, referenceDate: '2026-10-06', timezone: 'Asia/Shanghai' });
-  const settle = async () => { for (let i = 0; i < 2000 && app.runs.busy; i++) await Bun.sleep(2); expect(app.runs.busy).toBe(false); };
-  const content = (id: number) => InputContentSchema.parse(JSON.parse(db.query<{ content_json: string }, [number]>('SELECT content_json FROM session_inputs WHERE id=?').get(id)!.content_json));
-  return { root, author, db, requests, errors, app, agent, repos, contexts, source, toolStore, recorder, runtime, history, registry, prompt: ref(prompt), skill: ref(skill), request, settle, content,
-    close: async () => { await app.runs.shutdown(); server.stop(true); db.close(); rmSync(root, { recursive: true, force: true }); } };
-}
+import {agentRuntimeFixture} from "../fixtures/agent-runtime";
+// Exercise the existing input/history/resource assertions with the P12 combination enabled.
+const fixture=(respond?:Parameters<typeof agentRuntimeFixture>[0])=>agentRuntimeFixture(respond,true);
 
 test('p11 ordinary Send freezes author bytes and records the one real SDK expansion with unchanged raw input', async () => {
   const f = await fixture(); try {
@@ -323,7 +296,9 @@ test('p11 reopened SQLite and new native Session preserve old v1 history while a
     await f.app.prepareConfig('v2-selected',{...f.app.config,configVersion:'2',previous:old,resources:{bySession:{'1':{prompt:null,skills:[v2]}}}});f.app.commitConfig('v2-selected','2');
     const nextRequest=f.request('new v2 question');await f.app.runs.shutdown();f.db.close();second=openDatabase(join(f.root,'app.sqlite'));
     const history=sqliteHistory(second),repos=new Repositories(second,undefined,undefined,undefined,history.store),contexts=new SqliteContextStore(second),tools=new SqliteToolStore(second),catalog=new CatalogService(new SqliteCatalogStore(second)),queries=new QueryService(catalog,tools);
-    const registry=new ToolRegistry(createBusinessTools({catalog,queries,evidence:new EvidenceReader(catalog,queries,tools)})),recorder=new ToolRecorder(tools),agent=new PiAgentRuntime(f.runtime,f.root,history,{registry,recorder,executor:new ToolExecutor(registry,recorder)},new ContextService(contexts,{inspectManagedImport:async()=>({status:'valid'})}));
+    const registry=new ToolRegistry(createBusinessTools({catalog,queries,evidence:new EvidenceReader(catalog,queries,tools)})),recorder=new ToolRecorder(tools);
+    const configure=(_configuration:unknown,extra:readonly import('../../packages/contracts/src/tool').AnyToolDefinition[]=[])=>{const combined=new ToolRegistry([...registry.definitions,...extra]);return {registry:combined,executor:new ToolExecutor(combined,recorder)};};
+    const agent=new PiAgentRuntime(f.runtime,f.root,history,{registry,recorder,executor:new ToolExecutor(registry,recorder),configure},new ContextService(contexts,{inspectManagedImport:async()=>({status:'valid'})}),join(f.author,'extensions'));
     app=new Application('new-host',f.app.config,f.runtime,repos,async(_context,action)=>action(),(id,kind,at,context)=>new ModelCallRecorder(repos,id,kind,at,context),()=>{},undefined,agent,undefined,undefined,f.source);
     await agent.ensureLoaded(1);const request=SubmitInputSchema.parse({...nextRequest,clientSequence:repos.readSession(1)!.nextSubmissionSequence});
     const accepted=await app.runs.submitAgent(request,{instanceId:'new-host',operationRef:'v2-after-restart'});if(!accepted.ok||!accepted.data.runId)throw new Error('No v2');for(let i=0;i<2000&&app.runs.busy;i++)await Bun.sleep(2);expect(app.runs.busy).toBe(false);
@@ -331,7 +306,7 @@ test('p11 reopened SQLite and new native Session preserve old v1 history while a
     expect(facts.some(e=>e.kind==='provider_delivery'&&e.originRunId===first.data.runId&&e.resourceRef.version==='v1'&&e.inputId!==null)).toBe(true);
     expect(facts.some(e=>e.kind==='provider_delivery'&&e.originRunId===first.data.runId&&e.resourceRef.version==='v1'&&e.toolCallId!==null)).toBe(true);
     expect(facts.some(e=>e.kind==='provider_delivery'&&e.originRunId===accepted.data.runId&&e.resourceRef.version==='v2'&&e.coverage==='index')).toBe(true);
-    rmSync(f.author,{recursive:true});expect((await app.resources!.read({source:'run',runId:first.data.runId,resourceRef:f.skill,file:'SKILL.md'})).content).not.toContain('version two');
+    for(const name of ['catalog.json','prompts','skills'])rmSync(join(f.author,name),{recursive:true,force:true});expect((await app.resources!.read({source:'run',runId:first.data.runId,resourceRef:f.skill,file:'SKILL.md'})).content).not.toContain('version two');
     expect((await app.resources!.list({source:'selection',sessionId:1})).items.some(i=>i.ref.version==='v2'&&i.availability!=='ready')).toBe(true);
     expect(await app.runs.submitAgent({...request,clientSequence:3,text:'/skill:query required'},{instanceId:'new-host',operationRef:'missing-required-after-restart'})).toMatchObject({ok:false,error:{code:'resource_unavailable'}});expect(f.requests).toHaveLength(3);
   }finally{await app?.runs.shutdown();second?.close();await f.close();}

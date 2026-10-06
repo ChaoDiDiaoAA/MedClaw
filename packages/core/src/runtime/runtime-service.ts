@@ -26,6 +26,7 @@ type Execution = { handle: RunHandle; operationRef: string; abort: AbortControll
   primaryError: AppError | null; failureAt: string | null; secondaryErrors: AppError[]; pendingSave: boolean; finalCommitted: boolean; sequence: number; task: Promise<void>;
   scope?: RunScope; referenceDate?: string; timezone?: string; toolGap: boolean; budgetSummary?: BudgetSummary;
   rootInputId: number | null; acceptingInputs: boolean; stopEpoch: number; inputSettlement?: InputSettlementProof;
+  extensionReleaseBasis?: 'not_loaded';
   pendingInputFailures: Map<number, Parameters<RuntimeRunStore['recordInputFailure']>[1]>;
   agentFields?: Omit<StartRunInput<ResolvedProviderSelection>, 'inputId' | 'submission' | 'resolved'>;
   deadlineAt: number | null; deadlineTimer: ReturnType<typeof setTimeout> | null;compactionFailure?:boolean;
@@ -307,6 +308,8 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       const session = this.store.readSession(request.sessionId);
       if (!session) throw new Error('session_not_found');
       if (session.status === 'deleted') throw safeError('state_conflict', undefined, { reason: 'session_deleted' });
+      const extension=request.mode==='send'?this.settings().extensions?.bySession[String(request.sessionId)]?.extension:this.execution?.agentFields?.extensions?.selection.extension;
+      if(extension&&request.text.trimStart().split(/\s/,1)[0]==='/extension_status')throw safeError('extension_command_required');
       if (request.mode !== 'send') return this.submitQueuedInput(request, context);
       this.reserve(context.operationRef, request, "agent", request.sessionId);
       try {
@@ -318,7 +321,10 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const config = this.settings(), resolved = await this.modelRuntime.resolve(request.model, config.configVersion,
           config.credentialRefs[request.model.provider] ?? null, config.requestPolicy, true);
         this.recheck(context.operationRef, config.configVersion);
-        const workspace = this.store.readWorkspace(), scope = this.store.freezeAgentScope(workspace, this.agent.toolNames ?? []);
+        const extensions = await this.agent.freezeExtensions?.(request.sessionId,config);
+        this.recheck(context.operationRef, config.configVersion);
+        const workspace = this.store.readWorkspace(), scope = this.store.freezeAgentScope(workspace,
+          [...(this.agent.toolNames ?? []), ...(extensions?.source?.manifest.tools ?? [])]);
         const resources = await this.resources?.freeze(request.sessionId, config, scope), inputPlan = resources ? this.resources!.planInput(resources, request) : undefined;
         this.recheck(context.operationRef, config.configVersion);
         if (!isDeepStrictEqual(this.store.readWorkspace(), workspace)) throw safeError('state_conflict', undefined, { reason: 'workspace_revision_mismatch' });
@@ -331,7 +337,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const fields = { sessionId: request.sessionId, text: request.text, model: resolved.selection, policy: resolved.policy, goal: "answer" as const,
           workspace: toWorkspaceContext(workspace), scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: resolved.policy.timeoutMs,
           agentPolicy, runtimeConfiguration, toolConfiguration, ...(profiles ? structuredClone(profiles) : {}),
-          ...(resources ? { resources, inputPlan } : {}), agentOptions: this.agent.describe(resolved), ...(this.agent.contextContract ? {contextContract:this.agent.contextContract} : {}),...(this.agent.historyContract?{historyContract:this.agent.historyContract}:{}) };
+          ...(resources ? { resources, inputPlan } : {}), ...(extensions?{extensions}:{}), agentOptions: this.agent.describe(resolved), ...(this.agent.contextContract ? {contextContract:this.agent.contextContract} : {}),...(this.agent.historyContract?{historyContract:this.agent.historyContract}:{}) };
         const createdAt = now(), content: InputContent = { contract: 'medclaw.session-input/v1', originalSubmitInput: request, text: request.text,
           workspaceContext: toWorkspaceContext(workspace), scope: structuredClone(scope), model: structuredClone(resolved.selection),
           referenceDate: request.referenceDate, timezone: request.timezone, deliveryAttempt: null, ...(inputPlan ? { resourceInputPlan: inputPlan } : {}) };
@@ -465,11 +471,19 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   }
   private cleanup(execution: Execution, complete: boolean): RunCleanupRecord {
     const proof = execution.inputSettlement;
+    const savedCleanup=execution.fact?.cleanup;
+    const extensions=this.agent?.readExtensionCleanup?.(execution.handle.runId)??(execution.finalCommitted&&savedCleanup&&'extensions' in savedCleanup?savedCleanup.extensions:undefined);
+    const selected=execution.handle.kind==='agent'&&this.store.readRunExtensions?.(execution.handle.runId)?.selection.extension;
+    const extensionReleaseBasis=selected&&!extensions?execution.extensionReleaseBasis:undefined;
+    const resourcesReleased=execution.stopped&&(!selected||extensions?.resourcesReleased===true||extensionReleaseBasis==='not_loaded');
+    for(const error of extensions?.diagnostics??[])if(error.code==='extension_cleanup_failed'&&!execution.secondaryErrors.some(prior=>isDeepStrictEqual(prior,error)))execution.secondaryErrors.push(error);
     const inputsSettled = execution.rootInputId === null || !!proof && proof.admissionClosed && proof.preflightSettled
       && proof.nativeIdle && proof.nativeQueuesEmpty && !proof.pendingPersistence;
     return { contract: "medclaw.run-cleanup/v1", executionStarted: execution.executionStarted, stopConfirmed: execution.stopped,
-      requiredPersistenceComplete: complete, inputsSettled, resourcesReleased: execution.stopped,
-      unconfirmedItems: [...(execution.stopped ? [] : ['stop', 'resources']), ...(complete ? [] : ['persistence']), ...(inputsSettled ? [] : ['inputs']), ...(execution.toolGap && !complete ? ['tool_persistence'] : []), ...(this.agent?.hasPendingContextPersistence?.(execution.handle.runId) ? ['context_persistence'] : []),...(this.agent?.hasPendingHistoryPersistence?.(execution.handle.runId)?['history_persistence']:[])], secondaryErrors: execution.secondaryErrors, verifiedAt: complete && execution.stopped && inputsSettled ? now() : null,
+      requiredPersistenceComplete: complete, inputsSettled, resourcesReleased,
+      ...(extensions?{extensions}:{}),
+      ...(extensionReleaseBasis?{extensionReleaseBasis}:{}),
+      unconfirmedItems: [...(execution.stopped ? [] : ['stop']),...(resourcesReleased?[]:['resources']),...(extensions&&!extensions.resourcesReleased?['extension_cleanup']:[]), ...(complete ? [] : ['persistence']), ...(inputsSettled ? [] : ['inputs']), ...(execution.toolGap && !complete ? ['tool_persistence'] : []), ...(this.agent?.hasPendingContextPersistence?.(execution.handle.runId) ? ['context_persistence'] : []),...(this.agent?.hasPendingHistoryPersistence?.(execution.handle.runId)?['history_persistence']:[])], secondaryErrors: execution.secondaryErrors, verifiedAt: complete && execution.stopped && inputsSettled && resourcesReleased ? now() : null,
       ...(execution.budgetSummary ? { budgetSummary: structuredClone(execution.budgetSummary) } : {}) };
   }
   private deadline(execution: Execution, timeout: number) {
@@ -563,7 +577,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         entered = true;
         return this.agent!.execute({
         runId: execution.handle.runId, sessionId: input.sessionId, inputId: input.inputId, text: input.text, resolved: input.resolved, agentOptions: input.agentOptions,
-        resources: input.resources, inputPlan: input.inputPlan, nativeReceiptLimitBytes: input.nativeReceiptLimitBytes,
+        instanceId:this.instanceId,extensions:input.extensions,resources: input.resources, inputPlan: input.inputPlan, nativeReceiptLimitBytes: input.nativeReceiptLimitBytes,
         scope: input.scope, workspaceContext: toWorkspaceContext(input.workspace), referenceDate: input.referenceDate, timezone: input.timezone, signal: execution.abort.signal, deadlineAt,
         agentPolicy: input.agentPolicy, runtimeConfiguration: input.runtimeConfiguration, toolConfiguration: input.toolConfiguration, measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot }, {
         startCall: (time,context) => this.startCall(execution.handle.runId, "main", time,context), preview: text => this.preview(execution, text),
@@ -571,6 +585,10 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
           try { this.stream?.(structuredClone(snapshot)); } catch { try { this.report(safeError('preview_delivery_failed')); } catch {} } },
         inputStore: this.store, admissionClosed: () => { execution.acceptingInputs = false; },compaction,
         fatal: error => { this.checkpoint(execution, error,!execution.compactionFailure); execution.abort.abort(); },
+        extensionProof: proof => {
+          if(proof.runId!==execution.handle.runId||proof.sessionId!==execution.handle.sessionId||proof.instanceId!==this.instanceId)throw safeError('state_conflict');
+          try{this.store.saveRunCleanup(proof.runId,this.cleanup(execution,false));}catch{throw safeError('storage_write_failed',undefined,{runId:proof.runId});}
+        },
         nativeTerminal: outcome => { execution.nativeTerminal = true; if (outcome.error && !execution.cause) this.checkpoint(execution, outcome.error,!execution.compactionFailure); },
       }); });
       if (observed.budgetSummary) execution.budgetSummary = structuredClone(observed.budgetSummary);
@@ -590,6 +608,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       if (entered) this.checkpoint(execution, safeError("stop_unconfirmed"));
       else {
         execution.stopped = true; execution.executionStarted = false;
+        execution.extensionReleaseBasis='not_loaded';
         execution.acceptingInputs = false;
         if (execution.rootInputId !== null) {
           this.saveInputFailure(execution, execution.rootInputId, { sessionId: input.sessionId, targetRunId: execution.handle.runId,
@@ -654,6 +673,16 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     }
     if (execution.finalCommitted) {
       try {
+        if(this.store.readRunExtensions?.(execution.handle.runId)?.selection.extension) {
+          const cleanup=this.cleanup(execution,true), current=this.store.read({runId:execution.handle.runId});
+          if(current.kind!=='one'||!current.run)throw safeError('storage_read_failed');
+          if(current.run.cleanup?.verifiedAt&&cleanup.verifiedAt)cleanup.verifiedAt=current.run.cleanup.verifiedAt;
+          if(!isDeepStrictEqual(current.run.cleanup,cleanup))this.store.saveRunCleanup(execution.handle.runId,cleanup);
+          const saved=this.store.read({runId:execution.handle.runId});
+          if(saved.kind!=='one'||!saved.run||!isDeepStrictEqual(saved.run.cleanup,cleanup))throw safeError('storage_read_failed');
+          fact.cleanup=cleanup;
+          if(!cleanup.resourcesReleased) {execution.pendingSave=true;this.clearDeadline(execution);return;}
+        }
         if('calls' in fact&&fact.history) {
           const proof=this.store.confirmHistorySaved?.(fact.history);
           if(!proof)throw safeError('storage_read_failed');
@@ -744,11 +773,20 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const contextFacts = this.store.verifyPriorContextFacts?.(run.id) ?? {requiredPersistenceComplete:true,unconfirmedItems:[]};
         const historyFacts = this.store.verifyPriorHistoryFacts?.(run.id) ?? {requiredPersistenceComplete:true,unconfirmedItems:[]};
         const compactionFacts=this.store.verifyPriorCompactionFacts?.(run.id,previousProcessExited,at)??{requiredPersistenceComplete:true,unconfirmedItems:[]};
+        const extension=run.cleanup?.extensions;
+        const releasedExtension=extension&&previousProcessExited?{...extension,state:'disposed' as const,disposedAt:extension.disposedAt??at,resourcesReleased:true}:extension;
+        const extensionReleaseBasis=!extension&&this.store.readRunExtensions?.(run.id)?.selection.extension
+          ?run.cleanup?.extensionReleaseBasis??(previousProcessExited?'owner_process_exited' as const:undefined):undefined;
         this.recoveries.set(run.id, { run, at, verified: facts.stopConfirmed === true,
           cleanup: { contract: "medclaw.run-cleanup/v1", executionStarted: run.cleanup?.executionStarted ?? null, stopConfirmed: facts.stopConfirmed,
-            requiredPersistenceComplete: facts.requiredPersistenceComplete && inputFacts.requiredPersistenceComplete && contextFacts.requiredPersistenceComplete && historyFacts.requiredPersistenceComplete&&compactionFacts.requiredPersistenceComplete, inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed,
+            requiredPersistenceComplete: facts.requiredPersistenceComplete && inputFacts.requiredPersistenceComplete && contextFacts.requiredPersistenceComplete && historyFacts.requiredPersistenceComplete&&compactionFacts.requiredPersistenceComplete, inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed===true&&(!this.store.readRunExtensions?.(run.id)?.selection.extension||releasedExtension?.resourcesReleased===true||!!extensionReleaseBasis),
+            ...(releasedExtension?{extensions:releasedExtension}:{}),
+            ...(extensionReleaseBasis?{extensionReleaseBasis}:{}),
             unconfirmedItems: [...new Set([...facts.unconfirmedItems, ...inputFacts.unconfirmedItems,...contextFacts.unconfirmedItems,...historyFacts.unconfirmedItems,...compactionFacts.unconfirmedItems])], secondaryErrors: run.cleanup?.secondaryErrors ?? [], verifiedAt: facts.stopConfirmed === true && inputFacts.inputsSettled && contextFacts.requiredPersistenceComplete && historyFacts.requiredPersistenceComplete&&compactionFacts.requiredPersistenceComplete ? at : run.cleanup?.verifiedAt ?? null,
             ...(run.cleanup?.budgetSummary !== undefined ? { budgetSummary: run.cleanup.budgetSummary } : {}) } });
+      }
+      for(const recovery of this.recoveries.values())if(!recovery.cleanup.resourcesReleased){
+        recovery.cleanup.unconfirmedItems=[...new Set([...recovery.cleanup.unconfirmedItems,'resources','extension_cleanup'])];recovery.cleanup.verifiedAt=null;
       }
       if (previousProcessExited) for (const recovery of [...this.recoveries.values()]) this.saveRecovery(recovery);
       this.recoveryError = null;
@@ -759,7 +797,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       if (recovery.run.status === "created" || recovery.run.status === "running") this.store.checkpointFailure(recovery.run.id,
         safeError(recovery.run.kind === "provider" ? "host_interrupted" : "runtime_interrupted", undefined, { runId: recovery.run.id }), recovery.cleanup, recovery.at);
       else this.store.saveRunCleanup(recovery.run.id, recovery.cleanup);
-      if (recovery.cleanup.stopConfirmed === true && recovery.cleanup.requiredPersistenceComplete === true && recovery.cleanup.inputsSettled === true) this.recoveries.delete(recovery.run.id);
+      if (recovery.cleanup.stopConfirmed === true && recovery.cleanup.requiredPersistenceComplete === true && recovery.cleanup.inputsSettled === true && recovery.cleanup.resourcesReleased===true) this.recoveries.delete(recovery.run.id);
     } catch { this.report(safeError("storage_write_failed", undefined, { runId: recovery.run.id })); }
   }
   async shutdown() {
