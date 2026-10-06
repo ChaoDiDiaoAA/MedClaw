@@ -16,7 +16,7 @@ export interface StageReport {
   exitCode: number;
 }
 const projectRoot = resolve(import.meta.dir, "..");
-const stagePrefixes = { P1: "p1", P2: "p2", P3: "p3", P4: "p4", P5: "p5", P6: "p6", P7: "p7", P8: "p8", P9: "p9", P10: "p10" } as const;
+const stagePrefixes = { P1: "p1", P2: "p2", P3: "p3", P4: "p4", P5: "p5", P6: "p6", P7: "p7", P8: "p8", P9: "p9", P10: "p10", P11: "p11" } as const;
 
 export function discoverTests(category: TestCategory, stage: string, root = projectRoot): string[] {
   if (!["unit", "integration", "e2e"].includes(category)) throw new Error(`Unknown test category: ${category}`);
@@ -83,7 +83,7 @@ export async function runStage(category: TestCategory, stage: string, options: {
 if (import.meta.main) {
   try {
     const args = Bun.argv.slice(2).filter(arg => arg !== "--");
-    if (args.length !== 3 || args[1] !== "--stage") throw new Error("Usage: bun tests/run.ts unit|integration|e2e [--] --stage P1|P2|P3|P4|P5|P6|P7|P8|P9|P10");
+    if (args.length !== 3 || args[1] !== "--stage") throw new Error("Usage: bun tests/run.ts unit|integration|e2e [--] --stage P1|P2|P3|P4|P5|P6|P7|P8|P9|P10|P11");
     const report = await runStage(args[0] as TestCategory, args[2]!);
     console.log(JSON.stringify(report));
     process.exitCode = report.exitCode;
