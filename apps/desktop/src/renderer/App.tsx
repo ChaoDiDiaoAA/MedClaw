@@ -15,6 +15,7 @@ import { useInputQueue } from "./input-queue";
 import { ModelsPage, type DirectoryReadStatus } from "./models-page";
 import { SettingsPage } from "./settings-page";
 import { RunDetails } from "./run-details";
+import { ResourcePanel } from './resource-panel';
 import { DataWorkspace } from "./data-workspace";
 import { QueryHistory } from "./query-history";
 import { useRunEvents } from "./use-run-events";
@@ -29,7 +30,7 @@ export interface DesktopBridge {
   pickImportDirectory(operationRef: string): Promise<Result<{ fileToken: string; directoryName: string } | null>>;
 }
 declare global { interface Window { medclaw: DesktopBridge } }
-export type ViewPage = "chat" | "data" | "queries" | "models" | "settings";
+export type ViewPage = "chat" | "data" | "queries" | "models" | "prompt" | "skills" | "settings";
 const initialUi: DesktopDisplayPreferences = { navCollapsed: false, detailOpen: false, detailTab: "conditions" };
 const initialHost: HostView = { instanceId: null, state: "starting", canStart: false, sdkVersion: null, schemaVersion: null, error: null };
 const released = (run: RunView) => ["completed", "failed", "cancelled"].includes(run.status) && !!run.cleanup
@@ -686,7 +687,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       {pendingSessionChoice !== null && <p role="status">Session {pendingSessionChoice} is still your requested selection. <button disabled={!workspaceConfirmed || selecting} onClick={() => void selectSession(pendingSessionChoice)}>Confirm Session {pendingSessionChoice}</button></p>}
     </Sidebar>
     <main className="workspace">
-      <header className="page-header"><div className="header-title">{ui.navCollapsed && <button className="quiet" onClick={() => void updateUi({ navCollapsed: false })}>Expand navigation</button>}<h1>{{ chat: "Chat", data: "Data Workspace", queries: "Query History", models: "Models", settings: "Settings" }[page]}</h1></div><button ref={detailsButton} className="quiet" onClick={() => void updateUi({ detailOpen: !ui.detailOpen })}>View run details</button></header>
+      <header className="page-header"><div className="header-title">{ui.navCollapsed && <button className="quiet" onClick={() => void updateUi({ navCollapsed: false })}>Expand navigation</button>}<h1>{{ chat: "Chat", data: "Data Workspace", queries: "Query History", models: "Models", prompt:"Prompt", skills:"Skills", settings: "Settings" }[page]}</h1></div><button ref={detailsButton} className="quiet" onClick={() => void updateUi({ detailOpen: !ui.detailOpen })}>View run details</button></header>
       {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="Dismiss notice" onClick={() => setError(null)}>×</button></div>}
       <section className="page-content chat-page" hidden={page !== "chat"}><Chat compactionProgress={compactionProgress} visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control} run={run} preview={preview} events={runEvents.state} onFinalSource={runEvents.setFinalSource}
         workspace={workspace} workspaceConfirmed={workspaceConfirmed} workspacePending={selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} onWorkspace={updateWorkspace} dataDefaults={catalog}
@@ -701,6 +702,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
         sessionTarget={workspaceConfirmed && !selecting && current && currentDetail && host.instanceId ? { instanceId: host.instanceId, sessionId: current } : null} onUseForSession={useForSession}
         prompt={prompt} notification={authNotify} attempt={authAttempt} onChanged={changed} onAccepted={acceptedProvider} onError={setError} /></section>
       <section className="page-content" hidden={page !== "settings"}><SettingsPage ui={ui} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost} /></section>
+      {(page==='prompt'||page==='skills')&&<section className="page-content"><ResourcePanel host={host} source={workspaceConfirmed&&!selecting&&current?{source:'selection',sessionId:current}:null} kind={page==='prompt'?'prompt':'skill'} activeRunId={active?.sessionId===current?active?.runId:null} onPublished={()=>void readDirectory()} /></section>}
     </main>
     {ui.detailOpen && <RunDetails inputs={inputQueue.snapshots[run?.kind === "agent" ? run.sessionId : current ?? 0] ?? null} onRefreshInputs={() => { const id=run?.kind === "agent" ? run.sessionId : current; if(id)void refreshInputs(id,true); }} onMoreInputs={() => { const id=run?.kind === "agent" ? run.sessionId : current; if(id)void readInputPage(id,"more"); }} cancellingInputs={cancellingInputs} onCancelInput={original => void cancelInput(original)} run={run} host={host} viewSessionId={current} tab={ui.detailTab} active={active} control={control} events={runEvents.state} onResumeGap={runEvents.resumeGap} onTab={tab => void updateUi({ detailTab: tab })} onClose={() => void closeDetails()} onError={setError}
       onQuery={(queryId, sessionId) => { setRequestedQuery({ queryId, ownerSessionId: sessionId }); setPage("queries"); }}

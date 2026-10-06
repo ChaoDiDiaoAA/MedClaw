@@ -198,3 +198,5 @@ legend { padding: 0 6px; font-weight: 600; }
 @media (max-width: 1279px) { .desktop.has-details { grid-template-columns: 258px minmax(0, 1fr); } .desktop.nav-collapsed.has-details { grid-template-columns: minmax(0, 1fr); } .page-content { padding: 22px; } }
 @media (max-width: 1000px) { .desktop, .desktop.has-details { grid-template-columns: 210px minmax(0, 1fr); } .form-grid, .directory-toolbar { grid-template-columns: minmax(0, 1fr); } .page-header { padding-inline: 16px; } .messages, .composer-wrap { padding-inline: 20px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
+.resource-panel article { border-top: 1px solid var(--line); padding: 12px 0; }
+.resource-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 420px; overflow: auto; }
