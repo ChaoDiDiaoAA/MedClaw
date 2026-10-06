@@ -23,9 +23,14 @@ import { Repositories } from '../../packages/storage/src/repositories';
 import { SqliteContextStore } from '../../packages/storage/src/context-store';
 import { SqliteCatalogStore } from '../../packages/storage/src/catalog-store';
 import { SqliteToolStore } from '../../packages/storage/src/tool-store';
+import {SqliteWriteTransactions} from '../../packages/storage/src/write-transactions';
 import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
 import { InputContentSchema, SubmitInputSchema, type SubmitInput } from '../../packages/contracts/src/session';
 import { ResourceCatalogueSchema, resourceRefKey } from '../../packages/contracts/src/resources';
+import {canonicalRequest} from '../../packages/contracts/src/run';
+import {SessionService} from '../../packages/core/src/session/session-service';
+import type {ModelCallStarter} from '../../packages/contracts/src/run';
+import type {CompactionCallOwner} from '../../packages/contracts/src/session';
 import { parseSkillBlock } from '@earendil-works/pi-coding-agent';
 import { sqliteHistory } from '../fixtures/p9-memory';
 
@@ -43,7 +48,7 @@ async function fixture(respond?: (index: number, payload: Record<string, unknown
   await runtime.installCustom([definition]);
   const history = sqliteHistory(db), repos = new Repositories(db, undefined, undefined, undefined, history.store), contexts = new SqliteContextStore(db);
   const catalog = new CatalogService(new SqliteCatalogStore(db)), toolStore = new SqliteToolStore(db), queries = new QueryService(catalog, toolStore), evidence = new EvidenceReader(catalog, queries, toolStore);
-  const registry = new ToolRegistry(createBusinessTools({ catalog, queries, evidence })), errors: unknown[] = [], recorder = new ToolRecorder(toolStore, error => errors.push(error));
+  const registry = new ToolRegistry(createBusinessTools({ catalog, queries, evidence })), errors: unknown[] = [], recorder = new ToolRecorder(toolStore, (error,context) => {errors.push(error);app.runs.failToolPersistence(context.runId,error);});
   const agent = new PiAgentRuntime(runtime, root, history, { registry, recorder, executor: new ToolExecutor(registry, recorder) }, new ContextService(contexts, { inspectManagedImport: async () => ({ status: 'valid' as const }) }));
   const allocated = agent.allocate(); repos.createSession({ expectedWorkspaceRevision: 0 }, 'create-a', allocated.nativeSessionId, new Date().toISOString(), allocated.history); allocated.bind(1);
   const catalogue = ResourceCatalogueSchema.parse(JSON.parse(readFileSync(join(author, 'catalog.json'), 'utf8'))), prompt = catalogue.definitions.find(r => r.kind === 'prompt')!, skill = catalogue.definitions.find(r => r.kind === 'skill')!;
@@ -51,11 +56,12 @@ async function fixture(respond?: (index: number, payload: Record<string, unknown
   const config = PublishedSettingsSchema.parse({ schemaVersion: 'medclaw.settings/p1-v1', configVersion: '1', model: { provider: 'p11-fixture', modelId: 'fixture' }, customProviders: [{ definition, credentialRef: null }], credentialRefs: {}, previous: null, rollbackFromVersion: null,
     requestPolicy: { timeoutMs: 15000, maxRetries: 0, maxRetryDelayMs: 2000 }, resources: { bySession: { '1': { prompt: ref(prompt), skills: [ref(skill)] } } } });
   const source = createResourceSource(author);
-  const app = new Application('host', config, runtime, repos, async (_context, action) => action(), (runId, kind, at, context) => new ModelCallRecorder(repos, runId, kind, at, context), () => {}, error => errors.push(error), agent, undefined, undefined, source);
+  const starter=Object.assign((...args:Parameters<ModelCallStarter>)=>new ModelCallRecorder(repos,...args),{forCompaction:(owner:CompactionCallOwner,time:string)=>ModelCallRecorder.forCompaction(repos,owner,time)});
+  const app = new Application('host', config, runtime, repos, async (_context, action) => action(), starter, () => {}, error => errors.push(error), agent, undefined, SqliteWriteTransactions.forDatabase(db), source);
   const request = (text: string): SubmitInput => SubmitInputSchema.parse({ sessionId: 1, clientSequence: repos.readSession(1)!.nextSubmissionSequence, mode: 'send', text, expectedRevision: repos.readWorkspace().revision, expectedBatchIds: [], expectedQueryId: null, model: { provider: 'p11-fixture', modelId: 'fixture', expectedConfigVersion: app.config.configVersion }, referenceDate: '2026-10-06', timezone: 'Asia/Shanghai' });
   const settle = async () => { for (let i = 0; i < 2000 && app.runs.busy; i++) await Bun.sleep(2); expect(app.runs.busy).toBe(false); };
   const content = (id: number) => InputContentSchema.parse(JSON.parse(db.query<{ content_json: string }, [number]>('SELECT content_json FROM session_inputs WHERE id=?').get(id)!.content_json));
-  return { root, author, db, requests, errors, app, agent, repos, contexts, source, toolStore, recorder, prompt: ref(prompt), skill: ref(skill), request, settle, content,
+  return { root, author, db, requests, errors, app, agent, repos, contexts, source, toolStore, recorder, runtime, history, registry, prompt: ref(prompt), skill: ref(skill), request, settle, content,
     close: async () => { await app.runs.shutdown(); server.stop(true); db.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
@@ -273,6 +279,78 @@ test('p11 equal Prompt expansions in successive Runs each retain their original 
     expect(facts.map(e => e.originRunId).sort()).toEqual(runs); expect(new Set(facts.map(e => e.nativeEntryId)).size).toBe(2);
     expect(f.errors).toEqual([]);
   } finally {await f.close();}
+},15000);
+
+for (const failure of ['read_annotation','provider_delivery'] as const) test(`p11 ${failure} save failure retains original proof and retrySave never reexecutes HTTP or tools`,async()=>{
+  const f=await fixture((index,payload)=>{
+    if(failure==='read_annotation'&&index===1){const system=(payload.messages as {role:string;content:string}[]).find(m=>m.role==='system')!.content;const path=/<location>(.*?)<\/location>/.exec(system)![1]!;
+      return {role:'assistant',tool_calls:[{index:0,id:'save-read',type:'function',function:{name:'read',arguments:JSON.stringify({path})}}]};}
+    return {role:'assistant',content:'ENGINEERING'};
+  });
+  let reject=true;const read=f.toolStore.recordResourceRead.bind(f.toolStore),delivery=f.contexts.recordDelivery.bind(f.contexts);
+  if(failure==='read_annotation')f.toolStore.recordResourceRead=(...args)=>{if(reject)throw new Error('storage_write_failed');read(...args);};
+  else f.contexts.recordDelivery=input=>{if(reject)throw new Error('storage_write_failed');return delivery(input);};
+  try {
+    const result=await f.app.runs.submitAgent(f.request('save failure'),{instanceId:'host',operationRef:failure});if(!result.ok||!result.data.runId)throw new Error('No Run');const runId=result.data.runId;
+    for(let i=0;i<2000&&!f.app.runs.persistencePending;i++)await Bun.sleep(2);
+    expect(f.app.runs.persistencePending).toBe(true);expect(f.app.runs.activeHandle?.runId).toBe(runId);expect(f.requests).toHaveLength(1);
+    expect(await f.app.runs.submitAgent(f.request('must stay blocked'),{instanceId:'host',operationRef:'blocked-'+failure})).toMatchObject({ok:false,error:{code:'state_conflict'}});
+    const before=(await f.app.resources!.list({source:'run',runId})).evidence;
+    expect(before.filter(e=>e.kind===(failure==='read_annotation'?'native_read':'provider_delivery'))).toHaveLength(0);
+    expect(await f.app.runs.cancel(runId)).toMatchObject({ok:true,data:{stopped:true}});
+    reject=false;expect(await f.app.runs.retrySave(runId)).toMatchObject({ok:true,data:{status:'failed',cleanup:{requiredPersistenceComplete:true}}});
+    expect(f.app.runs.activeHandle).toBeNull();expect(f.requests).toHaveLength(1);
+    const after=(await f.app.resources!.list({source:'run',runId})).evidence;
+    expect(after.filter(e=>e.kind===(failure==='read_annotation'?'native_read':'provider_delivery')).length).toBeGreaterThan(0);
+    if(failure==='read_annotation'){expect(f.db.query('SELECT * FROM tool_calls').all()).toHaveLength(1);expect(after.some(e=>e.kind==='provider_delivery'&&e.toolCallId!==null)).toBe(false);}
+  }finally{reject=false;if(f.app.runs.activeHandle){const id=f.app.runs.activeHandle.runId;await f.app.runs.cancel(id);await f.app.runs.retrySave(id);}await f.close();}
+},15000);
+
+test('p11 reopened SQLite and new native Session preserve old v1 history while a v2 Run has a distinct current index',async()=>{
+  const f=await fixture((index,payload)=>{if(index!==1)return {role:'assistant',content:'ENGINEERING'};const system=(payload.messages as {role:string;content:string}[]).find(m=>m.role==='system')!.content;
+    return {role:'assistant',tool_calls:[{index:0,id:'old-read',type:'function',function:{name:'read',arguments:JSON.stringify({path:/<location>(.*?)<\/location>/.exec(system)![1]})}}]};});let second:ReturnType<typeof openDatabase>|undefined;let app:typeof f.app|undefined;
+  try {
+    const first=await f.app.runs.submitAgent(f.request('/skill:query historical v1'),{instanceId:'host',operationRef:'v1-before-restart'});if(!first.ok||!first.data.runId)throw new Error('No v1');await f.settle();
+    const catalogue=ResourceCatalogueSchema.parse(JSON.parse(readFileSync(join(f.author,'catalog.json'),'utf8'))),v1=catalogue.definitions.find(d=>d.kind==='skill')!;
+    const folder=join(f.author,'skills/query/v2');cpSync(join(f.author,'skills/query/v1'),folder,{recursive:true});writeFileSync(join(folder,'SKILL.md'),readFileSync(join(folder,'SKILL.md'),'utf8')+'\nENGINEERING version two.\n');
+    const definition={...v1,version:'v2',entry:'skills/query/v2/SKILL.md',treeHash:''};const hash=(text:string)=>createHash('sha256').update(text).digest('hex');
+    const metadata={kind:definition.kind,id:definition.id,version:definition.version,entry:definition.entry,keywords:[...definition.keywords].sort(),requiredTools:[...definition.requiredTools].sort(),requiredExtensions:[...definition.requiredExtensions].sort(),files:definition.files.map(path=>{const bytes=readFileSync(join(folder,path));return {path,bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')};}).sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0)};
+    definition.treeHash=hash(canonicalRequest(metadata));catalogue.definitions.push(definition);writeFileSync(join(f.author,'catalog.json'),JSON.stringify(catalogue));
+    const v2={kind:definition.kind,id:definition.id,version:definition.version,treeHash:definition.treeHash}, {previous,rollbackFromVersion,...old}=f.app.config;
+    await f.app.prepareConfig('v2-selected',{...f.app.config,configVersion:'2',previous:old,resources:{bySession:{'1':{prompt:null,skills:[v2]}}}});f.app.commitConfig('v2-selected','2');
+    const nextRequest=f.request('new v2 question');await f.app.runs.shutdown();f.db.close();second=openDatabase(join(f.root,'app.sqlite'));
+    const history=sqliteHistory(second),repos=new Repositories(second,undefined,undefined,undefined,history.store),contexts=new SqliteContextStore(second),tools=new SqliteToolStore(second),catalog=new CatalogService(new SqliteCatalogStore(second)),queries=new QueryService(catalog,tools);
+    const registry=new ToolRegistry(createBusinessTools({catalog,queries,evidence:new EvidenceReader(catalog,queries,tools)})),recorder=new ToolRecorder(tools),agent=new PiAgentRuntime(f.runtime,f.root,history,{registry,recorder,executor:new ToolExecutor(registry,recorder)},new ContextService(contexts,{inspectManagedImport:async()=>({status:'valid'})}));
+    app=new Application('new-host',f.app.config,f.runtime,repos,async(_context,action)=>action(),(id,kind,at,context)=>new ModelCallRecorder(repos,id,kind,at,context),()=>{},undefined,agent,undefined,undefined,f.source);
+    await agent.ensureLoaded(1);const request=SubmitInputSchema.parse({...nextRequest,clientSequence:repos.readSession(1)!.nextSubmissionSequence});
+    const accepted=await app.runs.submitAgent(request,{instanceId:'new-host',operationRef:'v2-after-restart'});if(!accepted.ok||!accepted.data.runId)throw new Error('No v2');for(let i=0;i<2000&&app.runs.busy;i++)await Bun.sleep(2);expect(app.runs.busy).toBe(false);
+    const facts=(await app.resources!.list({source:'run',runId:accepted.data.runId,evidencePageSize:100})).evidence;
+    expect(facts.some(e=>e.kind==='provider_delivery'&&e.originRunId===first.data.runId&&e.resourceRef.version==='v1'&&e.inputId!==null)).toBe(true);
+    expect(facts.some(e=>e.kind==='provider_delivery'&&e.originRunId===first.data.runId&&e.resourceRef.version==='v1'&&e.toolCallId!==null)).toBe(true);
+    expect(facts.some(e=>e.kind==='provider_delivery'&&e.originRunId===accepted.data.runId&&e.resourceRef.version==='v2'&&e.coverage==='index')).toBe(true);
+    rmSync(f.author,{recursive:true});expect((await app.resources!.read({source:'run',runId:first.data.runId,resourceRef:f.skill,file:'SKILL.md'})).content).not.toContain('version two');
+    expect((await app.resources!.list({source:'selection',sessionId:1})).items.some(i=>i.ref.version==='v2'&&i.availability!=='ready')).toBe(true);
+    expect(await app.runs.submitAgent({...request,clientSequence:3,text:'/skill:query required'},{instanceId:'new-host',operationRef:'missing-required-after-restart'})).toMatchObject({ok:false,error:{code:'resource_unavailable'}});expect(f.requests).toHaveLength(3);
+  }finally{await app?.runs.shutdown();second?.close();await f.close();}
+},15000);
+
+test('p11 actual manual compaction mentions a Skill name without inventing delivery of its omitted full body',async()=>{
+  const f=await fixture(()=>({role:'assistant',content:'ENGINEERING summary mentioning query only.'}));
+  try {
+    const describe=f.agent.describe.bind(f.agent);f.agent.describe=resolved=>({...describe(resolved),compaction:{...describe(resolved).compaction,keepRecentTokens:32,reserveTokens:256}});
+    const sessions=new SessionService('host',f.repos,f.agent,(input,context)=>f.app.runs.submitAgent(input,context),()=>f.app.runs.activeHandle,()=>null,undefined,f.app.runs);
+    let original=0;
+    for(let i=0;i<3;i++){const result=await f.app.runs.submitAgent(f.request(i===0?'/skill:query original large body':`turn ${i}`),{instanceId:'host',operationRef:`pre-compact-${i}`});if(!result.ok||!result.data.runId)throw new Error('No Run');original ||=result.data.runId;await f.settle();}
+    const accepted=await sessions.compact({sessionId:1,expectedStorageVersion:f.repos.readSession(1)!.storageVersion,model:{provider:'p11-fixture',modelId:'fixture',expectedConfigVersion:'1'}},{instanceId:'host',operationRef:'p11-compact'});expect(accepted).toMatchObject({ok:true});
+    let saved=false;for(let i=0;i<1000;i++){const read=await sessions.readCompaction({sessionId:1,operationRef:'p11-compact'});if(read.ok&&read.data?.canContinue){saved=true;break;}await Bun.sleep(2);}expect(saved).toBe(true);
+    const result=await f.app.runs.submitAgent(f.request('after compact'),{instanceId:'host',operationRef:'after-compact'});if(!result.ok||!result.data.runId)throw new Error('No next Run');await f.settle();
+    const facts=(await f.app.resources!.list({source:'run',runId:result.data.runId,evidencePageSize:100})).evidence;
+    expect(facts.some(e=>e.kind==='provider_delivery'&&e.originRunId===original&&e.inputId!==null)).toBe(false);
+    expect(facts.some(e=>e.kind==='provider_delivery'&&e.coverage==='index')).toBe(true);
+    const rows=f.db.query<{kind:string;model_json:string}, []>('SELECT kind,model_json FROM model_calls').all();expect(rows.some(r=>r.kind==='compaction')).toBe(true);
+    expect(rows.filter(r=>r.kind==='compaction').every(r=>!JSON.parse(r.model_json).context?.resources)).toBe(true);
+    expect((await f.app.resources!.list({source:'run',runId:original})).evidence.some(e=>e.kind==='provider_delivery'&&e.inputId!==null)).toBe(true);expect(f.errors).toEqual([]);
+  }finally{await f.close();}
 },15000);
 
 test('p11 resource capture rechecks the published configuration before creating any Run or Input', async () => {

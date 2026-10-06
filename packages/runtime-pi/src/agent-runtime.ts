@@ -295,8 +295,10 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
             if (this.toolPersistencePending(input.runId)) throw safeError('storage_write_failed');
             if (input.resources) {
               if (!callbacks.inputStore?.readResourceOrigins) throw safeError('state_conflict');
-              const branch = binding.manager.getBranch(), compaction = branch.findLast(e => e.type === 'compaction');
-              const kept = compaction?.type === 'compaction' ? branch.slice(branch.findIndex(e => e.id === compaction.firstKeptEntryId)) : branch;
+              const branch = binding.manager.getBranch(), compactionIndex = branch.findLastIndex(e => e.type === 'compaction'), compaction = branch[compactionIndex];
+              const firstKept = compaction?.type === 'compaction' ? compaction.firstKeptEntryId === null ? compactionIndex + 1 : branch.findIndex(e => e.id === compaction.firstKeptEntryId) : 0;
+              if (firstKept < 0) throw safeError('session_history_invalid');
+              const kept = branch.slice(firstKept);
               const entries = kept.filter(e => e.type === 'message' && (e.message.role === 'user' || e.message.role === 'toolResult'));
               if (entries.length > 1000) throw safeError('resource_unavailable', undefined, {reason:'resource_too_large'});
               const facts = callbacks.inputStore.readResourceOrigins(input.sessionId, entries.map(e => e.id));
