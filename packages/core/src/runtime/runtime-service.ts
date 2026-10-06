@@ -35,6 +35,11 @@ type ManualExecution={operation:StoredCompactionOperation;abort:AbortController;
   observed:NativeCompactionObservation|null;error:AppError|null;pendingCalls:Map<string,{owner:CompactionCallOwner;fact:FinalCallFact}>;
   task:Promise<void>;deadlineAt:number;timer:ReturnType<typeof setTimeout>|null;released:boolean};
 const now = () => new Date().toISOString();
+function receiptBudget(content: InputContent, instanceId: string, startedAt: string) {
+  return content.resourceInputPlan ? Math.min(RESOURCE_LIMITS.nativeReceiptBytes, RESOURCE_LIMITS.inputSavedBytes
+    - new TextEncoder().encode(JSON.stringify({ ...content, deliveryAttempt: { instanceId, startedAt } })).byteLength
+    - new TextEncoder().encode(',"nativeInput":').byteLength) : undefined;
+}
 
 /** The one owner of root admission and lifecycle, shared by Provider and Agent. */
 export class RuntimeService<Resolved extends ResolvedProviderSelection> {
@@ -330,9 +335,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const createdAt = now(), content: InputContent = { contract: 'medclaw.session-input/v1', originalSubmitInput: request, text: request.text,
           workspaceContext: toWorkspaceContext(workspace), scope: structuredClone(scope), model: structuredClone(resolved.selection),
           referenceDate: request.referenceDate, timezone: request.timezone, deliveryAttempt: null, ...(inputPlan ? { resourceInputPlan: inputPlan } : {}) };
-        const nativeReceiptLimitBytes = inputPlan ? Math.min(RESOURCE_LIMITS.nativeReceiptBytes, RESOURCE_LIMITS.inputSavedBytes
-          - new TextEncoder().encode(JSON.stringify({ ...content, deliveryAttempt: { instanceId: this.instanceId, startedAt: createdAt } })).byteLength
-          - new TextEncoder().encode(',"nativeInput":').byteLength) : undefined;
+        const nativeReceiptLimitBytes = receiptBudget(content, this.instanceId, createdAt);
         const accepted = this.store.acceptInput({ operationRef: context.operationRef, originalSubmitInput: request, content, createdAt,
           execution: { mode: 'send', run: { ...fields, instanceId: this.instanceId, createdAt } } });
         if (accepted.inputId === null || accepted.runId === null) throw new Error('state_conflict');
@@ -387,10 +390,13 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       || workspace.batchRefs.some(batch => !fields.scope.batchIds.includes(batch.id))
       || fields.scope.deviceIds !== null && (!workspace.deviceIds.length || workspace.deviceIds.some(id => !fields.scope.deviceIds!.includes(id))))
       throw new Error('state_conflict');
+    if (fields.resources && !this.resources) throw safeError('state_conflict');
+    const inputPlan = fields.resources ? this.resources!.planInput(fields.resources, request) : undefined;
     const content: InputContent = { contract: 'medclaw.session-input/v1', originalSubmitInput: request, text: request.text,
       workspaceContext: toWorkspaceContext(workspace), scope: structuredClone(fields.scope), model: structuredClone(fields.model),
-      referenceDate: fields.referenceDate, timezone: fields.timezone, deliveryAttempt: null };
-    const accepted = this.store.acceptInput({ operationRef: context.operationRef, originalSubmitInput: request, content, createdAt: now(),
+      referenceDate: fields.referenceDate, timezone: fields.timezone, deliveryAttempt: null, ...(inputPlan ? { resourceInputPlan: inputPlan } : {}) };
+    const createdAt = now(), nativeReceiptLimitBytes = receiptBudget(content, this.instanceId, createdAt);
+    const accepted = this.store.acceptInput({ operationRef: context.operationRef, originalSubmitInput: request, content, createdAt,
       execution: { mode: request.mode, targetRunId: request.targetRunId } });
     if (accepted.inputId === null) throw new Error('state_conflict');
     // The database commit proves acceptance. Delivery failure remains queryable under this Input.
@@ -399,7 +405,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       this.store.beginInputDelivery(accepted.inputId, this.instanceId, now());
       dispatched = true;
       await this.agent.inputAdapter.deliver({ inputId: accepted.inputId, sessionId: request.sessionId, targetRunId: request.targetRunId,
-        mode: request.mode, text: request.text, stopEpoch: execution.stopEpoch, workspaceContext: content.workspaceContext });
+        mode: request.mode, text: request.text, stopEpoch: execution.stopEpoch, workspaceContext: content.workspaceContext, inputPlan, nativeReceiptLimitBytes });
     } catch (native) {
       execution.acceptingInputs = false;
       const error = safeError(dispatched ? 'input_delivery_unknown' : 'storage_write_failed', native);

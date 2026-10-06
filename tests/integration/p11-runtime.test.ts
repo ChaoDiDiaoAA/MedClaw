@@ -26,6 +26,7 @@ import { SqliteToolStore } from '../../packages/storage/src/tool-store';
 import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
 import { InputContentSchema, SubmitInputSchema, type SubmitInput } from '../../packages/contracts/src/session';
 import { ResourceCatalogueSchema, resourceRefKey } from '../../packages/contracts/src/resources';
+import { parseSkillBlock } from '@earendil-works/pi-coding-agent';
 import { sqliteHistory } from '../fixtures/p9-memory';
 
 async function fixture(respond?: (index: number) => Promise<Record<string, unknown>> | Record<string, unknown>) {
@@ -77,6 +78,78 @@ test('p11 ordinary Send freezes author bytes and records the one real SDK expans
     expect(f.contexts.read({ callId: call.call_id })).toMatchObject({ kind: 'snapshot', evidence: 'saved' });
     rmSync(f.author, { recursive: true }); expect((await f.app.resources!.read({ source: 'run', runId, resourceRef: f.prompt, file: 'query.md' })).content).toContain('$ARGUMENTS');
   } finally { await f.close(); }
+}, 15000);
+
+test('p11 explicit Skill and queued commands consume only the active Run freeze after a new selection is published', async () => {
+  let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+  const f = await fixture(async index => { if (index === 1) await gate; return { role: 'assistant', content: 'ENGINEERING queue response' }; });
+  try {
+    const rootRequest = f.request('/skill:query first explicit'), root = await f.app.runs.submitAgent(rootRequest, { instanceId: 'host', operationRef: 'skill-root' });
+    if (!root.ok || !root.data.runId || !root.data.inputId) throw new Error('No explicit Skill Run');
+    for (let i = 0; i < 1000 && f.requests.length === 0; i++) await Bun.sleep(2); expect(f.requests).toHaveLength(1);
+    const runId = root.data.runId, first = f.content(root.data.inputId), block = parseSkillBlock(first.nativeInput!.text)!;
+    expect(block.name).toBe('query'); expect(block.location).toBe(join(f.root, 'runtime', String(runId), 'work', 'scratch', 'resources', 'skills/query/v1/SKILL.md'));
+    expect(block.userMessage).toBe('first explicit'); expect(first.resourceInputPlan?.kind).toBe('skill');
+    const { previous, rollbackFromVersion, ...old } = f.app.config;
+    await f.app.prepareConfig('disable-during-skill', { ...f.app.config, configVersion: '2', previous: old, resources: { bySession: { '1': { prompt: null, skills: [] } } } }); f.app.commitConfig('disable-during-skill', '2');
+    const queued = (mode: 'steer' | 'follow_up', text: string) => SubmitInputSchema.parse({ ...f.request(text), mode, targetRunId: runId, model: rootRequest.model });
+    expect(await f.app.runs.submitAgent(queued('steer', '/skill:not-selected fail'), { instanceId: 'host', operationRef: 'unselected-queue' })).toMatchObject({ ok: false, error: { code: 'resource_unavailable', reason: 'resource_missing' } });
+    const steer = await f.app.runs.submitAgent(queued('steer', 'plain steering'), { instanceId: 'host', operationRef: 'plain-steer' });
+    const queuedSkill = await f.app.runs.submitAgent(queued('steer', '/skill:query queued skill'), { instanceId: 'host', operationRef: 'skill-steer' });
+    const follow = await f.app.runs.submitAgent(queued('follow_up', '/query "explicit queued"'), { instanceId: 'host', operationRef: 'prompt-follow' });
+    if (!steer.ok || !steer.data.inputId || !queuedSkill.ok || !queuedSkill.data.inputId || !follow.ok || !follow.data.inputId) throw new Error('No queued Input');
+    expect(f.content(steer.data.inputId).model.configVersion).toBe('1'); expect(f.content(steer.data.inputId).resourceInputPlan?.kind).toBe('plain');
+    expect(f.content(follow.data.inputId).resourceInputPlan).toMatchObject({ kind: 'prompt', resourceRef: f.prompt });
+    release(); await f.settle();
+    expect(f.content(steer.data.inputId).nativeInput?.text).toBe('plain steering'); expect(f.content(follow.data.inputId).nativeInput?.text).toContain('explicit queued');
+    expect(parseSkillBlock(f.content(queuedSkill.data.inputId).nativeInput!.text)).toMatchObject({ name: 'query', location: block.location, userMessage: 'queued skill' });
+    for (const id of [root.data.inputId, steer.data.inputId, queuedSkill.data.inputId, follow.data.inputId]) expect(f.repos.readInput({ inputId: id })).toMatchObject({ status: 'consumed', runId, targetRunId: runId, processingStatus: 'completed' });
+    expect(f.requests).toHaveLength(4); expect(f.errors).toEqual([]);
+    expect(await f.app.runs.submitAgent(queued('steer', '/skill:query late'), { instanceId: 'host', operationRef: 'terminal-late' })).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(f.db.query('SELECT * FROM session_inputs').all()).toHaveLength(4);
+    expect(await f.app.runs.submitAgent(f.request('/skill:query now-disabled'), { instanceId: 'host', operationRef: 'disabled-new-root' })).toMatchObject({ ok: false, error: { code: 'resource_unavailable' } }); expect(f.requests).toHaveLength(4);
+  } finally { release(); await f.close(); }
+}, 15000);
+
+test('p11 cancelling an expanded queued Skill removes its original object while the surviving Prompt runs once', async () => {
+  let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+  const f = await fixture(async index => { if (index === 1) await gate; return { role: 'assistant', content: 'ENGINEERING' }; });
+  try {
+    const request = f.request('root'), root = await f.app.runs.submitAgent(request, { instanceId: 'host', operationRef: 'cancel-root' });
+    if (!root.ok || !root.data.runId) throw new Error('No root'); const runId = root.data.runId;
+    for (let i = 0; i < 1000 && f.requests.length === 0; i++) await Bun.sleep(2); expect(f.requests).toHaveLength(1);
+    const queued = (text: string) => SubmitInputSchema.parse({ ...f.request(text), mode: 'follow_up', targetRunId: runId });
+    const first = await f.app.runs.submitAgent(queued('/skill:query remove'), { instanceId: 'host', operationRef: 'cancel-skill' });
+    const survivor = await f.app.runs.submitAgent(queued('/query survivor'), { instanceId: 'host', operationRef: 'survivor-prompt' });
+    if (!first.ok || !first.data.inputId || !survivor.ok || !survivor.data.inputId) throw new Error('No queue');
+    const cancellation = f.app.runs.cancelInput(first.data.inputId, { instanceId: 'host', operationRef: 'remove-one' }); release();
+    expect(await cancellation).toMatchObject({ ok: true, data: { id: first.data.inputId, status: 'cancelled', nativeEntryId: null } }); await f.settle();
+    expect(f.content(first.data.inputId).nativeInput).toBeUndefined(); expect(f.content(survivor.data.inputId).nativeInput?.text).toContain('survivor');
+    expect(f.requests).toHaveLength(2); expect(f.errors).toEqual([]);
+    expect(await f.app.runs.cancelInput(first.data.inputId, { instanceId: 'host', operationRef: 'remove-again' })).toMatchObject({ ok: true, data: { status: 'cancelled' } }); expect(f.requests).toHaveLength(2);
+  } finally { release(); await f.close(); }
+}, 15000);
+
+test('p11 A and B Sessions retain different selections, native history and Run-owned queued inputs', async () => {
+  let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+  const f = await fixture(async index => { if (index === 1) await gate; return { role: 'assistant', content: 'ENGINEERING' }; });
+  try {
+    const rootRequest = f.request('A only'), root = await f.app.runs.submitAgent(rootRequest, { instanceId: 'host', operationRef: 'a-root' });
+    if (!root.ok || !root.data.runId) throw new Error('No A Run'); for (let i = 0; i < 1000 && f.requests.length === 0; i++) await Bun.sleep(2);
+    const allocated = f.agent.allocate(); f.repos.createSession({ expectedWorkspaceRevision: f.repos.readWorkspace().revision }, 'create-b', allocated.nativeSessionId, new Date().toISOString(), allocated.history); allocated.bind(2);
+    const { previous, rollbackFromVersion, ...old } = f.app.config;
+    await f.app.prepareConfig('b-selection', { ...f.app.config, configVersion: '2', previous: old, resources: { bySession: { ...f.app.config.resources!.bySession, '2': { prompt: null, skills: [] } } } }); f.app.commitConfig('b-selection', '2');
+    const forged = SubmitInputSchema.parse({ ...f.request('/skill:query forged'), sessionId: 2, clientSequence: 1, mode: 'steer', targetRunId: root.data.runId });
+    expect(await f.app.runs.submitAgent(forged, { instanceId: 'host', operationRef: 'b-borrows-a' })).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(await f.app.resources!.list({ source: 'selection', sessionId: 2 })).toMatchObject({ sessionId: 2, selection: { prompt: null, skills: [] }, evidence: [] });
+    const denied = await f.app.resources!.read({ source: 'selection', sessionId: 2, resourceRef: f.skill, file: 'SKILL.md' }).then(() => null, error => error); expect(denied).toMatchObject({ code: 'access_denied' });
+    release(); await f.settle();
+    const b = SubmitInputSchema.parse({ ...f.request('B plain'), sessionId: 2, clientSequence: 1 }), result = await f.app.runs.submitAgent(b, { instanceId: 'host', operationRef: 'b-root' });
+    if (!result.ok || !result.data.runId || !result.data.inputId) throw new Error('No B Run'); await f.settle();
+    expect(f.content(result.data.inputId).nativeInput?.text).toBe('B plain'); expect(f.repos.readRunResources(result.data.runId)).toMatchObject({ sessionId: 2, configVersion: '2', available: [] });
+    expect(JSON.stringify(f.requests[1])).not.toContain('A only'); expect(JSON.stringify(f.requests[1])).not.toContain('SKILL.md');
+    expect(f.db.query('SELECT session_id,run_id FROM session_inputs ORDER BY id').all()).toEqual([{ session_id: 1, run_id: root.data.runId }, { session_id: 2, run_id: result.data.runId }]); expect(f.errors).toEqual([]);
+  } finally { release(); await f.close(); }
 }, 15000);
 
 test('p11 disabling selected resources during a Run preserves its snapshot and applies to the next Run', async () => {
