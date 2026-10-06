@@ -105,6 +105,15 @@ export class RunControl {
     return {allowTools:preview.allowTools,feedback:preview.feedback};
   }
 
+  admitCompactionCall(): void {
+    this.checkActive();
+    if (this.modelCalls >= this.runtimeSnapshot.runBudget.maxModelCalls) {
+      this.modelAdmissionsRejected++; this.stopReason = 'agent_call_limit';
+      throw new Error('agent_call_limit');
+    }
+    this.modelCalls++; this.revision++;
+  }
+
   observeToolAttempt(id: string, name: string, raw: unknown): void {
     const prior = this.attempts.get(id);
     if (prior) {

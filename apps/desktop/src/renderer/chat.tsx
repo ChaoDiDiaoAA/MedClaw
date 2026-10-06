@@ -2,7 +2,7 @@ import { errorMessage, safeError, type Result } from "../../../../packages/contr
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { HostView, ModelChoice, ModelDirectoryView } from "../../../../packages/contracts/src/model";
 import type { ActiveRunView, RunView, RuntimeControlView } from "../../../../packages/contracts/src/run";
-import type { InputMode, SessionDetail, SessionInput } from "../../../../packages/contracts/src/session";
+import type { InputMode, SessionDetail, SessionInput,CompactionOperationView } from "../../../../packages/contracts/src/session";
 import type { SessionCheckpoint, SessionCheckpointPage, SessionCheckpointReceipt, RestoreSessionCheckpointInput, RestoreSessionInput } from '../../../../packages/contracts/src/session';
 import type { WorkspaceChange, WorkspaceView } from "../../../../packages/contracts/src/workspace";
 import { sessionDisplayTitle, type SessionDraft } from "./session-list";
@@ -193,7 +193,95 @@ export function SessionCheckpoints(props:{host:HostView;session:SessionDetail|nu
   </section>;
 }
 
-export function Chat(props: { visible: boolean; sessionId: number | null; onCreate: () => void; directory: ModelDirectoryView | null; directoryCurrent: boolean; directoryStatus?: DirectoryReadStatus; host: HostView; active: ActiveRunView | null; control: RuntimeControlView | null;
+export function SessionCompaction(props:{host:HostView;session:SessionDetail|null;model:ModelChoice|null;visible:boolean;blockedReason:string|null;control:RuntimeControlView|null;
+  onHistoryVerified:(sessionId:number,operationRef?:string)=>Promise<void>;onRestoreSession:(input:RestoreSessionInput)=>Promise<Result<SessionDetail>>}) {
+  type Attempt={operationRef:string;instanceId:string;view:CompactionOperationView|null;unknown:boolean;revision:number;readOrder:number;reading?:{instanceId:string;again:boolean}};
+  const attempts=useRef(new Map<number,Attempt>()),target=useRef(props),mounted=useRef(true);
+  target.current=props;
+  const [,render]=useState(0),[message,setMessage]=useState<{sessionId:number;text:string}|null>(null),[working,setWorking]=useState(false);
+  const sessionId=props.session?.session.id??null,attempt=sessionId?attempts.current.get(sessionId):undefined,view=attempt?.view;
+  const refresh=()=>{if(mounted.current)render(value=>value+1);};
+  useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;};},[]);
+  useEffect(()=>{
+    const original=props.session?.compactionOperation;
+    if(sessionId&&original&&!attempts.current.has(sessionId)){attempts.current.set(sessionId,{operationRef:original.operationRef,instanceId:props.host.instanceId??'',view:original,unknown:false,revision:0,readOrder:0});refresh();}
+    setWorking(false);if(props.visible&&props.host.state==='ready'&&sessionId&&attempts.current.has(sessionId))void readOriginal(sessionId,true);
+  },[sessionId,props.host.instanceId,props.host.state,props.visible,props.session?.compactionOperation?.operationRef]);
+  useEffect(()=>{
+    try{return window.medclaw.subscribe(notice=>{
+      const current=target.current,id=current.session?.session.id,original=id?attempts.current.get(id):undefined;
+      if(notice.type!=='compaction.progress'||!current.visible||notice.instanceId!==current.host.instanceId||notice.runId!==null||notice.sessionId!==id||!original||notice.operationRef!==original.operationRef||original.view?.receipt&&notice.phase!=='finished'||notice.revision<=original.revision)return;
+      original.revision=notice.revision;void readOriginal(id!,true);
+    });}catch{return;}
+  },[]);
+  useEffect(()=>{
+    if(!props.visible||props.host.state!=='ready'||!sessionId||!attempt||view?.receipt||view?.phase==='blocked')return;
+    const timer=setInterval(()=>void readOriginal(sessionId),500);return()=>clearInterval(timer);
+  },[sessionId,props.host.instanceId,props.host.state,props.visible,attempt?.operationRef,view?.phase,!!view?.receipt]);
+  async function readOriginal(id:number,followUp=false) {
+    const current=target.current,original=attempts.current.get(id),instance=current.host.instanceId;
+    if(!original||!instance||current.host.state!=='ready')return;
+    if(original.reading?.instanceId===instance){if(followUp)original.reading.again=true;return;}
+    const reading={instanceId:instance,again:false};original.reading=reading;
+    const order=++original.readOrder,owns=()=>mounted.current&&target.current.host.instanceId===instance&&target.current.session?.session.id===id&&attempts.current.get(id)===original&&original.readOrder===order;
+    try {
+      const result=await window.medclaw.request('session.compaction.read',{sessionId:id,operationRef:original.operationRef});if(!owns())return;
+      if(!result.ok){setMessage({sessionId:id,text:errorMessage(result.error)});return;}
+      if(!result.data){
+        if(instance!==original.instanceId){await current.onHistoryVerified(id,original.operationRef);if(!owns())return;attempts.current.delete(id);setMessage({sessionId:id,text:'Original compaction not recorded in this Host. Review saved history before another action.'});}
+        else {original.unknown=true;setMessage({sessionId:id,text:'Original compaction is not recorded. Keep its identity and read it again.'});}
+        refresh();return;
+      }
+      if(result.data.sessionId!==id||result.data.operationRef!==original.operationRef)return;
+      // A durable receipt outranks all progress, including late notices and stale reads.
+      if(original.view?.receipt&&!result.data.receipt)return;
+      original.view=result.data;original.unknown=false;refresh();
+      if(result.data.receipt||result.data.phase==='blocked')await current.onHistoryVerified(id,original.operationRef);
+    } catch {if(owns())setMessage({sessionId:id,text:'Compaction read unconfirmed. Read the original operation again.'});}
+    finally {if(original.reading===reading){original.reading=undefined;if(reading.again&&owns())void readOriginal(id);}}
+  }
+  async function compact() {
+    const current=target.current,id=current.session?.session.id,instance=current.host.instanceId;
+    if(!id||!instance||!current.model||current.blockedReason||working||attempts.current.get(id)?.unknown||attempts.current.get(id)&&!attempts.current.get(id)!.view?.receipt)return;
+    const previous=attempts.current.get(id),original:Attempt={operationRef:crypto.randomUUID(),instanceId:instance,view:null,unknown:true,revision:0,readOrder:0};attempts.current.set(id,original);setWorking(true);setMessage(null);refresh();
+    try {
+      const result=await window.medclaw.request('session.compact',{sessionId:id,expectedStorageVersion:current.session!.session.storageVersion,model:current.model},original.operationRef);
+      if(!mounted.current||target.current.host.instanceId!==instance||target.current.session?.session.id!==id)return;
+      if(result.ok&&result.data.operationRef===original.operationRef&&result.data.sessionId===id){original.view=result.data;original.unknown=false;}
+      else if(!result.ok){const unknown=['operation_result_unknown','resource_unavailable','stop_unconfirmed'].includes(result.error.code);original.unknown=unknown;if(!unknown){if(previous)attempts.current.set(id,previous);else attempts.current.delete(id);}setMessage({sessionId:id,text:unknown?'Compaction acceptance unconfirmed. Read the original operation.':errorMessage(result.error)});}
+      refresh();await current.onHistoryVerified(id,original.operationRef);if(!original.unknown)void readOriginal(id);
+    } catch {setMessage({sessionId:id,text:'Compaction acceptance unconfirmed. Read the original operation.'});}
+    finally {if(mounted.current&&target.current.session?.session.id===id)setWorking(false);}
+  }
+  async function cancel() {
+    if(!sessionId||!attempt||working||view?.receipt)return;const instance=props.host.instanceId;setWorking(true);
+    const owns=()=>mounted.current&&target.current.session?.session.id===sessionId&&target.current.host.instanceId===instance;
+    try {const result=await window.medclaw.request('session.compaction.cancel',{sessionId,operationRef:attempt.operationRef},crypto.randomUUID());if(!owns())return;
+      if(!result.ok)setMessage({sessionId,text:errorMessage(result.error)});else {attempt.view=result.data.operation;refresh();}await readOriginal(sessionId);
+    } catch {if(owns())setMessage({sessionId,text:'Cancellation unconfirmed. Read the original compaction.'});}
+    finally {if(owns())setWorking(false);}
+  }
+  async function restore() {
+    if(!props.session||working)return;const id=props.session.session.id,instance=props.host.instanceId;setWorking(true);
+    const owns=()=>mounted.current&&target.current.session?.session.id===id&&target.current.host.instanceId===instance;
+    try {const result=await props.onRestoreSession({sessionId:id,expectedLeafId:props.session.session.leafId});if(owns()){setMessage({sessionId:id,text:result.ok?'Session restored from saved history.':errorMessage(result.error)});await readOriginal(id);}}
+    catch {if(owns())setMessage({sessionId:id,text:'Session restore unconfirmed. Read its saved history.'});}
+    finally {if(owns())setWorking(false);}
+  }
+  const disabledReason=props.blockedReason??(attempt?.unknown?'Read the original compaction before another action.':attempt&&!view?.receipt?'The original compaction is still running.':null);
+  return <section className="native-messages" data-testid="session-compaction" aria-label="Context compaction">
+    <div className="section-heading"><h3>Context compaction</h3><button disabled={!!disabledReason||working} title={disabledReason??undefined} aria-describedby={disabledReason?'compaction-disabled':undefined} onClick={()=>void compact()}>Compact context</button></div>
+    {disabledReason&&<p id="compaction-disabled" className="tiny muted">{disabledReason}</p>}
+    {attempt&&<><p className="tiny">Original operation <code>{attempt.operationRef}</code></p><button disabled={working||props.host.state!=='ready'} onClick={()=>sessionId&&void readOriginal(sessionId,true)}>Read original compaction</button>{!view?.receipt&&<button disabled={working||props.host.state!=='ready'} onClick={()=>void cancel()}>Cancel compaction</button>}</>}
+    <div aria-live="polite" aria-atomic="true">{view&&<p>Compaction · {view.status} · {view.phase}</p>}{message?.sessionId===sessionId&&<p role="status">{message.text}</p>}</div>
+    {view&&<><dl className="facts"><dt>Native generated</dt><dd>{view.nativeGenerated===null?'Unknown':view.nativeGenerated?'Yes':'No'}</dd><dt>Native saved</dt><dd>{view.nativeSaved?'Yes':'No'}</dd><dt>Can continue</dt><dd>{view.canContinue?'Yes':'No'}</dd></dl>{view.receipt&&<p className="tiny">SDK context tokens before {view.receipt.tokensBefore??'Unknown'} · estimated after {view.receipt.estimatedTokensAfter??'Unknown'} · saved version {view.receipt.storageVersion??'None'}</p>}{view.error&&<p role="alert" className="error-text">{errorMessage(view.error)}</p>}
+      {view.calls.map(call=><p key={call.callId} className="tiny">Compaction call <code>{call.callId}</code> · {call.state} · input / output tokens {call.inputTokens??'Unknown'} / {call.outputTokens??'Unknown'} · cost {call.cost??'Unknown'}{call.unavailableReason?' · '+call.unavailableReason:''}</p>)}
+      {(view.phase==='blocked'||view.receipt&&!view.nativeSaved)&&!props.control?.acceptingNewRuns&&view.error?.code!=='stop_unconfirmed'&&<button disabled={working||props.host.state!=='ready'} onClick={()=>void restore()}>Restore compaction session</button>}
+    </>}
+  </section>;
+}
+
+export function Chat(props: { compactionProgress?:{sessionId:number;runId:number|null;phase:string}|null;visible: boolean; sessionId: number | null; onCreate: () => void; directory: ModelDirectoryView | null; directoryCurrent: boolean; directoryStatus?: DirectoryReadStatus; host: HostView; active: ActiveRunView | null; control: RuntimeControlView | null;
   run: RunView | null; preview: { text: string; truncated: boolean } | null; session: SessionDetail | null; draft: SessionDraft | null;
   events: RunEventProjectionState | null; onFinalSource: (source: 'native' | 'saved' | 'unavailable') => void;
   selecting: boolean; sending: boolean; runningTitle: string | null; onDraft: (patch: Partial<SessionDraft>) => void; onSend: () => void; onResend: () => void;
@@ -353,6 +441,8 @@ export function Chat(props: { visible: boolean; sessionId: number | null; onCrea
             {showRunBody && run.output.nextOffset !== null && !props.preview && <p className="muted">Showing {run.output.text.length} / {run.output.totalChars} characters. Read the full output in Run details.</p>}
             {run.error && <p role="alert" className="error-text">{errorMessage(run.error)}</p>}</article></>}
         <SessionCheckpoints host={props.host} session={props.session} workspace={props.workspace} visible={props.visible} blocked={props.selecting||props.sending||!props.workspaceConfirmed||!!props.draft?.pending||props.control?.acceptingNewRuns!==true||props.host.state!=='ready'} onResumeCheckpoint={props.onResumeCheckpoint} onRestoreSession={props.onRestoreSession} onHistoryVerified={props.onHistoryVerified}/>
+        <SessionCompaction host={props.host} session={props.session} model={choice??null} visible={props.visible} control={props.control} blockedReason={props.selecting||props.sending||!props.workspaceConfirmed||props.draft?.pending?'Verify the current session and original input first.':!props.session?'Create or select a session.':props.session.runtime.availability==='blocked'?'Restore the session before compacting.':sendReason} onHistoryVerified={props.onHistoryVerified} onRestoreSession={props.onRestoreSession}/>
+        {props.compactionProgress?.sessionId===props.sessionId&&props.compactionProgress.runId===props.active?.runId&&<p role="status" aria-live="polite">Automatic context compaction · {props.compactionProgress.phase}</p>}
       </div>
     </div>
     {contentUpdated === readingKey && !following && <p className="tiny evidence-gap reading-update" data-testid="reading-content-updated">Content updated. Kept the nearest available message.</p>}

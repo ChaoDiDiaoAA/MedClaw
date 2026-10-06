@@ -160,6 +160,11 @@ function projectEntry(entry: SessionEntry, entryRuns: ReadonlyMap<string, number
     }
     return unsupported();
   }
+  if(entry.type==='compaction') {
+    if(typeof entry.summary!=='string')return unsupported();
+    const text='History compacted\n'+entry.summary,preview=safePreview(text,MAX_MESSAGE_TEXT_CHARS);
+    return {...base,displayRole:'history_marker',text:preview.text,textInfo:{totalChars:text.length,truncated:preview.truncated,redacted:false}};
+  }
   if (!Object.hasOwn(markers, entry.type)) return unsupported();
   const text = markers[entry.type as keyof typeof markers];
   return { ...base, displayRole: "history_marker", text, textInfo: { totalChars: text.length, truncated: false, redacted: true } };

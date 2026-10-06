@@ -29,7 +29,10 @@ export const ContextSnapshotSchema = ContextSnapshotBodySchema.safeExtend({ id: 
 export type ContextSnapshot = z.infer<typeof ContextSnapshotSchema>;
 export const ContextDeliveryObservationSchema = z.strictObject({ contract: z.literal('medclaw.context-observation/v1'), api: z.enum(CONTEXT_HTTP_APIS), transport: z.enum(['sse','aws-event-stream']), observedAt: TimestampSchema, httpStatus: z.number().int().min(200).max(299), projectionHash: ContextHashSchema, feedbackHash: ContextHashSchema, verifiedNativeRefs: z.array(z.strictObject({ kind: NativeContextRefSchema.shape.kind, id: PositiveIdSchema, contentHash: ContextHashSchema })).max(1000) }).refine(observation => observation.transport === (observation.api === 'bedrock-converse-stream' ? 'aws-event-stream' : 'sse'), 'Transport must match the verified API');
 export type ContextDeliveryObservation = z.infer<typeof ContextDeliveryObservationSchema>;
-export const ModelCallContextSchema = z.strictObject({ contract: z.literal('medclaw.context-call/v1'), snapshotId: PositiveIdSchema, inputId: PositiveIdSchema, observation: ContextDeliveryObservationSchema.nullable(), responseStatus: z.number().int().min(100).max(599).nullable(), payloadVerified: z.boolean().nullable() }).refine(context => context.observation === null || context.payloadVerified === true && context.responseStatus === context.observation.httpStatus, 'Observation requires confirmed payload and response');
+export const NativeHistoryContextSchema = z.strictObject({ contract: z.literal('medclaw.native-history-context/v1'), leafId: OpaqueIdSchema.nullable(), storageVersion: z.number().int().nonnegative().safe(),
+  compactionEntryIds: z.array(OpaqueIdSchema).refine(ids => new Set(ids).size === ids.length, 'Duplicate native compaction entries') });
+export type NativeHistoryContext = z.infer<typeof NativeHistoryContextSchema>;
+export const ModelCallContextSchema = z.strictObject({ contract: z.literal('medclaw.context-call/v1'), snapshotId: PositiveIdSchema, inputId: PositiveIdSchema, observation: ContextDeliveryObservationSchema.nullable(), responseStatus: z.number().int().min(100).max(599).nullable(), payloadVerified: z.boolean().nullable(), nativeHistory: NativeHistoryContextSchema.optional() }).refine(context => context.observation === null || context.payloadVerified === true && context.responseStatus === context.observation.httpStatus, 'Observation requires confirmed payload and response');
 export type ModelCallContext = z.infer<typeof ModelCallContextSchema>;
 export const ContextDeliverySchema = z.strictObject({ modelCallId: PositiveIdSchema, callId: OpaqueIdSchema, snapshotId: PositiveIdSchema, runId: PositiveIdSchema, sessionId: PositiveIdSchema, deliveredAt: TimestampSchema, observation: ContextDeliveryObservationSchema }).refine(delivery => delivery.deliveredAt === delivery.observation.observedAt, 'Delivery timestamp mismatch');
 export type ContextDelivery = z.infer<typeof ContextDeliverySchema>;
@@ -37,7 +40,8 @@ export const ReadContextInputSchema = z.union([z.strictObject({ snapshotId: Posi
 export type ReadContextInput = z.infer<typeof ReadContextInputSchema>;
 export const ContextReadResultSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('snapshot'), snapshot: ContextSnapshotSchema, deliveries: z.array(ContextDeliverySchema).max(1000), selectedCallId: OpaqueIdSchema.nullable(), evidence: z.enum(['saved', 'unconfirmed', 'persistence_gap']) }).refine(result => result.deliveries.every(delivery => delivery.snapshotId === result.snapshot.id && delivery.runId === result.snapshot.runId && delivery.sessionId === result.snapshot.sessionId), 'Delivery owner mismatch'),
-  z.strictObject({ kind: z.literal('not_recorded'), runId: PositiveIdSchema, sessionId: PositiveIdSchema.nullable(), callId: OpaqueIdSchema, reason: z.enum(['pre_p8', 'not_applicable']) }),
+  z.strictObject({ kind: z.literal('not_recorded'), runId: PositiveIdSchema.nullable(), sessionId: PositiveIdSchema.nullable(), callId: OpaqueIdSchema, reason: z.enum(['pre_p8', 'not_applicable']) })
+    .refine(value => value.runId !== null || value.reason === 'not_applicable' && value.sessionId !== null, 'A missing Run is only valid for an inapplicable session call'),
 ]).refine(result => new TextEncoder().encode(JSON.stringify(result)).byteLength <= CONTEXT_READ_BYTES, 'Context result exceeds byte limit');
 export type ContextReadResult = z.infer<typeof ContextReadResultSchema>;
 export const PrepareContextInputSchema = z.strictObject({ runId: PositiveIdSchema, sessionId: PositiveIdSchema, inputId: PositiveIdSchema, nativeEntryId: OpaqueIdSchema, workspaceContext: WorkspaceContextSchema, scope: RunScopeSchema, runtimeFeedback: z.string(), nativeRefs: z.array(NativeContextRefSchema).max(1000), createdAt: TimestampSchema });
@@ -45,7 +49,7 @@ export type PrepareContextInput = z.infer<typeof PrepareContextInputSchema>;
 export type SaveContextSelection = { input: PrepareContextInput; body: ContextSnapshotBody; sourceFingerprint: string };
 export const RegisterContextDeliveryInputSchema = z.strictObject({ runId: PositiveIdSchema, sessionId: PositiveIdSchema, inputId: PositiveIdSchema, callId: OpaqueIdSchema, snapshotId: PositiveIdSchema, observation: ContextDeliveryObservationSchema });
 export type RegisterContextDeliveryInput = z.infer<typeof RegisterContextDeliveryInputSchema>;
-export type StartCallContext = { snapshotId: number; inputId: number };
+export type StartCallContext = { snapshotId: number; inputId: number; nativeHistory?: NativeHistoryContext };
 export type ModelAdmissionPreview = { revision: number; preparedAt: number; allowTools: boolean; feedback: string };
 export interface ContextStore {
   select(input: PrepareContextInput): SaveContextSelection;

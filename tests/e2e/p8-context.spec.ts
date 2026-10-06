@@ -33,7 +33,7 @@ for(const [name,reply,text] of [
   ['empty',{ok:true,data:{kind:'snapshot',snapshot:uiSnapshot,deliveries:[],selectedCallId:'call-a',evidence:'unconfirmed'}},'No material references were selected.'],
   ['gap',{ok:true,data:{kind:'snapshot',snapshot:uiSnapshot,deliveries:[],selectedCallId:'call-a',evidence:'persistence_gap'}},'Delivery evidence has not been confirmed saved. Retry saving the original Run.'],
   ['legacy',{ok:true,data:{kind:'not_recorded',runId:1,sessionId:1,callId:'call-a',reason:'pre_p8'}},'Context was not recorded for this pre-P8 call.'],
-  ['provider',{ok:true,data:{kind:'not_recorded',runId:1,sessionId:1,callId:'call-a',reason:'not_applicable'}},'Context snapshots do not apply to this Provider or diagnostic call.'],
+  ['provider',{ok:true,data:{kind:'not_recorded',runId:1,sessionId:1,callId:'call-a',reason:'not_applicable'}},'Context snapshots do not apply to this Provider, diagnostic or compaction call.'],
   ['wrong owner',{ok:true,data:{kind:'snapshot',snapshot:{...uiSnapshot,runId:2},deliveries:[],selectedCallId:'call-a',evidence:'unconfirmed'}},'Context ownership could not be verified. Read the original call again.'],
 ] as const) test(`p8 ContextDetails ${name} is explicit and read only`,async({page})=>{
   await page.goto(rendererUrl);await page.getByRole('button',{name:'View context for call call-a'}).click();

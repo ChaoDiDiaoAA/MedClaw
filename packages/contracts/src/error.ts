@@ -4,7 +4,7 @@ export const PositiveIdSchema = z.number().int().positive().max(Number.MAX_SAFE_
 export const OpaqueIdSchema = z.string().min(1).max(256).regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/);
 export const TimestampSchema = z.string().datetime({ offset: true }).max(64);
 export const ErrorCategorySchema = z.enum(["provider", "runtime", "tool", "session", "storage", "input", "extension", "internal"]);
-export const ErrorReasonSchema = z.enum(["runtime_busy", "workspace_revision_mismatch", "session_not_found", "session_deleted", "session_metadata_revision_mismatch", "message_cursor_invalid", "input_cursor_invalid", "host_interrupted", "checkpoint_invalid", "history_version_mismatch", "session_restore_failed"]);
+export const ErrorReasonSchema = z.enum(["runtime_busy", "workspace_revision_mismatch", "session_not_found", "session_deleted", "session_metadata_revision_mismatch", "message_cursor_invalid", "input_cursor_invalid", "host_interrupted", "checkpoint_invalid", "history_version_mismatch", "session_restore_failed", "compaction_model_failed", "compaction_capacity", "compaction_native_result_invalid"]);
 
 export const EventRangeErrorSchema = z.strictObject({ runId: PositiveIdSchema, firstSequence: PositiveIdSchema.nullable(), lastSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), resumeAfterSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable() }).refine(value => (value.firstSequence === null ? value.lastSequence === 0 : value.firstSequence <= value.lastSequence) && (value.resumeAfterSequence === null || value.resumeAfterSequence <= value.lastSequence));
 export type EventRangeError = z.infer<typeof EventRangeErrorSchema>;
@@ -30,6 +30,7 @@ export const resultSchema = <S extends z.ZodType>(data: S) => z.discriminatedUni
 ]);
 
 const errorDefinitions = {
+  compaction_failed: ['runtime', 'Context compaction failed. Read its original generation, saving and continuation facts.', false],
   answer_evidence_invalid: ['runtime', 'Final answer references cannot be verified. Read the original saved query facts.', false],
   context_delivery_unsupported: ['provider', 'Context delivery cannot be verified for this model API.', false],
   context_payload_mismatch: ['runtime', 'The final model payload does not contain the saved context.', false],

@@ -28,11 +28,14 @@ import { EventAdapter } from './event-adapter';
 import { CONTEXT_CONTRACT, CONTEXT_HTTP_APIS, type ContextSnapshot, type ModelCallContext, type RegisterContextDeliveryInput, type NativeContextRef } from '../../contracts/src/context';
 import type { ContextService } from '../../core/src/context/context-service';
 import { AppErrorSchema } from '../../contracts/src/error';
+import { CompactionAdapter } from './compaction-adapter';
+import type { CompactionExecutionInput, CompactionCallbacks, NativeCompactionObservation } from '../../contracts/src/session';
 
 type ExecutionInput = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[0];
 type Callbacks = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[1];
 type RunTools = { registry: ToolRegistry; executor: ToolExecutor };
-type Binding = { manager: SessionManager; nativeSessionId: string; memory?:PiMemoryAdapter; assembling?:boolean; entryRuns: Map<string, number>; session?: AgentSession; toolSignature?: string; lastRunId?: number; bindTools?: () => () => void; available: boolean; execution?: { input: ExecutionInput; callbacks: Callbacks; toolCalls: Set<string>;
+type Binding = { manager: SessionManager; nativeSessionId: string; memory?:PiMemoryAdapter; assembling?:boolean; entryRuns: Map<string, number>; session?: AgentSession; toolSignature?: string; lastRunId?: number; bindTools?: () => () => void; available: boolean;
+  manual?:CompactionExecutionInput<ResolvedModel>;compaction?:CompactionAdapter;originalStream?:AgentSession['agent']['streamFunction'];execution?: { input: ExecutionInput; callbacks: Callbacks; toolCalls: Set<string>;
   observers: Promise<void>[]; facts: (FinalCallFact | null)[]; lastOutcome: ProviderOutcome | null; unsupported: boolean;
   registrationFailed: boolean; currentModelCallId: string | null; abort: () => void; control: RunControl; tools?: RunTools; toolContexts: Map<string, ToolExecutionContext>; toolOrigins: Map<string, { callId: string; snapshot: ContextSnapshot }> } };
 const unobservedFailure = (code: string): ProviderOutcome => ({ sdkStopReason: "pending", text: "", responseModel: null, callState: "failed",
@@ -75,7 +78,8 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     if (contexts) this.contextContract = CONTEXT_CONTRACT;
     if (tools) this.toolNames = Object.freeze([...tools.registry.definitions.map(tool => tool.name), "read", "grep", "find", "ls", "edit", "write", "bash", "powershell"]);
   }
-  describe(resolved: ResolvedModel) { return { requestedThinkingLevel: "off" as const, effectiveThinkingLevel: clampThinkingLevel(resolved.model, "off") }; }
+  describe(resolved: ResolvedModel) { return { requestedThinkingLevel: "off" as const, effectiveThinkingLevel: clampThinkingLevel(resolved.model, "off"),
+    compaction:{contract:'medclaw.compaction/v1' as const,...SettingsManager.inMemory({compaction:{enabled:true}}).getCompactionSettings(resolved.model)} }; }
   toolPersistencePending(runId: number) { return this.tools?.recorder.persistencePending(runId) ?? false; }
   retryToolPersistence(runId: number) { this.tools?.recorder.retryPersistence(runId); }
   releaseToolFacts(runId: number) {
@@ -128,6 +132,14 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     await this.rebuild(sessionId);
   }
   async restore(sessionId:number):Promise<void> {await this.rebuild(sessionId);}
+  async discardCompactionForRestore(proof:Omit<import('../../contracts/src/session').RestoreDiscardProof,'persistentSnapshot'>):Promise<void> {
+    const binding=this.sessions.get(proof.sessionId);
+    if(!binding?.memory||binding.execution||binding.manual||binding.memory.compactionOperationRef!==proof.operationRef||binding.session&&(!binding.session.isIdle||binding.session.agent.hasQueuedMessages()))throw safeError('stop_unconfirmed');
+    await binding.compaction?.settle();
+    const loaded=await this.history.store.load(proof.sessionId);if(!loaded.ok)throw loaded.error;
+    binding.memory.discardUncommittedForRestore({...proof,persistentSnapshot:loaded.data});
+    binding.session?.dispose();this.sessions.delete(proof.sessionId);this.blocked.delete(proof.sessionId);
+  }
   private async rebuild(sessionId:number):Promise<void> {
     if(this.loading.has(sessionId))return this.loading.get(sessionId)!;
     const task=this.rebuildNow(sessionId);this.loading.set(sessionId,task);
@@ -201,6 +213,11 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
   }
 
   private async prepare(binding:Binding,resolved:ResolvedModel) {await this.assemble(binding,resolved.model,true);}
+  private checkPreparation(binding:Binding):void {
+    if(binding.execution)binding.execution.control.checkActive();
+    else if(binding.manual){binding.manual.signal.throwIfAborted();if(performance.now()>=binding.manual.deadlineAt)throw safeError('run_timeout');}
+    else throw safeError('state_conflict');
+  }
   private async assemble(binding: Binding, model:ResolvedModel['model']|undefined, applyModel:boolean) {
     const workdir = () => {
       if (!binding.execution) throw new Error("state_conflict");
@@ -215,12 +232,14 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     const registry = { get: (name: string) => binding.execution!.tools!.registry.get(name) };
     const executor = { execute: (...args: Parameters<ToolExecutor['execute']>) => binding.execution!.tools!.executor.execute(...args) };
     const definitions = this.tools ? [...createPiToolDefinitions(binding.execution?.tools?.registry??this.tools.registry, executor, getContext, getControl), ...native!.definitions] : [];
-    const signature = JSON.stringify({ tools: definitions.map(({ name, description, parameters, executionMode }) => ({ name, description, parameters, executionMode })) });
+    const configured=binding.manual?.frozen.settings??binding.execution?.input.agentOptions.compaction;
+    const compaction=configured?{enabled:configured.enabled,reserveTokens:configured.reserveTokens,keepRecentTokens:configured.keepRecentTokens}:{enabled:false};
+    const signature = JSON.stringify({ compaction, tools: definitions.map(({ name, description, parameters, executionMode }) => ({ name, description, parameters, executionMode })) });
     if (!binding.session || binding.toolSignature !== signature) {
       if (binding.session && (!binding.session.isIdle || binding.lastRunId !== undefined && this.tools?.recorder.persistencePending(binding.lastRunId))) throw new Error('state_conflict');
       let candidate: AgentSession | undefined;
       try {
-        const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off",
+        const settingsManager = SettingsManager.inMemory({ compaction, retry: { enabled: false }, cacheWarming: "off",
           defaultTools: [], packages: [], extensions: [], skills: [], prompts: [], themes: [], enableAnalytics: false, enableInstallTelemetry: false });
         const resourceLoader = new DefaultResourceLoader({ cwd: this.dataRoot, agentDir: join(this.dataRoot, "runtime", "pi"), settingsManager,
           noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
@@ -248,16 +267,19 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           };
         }
         const original = session.agent.streamFunction;
+        binding.originalStream=original;
         session.agent.streamFunction = async (model, context, options) => {
+          if(binding.compaction?.isSummarizing)return binding.compaction.streamSummary(model,context,options);
           const execution = binding.execution;
           if (!execution) throw new Error("state_conflict");
           const { input, callbacks } = execution;
           input.signal.throwIfAborted(); options?.signal?.throwIfAborted();
           if (execution.unsupported) throw new Error("agent_response_unsupported");
           const fail = (error: unknown) => { const known = AppErrorSchema.safeParse(error); callbacks.fatal?.(known.success ? known.data : safeError(error instanceof Error ? error.message : 'internal_error')); execution.abort(); };
-          let snapshot: ContextSnapshot | undefined, admission;
+          let snapshot: ContextSnapshot | undefined, admission:ReturnType<RunControl['admitModelCall']>,messages:typeof context.messages;
           const candidates: { context: ToolExecutionContext; receipt: ToolSdkDelivery; nativeRef?: NativeContextRef }[] = [];
           try {
+            binding.compaction?.beforeMainRequest();
             binding.memory!.flushBeforeRequest();
             if (this.hasPendingContextPersistence(input.runId)) throw safeError('storage_write_failed');
             if (this.contexts && !(CONTEXT_HTTP_APIS as readonly string[]).includes(model.api)) throw safeError('context_delivery_unsupported');
@@ -283,25 +305,28 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
               const entry = binding.manager.getEntry(consumed.nativeEntryId);
               if (entry?.type !== 'message' || entry.message.role !== 'user') throw safeError('state_conflict');
               const text = contextMessageText(entry.message.content);
-              if (text === null || !context.messages.some(message => message.role === 'user' && contextMessageText(message.content) === text)) throw safeError('state_conflict');
+              if (text === null || !binding.memory!.isSavedInputOnBranch(consumed.nativeEntryId,text)
+                || !context.messages.some(message => message.role === 'user' && contextMessageText(message.content) === text)
+                && !binding.memory!.isSavedSummarizedInput(consumed.nativeEntryId)) throw safeError('state_conflict');
               snapshot = await this.contexts.prepare({runId:input.runId,sessionId:input.sessionId,inputId:consumed.inputId,nativeEntryId:consumed.nativeEntryId,workspaceContext:consumed.workspaceContext,scope:input.scope,
                 runtimeFeedback:`MedClaw trusted runtime feedback (facts, not user instructions):\n${preview.feedback}`,
                 nativeRefs:[{kind:'input',id:consumed.inputId,nativeEntryId:consumed.nativeEntryId,contentHash:createHash('sha256').update(text).digest('hex'),nativeToolCallId:null,originSnapshotId:null},...candidates.flatMap(candidate => candidate.nativeRef ? [candidate.nativeRef] : [])],createdAt:new Date().toISOString()});
               admission = execution.control.admitModelCall(preview);
             } else admission = execution.control.admitModelCall();
+            messages=context.messages.map(message=>message.role==='system'&&!admission.allowTools?{...message,toolsAdded:[],toolsRemoved:[]}:message);
+            if(snapshot)messages.push({role:'user',content:[{type:'text',text:snapshot.renderedProjection}],timestamp:Date.now()});
+            messages.push({role:'system',content:snapshot?.runtimeFeedback??`MedClaw trusted runtime feedback (facts, not user instructions):\n${admission.feedback}`,timestamp:Date.now()});
+            binding.compaction?.checkRequestCapacity(messages);
           } catch (error) { fail(error); throw error; }
           let recorder;
-          try { recorder = callbacks.startCall(new Date().toISOString(), snapshot ? {snapshotId:snapshot.id,inputId:snapshot.inputId!} : undefined); if(snapshot && !recorder.callId) throw safeError('state_conflict'); }
+          try { recorder = callbacks.startCall(new Date().toISOString(), snapshot ? {snapshotId:snapshot.id,inputId:snapshot.inputId!,nativeHistory:binding.memory!.readSavedContext()} : undefined); if(snapshot && !recorder.callId) throw safeError('state_conflict'); }
           catch (error) { execution.registrationFailed = true; fail(error); throw error; }
           execution.currentModelCallId = recorder.callId ?? null;
-          const callContext: ModelCallContext | undefined = snapshot ? {contract:'medclaw.context-call/v1',snapshotId:snapshot.id,inputId:snapshot.inputId!,observation:null,responseStatus:null,payloadVerified:null} : undefined;
+          const callContext: ModelCallContext | undefined = snapshot ? {contract:'medclaw.context-call/v1',snapshotId:snapshot.id,inputId:snapshot.inputId!,observation:null,responseStatus:null,payloadVerified:null,nativeHistory:binding.memory!.readSavedContext()} : undefined;
           const finish = (outcome: ProviderOutcome) => ({...recorder.finish(outcome,new Date().toISOString()),...(callContext ? {context:structuredClone(callContext)} : {})});
           const index = execution.facts.push(null) - 1;
           let stream;
           try {
-            const messages = context.messages.map(message => message.role === 'system' && !admission.allowTools ? { ...message, toolsAdded: [], toolsRemoved: [] } : message);
-            if (snapshot) messages.push({role:'user',content:[{type:'text',text:snapshot.renderedProjection}],timestamp:Date.now()});
-            messages.push({ role: 'system', content: snapshot?.runtimeFeedback ?? `MedClaw trusted runtime feedback (facts, not user instructions):\n${admission.feedback}`, timestamp: Date.now() });
             let matched: typeof candidates = [], confirmed = false;
             stream = await original(model, { ...context, messages }, { ...options, maxTokens: input.resolved.selection.maxOutputTokens,
               ...(snapshot && model.api === 'openai-codex-responses' ? {transport:'sse' as const} : {}),
@@ -374,7 +399,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           return stream;
         };
         if(applyModel) {
-          await session.setModel(model!, { persist: false });binding.execution!.control.checkActive();session.setThinkingLevel("off", { persist: false });
+          this.checkPreparation(binding);await session.setModel(model!, { persist: false });this.checkPreparation(binding);session.setThinkingLevel("off", { persist: false });
         }
         binding.session?.dispose();
         binding.session = session;
@@ -383,18 +408,68 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         candidate = undefined;
       } catch (error) { candidate?.dispose(); throw error; }
     } else if(applyModel) {
-      binding.execution!.control.checkActive();
+      this.checkPreparation(binding);
       await binding.session.setModel(model!, { persist: false });
-      binding.execution!.control.checkActive();
+      this.checkPreparation(binding);
       binding.session.setThinkingLevel("off", { persist: false });
     }
+  }
+
+  async compact(input:CompactionExecutionInput<ResolvedModel>,callbacks:CompactionCallbacks):Promise<NativeCompactionObservation> {
+    const binding=this.sessions.get(input.sessionId);
+    if(!binding?.available||binding.execution||binding.manual)throw safeError('state_conflict');
+    if(binding.session&&(!binding.session.isIdle||binding.session.agent.hasQueuedMessages()))throw safeError('stop_unconfirmed');
+    if(binding.memory!.readSavedContext().storageVersion!==input.frozen.baseStorageVersion||binding.manager.getLeafId()!==input.frozen.baseLeafId)throw safeError('state_conflict');
+    const empty:NativeCompactionObservation={nativeGenerated:false,nativeIdle:true,change:null,result:{nativeEntryId:null,firstKeptEntryId:null,tokensBefore:null,estimatedTokensAfter:null,callIds:[],noOpReason:null,error:null}};
+    if(input.resolved.model.contextWindow<=input.frozen.settings.reserveTokens)return {...empty,result:{...empty.result,error:safeError('compaction_failed',undefined,{reason:'compaction_capacity'})}};
+    const branch=binding.manager.getBranch();
+    if(branch.at(-1)?.type==='compaction'||!branch.some(entry=>entry.type==='message'))return {...empty,result:{...empty.result,noOpReason:branch.at(-1)?.type==='compaction'?'already_compacted':'nothing_to_compact'}};
+    binding.manual=input;binding.memory!.beginCompaction(input.operationRef);
+    const abort=()=>binding.session?.abortCompaction();input.signal.addEventListener('abort',abort,{once:true});
+    let stop:(()=>void)|undefined,entered=false;
+    try {
+      await this.prepare(binding,input.resolved);this.checkPreparation(binding);
+      const adapter=new CompactionAdapter(binding.session!,binding.manager,binding.memory!,{kind:'manual',input,callbacks},binding.originalStream!);
+      binding.compaction=adapter;stop=binding.session!.subscribe(event=>adapter.onNativeEvent(event));
+      entered=true;const observed=await adapter.runManual();
+      if(observed.nativeGenerated&&observed.result.estimatedTokensAfter!=null&&observed.result.estimatedTokensAfter>=input.resolved.model.contextWindow-input.frozen.settings.reserveTokens)
+        observed.result.error=safeError('compaction_failed',undefined,{reason:'compaction_capacity'});
+      return observed;
+    } catch(error) {
+      if(!entered&&(!binding.session||binding.session.isIdle&&!binding.session.agent.hasQueuedMessages()))return {...empty,result:{...empty.result,error:input.signal.aborted?null:AppErrorSchema.safeParse(error).success?error as AppError:safeError('compaction_failed',undefined,{reason:'compaction_native_result_invalid'})}};
+      throw error;
+    } finally {await binding.session?.waitForIdle();stop?.();input.signal.removeEventListener('abort',abort);binding.manual=undefined;}
+  }
+  abortCompaction(sessionId:number,operationRef:string):void {
+    const binding=this.sessions.get(sessionId);
+    if(!binding)throw safeError('state_conflict');
+    if(!binding.manual&&(!binding.session||binding.session.isIdle))return;
+    if(binding.manual?.operationRef!==operationRef&&binding.compaction?.operationRef!==operationRef)throw safeError('state_conflict');
+    binding.session?.abortCompaction();
+  }
+  async acknowledgeCompactionSaved(sessionId:number,operationRef:string,change:NativeHistoryCommit|null,storageVersion:number):Promise<void> {
+    const binding=this.sessions.get(sessionId);if(!binding||binding.manual||binding.execution||binding.session&&(!binding.session.isIdle||binding.session.agent.hasQueuedMessages()))throw safeError('stop_unconfirmed');
+    if(binding.memory!.compactionOperationRef!==operationRef){if(!binding.memory!.compactionOperationRef&&!change&&binding.memory!.readSavedContext().storageVersion===storageVersion)return;throw safeError('state_conflict');}
+    const original=binding.memory!.readCompactionCommit(operationRef);
+    if(!change&&binding.compaction?.hasManualNoOp) {
+      if(storageVersion!==binding.memory!.readSavedContext().storageVersion||original.newEntries.some(entry=>entry.type!=='model_change'&&entry.type!=='thinking_level_change'))throw safeError('storage_write_failed');
+      await binding.compaction.settle();
+      const loaded=await this.history.store.load(sessionId);if(!loaded.ok)throw loaded.error;
+      const manager=restoreNativeManager(loaded.data,this.dataRoot),candidate:Binding={manager,nativeSessionId:loaded.data.nativeSessionId,entryRuns:new Map(),available:true};
+      this.attachMemory(sessionId,candidate,loaded.data);
+      // Core already confirmed the original receipt; discard only idle no-op setup, keeping SQLite unchanged.
+      binding.memory!.discardUncommittedForRestore({sessionId,operationRef,nativeIdle:true,nativeQueuesEmpty:true,observersSettled:true,requiredCallFactsSaved:true,persistentSnapshot:loaded.data});
+      binding.session?.dispose();this.sessions.set(sessionId,candidate);this.blocked.delete(sessionId);return;
+    }
+    if(change&&nativeHistoryJSON(change)!==nativeHistoryJSON(original)||!change&&(original.newEntries.length||original.activeLeafId!==binding.memory!.readSavedContext().leafId))throw safeError('storage_write_failed');
+    binding.memory!.acknowledgeCompaction(original,storageVersion);binding.compaction=undefined;
   }
 
   async execute(input: ExecutionInput, callbacks: Callbacks): Promise<AgentExecutionObservation> {
     const binding = this.sessions.get(input.sessionId);
     if (!binding || !binding.available) throw new Error("session_history_invalid");
-    if (binding.execution) throw new Error("state_conflict");
-    let abortTask: Promise<void> | null = null, unsubscribe: (() => void) | undefined, unsubscribeTools: (() => void) | undefined, unsubscribeMessages: (() => void) | undefined, terminalEmitted = false;
+    if (binding.execution||binding.manual||binding.compaction) throw new Error("state_conflict");
+    let abortTask: Promise<void> | null = null, unsubscribe: (() => void) | undefined, unsubscribeTools: (() => void) | undefined, unsubscribeMessages: (() => void) | undefined, unsubscribeCompaction:(()=>void)|undefined,activeCompaction:CompactionAdapter|undefined, terminalEmitted = false;
     const abort = () => { this.inputs.get(input.runId)?.stop(); if (binding.session && !abortTask) abortTask = binding.session.abort(); };
     const control = new RunControl({ runId: input.runId, toolConfiguration: input.toolConfiguration, runtimeConfiguration: input.runtimeConfiguration, policy: input.agentPolicy,
       scope: input.scope ?? { batchIds: [], deviceIds: null, allowedToolNames: [], allowedResourceRefs: [], artifactIds: [], readOnly: true },
@@ -417,6 +492,11 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
       await this.prepare(binding, input.resolved); input.signal.throwIfAborted();
       if (performance.now() >= input.deadlineAt) throw new Error("run_timeout");
       const session = binding.session!;
+      if(callbacks.compaction) {
+        binding.compaction=new CompactionAdapter(session,binding.manager,binding.memory!,{kind:'auto',input,callbacks:callbacks.compaction,control,facts:execution.facts},binding.originalStream!);
+        activeCompaction=binding.compaction;
+        unsubscribeCompaction=session.subscribe(event=>binding.compaction!.onNativeEvent(event));
+      }
       const originalRunId = input.runId, manager = binding.manager;
       unsubscribeMessages = session.agent.subscribe(event => {
         if (event.type !== "message_end" || event.message.role !== "user" && event.message.role !== "assistant") return;
@@ -460,7 +540,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
       abort();
     } finally {
       try {
-        await binding.session?.waitForIdle(); await abortTask; await Promise.all(execution.observers);
+        await binding.session?.waitForIdle(); await abortTask; await Promise.all(execution.observers);await binding.compaction?.settle();
         if (binding.session && !binding.session.isIdle) throw new Error("stop_unconfirmed");
         if (this.inputs.has(input.runId)) inputSettlement = await this.inputs.get(input.runId)!.close(input.runId, input.signal.aborted ? 'cancelled' : execution.lastOutcome?.error ? 'failed' : 'completed');
         else if (input.inputId != null) {
@@ -474,8 +554,8 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           this.inputStartFailures.set(input.runId, failed); inputSettlement = { ...proof, pendingPersistence: failed.pending };
         }
         terminal();
-      } finally { unsubscribe?.(); unsubscribeTools?.(); unsubscribeMessages?.(); input.signal.removeEventListener("abort", abort); binding.lastRunId = input.runId; binding.execution = undefined; }
+      } finally { unsubscribe?.(); unsubscribeTools?.(); unsubscribeMessages?.();unsubscribeCompaction?.(); input.signal.removeEventListener("abort", abort); binding.lastRunId = input.runId; binding.execution = undefined;binding.compaction=undefined; }
     }
-    return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []), budgetSummary: control.summary(), history:binding.memory!.freezeFinal(input.runId), ...(inputSettlement ? { inputSettlement } : {}) };
+    return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []), budgetSummary: control.summary(), history:binding.memory!.freezeFinal(input.runId),...(activeCompaction?{compactions:activeCompaction.readSaveFacts()}:{}), ...(inputSettlement ? { inputSettlement } : {}) };
   }
 }

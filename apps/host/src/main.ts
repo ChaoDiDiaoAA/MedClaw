@@ -31,7 +31,8 @@ import { createBusinessTools } from '../../../packages/core/src/tools/tools.ts';
 import { ToolRegistry } from '../../../packages/core/src/tools/registry.ts';
 import { ToolRecorder } from '../../../packages/core/src/tools/recorder.ts';
 import { ToolExecutor } from '../../../packages/core/src/tools/executor.ts';
-import { RunScopeSchema, canonicalRequest } from '../../../packages/contracts/src/run.ts';
+import { RunScopeSchema, canonicalRequest, type ModelCallStarter } from '../../../packages/contracts/src/run.ts';
+import type { CompactionCallOwner } from '../../../packages/contracts/src/session';
 import { BUSINESS_RULES, createStoredQuerySchemas, QuerySummarySchema, EvidenceSummarySchema, type QueryExecutionContext, type QueryRecord, type Evidence } from '../../../packages/contracts/src/query.ts';
 import { StoredToolConfigurationSchema } from '../../../packages/contracts/src/tool-config.ts';
 import { AbsolutePathSchema } from '../../../packages/contracts/src/protocol.ts';
@@ -209,8 +210,9 @@ async function initialize(raw: unknown) {
     resolveToken: async (fileToken, operationRef) => AbsolutePathSchema.parse(await credentials('file.resolve', { fileToken, operationRef })) });
   application = new Application(config.instanceId, settings, runtime, repositories,
     (context, action) => credentialStore.withContext(context, action),
-    (runId, kind, time, context) => new ModelCallRecorder(repositories, runId, kind, time, context),
-    notice, error => errorLog.add(error), agent, events);
+    Object.assign((...args:Parameters<ModelCallStarter>) => new ModelCallRecorder(repositories, ...args),
+      {forCompaction:(owner:CompactionCallOwner,time:string)=>ModelCallRecorder.forCompaction(repositories!,owner,time)}),
+    notice, error => errorLog.add(error), agent, events,transactions);
   application.runs.recoverInterrupted(true); // The writer lock proves that the previous owning process exited.
   sessions = new SessionService(config.instanceId, repositories, agent, (input, context) => application!.runs.submitAgent(input, context),
     () => application!.runs.activeHandle, sessionId => application!.runs.readInputControl(sessionId),
@@ -295,6 +297,9 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case 'session.checkpoints.read': return unwrap(await sessions!.readCheckpoints(request.payload));
     case 'session.restoreCheckpoint': return unwrap(await sessions!.restoreCheckpoint(request.payload,request));
     case 'session.restore': return unwrap(await sessions!.restore(request.payload,request));
+    case 'session.compact': return unwrap(await sessions!.compact(request.payload,request));
+    case 'session.compaction.read': return unwrap(await sessions!.readCompaction(request.payload));
+    case 'session.compaction.cancel': return unwrap(await sessions!.cancelCompaction(request.payload,request));
     case "session.readSubmission": return unwrap(await sessions!.readSubmission(request.payload));
     case "session.readInput": return unwrap(await sessions!.readInput(request.payload));
     case "session.listInputs": return unwrap(await sessions!.listInputs(request.payload));
