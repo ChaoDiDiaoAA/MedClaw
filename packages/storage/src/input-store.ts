@@ -1,5 +1,7 @@
 import type { Database } from 'bun:sqlite';
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
+import { NativeInputReceiptSchema } from '../../contracts/src/resources';
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, safeError } from '../../contracts/src/error';
 import { InputContentSchema, SessionInputSchema, ReadInputRequestSchema, ListInputsRequestSchema, SessionInputPageSchema, MAX_INPUT_PAGE_BYTES,
  type InputContent, type SessionInput, type SessionInputPage, type ReadInputRequest, type ListInputsRequest, type InputStore, type InputCancelProof, type InputSettlementProof } from '../../contracts/src/session';
@@ -24,7 +26,9 @@ export class SqliteInputStore {
  }
  row(inputId:number):InputRow|null {check(PositiveIdSchema,inputId);return this.db.query<InputRow,[number]>('SELECT * FROM session_inputs WHERE id=?').get(inputId);}
  required(inputId:number):InputRow {return this.row(inputId)??fail('input_not_found');}
- content(row:InputRow):InputContent {const content=check(InputContentSchema,readJson(row.content_json),'storage_read_failed'); if(content.originalSubmitInput.sessionId!==row.session_id||content.originalSubmitInput.clientSequence!==row.client_sequence||content.originalSubmitInput.mode!==row.mode)fail('storage_read_failed');return content;}
+ content(row:InputRow):InputContent {const content=check(InputContentSchema,readJson(row.content_json),'storage_read_failed'); if(content.originalSubmitInput.sessionId!==row.session_id||content.originalSubmitInput.clientSequence!==row.client_sequence||content.originalSubmitInput.mode!==row.mode
+   || content.nativeInput && createHash('sha256').update(content.nativeInput.text).digest('hex')!==content.nativeInput.sha256
+   || content.resourceInputPlan && row.status==='consumed' && !content.nativeInput)fail('storage_read_failed');return content;}
  projection(row:InputRow):SessionInput {
   const c=this.content(row),p=safePreview(c.text,8192);
   return check(SessionInputSchema,{id:row.id,sessionId:row.session_id,clientSequence:row.client_sequence,mode:row.mode,text:p.text,textInfo:{totalChars:c.text.length,truncated:p.truncated},workspaceContext:c.workspaceContext,status:row.status,processingStatus:row.processing_status,targetRunId:row.target_run_id,runId:row.run_id,nativeEntryId:row.native_entry_id,createdAt:row.created_at,updatedAt:row.updated_at,deliveredAt:row.delivered_at,processedAt:row.processed_at,error:row.error_json===null?null:check(AppErrorSchema,readJson(row.error_json),'storage_read_failed')},'storage_read_failed');
@@ -32,9 +36,9 @@ export class SqliteInputStore {
  result(row:InputRow) {this.content(row);return {sessionId:row.session_id,clientSequence:row.client_sequence,inputId:row.id,runId:row.mode==='send'?row.target_run_id:row.run_id};}
  operation(op:string):InputRow|null{return this.db.query<InputRow,[string]>('SELECT * FROM session_inputs WHERE operation_ref=?').get(op);}
  sequence(sessionId:number,seq:number):InputRow|null{return this.db.query<InputRow,[number,number]>('SELECT * FROM session_inputs WHERE session_id=? AND client_sequence=?').get(sessionId,seq);}
- private cas(row:InputRow,status:InputRow['status'],processing:InputRow['processing_status'],at:string,error:string|null,runId=row.run_id,entry=row.native_entry_id) {
+ private cas(row:InputRow,status:InputRow['status'],processing:InputRow['processing_status'],at:string,error:string|null,runId=row.run_id,entry=row.native_entry_id,contentJson=row.content_json) {
   check(TimestampSchema,at);
-  const changed=this.db.query(`UPDATE session_inputs SET status=?,processing_status=?,processed_at=?,updated_at=?,error_json=?,run_id=?,native_entry_id=? WHERE id=? AND status=? AND processing_status=? AND run_id IS ? AND native_entry_id IS ?`).run(status,processing,processing==='pending'?null:row.processed_at??at,at,error,runId,entry,row.id,row.status,row.processing_status,row.run_id,row.native_entry_id);
+  const changed=this.db.query(`UPDATE session_inputs SET status=?,processing_status=?,processed_at=?,updated_at=?,error_json=?,run_id=?,native_entry_id=?,content_json=? WHERE id=? AND status=? AND processing_status=? AND run_id IS ? AND native_entry_id IS ? AND content_json=?`).run(status,processing,processing==='pending'?null:row.processed_at??at,at,error,runId,entry,contentJson,row.id,row.status,row.processing_status,row.run_id,row.native_entry_id,row.content_json);
   if(changed.changes!==1)fail('state_conflict');
   const next=this.required(row.id),payload=this.fields(next);
   if(status==='consumed'&&row.status!=='consumed')this.event(next,{type:'input_delivered',payload:{...payload,phase:'native_consumed'}},at);
@@ -57,14 +61,19 @@ export class SqliteInputStore {
  }
  recordInputConsumption(inputId:number,fact:Parameters<InputStore['recordInputConsumption']>[1]):void {
   check(PositiveIdSchema,fact.sessionId);check(PositiveIdSchema,fact.runId);check(OpaqueIdSchema,fact.nativeEntryId);check(TimestampSchema,fact.at);
-  const row=this.required(inputId);this.content(row);
+  const row=this.required(inputId), content=this.content(row);
   if(row.session_id!==fact.sessionId||row.target_run_id!==fact.runId)fail('state_conflict');
-  if(row.status==='consumed'){if(row.run_id===fact.runId&&row.native_entry_id===fact.nativeEntryId)return;fail('state_conflict');}
+  const receipt=fact.nativeInput===undefined?undefined:check(NativeInputReceiptSchema,fact.nativeInput);
+  if(receipt&&createHash('sha256').update(receipt.text).digest('hex')!==receipt.sha256)fail('invalid_argument');
+  if(content.resourceInputPlan&&!receipt||receipt&&!content.resourceInputPlan)fail('state_conflict');
+  if(row.status==='consumed'){if(row.run_id===fact.runId&&row.native_entry_id===fact.nativeEntryId&&canonicalRequest(content.nativeInput??null)===canonicalRequest(receipt??null))return;fail('state_conflict');}
   if(row.status==='cancelled'||row.status==='failed')fail('native_state_invalid');
   const run=this.db.query<{session_id:number;kind:string},[number]>('SELECT session_id,kind FROM runs WHERE id=?').get(fact.runId);
   if(!run||run.kind!=='agent'||run.session_id!==row.session_id||!this.content(row).deliveryAttempt)fail('state_conflict');
   if(this.db.query('SELECT id FROM session_inputs WHERE session_id=? AND native_entry_id=? AND id<>?').get(row.session_id,fact.nativeEntryId,row.id))fail('native_state_invalid');
-  this.cas(row,'consumed',row.processing_status,fact.at,row.error_json,fact.runId,fact.nativeEntryId);
+  if(receipt)content.nativeInput=receipt;
+  check(InputContentSchema,content);
+  this.cas(row,'consumed',row.processing_status,fact.at,row.error_json,fact.runId,fact.nativeEntryId,canonicalRequest(content));
  }
  recordInputFailure(inputId:number,fact:Parameters<InputStore['recordInputFailure']>[1]):void {
   check(AppErrorSchema,fact.error);check(TimestampSchema,fact.at);const row=this.required(inputId);this.content(row);

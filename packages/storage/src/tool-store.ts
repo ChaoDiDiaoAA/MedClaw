@@ -15,6 +15,7 @@ import { ToolCallRecordSchema, ToolContextIdentitySchema, ToolContextFieldsSchem
 import { InputContentSchema } from '../../contracts/src/session';
 import { WorkspaceContextSchema } from '../../contracts/src/workspace';
 import { ModelCallContextSchema, ContextSnapshotBodySchema } from '../../contracts/src/context';
+import { FrozenRunResourcesSchema, ResourceReadFactSchema, resourceRefKey, type ResourceReadFact } from '../../contracts/src/resources';
 
 const knownErrors = new Set(["invalid_argument", "access_denied", "state_conflict", "operation_not_found", "runtime_interrupted", "storage_read_failed", "storage_write_failed"]);
 function fail(code: string): never { throw new Error(code); }
@@ -154,7 +155,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   private call(row: CallRow): ToolCallRecord {
     const delivery = row.delivery_json === null ? null : decode(row.delivery_json);
     if (delivery !== null && (typeof delivery !== "object" || !Object.hasOwn(delivery, "sdkReturned") || !Object.hasOwn(delivery, "nativeEntryId"))) fail("storage_read_failed");
-    const receipt = delivery as { sdkReturned: boolean; nativeEntryId: string | null; message?: ToolSdkDelivery; nextModelCallId?: string | null; consumedAt?: string | null; consumptionEvidence?: unknown; control?: ToolControlObservation } | null;
+    const receipt = delivery as { sdkReturned: boolean; nativeEntryId: string | null; message?: ToolSdkDelivery; nextModelCallId?: string | null; consumedAt?: string | null; consumptionEvidence?: unknown; control?: ToolControlObservation; resourceRead?: ResourceReadFact } | null;
     const model = row.model_call_id ? this.db.query<{ call_id: string }, [number]>("SELECT call_id FROM model_calls WHERE id=?").get(row.model_call_id) : null;
     const parsed = ToolCallRecordSchema.safeParse({ id: row.id, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id,
       name: row.tool_name, version: row.tool_version, executionMode: row.execution_mode, input: decode(row.args_json), status: row.status,
@@ -162,6 +163,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       sdkReturned: receipt?.sdkReturned ?? false, nativeEntryId: receipt?.nativeEntryId ?? null,
       contextSnapshotId: row.context_snapshot_id ?? null,
       ...(receipt?.message ? { sdkDelivery: receipt.message } : {}), ...(model ? { modelCallId: model.call_id } : {}),
+      ...(receipt?.resourceRead ? { resourceRead: receipt.resourceRead } : {}),
       ...(row.stopped_at ? { stoppedAt: row.stopped_at } : {}), ...(receipt?.nextModelCallId ? { nextModelCallId: receipt.nextModelCallId } : {}),
       ...(receipt?.consumedAt ? { consumedAt: receipt.consumedAt } : {}), ...(receipt?.control ? { control: receipt.control } : {}),
       ...(receipt && Object.hasOwn(receipt, 'consumptionEvidence') ? { consumptionEvidence: receipt.consumptionEvidence } : {}) });
@@ -296,6 +298,22 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
     }), "storage_write_failed");
   }
 
+  recordResourceRead(context: ToolExecutionContext, raw: ResourceReadFact): void {
+    protect(() => this.transactions.immediate(() => {
+      this.identity(context, false);
+      const parsed = ResourceReadFactSchema.safeParse(raw); if (!parsed.success) fail('invalid_argument'); const fact = parsed.data;
+      const row = this.callRow(context); if (!row) fail('operation_not_found'); const record = this.call(row);
+      if (record.resourceRead) { if (!isDeepStrictEqual(record.resourceRead, fact)) fail('state_conflict'); return; }
+      if (record.name !== 'read' || record.status !== 'succeeded' || !record.sdkReturned || !record.nativeEntryId || !record.sdkDelivery || record.sdkDelivery.isError) fail('state_conflict');
+      const config = this.db.query<{ config_json: string }, [number, number]>('SELECT config_json FROM runs WHERE id=? AND session_id=?').get(context.runId, context.sessionId);
+      const frozen = FrozenRunResourcesSchema.safeParse((config ? decode(config.config_json) as { agent?: { resources?: unknown } } : null)?.agent?.resources);
+      if (!frozen.success || frozen.data.sessionId !== context.sessionId) fail('state_conflict');
+      const snapshot = frozen.data.available.find(s => resourceRefKey(s.ref) === resourceRefKey(fact.resourceRef)), file = snapshot?.files.find(f => f.file === fact.file);
+      if (!file || file.sha256 !== fact.fileHash || createHash('sha256').update(file.content).digest('hex') !== file.sha256
+        || createHash('sha256').update(canonicalRequest(record.sdkDelivery.content)).digest('hex') !== fact.returnedContentHash) fail('state_conflict');
+      this.db.query('UPDATE tool_calls SET delivery_json=? WHERE id=?').run(json({ ...this.delivery(row), resourceRead: fact }), row.id);
+    }), 'storage_write_failed');
+  }
   recordConsumption(context: ToolExecutionContext, nextCallId: string, evidence?: 'provider_input_verified'): void {
     protect(() => this.transactions.immediate(() => {
       this.identity(context, false);

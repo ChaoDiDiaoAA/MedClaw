@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { ToolCallIdentity, ToolCallStore, ToolExecutionContext, ToolResult, ToolSdkDelivery } from "@medclaw/contracts/tool";
 import { isDeepStrictEqual } from 'node:util';
 import type { ToolControlObservation } from '@medclaw/contracts/model';
+import type { ResourceReadFact } from '@medclaw/contracts/resources';
 
 export class ToolRecorder {
   private readonly blockedRuns = new Map<number, AppError>();
@@ -116,5 +117,11 @@ export class ToolRecorder {
       if (this.blocked(context)) this.defer(context, `consumed:${context.nativeToolCallId}`, save);
       throw error;
     }
+  }
+  recordResourceRead(context: ToolExecutionContext, fact: ResourceReadFact) {
+    const save = () => { if (!this.store.recordResourceRead) throw new Error('storage_write_failed'); this.store.recordResourceRead(context, fact); };
+    if (this.blocked(context)) throw this.defer(context, `resource-read:${context.nativeToolCallId}`, save);
+    try { return this.checked(save, 'storage_write_failed', context); }
+    catch (error) { if (this.blocked(context)) this.defer(context, `resource-read:${context.nativeToolCallId}`, save); throw error; }
   }
 }

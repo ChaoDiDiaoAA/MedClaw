@@ -9,6 +9,7 @@
     "./runtime-config": "./src/runtime-config.ts",
     "./run": "./src/run.ts",
     "./context": "./src/context.ts",
+    "./resources": "./src/resources.ts",
     "./session": "./src/session.ts",
     "./messages": "./src/messages.ts",
     "./workspace": "./src/workspace.ts",

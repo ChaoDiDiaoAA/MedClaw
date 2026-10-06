@@ -4,6 +4,7 @@ import { RunScopeSchema, type RunScope } from "./run";
 import { MeasurementContextSchema, ReferenceDateSchema, TimezoneSchema, ToolControlObservationSchema, type ToolControlObservation } from "./model";
 import type { ToolConfiguration } from './tool-config';
 import { WorkspaceContextSchema, RevisionSchema, type WorkspaceContext } from './workspace';
+import { ResourceReadFactSchema, type ResourceReadFact } from './resources';
 
 export const TOOL_READ_RULES = Object.freeze({
   defaultPage: 1,
@@ -81,6 +82,7 @@ export const ToolCallRecordSchema = z.strictObject({
   data: z.unknown().nullable(), error: AppErrorSchema.nullable(),
   sdkReturned: z.boolean(), nativeEntryId: z.string().nullable(),
   sdkDelivery: ToolSdkDeliverySchema.optional(),
+  resourceRead: ResourceReadFactSchema.optional(),
   modelCallId: z.string().min(1).optional(),
   stoppedAt: z.string().min(1).optional(),
   nextModelCallId: z.string().min(1).optional(),
@@ -128,6 +130,7 @@ export interface ToolCallStore {
   mergeControl?(context: ToolExecutionContext, patch: Partial<ToolControlObservation>): ToolCallRecord;
   readToolObservations?(input: { cutoffAt: string; maxToolCallId?: number | null; limit: number; windowDays: number }): { maxToolCallId: number | null; observations: ToolObservation[] };
   recordDelivery(context: ToolExecutionContext, nativeEntryId: string, message?: ToolSdkDelivery): void;
+  recordResourceRead?(context: ToolExecutionContext, fact: ResourceReadFact): void;
   recordConsumption?(context: ToolExecutionContext, nextCallId: string, evidence?: "provider_input_verified"): void;
   recordFailedRequest?(tool: ToolCallIdentity, input: unknown, context: ToolExecutionContext, error: AppError, requestedAt: string): void;
 }

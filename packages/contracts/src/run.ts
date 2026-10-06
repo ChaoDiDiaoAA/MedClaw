@@ -172,6 +172,7 @@ export interface FinalProviderFact {
   cleanup?: RunCleanupRecord | { oldProcessExited?: boolean; observationGap?: boolean; previousInstanceId?: string; errors?: AppError[] } | null;
 }
 interface AgentStartCommon {
+  resources?: import('./resources').FrozenRunResources;
   contextContract?: 'medclaw.context/v1';
   historyContract?: 'medclaw.history/p9-v1';
   sessionId: number; text: string; model: ModelSelection; policy: RequestPolicy; goal: "answer";
@@ -213,6 +214,7 @@ export type AgentRuntimePort<Resolved> = {
   readBudget?: (runId: number) => RuntimeBudgetView | null;
   describe: (resolved: Resolved) => P2AgentOptions;
   execute: (input: { runId: number; sessionId: number; inputId?: number | null; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number;
+    resources?: import('./resources').FrozenRunResources; inputPlan?: import('./resources').ResourceInputPlan;
     workspaceContext?: WorkspaceContext; scope?: RunScope; referenceDate?: string; timezone?: string; agentPolicy?: AgentPolicy; runtimeConfiguration?: RuntimeConfiguration; toolConfiguration?: ToolConfiguration; measurementContext?: MeasurementContext; toolProfileSnapshot?: ToolProfileSnapshot },
     callbacks: { stream?: (snapshot: StreamSnapshot) => void; startCall: (time: string, context?: StartCallContext) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
       fatal?: (error: AppError) => void; inputStore?: InputStore; admissionClosed?: () => void; compaction?: import('./session').AutoCompactionCallbacks }) => Promise<AgentExecutionObservation>;
@@ -240,6 +242,8 @@ export interface ProviderRunStore {
   active(): RunHandle | null;
 }
 export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputStore {
+  readRunResources?(runId: number): import('./resources').FrozenRunResources | null;
+  readResourceEvidence?(runId: number, page: number, pageSize: number): { items: import('./resources').ResourceEvidence[]; totalRows: number };
   confirmCompactionSaved?(change:NativeHistoryCommit|null,fact:import('./session').CompactionReceipt|import('./session').CompactionSaveFact):number|null;
   verifyPriorCompactionFacts?(runId:number,previousProcessExited?:boolean,time?:string):{requiredPersistenceComplete:boolean;unconfirmedItems:string[]};
   recoverManualCompactions?:(instanceId:string,previousProcessExited:boolean,time:string)=>import('./session').StoredCompactionOperation[];

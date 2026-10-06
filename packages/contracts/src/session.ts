@@ -7,6 +7,7 @@ import { RunScopeSchema,ModelCallViewSchema } from "./run";
 import type { AppError, Result } from "./error";
 import type { StoredOperation, RunHandle, RegisterAgentInput } from "./run";
 import type { ReadSessionMessagesInput, SessionMessagePage } from "./messages";
+import { ResourceInputPlanSchema, NativeInputReceiptSchema, RESOURCE_LIMITS, type ResourceInputPlan, type NativeInputReceipt } from './resources';
 
 export const NewSessionInputSchema = z.strictObject({ selectOnCreate: z.literal(true).default(true), expectedWorkspaceRevision: RevisionSchema });
 export const SelectSessionInputSchema = z.strictObject({ sessionId: PositiveIdSchema, expectedWorkspaceRevision: RevisionSchema });
@@ -190,7 +191,11 @@ export const SessionInputPageSchema = z.strictObject({ sessionId: PositiveIdSche
     && (page.hasMore ? page.items.length > 0 && page.nextClientSequence === page.items.at(-1)!.clientSequence : page.nextClientSequence === null), "Inconsistent input page cursor or ownership");
 export const InputContentSchema = z.strictObject({ contract: z.literal("medclaw.session-input/v1"), originalSubmitInput: SubmitInputSchema,
   text: z.string(), workspaceContext: WorkspaceContextSchema, scope: RunScopeSchema, model: ModelSelectionSchema, referenceDate: ReferenceDateSchema, timezone: TimezoneSchema,
-  deliveryAttempt: z.strictObject({ instanceId: OpaqueIdSchema, startedAt: TimestampSchema }).nullable() });
+  deliveryAttempt: z.strictObject({ instanceId: OpaqueIdSchema, startedAt: TimestampSchema }).nullable(),
+  resourceInputPlan: ResourceInputPlanSchema.optional(), nativeInput: NativeInputReceiptSchema.optional() })
+  .refine(c => !c.resourceInputPlan || c.text === c.originalSubmitInput.text && c.text.isWellFormed()
+    && new TextEncoder().encode(JSON.stringify(c)).byteLength <= (c.nativeInput ? RESOURCE_LIMITS.inputSavedBytes : RESOURCE_LIMITS.inputAcceptBytes), 'P11 input identity or capacity mismatch')
+  .refine(c => !c.nativeInput || !!c.resourceInputPlan, 'Native receipt requires original resource input plan');
 export type InputContent = z.infer<typeof InputContentSchema>;
 export type InputMode = z.infer<typeof InputModeSchema>;
 export type InputStatus = z.infer<typeof InputStatusSchema>;
@@ -200,7 +205,7 @@ export type SessionInputPage = z.infer<typeof SessionInputPageSchema>;
 export type ReadInputRequest = z.infer<typeof ReadInputRequestSchema>;
 export type ListInputsRequest = z.input<typeof ListInputsRequestSchema>;
 export type CancelInputRequest = z.infer<typeof CancelInputRequestSchema>;
-export interface InputBinding { inputId: number; sessionId: number; targetRunId: number; mode: InputMode; text: string; stopEpoch: number; workspaceContext?: WorkspaceContext }
+export interface InputBinding { inputId: number; sessionId: number; targetRunId: number; mode: InputMode; text: string; stopEpoch: number; workspaceContext?: WorkspaceContext; inputPlan?: ResourceInputPlan; nativeReceiptLimitBytes?: number }
 export type ConsumedWorkspace = { inputId: number; nativeEntryId: string; workspaceContext: WorkspaceContext };
 export type InputCancelProof = { kind: "removed"; inputId: number; runId: number; at: string }
   | { kind: "consumed"; inputId: number; runId: number; nativeEntryId: string } | { kind: "unknown"; inputId: number; error: AppError };
@@ -215,7 +220,7 @@ export interface InputStore {
   acceptInput(plan: PreparedInput): SubmitResult;
   beginInputDelivery(inputId: number, instanceId: string, at: string): void;
   recordInputDelivery(inputId: number, at: string): void;
-  recordInputConsumption(inputId: number, fact: { sessionId: number; runId: number; nativeEntryId: string; at: string }): void;
+  recordInputConsumption(inputId: number, fact: { sessionId: number; runId: number; nativeEntryId: string; at: string; nativeInput?: NativeInputReceipt }): void;
   recordInputFailure(inputId: number, fact: { sessionId: number; targetRunId: number; at: string; error: AppError;
     proof: { kind: "not_consumed"; reason: "hook_handled" | "dispatch_rejected" | "start_failed" } | { kind: "delivery_unknown"; reason: "append_failed" | "delivery_unconfirmed" | "remove_unconfirmed" } }): void;
   recordInputCancellation(proof: InputCancelProof, at: string): SessionInput;

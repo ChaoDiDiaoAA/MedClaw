@@ -1,10 +1,12 @@
 import { z } from "zod";
 
 export const PositiveIdSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+export const ConfigVersionSchema = z.string().max(128).regex(/^(0|[1-9][0-9]*)$/);
 export const OpaqueIdSchema = z.string().min(1).max(256).regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/);
 export const TimestampSchema = z.string().datetime({ offset: true }).max(64);
 export const ErrorCategorySchema = z.enum(["provider", "runtime", "tool", "session", "storage", "input", "extension", "internal"]);
-export const ErrorReasonSchema = z.enum(["runtime_busy", "workspace_revision_mismatch", "session_not_found", "session_deleted", "session_metadata_revision_mismatch", "message_cursor_invalid", "input_cursor_invalid", "host_interrupted", "checkpoint_invalid", "history_version_mismatch", "session_restore_failed", "compaction_model_failed", "compaction_capacity", "compaction_native_result_invalid"]);
+export const ErrorReasonSchema = z.enum(["runtime_busy", "workspace_revision_mismatch", "session_not_found", "session_deleted", "session_metadata_revision_mismatch", "message_cursor_invalid", "input_cursor_invalid", "host_interrupted", "checkpoint_invalid", "history_version_mismatch", "session_restore_failed", "compaction_model_failed", "compaction_capacity", "compaction_native_result_invalid",
+  'resource_catalog_invalid', 'resource_missing', 'resource_conflict', 'resource_invalid', 'resource_dependency_missing', 'resource_changed', 'resource_too_large', 'resource_path_invalid', 'resource_snapshot_invalid', 'resource_expansion_failed']);
 
 export const EventRangeErrorSchema = z.strictObject({ runId: PositiveIdSchema, firstSequence: PositiveIdSchema.nullable(), lastSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), resumeAfterSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable() }).refine(value => (value.firstSequence === null ? value.lastSequence === 0 : value.firstSequence <= value.lastSequence) && (value.resumeAfterSequence === null || value.resumeAfterSequence <= value.lastSequence));
 export type EventRangeError = z.infer<typeof EventRangeErrorSchema>;
@@ -138,6 +140,7 @@ export function safeError(code: string, _native?: unknown, context: ErrorContext
   if (safeCode === 'state_conflict' && error.reason === 'history_version_mismatch') error.message = 'The saved history position has changed. Read it again before restoring.';
   if (safeCode === 'session_history_invalid' && error.reason === 'checkpoint_invalid') error.message = 'This entry is not an eligible saved user turn in this session.';
   if (safeCode === 'resource_unavailable' && error.reason === 'session_restore_failed') error.message = 'The saved history position is preserved, but this session cannot continue yet. Restore the session explicitly.';
+  if (safeCode === 'resource_unavailable' && error.reason?.startsWith('resource_')) error.message = 'The selected resource cannot be verified. Read its diagnostics and refresh after repair.';
   if (safeCode === "input_invalid" && error.reason === "session_not_found") error.message = errorDefinitions.session_not_found[1];
   if (safeCode === "runtime_interrupted") error.reason = "host_interrupted";
   return error;
