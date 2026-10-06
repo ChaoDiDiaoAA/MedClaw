@@ -33,6 +33,8 @@ export const RegisteredEventPayloadSchema = z.discriminatedUnion('type', [
   variant('query_completed', { queryId: PositiveIdSchema, resultHash: z.string().regex(/^[a-f0-9]{64}$/), batchIds: ids }),
   variant('context_delivered', { snapshotId: PositiveIdSchema, callId: OpaqueIdSchema }),
   variant('history_saved', { storageVersion: PositiveIdSchema, nativeLeafId: OpaqueIdSchema.nullable() }),
+  variant('compaction_completed', { operationRef: OpaqueIdSchema, reason: z.enum(['threshold', 'overflow']), nativeEntryId: OpaqueIdSchema, firstKeptEntryId: OpaqueIdSchema,
+    storageVersion: PositiveIdSchema, tokensBefore: nonnegative, estimatedTokensAfter: nonnegative.nullable() }),
 ]);
 export const EventSourceSchema = z.enum(['application', 'pi', 'intent', 'tool', 'host']);
 const envelope = { runId: PositiveIdSchema, sessionId: PositiveIdSchema, source: EventSourceSchema, sourceConnection: OpaqueIdSchema.nullable(), sourceSequence: nonnegative.nullable(), toolCallId: PositiveIdSchema.nullable(), occurredAt: TimestampSchema, receivedAt: TimestampSchema };
@@ -43,6 +45,7 @@ function validEvent(event: RegisteredEventDraft, ctx: z.RefinementCtx) {
   if ('inputId' in event.payload && (event.payload.runId ?? event.payload.targetRunId) !== event.runId) ctx.addIssue({ code: 'custom', message: 'Input run identity mismatch' });
   if (event.type.startsWith('tool_') && 'callId' in event.payload && event.payload.callId !== event.toolCallId) ctx.addIssue({ code: 'custom', message: 'Tool identity mismatch' });
   if (event.type === 'context_delivered' && (event.toolCallId !== null || event.source !== 'pi' || event.sourceConnection !== null)) ctx.addIssue({ code: 'custom', message: 'Context delivery source mismatch' });
+  if (event.type === 'compaction_completed' && (event.toolCallId !== null || event.source !== 'pi' || event.sourceConnection !== null || event.sourceSequence !== null)) ctx.addIssue({ code: 'custom', message: 'Compaction source mismatch' });
 }
 const drafts = RegisteredEventPayloadSchema.options.map(option => option.extend(envelope));
 export const RegisteredEventDraftSchema = z.union(drafts).superRefine(validEvent);

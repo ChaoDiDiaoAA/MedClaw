@@ -22,7 +22,7 @@ const nullableToken = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER
 const safeLabel = z.string().min(1).max(256);
 export const ModelCallViewSchema = z.strictObject({
   contextSnapshotId: PositiveIdSchema.nullable().optional(),
-  id: PositiveIdSchema, inputId: PositiveIdSchema.nullable().default(null), callId: OpaqueIdSchema, kind: z.enum(["main", "diagnostic"]), state: z.enum(["started", "completed", "failed", "cancelled"]),
+  id: PositiveIdSchema, inputId: PositiveIdSchema.nullable().default(null), callId: OpaqueIdSchema, kind: z.enum(["main", "diagnostic", "compaction"]), state: z.enum(["started", "completed", "failed", "cancelled"]),
   granularity: z.literal("logical_request"), attempt: z.literal(1), attemptCountUnknown: z.literal(true), model: ModelSelectionSchema,
   responseModel: z.string().min(1).max(256).nullable(), sdkStopReason: SdkStopReasonSchema.nullable(),
   startedAt: TimestampSchema, endedAt: TimestampSchema.nullable(), durationMs: nullableAmount,
@@ -131,7 +131,8 @@ export type ActiveRunView = z.infer<typeof ActiveRunViewSchema>;
 export type UsageView = z.infer<typeof UsageViewSchema>;
 export type OutputPage = z.infer<typeof OutputPageSchema>;
 export const P2AgentOptionsSchema = z.strictObject({ requestedThinkingLevel: z.literal("off"),
-  effectiveThinkingLevel: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]) });
+  effectiveThinkingLevel: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+  compaction: z.strictObject({ contract: z.literal('medclaw.compaction/v1'), enabled: z.boolean(), reserveTokens: PositiveIdSchema, keepRecentTokens: z.number().int().nonnegative().safe() }).optional() });
 export type P2AgentOptions = z.infer<typeof P2AgentOptionsSchema>;
 
 /** Internal Run facts and ports, injected by Host; they are not public IPC payloads. */
@@ -183,8 +184,10 @@ interface AgentStartCommon {
 export type AgentStartFields = AgentStartCommon & ({ inputId: null; submission: { operationRef: string; originalSubmitInput: SubmitInput } } | { inputId: number; submission: null });
 export type StartRunInput<Resolved> = AgentStartFields & { resolved: Resolved };
 export type RegisterAgentInput = AgentStartFields & { instanceId: string; createdAt: string };
-export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[]; budgetSummary?: BudgetSummary; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit };
+export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[]; budgetSummary?: BudgetSummary; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit; compactions?: import('./session').CompactionSaveFact[] };
 export type AgentRuntimePort<Resolved> = {
+  compact?: (input: import('./session').CompactionExecutionInput<Resolved>, callbacks: import('./session').CompactionCallbacks) => Promise<import('./session').NativeCompactionObservation>;
+  abortCompaction?: (sessionId: number, operationRef: string) => void;
   readonly historyContract?: 'medclaw.history/p9-v1';
   hasPendingHistoryPersistence?: (runId: number) => boolean;
   retryHistoryPersistence?: (runId: number) => void;
@@ -210,15 +213,16 @@ export type AgentRuntimePort<Resolved> = {
   execute: (input: { runId: number; sessionId: number; inputId?: number | null; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number;
     workspaceContext?: WorkspaceContext; scope?: RunScope; referenceDate?: string; timezone?: string; agentPolicy?: AgentPolicy; runtimeConfiguration?: RuntimeConfiguration; toolConfiguration?: ToolConfiguration; measurementContext?: MeasurementContext; toolProfileSnapshot?: ToolProfileSnapshot },
     callbacks: { stream?: (snapshot: StreamSnapshot) => void; startCall: (time: string, context?: StartCallContext) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
-      fatal?: (error: AppError) => void; inputStore?: InputStore; admissionClosed?: () => void }) => Promise<AgentExecutionObservation>;
+      fatal?: (error: AppError) => void; inputStore?: InputStore; admissionClosed?: () => void; compaction?: import('./session').AutoCompactionCallbacks }) => Promise<AgentExecutionObservation>;
 };
-export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit };
+export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit; compactions?: import('./session').CompactionSaveFact[] };
 export type StoredOperation = ProviderOperation
   | { method: "session.create"; operationRef: string; originalRequest: NewSessionInput; result: NewSessionResult }
   | { method: "session.submit"; operationRef: string; originalRequest: SubmitInput; result: SubmitResult }
   | { method: "session.rename"; operationRef: string; originalRequest: RenameSessionInput; result: SessionManagementReceipt }
   | { method: "session.delete"; operationRef: string; originalRequest: DeleteSessionInput; result: SessionManagementReceipt }
-  | { method: "session.restoreCheckpoint"; operationRef:string; originalRequest:import('./session').RestoreSessionCheckpointInput;result:import('./session').SessionCheckpointReceipt };
+  | { method: "session.restoreCheckpoint"; operationRef:string; originalRequest:import('./session').RestoreSessionCheckpointInput;result:import('./session').SessionCheckpointReceipt }
+  | { method: 'session.compact'; operationRef: string; originalRequest: import('./session').CompactSessionInput; result: import('./session').StoredCompactionOperation };
 export function canonicalRequest(value: unknown): string {
   const ordered = (item: unknown): unknown => Array.isArray(item) ? item.map(ordered)
     : item !== null && typeof item === "object" ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, val]) => [key, ordered(val)])) : item;

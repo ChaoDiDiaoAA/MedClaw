@@ -79,6 +79,72 @@ export interface MemoryStore {
   commit(change: NativeHistoryCommit): Promise<Result<{ storageVersion: number }>>;
   listEntries(sessionId: number, afterSequence: number, limit: number): Promise<Result<unknown[]>>;
 }
+export const CompactSessionInputSchema = z.strictObject({ sessionId: PositiveIdSchema, expectedStorageVersion: RevisionSchema, model: ModelChoiceSchema });
+export const ReadCompactionInputSchema = z.strictObject({ sessionId: PositiveIdSchema, operationRef: OpaqueIdSchema });
+export const CompactionReasonSchema = z.enum(['manual', 'threshold', 'overflow']);
+export const CompactionStatusSchema = z.enum(['running', 'completed', 'no_op', 'failed', 'cancelled', 'interrupted', 'unconfirmed']);
+export const CompactionPhaseSchema = z.enum(['accepted', 'summarizing', 'saving', 'stopping', 'blocked', 'finished']);
+const compactionIdentity = { contract: z.literal('medclaw.compaction/v1'), operationRef: OpaqueIdSchema, sessionId: PositiveIdSchema };
+const compactionCallIds = z.array(OpaqueIdSchema).refine(ids => new Set(ids).size === ids.length, 'Duplicate compaction calls');
+export const CompactionReceiptSchema = z.strictObject({
+  ...compactionIdentity, runId: PositiveIdSchema.nullable(), reason: CompactionReasonSchema,
+  status: z.enum(['completed', 'no_op', 'failed', 'cancelled', 'interrupted']), nativeGenerated: z.boolean().nullable(), nativeSaved: z.boolean(),
+  nativeEntryId: OpaqueIdSchema.nullable(), firstKeptEntryId: OpaqueIdSchema.nullable(), tokensBefore: RevisionSchema.nullable(), estimatedTokensAfter: RevisionSchema.nullable(),
+  baseStorageVersion: RevisionSchema, storageVersion: RevisionSchema.nullable(), activeLeafId: OpaqueIdSchema.nullable(), callIds: compactionCallIds,
+  continuationEligibleAtCommit: z.boolean(), cancelRequestedAt: TimestampSchema.nullable(), stoppedAt: TimestampSchema, finishedAt: TimestampSchema,
+  noOpReason: z.enum(['nothing_to_compact', 'already_compacted']).nullable(), error: AppErrorSchema.nullable(),
+}).superRefine((receipt, ctx) => {
+  const invalid = (message: string) => ctx.addIssue({ code: 'custom', message });
+  if ((receipt.reason === 'manual') !== (receipt.runId === null)) invalid('Compaction Run owner mismatch');
+  if (receipt.nativeSaved && (receipt.nativeGenerated !== true || !receipt.nativeEntryId || !receipt.firstKeptEntryId || receipt.storageVersion === null || receipt.storageVersion <= receipt.baseStorageVersion)) invalid('Saved compaction requires native identity and committed version');
+  if (!receipt.nativeSaved && receipt.storageVersion !== null) invalid('Unsaved compaction cannot claim a version');
+  if (receipt.nativeGenerated === false && (receipt.nativeEntryId !== null || receipt.firstKeptEntryId !== null || receipt.tokensBefore !== null || receipt.estimatedTokensAfter !== null)) invalid('Ungenerated compaction cannot claim native result fields');
+  if (receipt.status === 'completed' && (!receipt.nativeSaved || receipt.error !== null || receipt.noOpReason !== null || receipt.callIds.length === 0)) invalid('Completed compaction requires saved calls and history');
+  if (receipt.status === 'no_op' && (receipt.nativeGenerated !== false || receipt.nativeSaved || receipt.callIds.length || !receipt.noOpReason || receipt.error !== null)) invalid('No-op cannot claim generation or model calls');
+  if (receipt.status !== 'no_op' && receipt.noOpReason !== null) invalid('No-op reason requires no-op status');
+  if (['failed', 'interrupted'].includes(receipt.status) && receipt.error === null) invalid('Failed compaction requires a safe error');
+  if (['failed', 'cancelled', 'interrupted'].includes(receipt.status) && receipt.continuationEligibleAtCommit) invalid('Stopped compaction cannot continue');
+  if (receipt.status === 'cancelled' && !receipt.cancelRequestedAt) invalid('Cancellation requires its original request');
+});
+export const CompactionOperationViewSchema = z.strictObject({
+  ...compactionIdentity, status: CompactionStatusSchema, phase: CompactionPhaseSchema, revision: RevisionSchema,
+  nativeGenerated: z.boolean().nullable(), nativeSaved: z.boolean(), canContinue: z.boolean(), receipt: CompactionReceiptSchema.nullable(), error: AppErrorSchema.nullable(),
+}).superRefine((view, ctx) => {
+  const receipt = view.receipt;
+  if (receipt ? receipt.sessionId !== view.sessionId || receipt.operationRef !== view.operationRef || receipt.status !== view.status || receipt.nativeGenerated !== view.nativeGenerated || receipt.nativeSaved !== view.nativeSaved
+    : !['running', 'unconfirmed'].includes(view.status) || view.nativeSaved) ctx.addIssue({ code: 'custom', message: 'Compaction view must match its original receipt' });
+  if (view.canContinue && (view.status !== 'completed' && view.status !== 'no_op' || !receipt?.continuationEligibleAtCommit)) ctx.addIssue({ code: 'custom', message: 'Continuation requires an eligible original receipt' });
+});
+export const CancelCompactionResultSchema = z.strictObject({ operation: CompactionOperationViewSchema, disposition: z.enum(['requested', 'already_requested', 'already_finished']) });
+export const CompactionCallOwnerSchema = z.strictObject({ operationRef: OpaqueIdSchema, sessionId: PositiveIdSchema, runId: PositiveIdSchema.nullable(), source: z.enum(['manual', 'auto']), reason: CompactionReasonSchema,
+  model: ModelSelectionSchema, baseStorageVersion: RevisionSchema, baseLeafId: OpaqueIdSchema.nullable(), ordinal: PositiveIdSchema,
+}).refine(owner => owner.source === 'manual' ? owner.runId === null && owner.reason === 'manual' : owner.runId !== null && owner.reason !== 'manual', 'Compaction call owner mismatch');
+export const CompactionSaveFactSchema = z.strictObject({ operationRef: OpaqueIdSchema, sessionId: PositiveIdSchema, runId: PositiveIdSchema, reason: z.enum(['threshold', 'overflow']),
+  nativeEntryId: OpaqueIdSchema, firstKeptEntryId: OpaqueIdSchema, tokensBefore: RevisionSchema, estimatedTokensAfter: RevisionSchema.nullable(), baseStorageVersion: RevisionSchema, callIds: compactionCallIds.min(1) });
+export const FrozenCompactionSchema = z.strictObject({ model: ModelSelectionSchema, baseStorageVersion: RevisionSchema, baseLeafId: OpaqueIdSchema.nullable(),
+  settings: z.strictObject({ enabled: z.boolean(), reserveTokens: PositiveIdSchema, keepRecentTokens: RevisionSchema }), budget: z.strictObject({ maxModelCalls: PositiveIdSchema, timeoutMs: PositiveIdSchema }), instanceId: OpaqueIdSchema, startedAt: TimestampSchema });
+export const StoredCompactionOperationSchema = z.strictObject({ operationRef: OpaqueIdSchema, request: CompactSessionInputSchema, frozen: FrozenCompactionSchema, cancelRequestedAt: TimestampSchema.nullable(), receipt: CompactionReceiptSchema.nullable() })
+  .refine(value => value.request.expectedStorageVersion === value.frozen.baseStorageVersion && (!value.receipt || value.receipt.operationRef === value.operationRef && value.receipt.sessionId === value.request.sessionId && value.receipt.reason === 'manual'), 'Compaction operation identity mismatch');
+export type CompactSessionInput = z.infer<typeof CompactSessionInputSchema>;
+export type ReadCompactionInput = z.infer<typeof ReadCompactionInputSchema>;
+export type CompactionReason = z.infer<typeof CompactionReasonSchema>;
+export type CompactionPhase = z.infer<typeof CompactionPhaseSchema>;
+export type CompactionReceipt = z.infer<typeof CompactionReceiptSchema>;
+export type CompactionOperationView = z.infer<typeof CompactionOperationViewSchema>;
+export type CancelCompactionResult = z.infer<typeof CancelCompactionResultSchema>;
+export type CompactionCallOwner = z.infer<typeof CompactionCallOwnerSchema>;
+export const CompactionCallMetadataSchema = z.strictObject({ contract: z.literal('medclaw.compaction/v1'), operationRef: OpaqueIdSchema, source: z.enum(['manual','auto']), reason: CompactionReasonSchema,
+  ordinal: PositiveIdSchema, baseStorageVersion: RevisionSchema, baseLeafId: OpaqueIdSchema.nullable(), nativeEntryId: OpaqueIdSchema.nullable(), savedStorageVersion: RevisionSchema.nullable(), operationEndedAt: TimestampSchema.nullable(), operationError: AppErrorSchema.nullable() })
+  .refine(value => (value.source === 'manual') === (value.reason === 'manual') && (value.nativeEntryId === null) === (value.savedStorageVersion === null), 'Compaction call evidence mismatch');
+export type CompactionSaveFact = z.infer<typeof CompactionSaveFactSchema>;
+export type FrozenCompaction = z.infer<typeof FrozenCompactionSchema>;
+export type StoredCompactionOperation = z.infer<typeof StoredCompactionOperationSchema>;
+export type NativeCompactionObservation = { nativeGenerated: boolean; nativeIdle: true; change: NativeHistoryCommit | null; result: Pick<CompactionReceipt, 'nativeEntryId' | 'firstKeptEntryId' | 'tokensBefore' | 'estimatedTokensAfter' | 'callIds' | 'noOpReason' | 'error'> };
+export type CompactionExecutionInput<Resolved> = { operationRef: string; sessionId: number; resolved: Resolved; frozen: FrozenCompaction; signal: AbortSignal; deadlineAt: number };
+export type CompactionCallbacks = { startCall: (time: string, ordinal: number) => import('./run').ModelCallRecorderPort; finishCall: (fact: import('./run').FinalCallFact) => void; progress: (phase: CompactionPhase) => void };
+export type AutoCompactionCallbacks = { begin: (reason: 'threshold' | 'overflow', time: string) => string; startCall: (operationRef: string, time: string, ordinal: number) => import('./run').ModelCallRecorderPort;
+  finishCall: (operationRef: string, fact: import('./run').FinalCallFact) => void; save: (change: NativeHistoryCommit, fact: CompactionSaveFact) => number; failed: (operationRef: string, error: AppError, endedAt: string) => void; progress: (operationRef: string, phase: CompactionPhase) => void };
+export type RestoreDiscardProof = { sessionId: number; operationRef: string; nativeIdle: true; nativeQueuesEmpty: true; observersSettled: true; requiredCallFactsSaved: true; persistentSnapshot: NativeHistorySnapshot };
 export const InputStatusSchema = z.enum(["queued", "consumed", "failed", "cancelled", "delivery_unknown"]);
 export const InputProcessingStatusSchema = z.enum(["pending", "completed", "failed", "cancelled"]);
 const submissionFields = {
@@ -185,6 +251,12 @@ export type NativeSessionBindings = {
 };
 /** Product persistence port; native SDK objects stay in the Host's adapter. */
 export interface SessionStore extends Pick<InputStore, "readInput" | "listInputs"> {
+  acceptCompaction(request: CompactSessionInput, operationRef: string, frozen: FrozenCompaction): StoredCompactionOperation;
+  readCompactionOperation(input: ReadCompactionInput): StoredCompactionOperation | null;
+  requestCompactionCancel(input: ReadCompactionInput, requestedAt: string): boolean;
+  startCompactionCall(input: {callId: string; owner: CompactionCallOwner; startedAt: string}): void;
+  finishCompactionCall(owner: CompactionCallOwner, fact: import('./run').FinalCallFact): void;
+  commitCompactionInTransaction(change: NativeHistoryCommit | null, fact: CompactionReceipt | CompactionSaveFact): number;
   createSession(input: NewSessionInput, operationRef: string, nativeSessionId: string, time: string, initialHistory:InitialNativeHistory): NewSessionResult;
   selectSession(input: SelectSessionInput, time: string): WorkspaceView;
   renameSession(input: RenameSessionInput, operationRef: string, time: string): SessionManagementReceipt;

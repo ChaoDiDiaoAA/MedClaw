@@ -21,11 +21,12 @@ import { RuntimeConfigurationSchema, normalizeRuntimeConfiguration, projectRunti
 import { ReadSessionMessagesInputSchema, SessionMessagePageSchema } from "./messages";
 import { ReadContextInputSchema, ContextReadResultSchema } from './context';
 import { ReadSessionCheckpointsInputSchema, RestoreSessionCheckpointInputSchema, SessionCheckpointPageSchema, SessionCheckpointReceiptSchema, RestoreSessionInputSchema } from './session';
+import { CompactSessionInputSchema, ReadCompactionInputSchema, CompactionOperationViewSchema, CancelCompactionResultSchema, CompactionPhaseSchema } from './session';
 
 import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, EventSubscribeResultSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema } from './event';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p9-v1" as const;
-export const DATABASE_SCHEMA_VERSION = 9 as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p10-v1" as const;
+export const DATABASE_SCHEMA_VERSION = 10 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
@@ -136,6 +137,9 @@ export const publicMethodSchemas = {
   "session.checkpoints.read": { input: ReadSessionCheckpointsInputSchema, output: SessionCheckpointPageSchema },
   "session.restoreCheckpoint": { input: RestoreSessionCheckpointInputSchema, output: SessionCheckpointReceiptSchema },
   "session.restore": { input: RestoreSessionInputSchema, output: SessionDetailSchema },
+  "session.compact": { input: CompactSessionInputSchema, output: CompactionOperationViewSchema },
+  "session.compaction.read": { input: ReadCompactionInputSchema, output: CompactionOperationViewSchema.nullable() },
+  "session.compaction.cancel": { input: ReadCompactionInputSchema, output: CancelCompactionResultSchema },
   "session.submit": { input: SubmitInputSchema, output: SubmitResultSchema },
   "session.readInput": { input: ReadInputRequestSchema, output: SessionInputSchema.nullable() },
   "session.listInputs": { input: ListInputsRequestSchema, output: SessionInputPageSchema },
@@ -268,6 +272,9 @@ export const PublicHostRequestSchema = z.discriminatedUnion("method", [
   hostRequest("session.checkpoints.read", publicMethodSchemas["session.checkpoints.read"].input),
   hostRequest("session.restoreCheckpoint", publicMethodSchemas["session.restoreCheckpoint"].input),
   hostRequest("session.restore", publicMethodSchemas["session.restore"].input),
+  hostRequest("session.compact", publicMethodSchemas["session.compact"].input),
+  hostRequest("session.compaction.read", publicMethodSchemas["session.compaction.read"].input),
+  hostRequest("session.compaction.cancel", publicMethodSchemas["session.compaction.cancel"].input),
   hostRequest("session.submit", publicMethodSchemas["session.submit"].input),
   hostRequest("session.readInput", publicMethodSchemas["session.readInput"].input),
   hostRequest("session.listInputs", publicMethodSchemas["session.listInputs"].input),
@@ -329,6 +336,7 @@ export const AgentNoticeSchema = z.discriminatedUnion("type", [
 ]);
 export const RuntimeNoticeSchema = z.union([
   ProviderNoticeSchema, AgentNoticeSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema,
+  z.strictObject({ type: z.literal('compaction.progress'), sessionId: PositiveIdSchema, operationRef: OpaqueIdSchema, runId: PositiveIdSchema.nullable(), revision: PositiveIdSchema, phase: CompactionPhaseSchema }),
   z.strictObject({ type: z.literal("auth.prompt"), prompt: AuthPromptViewSchema }),
   z.strictObject({ type: z.literal("auth.notify"), notification: AuthNotifyViewSchema }),
   z.strictObject({ type: z.literal("auth.finished"), attempt: AuthAttemptViewSchema }),
