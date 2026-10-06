@@ -92,6 +92,12 @@ function normalizedInput(tool: AnyToolDefinition, input: unknown): unknown {
     return parsed.success ? parsed.data : sdkInput;
   } catch { return input; }
 }
+function finalBusinessInput(tool: AnyToolDefinition, id: string, original: unknown, control?: RunControl): unknown {
+  const final = control?.readHookInput(id);
+  if (!final) return normalizedInput(tool, original);
+  const parsed = tool.inputSchema.safeParse(final.value);
+  return parsed.success ? parsed.data : final.value;
+}
 function matchesRecordedResult(record: ToolCallRecord, message: ToolResultMessage): boolean {
   if (record.name !== message.toolName || message.content.length !== 1 || message.content[0]?.type !== "text") return false;
   let payload: unknown;
@@ -147,8 +153,9 @@ export function observePiToolDelivery(
       try {
         if (!recorder.read(context)) {
           if (!event.isError || !attempts.has(event.toolCallId)) throw safeError("storage_write_failed");
-          sanitizeSdkRefusal(getControl?.(), event.toolCallId, event.result, tool.inputSchema, attempts.get(event.toolCallId));
-          const call = recorder.request(tool, normalizedInput(tool, attempts.get(event.toolCallId)), context);
+          const input = finalBusinessInput(tool, event.toolCallId, attempts.get(event.toolCallId), getControl?.());
+          sanitizeSdkRefusal(getControl?.(), event.toolCallId, event.result, tool.inputSchema, input);
+          const call = recorder.request(tool, input, context);
           const control = getControl?.(), observed = control?.observation(event.toolCallId), reason = observed?.failureClass;
           control?.noteFailure(event.toolCallId, { code: context.signal.aborted ? 'tool_cancelled' : reason ?? 'tool_input_invalid',
             stage: observed?.failureStage ?? 'sdk', recordId: call.id });
@@ -158,6 +165,12 @@ export function observePiToolDelivery(
           Object.assign(event.result, checked.result); event.isError = checked.isError;
           // Normalize before the snapshots Pi will compare with its actual history receipt.
           sdkRejections.set(event.toolCallId, { recordId: call.id, content: structuredClone(event.result.content), details: structuredClone(event.result.details) });
+        }
+        const refusal = recorder.read(context);
+        if (event.isError && refusal?.error && getControl?.()?.observation(event.toolCallId).preflightStatus === 'failed') {
+          event.result.content = [{type:'text',text:JSON.stringify({status:refusal.status,error:refusal.error})}];
+          event.result.details = {};
+          sdkRejections.set(event.toolCallId,{recordId:refusal.id,content:structuredClone(event.result.content),details:{}});
         }
         const checked = checkDelivery(event.result, event.isError, context, getControl?.(), recorder.read(context));
         Object.assign(event.result, checked.result); event.isError = checked.isError;
@@ -176,7 +189,7 @@ export function observePiToolDelivery(
       const record = recorder.read(context), rejected = sdkRejections.get(event.message.toolCallId);
       const tool = registry.get(event.message.toolName)!;
       if (!record || !attempts.has(event.message.toolCallId)
-        || !isDeepStrictEqual(record.input, normalizedInput(tool, attempts.get(event.message.toolCallId)))) throw safeError("storage_write_failed");
+        || !isDeepStrictEqual(record.input, finalBusinessInput(tool, event.message.toolCallId, attempts.get(event.message.toolCallId), getControl?.()))) throw safeError("storage_write_failed");
       const isSdkRejection = record && rejected?.recordId === record.id && record.name === event.message.toolName && event.message.isError
         && isDeepStrictEqual(rejected.content, event.message.content) && isDeepStrictEqual(rejected.details, event.message.details);
       const final = finalized.get(event.message.toolCallId);
@@ -206,14 +219,13 @@ export function createPiRunControlBinding(session: AgentSession, registry: Pick<
     const control = getControl(), id = context.toolCall.id;
     if (!control) return before?.(context, signal);
     const business = registry.get(context.toolCall.name);
-    const prepared = business?.inputSchema.safeParse(context.args);
     const executionContext = getContext(id, signal);
     const nativeName = ['read', 'grep', 'find', 'ls', 'edit', 'write', 'bash', 'powershell'].includes(context.toolCall.name);
     const tool = business ?? (nativeName ? { name: context.toolCall.name, version: VERSION,
       effect: ['read', 'grep', 'find', 'ls'].includes(context.toolCall.name) ? 'READ' as const : 'LOCAL_WRITE' as const,
       executionMode: 'parallel' as const } : undefined);
     let rejected: ReturnType<typeof safeError> | null = null;
-    try { ToolExecutor.beforeToolUse('sdk_admission', context.toolCall.name, prepared?.success ? prepared.data : context.args,
+    try { ToolExecutor.beforeToolUse('hook_preflight', context.toolCall.name, context.args,
       executionContext, recorder, control, tool); }
     catch (native) { const parsed = AppErrorSchema.safeParse(native); rejected = parsed.success ? parsed.data : safeError(native instanceof Error ? native.message : 'internal_error'); }
     if (recorder.read(getContext(id, signal))?.sdkReturned) return rejected ? { block: true, reason: JSON.stringify(rejected) } : undefined;
@@ -222,17 +234,40 @@ export function createPiRunControlBinding(session: AgentSession, registry: Pick<
       control.noteFailure(id, { code: rejected.code, stage: 'admission' });
       return { block: true, reason: JSON.stringify(rejected) };
     }
+    const original = structuredClone(context.args);
     try {
       const result = await before?.(context, signal);
+      control.recordHookInput(id, original, context.args);
       if (result?.block) {
         control.updateObservation(id, { preflightStatus: 'blocked', admission: { status: 'blocked', reason: 'access_denied' } });
         control.noteFailure(id, { code: 'access_denied', stage: 'before_hook' });
+        return result;
+      }
+      const prepared = business?.inputSchema.safeParse(context.args);
+      if (prepared && !prepared.success) {
+        control.updateObservation(id, { inputValidation: 'failed', validationIssues: inputIssues(business!.inputSchema, context.args), preflightStatus: 'blocked' });
+        control.noteFailure(id, { code: 'tool_input_invalid', stage: 'after_hook_input' });
+        return { block: true, reason: JSON.stringify(safeError('tool_input_invalid')) };
+      }
+      try { ToolExecutor.beforeToolUse('sdk_admission', context.toolCall.name, prepared?.success ? prepared.data : context.args,
+        executionContext, recorder, control, tool); }
+      catch (native) {
+        const parsed = AppErrorSchema.safeParse(native), error = parsed.success ? parsed.data : safeError(native instanceof Error ? native.message : 'internal_error');
+        control.noteFailure(id, { code: error.code, stage: 'admission' });
+        control.updateObservation(id, { preflightStatus: 'blocked' });
+        return { block: true, reason: JSON.stringify(error) };
       }
       return result;
-    } catch {
-      control.updateObservation(id, { preflightStatus: 'failed', hookFailure: { stage: 'beforeToolCall', code: 'internal_error' } });
-      control.noteFailure(id, { code: 'internal_error', stage: 'before_hook' });
-      throw new Error(JSON.stringify(safeError('internal_error')));
+    } catch (native) {
+      control.recordHookInput(id, original, context.args);
+      const parsed = AppErrorSchema.safeParse(native), error = parsed.success ? parsed.data : safeError('internal_error');
+      control.updateObservation(id, { preflightStatus: 'failed', hookFailure: { stage: 'beforeToolCall', code: error.code } });
+      control.noteFailure(id, { code: error.code, stage: 'before_hook' });
+      // A critical Hook can abort Pi before it emits tool_execution_end. Retain this actual attempt.
+      if (tool && !recorder.read(executionContext)) {
+        recorder.recordRefusal(tool, business ? finalBusinessInput(business,id,original,control) : context.args, executionContext, error, control.observation(id));
+      }
+      throw new Error(JSON.stringify(error));
     }
   };
   session.agent.afterToolCall = async (context, signal) => {
@@ -409,7 +444,7 @@ export function createPiNativeTools(
     session = boundSession;
     const attempts = new Map<string, unknown>();
     const saveRead = async (context: ToolExecutionContext, message: ToolResultMessage) => {
-      const frozen = getResources?.(), input = attempts.get(message.toolCallId);
+      const frozen = getResources?.(), input = getControl?.()?.readHookInput(message.toolCallId)?.value ?? attempts.get(message.toolCallId);
       if (!frozen || message.toolName !== 'read' || message.isError || !input || typeof input !== 'object' || !('path' in input) || typeof input.path !== 'string') return;
       const requested = await canonicalReadPath(input.path,getWorkdir());
       if (requested === null) return;
@@ -438,7 +473,8 @@ export function createPiNativeTools(
           if (existing && !finished(existing)) throw fatal(context);
           if (!existing) {
             if (!event.isError || !attempts.has(event.toolCallId)) throw fatal(context);
-            const prepared = preparedNativeInput(tool, attempts.get(event.toolCallId));
+            const final = getControl?.()?.readHookInput(event.toolCallId);
+            const prepared = final ? { input: final.value, valid: true } : preparedNativeInput(tool, attempts.get(event.toolCallId));
             if (!prepared.valid) {
               let schema: z.ZodType | undefined;
               try { schema = z.fromJSONSchema(z.record(z.string(), z.json()).parse(wireValue(tool.parameters))); } catch { /* Unsupported SDK schemas retain an honest unknown field diagnosis. */ }
@@ -467,7 +503,7 @@ export function createPiNativeTools(
           return;
         }
         if (!record || !finished(record) || record.name !== tool.name || !entry || !attempts.has(event.message.toolCallId)
-          || !isDeepStrictEqual(record.input, preparedNativeInput(tool, attempts.get(event.message.toolCallId)).input)) throw fatal(context);
+          || !isDeepStrictEqual(record.input, getControl?.()?.readHookInput(event.message.toolCallId)?.value ?? preparedNativeInput(tool, attempts.get(event.message.toolCallId)).input)) throw fatal(context);
         if (!record.sdkReturned) recorder.recordDelivery(context, entry.id, ToolSdkDeliverySchema.parse(wireValue(event.message)));
         await saveRead(context, event.message);
       } catch (native) { throw fatal(context, native); }

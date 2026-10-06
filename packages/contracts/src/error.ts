@@ -32,6 +32,12 @@ export const resultSchema = <S extends z.ZodType>(data: S) => z.discriminatedUni
 ]);
 
 const errorDefinitions = {
+  extension_unavailable: ['extension', 'The selected extension cannot be verified or loaded. Read its original diagnostics.', false],
+  extension_conflict: ['extension', 'The extension registration conflicts with the allowed capability names.', false],
+  extension_hook_failed: ['extension', 'An extension hook failed. Read its original diagnostics and run status.', false],
+  extension_cleanup_failed: ['extension', 'Extension resource release is unconfirmed. The original instance cannot be reused.', false],
+  extension_command_failed: ['extension', 'The original extension command did not confirm a valid result.', false],
+  extension_command_required: ['input', 'Use the Extensions page to run /extension_status for its original active Run.', false],
   compaction_failed: ['runtime', 'Context compaction failed. Read its original generation, saving and continuation facts.', false],
   answer_evidence_invalid: ['runtime', 'Final answer references cannot be verified. Read the original saved query facts.', false],
   context_delivery_unsupported: ['provider', 'Context delivery cannot be verified for this model API.', false],

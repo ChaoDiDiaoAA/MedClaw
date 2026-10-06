@@ -1,0 +1,14 @@
+{
+  "contract": "medclaw.extension-manifest/v1",
+  "id": "tool-audit",
+  "version": "v1",
+  "sdkVersion": "0.87.1",
+  "entry": "index.ts",
+  "files": ["manifest.json", "index.ts"],
+  "hooks": {
+    "critical": ["session_start", "tool_call"],
+    "observation": ["input", "context", "tool_result", "agent_start", "agent_end"]
+  },
+  "tools": ["extension_runtime_status"],
+  "commands": ["extension_status"]
+}

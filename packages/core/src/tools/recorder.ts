@@ -74,6 +74,18 @@ export class ToolRecorder {
       throw error;
     }
   }
+  recordRefusal(tool: ToolCallIdentity, input: unknown, context: ToolExecutionContext, error: AppError, control: ToolControlObservation): void {
+    const requestedAt = new Date().toISOString();
+    const save = () => {
+      const previous = this.store.readCall(context);
+      if (!previous) {
+        if (!this.store.recordFailedRequest) throw safeError('storage_write_failed');
+        this.store.recordFailedRequest(tool, input, context, error, requestedAt);
+      } else if (previous.name !== tool.name || !isDeepStrictEqual(previous.input,input) || previous.error?.code !== error.code) throw safeError('state_conflict');
+      this.store.mergeControl?.(context,control);
+    };
+    try { save(); } catch { throw this.defer(context,`refusal:${context.nativeToolCallId}`,save); }
+  }
   start(id: number) {
     const context = this.contexts.get(id);
     try { return this.checked(() => this.store.transition(id, 'requested', 'running'), 'storage_write_failed', context); }

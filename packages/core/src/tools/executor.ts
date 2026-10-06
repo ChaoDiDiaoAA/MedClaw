@@ -16,7 +16,7 @@ export class ToolExecutor {
   constructor(private readonly registry: ToolRegistry, private readonly recorder: ToolRecorder,
     private readonly options: { findCommittedQuery?: (context: ToolExecutionContext) => { id: number; runId: number; sessionId: number; kind: 'current' | 'changes'; callRef: string } | null } = {}) {}
 
-  static beforeToolUse(phase: 'sdk_admission' | 'execution', name: string, input: unknown, context: ToolExecutionContext,
+  static beforeToolUse(phase: 'hook_preflight' | 'sdk_admission' | 'execution', name: string, input: unknown, context: ToolExecutionContext,
     recorder: Pick<ToolRecorder, 'blocked'>, control?: RunControl, tool?: ToolCallIdentity): ToolExecutionContext {
     if (!ToolContextIdentitySchema.safeParse(context).success || !(context.signal instanceof AbortSignal)) throw safeError('invalid_argument');
     const blocked = recorder.blocked(context);
@@ -31,6 +31,7 @@ export class ToolExecutor {
       throw safeError('tool_cancelled');
     }
     const configured = control ? { ...context, toolConfiguration: control.configuration } : context;
+    if (phase === 'hook_preflight') { control?.checkActive(); return configured; }
     if (phase === 'execution') {
       const lease = control?.beginToolExecution(context.nativeToolCallId, name, tool.version, input, context.signal);
       const executionContext = lease ? { ...configured, signal: lease.signal, checkActive: lease.checkActive } : configured;

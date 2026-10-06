@@ -7,7 +7,7 @@ import {
   ProviderAcceptedSchema, ProviderIdSchema, ProviderRequestSchema, RequestPolicySchema,
   SDK_VERSION, SecretInputTokenSchema, PublishedSettingsSchema,
 } from "./model";
-import { ActiveRunViewSchema, CancelRunResultSchema, ReadRunRequestSchema, ReadRunResultSchema, RunViewSchema, RuntimeControlViewSchema } from "./run";
+import { ActiveRunViewSchema, CancelRunResultSchema, ReadRunRequestSchema, ReadRunResultSchema, RunViewSchema, RuntimeControlViewSchema, RunCleanupRecordSchema } from "./run";
 import { ListSessionsRequestSchema, NewSessionInputSchema, NewSessionResultSchema, ReadSubmissionRequestSchema, SelectSessionInputSchema,
   RenameSessionInputSchema, DeleteSessionInputSchema, ReadManagementOperationInputSchema, SessionManagementReceiptSchema,
   ReadInputRequestSchema, ListInputsRequestSchema, CancelInputRequestSchema, SessionInputSchema, SessionInputPageSchema, SessionDetailSchema, SessionPageSchema, SubmitInputSchema, SubmitResultSchema } from "./session";
@@ -23,15 +23,17 @@ import { ReadContextInputSchema, ContextReadResultSchema } from './context';
 import { ReadSessionCheckpointsInputSchema, RestoreSessionCheckpointInputSchema, SessionCheckpointPageSchema, SessionCheckpointReceiptSchema, RestoreSessionInputSchema } from './session';
 import { CompactSessionInputSchema, ReadCompactionInputSchema, CompactionOperationViewSchema, CancelCompactionResultSchema, CompactionPhaseSchema } from './session';
 import { ResourceListInputSchema, ResourceListSchema, ResourceSelectInputSchema, ResourceSelectionReceiptSchema, ResourceReadInputSchema, ResourceTextSchema } from './resources';
+import { ExtensionAssemblyProofSchema, ExtensionDescriptorSchema, ExtensionSelectionSchema, ExtensionStatusSchema, FrozenExtensionSummarySchema,
+  ExtensionsReadInputSchema, ExtensionsSelectInputSchema, ExtensionsSelectResultSchema, ExtensionsCommandInputSchema } from './extensions';
 
 import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, EventSubscribeResultSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema } from './event';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p11-v1" as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p12-v1" as const;
 export const DATABASE_SCHEMA_VERSION = 11 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
-  return method === "session.readManagementOperation" || method === "event.subscribe" || method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method.startsWith('evidence.read') || method === 'data.rows' || method === 'tool.read' || method === "run.active" || method === "session.readSubmission" || method === "session.readInput" || method === "session.listInputs";
+  return method === 'extensions.command' || method === "session.readManagementOperation" || method === "event.subscribe" || method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method.startsWith('evidence.read') || method === 'data.rows' || method === 'tool.read' || method === "run.active" || method === "session.readSubmission" || method === "session.readInput" || method === "session.listInputs";
 }
 export const EmptyPayloadSchema = z.strictObject({});
 const accepted = z.strictObject({ accepted: z.literal(true) });
@@ -84,7 +86,22 @@ export const DiagnosticsViewSchema = z.strictObject({
 });
 
 /** Each public method owns its exact input and output; private control and secrets are absent. */
+export const ExtensionsReadResultSchema = z.discriminatedUnion('source', [
+  z.strictObject({ source: z.literal('selection'), sessionId: PositiveIdSchema, configVersion: ConfigVersionSchema, selection: ExtensionSelectionSchema,
+    available: ExtensionDescriptorSchema.nullable(), live: ExtensionAssemblyProofSchema.nullable(), diagnostics: z.array(AppErrorSchema).max(8) })
+    .refine(value => !value.live || value.live.sessionId === value.sessionId),
+  z.strictObject({ source: z.literal('run'), runId: PositiveIdSchema, sessionId: PositiveIdSchema, evidence: z.enum(['recorded', 'not_recorded']),
+    frozen: FrozenExtensionSummarySchema.nullable(), assembly: ExtensionAssemblyProofSchema.nullable(), cleanup: RunCleanupRecordSchema.nullable() })
+    .refine(value => (value.evidence === 'recorded') === (value.frozen !== null)
+      && (!value.frozen || value.frozen.sessionId === value.sessionId)
+      && (!value.assembly || value.assembly.sessionId === value.sessionId && value.assembly.runId === value.runId)
+      && (!value.cleanup?.extensions || value.cleanup.extensions.sessionId === value.sessionId && value.cleanup.extensions.runId === value.runId)),
+]);
+export type ExtensionsReadResult = z.infer<typeof ExtensionsReadResultSchema>;
 export const publicMethodSchemas = {
+  'extensions.read': { input: ExtensionsReadInputSchema, output: ExtensionsReadResultSchema },
+  'extensions.select': { input: ExtensionsSelectInputSchema, output: ExtensionsSelectResultSchema },
+  'extensions.command': { input: ExtensionsCommandInputSchema, output: ExtensionStatusSchema },
   'resources.list': { input: ResourceListInputSchema, output: ResourceListSchema },
   'resources.select': { input: ResourceSelectInputSchema, output: ResourceSelectionReceiptSchema },
   'resources.read': { input: ResourceReadInputSchema, output: ResourceTextSchema },
@@ -246,6 +263,9 @@ export type HostPrivateMethod = keyof typeof hostPrivateMethodSchemas;
 const hostFields = { protocolVersion: z.literal(HOST_PROTOCOL_VERSION), kind: z.literal("request"), requestId: OpaqueIdSchema, instanceId: OpaqueIdSchema, operationRef: OpaqueIdSchema };
 const hostRequest = <M extends string, S extends z.ZodType>(method: M, payload: S) => z.strictObject({ ...hostFields, method: z.literal(method), payload });
 export const PublicHostRequestSchema = z.discriminatedUnion("method", [
+  hostRequest('extensions.read', publicMethodSchemas['extensions.read'].input),
+  hostRequest('extensions.select', publicMethodSchemas['extensions.select'].input),
+  hostRequest('extensions.command', publicMethodSchemas['extensions.command'].input),
   hostRequest('resources.list', publicMethodSchemas['resources.list'].input),
   hostRequest('resources.select', publicMethodSchemas['resources.select'].input),
   hostRequest('resources.read', publicMethodSchemas['resources.read'].input),

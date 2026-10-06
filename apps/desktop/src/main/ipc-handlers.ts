@@ -55,9 +55,9 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
     requireHost();
     return settings.synchronize();
   };
-  const publish = async (expected: string, patch: Parameters<MainSettings["publish"]>[1], kind: "model" | "custom" | "policy" | "ui" | "rollback" | 'resources', targetConfigVersion?: string, coordination: Pick<PublishOptions, "beforeWrite" | "onUnpublished"> = {}) => {
+  const publish = async (expected: string, patch: Parameters<MainSettings["publish"]>[1], kind: "model" | "custom" | "policy" | "ui" | "rollback" | 'resources' | 'extensions', targetConfigVersion?: string, coordination: Pick<PublishOptions, "beforeWrite" | "onUnpublished"> = {}) => {
     const result = await settings.publish(expected, patch, { kind, ...(targetConfigVersion ? { targetConfigVersion } : {}), ...coordination,
-      beforeWrite: async candidate => { await coordination.beforeWrite?.(candidate); if (kind !== "ui" && kind !== 'resources') await checkSelectionAuth(candidate.model); },
+      beforeWrite: async candidate => { await coordination.beforeWrite?.(candidate); if (kind !== "ui" && kind !== 'resources' && kind !== 'extensions') await checkSelectionAuth(candidate.model); },
     });
     if (kind !== "ui") options.notify({ type: "config.changed", configVersion: result.configVersion });
     return result;
@@ -111,8 +111,8 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
         const dir = await request("model.read", {}) as { selection: unknown }; return { configVersion: s.configVersion, selection: dir.selection };
       }
       case "model.policy.update": { await synchronize(); const p = raw as PublicPayload<'model.policy.update'>; const s = await publish(p.expectedConfigVersion, { ...(p.policy ? { requestPolicy: p.policy } : {}), ...(p.agentPolicy ? { agentPolicy: p.agentPolicy } : {}), ...(p.runtimeConfiguration ? { runtimeConfiguration: p.runtimeConfiguration } : {}), ...(p.toolConfiguration ? { toolConfiguration: p.toolConfiguration } : {}) }, "policy"); return { configVersion: s.configVersion, policy: s.requestPolicy, agentPolicy: s.agentPolicy, runtimeConfiguration: s.runtimeConfiguration, toolConfiguration: s.toolConfiguration }; }
-      case 'resources.list': case 'resources.read': {
-        const p = raw as PublicPayload<'resources.list' | 'resources.read'>;
+      case 'resources.list': case 'resources.read': case 'extensions.read': {
+        const p = raw as PublicPayload<'resources.list' | 'resources.read' | 'extensions.read'>;
         if (p.source === 'selection') await synchronize(); else requireHost();
         return request(method, raw, operationRef);
       }
@@ -121,6 +121,12 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
         const resources = { bySession: { ...current.resources?.bySession, [String(p.sessionId)]: p.selection } };
         const published = await publish(p.expectedConfigVersion, { resources }, 'resources');
         return { sessionId: p.sessionId, configVersion: published.configVersion, selection: published.resources!.bySession[String(p.sessionId)]! };
+      }
+      case 'extensions.select': {
+        const current=await synchronize(),p=raw as PublicPayload<'extensions.select'>;
+        const extensions={bySession:{...current.extensions?.bySession,[String(p.sessionId)]:p.selection}};
+        const published=await publish(p.expectedConfigVersion,{extensions},'extensions');
+        return {sessionId:p.sessionId,configVersion:published.configVersion,selection:published.extensions!.bySession[String(p.sessionId)]!,effective:'next_assembly' as const};
       }
       case "model.config.rollback": {
         await synchronize(); const p = raw as { expectedConfigVersion: string; targetConfigVersion: string };

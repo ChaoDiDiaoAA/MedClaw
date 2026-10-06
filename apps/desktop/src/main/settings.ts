@@ -35,12 +35,12 @@ export interface SettingsCoordinator {
   abort(token: string): Promise<unknown>;
   readVersion?(): Promise<string>;
 }
-export type SettingsPatch = Partial<Pick<SettingsSnapshot, "model" | "customProviders" | "credentialRefs" | "requestPolicy" | "agentPolicy" | 'runtimeConfiguration' | 'resources'>> & {
+export type SettingsPatch = Partial<Pick<SettingsSnapshot, "model" | "customProviders" | "credentialRefs" | "requestPolicy" | "agentPolicy" | 'runtimeConfiguration' | 'resources' | 'extensions'>> & {
   toolConfiguration?: StoredToolConfiguration;
   ui?: Partial<DesktopDisplayPreferences>;
 };
 export interface PublishOptions {
-  kind?: "model" | "custom" | "policy" | "ui" | "rollback" | 'resources';
+  kind?: "model" | "custom" | "policy" | "ui" | "rollback" | 'resources' | 'extensions';
   targetConfigVersion?: string;
   beforeWrite?(candidate: PublishedSettings): Promise<void>;
   onUnpublished?(): Promise<void>;
@@ -54,6 +54,7 @@ const patchSchema = z.strictObject({
   runtimeConfiguration: RuntimeConfigurationSchema.optional(),
   toolConfiguration: StoredToolConfigurationSchema.optional(),
   resources: SettingsSnapshotObjectSchema.shape.resources,
+  extensions: SettingsSnapshotObjectSchema.shape.extensions,
 });
 function snapshot(value: PublishedSettings): SettingsSnapshot {
   const { previous, rollbackFromVersion, ...current } = value;
@@ -100,6 +101,7 @@ export class MainSettings {
       const kind = options.kind ?? (Object.keys(parsed.data).every(key => key === "ui") ? "ui" : "model");
       if (kind === "ui" && (Object.keys(parsed.data).some(key => key !== "ui") || !parsed.data.ui || Object.keys(parsed.data.ui).length === 0)) fail("invalid_argument");
       if (kind === 'resources' && (Object.keys(parsed.data).some(key => key !== 'resources') || !parsed.data.resources)) fail('invalid_argument');
+      if (kind === 'extensions' && (Object.keys(parsed.data).some(key => key !== 'extensions') || !parsed.data.extensions)) fail('invalid_argument');
       let next: SettingsSnapshot;
       let rollbackFromVersion: string | null = null;
       if (kind === "rollback") {
