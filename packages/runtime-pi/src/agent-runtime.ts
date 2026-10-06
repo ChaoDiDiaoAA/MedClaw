@@ -132,6 +132,14 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     await this.rebuild(sessionId);
   }
   async restore(sessionId:number):Promise<void> {await this.rebuild(sessionId);}
+  async discardCompactionForRestore(proof:Omit<import('../../contracts/src/session').RestoreDiscardProof,'persistentSnapshot'>):Promise<void> {
+    const binding=this.sessions.get(proof.sessionId);
+    if(!binding?.memory||binding.execution||binding.manual||binding.memory.compactionOperationRef!==proof.operationRef||binding.session&&(!binding.session.isIdle||binding.session.agent.hasQueuedMessages()))throw safeError('stop_unconfirmed');
+    await binding.compaction?.settle();
+    const loaded=await this.history.store.load(proof.sessionId);if(!loaded.ok)throw loaded.error;
+    binding.memory.discardUncommittedForRestore({...proof,persistentSnapshot:loaded.data});
+    binding.session?.dispose();this.sessions.delete(proof.sessionId);this.blocked.delete(proof.sessionId);
+  }
   private async rebuild(sessionId:number):Promise<void> {
     if(this.loading.has(sessionId))return this.loading.get(sessionId)!;
     const task=this.rebuildNow(sessionId);this.loading.set(sessionId,task);
@@ -441,7 +449,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
   }
   acknowledgeCompactionSaved(sessionId:number,operationRef:string,change:NativeHistoryCommit|null,storageVersion:number):void {
     const binding=this.sessions.get(sessionId);if(!binding||binding.manual||binding.execution||binding.session&&!binding.session.isIdle)throw safeError('stop_unconfirmed');
-    if(binding.compaction?.operationRef!==operationRef){if(!binding.compaction&&!change&&binding.memory!.readSavedContext().storageVersion===storageVersion)return;throw safeError('state_conflict');}
+    if(binding.memory!.compactionOperationRef!==operationRef){if(!binding.memory!.compactionOperationRef&&!change&&binding.memory!.readSavedContext().storageVersion===storageVersion)return;throw safeError('state_conflict');}
     const original=binding.memory!.readCompactionCommit(operationRef);
     if(change&&nativeHistoryJSON(change)!==nativeHistoryJSON(original)||!change&&(original.newEntries.length||original.activeLeafId!==binding.memory!.readSavedContext().leafId))throw safeError('storage_write_failed');
     binding.memory!.acknowledgeCompaction(original,storageVersion);binding.compaction=undefined;

@@ -54,6 +54,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   const [directoryStatus, setDirectoryStatus] = useState<DirectoryReadStatus>({ state: 'unread', error: null });
   const [error, setError] = useState<string | null>(null), [active, setActive] = useState<ActiveRunView | null>(null), [control, setControl] = useState<RuntimeControlView | null>(null);
   const [run, setRun] = useState<RunView | null>(null), [preview, setPreview] = useState<{ text: string; truncated: boolean } | null>(null);
+  const [compactionProgress,setCompactionProgress]=useState<Extract<DesktopNotice,{type:'compaction.progress'}>|null>(null),compactionRevisions=useRef(new Map<string,number>());
   const [workspace, setWorkspace] = useState<WorkspaceView | null>(null), [workspaceConfirmed, setWorkspaceConfirmed] = useState(false), [selecting, setSelecting] = useState(false);
   const [catalog, setCatalog] = useState<PublicReturn<"data.read"> | null>(null), catalogRead = useRef(0);
   const [requestedQuery, setRequestedQuery] = useState<{ queryId: number; ownerSessionId: number } | null>(null);
@@ -323,6 +324,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       const prior = hostRef.current.instanceId; hostRef.current = notice.host; setHost(notice.host);
       if (notice.host.state !== "ready") { directoryRead.current++; setDirectoryStatus({ state: 'unread', error: null }); setDirectoryCurrent(false); setControl(null); confirmedWorkspace.current = false; setWorkspaceConfirmed(false); }
       if (notice.host.instanceId !== prior) {
+        setCompactionProgress(null);compactionRevisions.current.clear();
         sessionListGeneration.current++;
         if (managementRef.current?.pending) showManagement({ ...managementRef.current, busy: false, unknown: true, error: 'The Host changed. Read the original operation after the saved selection is restored.' });
         workspaceMutation.current = null; unknownWorkspaceInstance.current = null; setWorkspaceRecovery(null);
@@ -339,6 +341,12 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       } return;
     }
     if (notice.instanceId && notice.instanceId !== hostRef.current.instanceId) return;
+    if(notice.type==='compaction.progress'&&notice.runId!==null) {
+      if(settled.current.has(notice.runId)||activeRef.current?.runId!==notice.runId||activeRef.current.sessionId!==notice.sessionId)return;
+      const key=JSON.stringify([notice.instanceId,notice.sessionId,notice.runId,notice.operationRef]);if(notice.revision<=(compactionRevisions.current.get(key)??0))return;
+      compactionRevisions.current.set(key,notice.revision);if(compactionRevisions.current.size>50)compactionRevisions.current.delete(compactionRevisions.current.keys().next().value!);
+      setCompactionProgress(notice);void readRun(notice.runId);void readActive();return;
+    }
     if (notice.type === "provider.preview" || notice.type === "agent.preview") {
       const known = runRef.current?.id === notice.runId ? runRef.current : notice.type === "agent.preview" ? selectedRuns.current.get(notice.sessionId) : null;
       if (settled.current.has(notice.runId) || known?.id === notice.runId && released(known)) return;
@@ -350,6 +358,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       if (runRef.current?.id === notice.runId && (sessionId === null || workspaceRef.current?.sessionId === sessionId)) setPreview(cached);
     } else if (notice.type === "provider.settled" || notice.type === "agent.settled") {
       settled.current.add(notice.runId); previews.current.delete(notice.runId);
+      setCompactionProgress(previous=>previous?.runId===notice.runId?null:previous);
       if (settled.current.size > 50) settled.current.delete(settled.current.values().next().value!);
       if (runRef.current?.id === notice.runId) setPreview(null);
       void readActive(); void readRun(notice.runId);
@@ -679,7 +688,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     <main className="workspace">
       <header className="page-header"><div className="header-title">{ui.navCollapsed && <button className="quiet" onClick={() => void updateUi({ navCollapsed: false })}>Expand navigation</button>}<h1>{{ chat: "Chat", data: "Data Workspace", queries: "Query History", models: "Models", settings: "Settings" }[page]}</h1></div><button ref={detailsButton} className="quiet" onClick={() => void updateUi({ detailOpen: !ui.detailOpen })}>View run details</button></header>
       {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="Dismiss notice" onClick={() => setError(null)}>×</button></div>}
-      <section className="page-content chat-page" hidden={page !== "chat"}><Chat visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control} run={run} preview={preview} events={runEvents.state} onFinalSource={runEvents.setFinalSource}
+      <section className="page-content chat-page" hidden={page !== "chat"}><Chat compactionProgress={compactionProgress} visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control} run={run} preview={preview} events={runEvents.state} onFinalSource={runEvents.setFinalSource}
         workspace={workspace} workspaceConfirmed={workspaceConfirmed} workspacePending={selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} onWorkspace={updateWorkspace} dataDefaults={catalog}
         session={currentDetail} draft={draft} selecting={selecting || !workspaceConfirmed} sending={sending !== null && sending === current} runningTitle={runningSession ? sessionDisplayTitle(runningSession) : null}
         queueRun={queueRun} queueRootInput={queueRootInput} frozenInput={frozenInput} frozenRunId={frozenRun?.id} inputs={current ? inputQueue.snapshots[current] ?? null : null} cancellingInputs={cancellingInputs}

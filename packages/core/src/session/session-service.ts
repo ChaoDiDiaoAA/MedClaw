@@ -22,7 +22,9 @@ export class SessionService {
     private readonly runtime?: { assertOperationAvailable(operationRef: string): void; withSessionDeletion<T>(sessionId: number, write: () => T): T;
       compactSession?:(input:CompactSessionInput,context:CommandContext)=>Promise<CompactionOperationView>;
       readCompaction?:(input:ReadCompactionInput)=>CompactionOperationView|null;
+      readLatestCompaction?:(sessionId:number)=>CompactionOperationView|null;
       cancelCompaction?:(input:ReadCompactionInput,context:CommandContext)=>CancelCompactionResult;
+      withSessionRestore?<T>(operationRef:string,sessionId:number,expectedLeafId:string|null,action:()=>T|Promise<T>):Promise<T>;
       assertNoHistoryMutation?():void;withHistoryMutation?<T>(operationRef:string,sessionId:number,action:()=>T|Promise<T>):Promise<T> },private readonly transactions?:WriteTransactions) {}
 
   compact(input:CompactSessionInput,context:CommandContext):Promise<Result<CompactionOperationView>> {
@@ -76,10 +78,11 @@ export class SessionService {
       this.validateContext(context);const request=RestoreSessionInputSchema.parse(input);this.requireUserSession(request.sessionId);
       if(this.store.findOperation(context.operationRef))throw safeError('state_conflict');
       if(!this.runtime?.withHistoryMutation)throw safeError('state_conflict',undefined,{reason:'runtime_busy'});
-      return this.runtime.withHistoryMutation(context.operationRef,request.sessionId,async()=>{
+      const action=async()=>{
         if(this.store.readSession(request.sessionId)!.leafId!==request.expectedLeafId)throw safeError('state_conflict',undefined,{reason:'history_version_mismatch'});
         await this.rebuild(request.sessionId);const detail=await this.read(request.sessionId);if(!detail.ok)throw detail.error;return detail.data;
-      });
+      };
+      return this.runtime.withSessionRestore?this.runtime.withSessionRestore(context.operationRef,request.sessionId,request.expectedLeafId,action):this.runtime.withHistoryMutation(context.operationRef,request.sessionId,action);
     },'storage_read_failed',{operationRef:context.operationRef,sessionId:input.sessionId});
   }
   private requireUserSession(sessionId:number) {const session=this.store.readSession(sessionId);if(!session)throw safeError('session_not_found');if(session.kind!=='user')throw safeError('access_denied');}
@@ -130,6 +133,7 @@ export class SessionService {
       const { leafId,storageVersion, ...history } = preview, active = this.active();
       const runtime=session.storageVersion===0 ? {availability:'blocked' as const,error:safeError('session_history_invalid')} : this.native.readAvailability(sessionId);
       return SessionDetailSchema.parse({ session: { ...session, leafId,storageVersion, inputControl: this.inputControl(sessionId) }, history,runtime,
+        compactionOperation:this.runtime?.readLatestCompaction?.(sessionId)??null,
         runningRunId: active?.kind === "agent" && active.sessionId === sessionId ? active.runId : null });
     }, "storage_read_failed", { sessionId });
   }

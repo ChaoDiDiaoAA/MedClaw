@@ -14,6 +14,16 @@ import { PiMemoryAdapter } from '../../packages/runtime-pi/src/memory-store';
 import { CompactionAdapter } from '../../packages/runtime-pi/src/compaction-adapter';
 import { DEFAULT_REQUEST_POLICY } from '../../packages/contracts/src/model';
 import { contextModel } from '../fixtures/p8-context';
+import { projectSessionMessages } from '../../packages/runtime-pi/src/messages';
+import { MAX_MESSAGE_TEXT_CHARS } from '../../packages/contracts/src/messages';
+
+test('p10 native summary stays a bounded history marker with its original identity',()=>{
+  const manager=SessionManager.inMemory(process.cwd()),input=manager.appendMessage({role:'user',content:'ENGINEERING original',timestamp:1});
+  const id=manager.appendCompaction('ENGINEERING summary '+ 'x'.repeat(MAX_MESSAGE_TEXT_CHARS),input,10);
+  const page=projectSessionMessages(manager,{sessionId:1,leafId:null,afterEntryId:null,limit:50},new Map());
+  expect(page.items.at(-1)).toMatchObject({nativeEntryId:id,entryType:'compaction',displayRole:'history_marker',runId:null,textInfo:{truncated:true,redacted:false}});
+  expect(page.items.at(-1)!.text).toContain('ENGINEERING summary');expect(page.items.at(-1)!.text!.length).toBeLessThanOrEqual(MAX_MESSAGE_TEXT_CHARS);
+});
 
 test('p10 stage discovers its real unit tests and rejects unsupported stages', () => {
   expect(discoverTests('unit', 'P10')).toContain(join(import.meta.dir, 'p10-compaction.test.ts'));

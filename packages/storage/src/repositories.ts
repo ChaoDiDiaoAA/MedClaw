@@ -230,6 +230,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         compaction: CompactionCallMetadataSchema.optional(),
       }).strict(), decoded(row.model_json), "storage_write_failed");
       return checked(ModelCallViewSchema, {
+        ...(model.compaction?{compaction:{operationRef:model.compaction.operationRef,reason:model.compaction.reason,nativeEntryId:model.compaction.nativeEntryId,savedStorageVersion:model.compaction.savedStorageVersion}}:{}),
         id: row.id, inputId: row.input_id, callId: row.call_id, kind: row.kind, state: row.state, contextSnapshotId: model.context?.snapshotId ?? null,
         granularity: row.granularity, attempt: row.attempt, attemptCountUnknown: row.attempt_count_unknown === 1,
         model: model.selection, responseModel: model.responseModel, sdkStopReason: model.sdkStopReason,
@@ -311,6 +312,11 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     if (operation && operation.request.sessionId !== request.sessionId) fail('access_denied');
     return operation;
   }
+  latestCompactionOperation(sessionId:number):StoredCompactionOperation|null {
+    id(sessionId);const row=this.db.query<{operation_ref:string},[number]>("SELECT operation_ref FROM business_events WHERE session_id=? AND type='session_compaction_started' ORDER BY id DESC LIMIT 1").get(sessionId);
+    return row?this.readCompactionOperation({sessionId,operationRef:row.operation_ref}):null;
+  }
+  readCompactionCalls(operationRef:string):ModelCallView[] {return this.compactionCalls(operationRef).map(call=>this.call(call));}
   acceptCompaction(input: CompactSessionInput, operationRef: string, inputFrozen: FrozenCompaction): StoredCompactionOperation {
     const request = checked(CompactSessionInputSchema,input); checked(OpaqueIdSchema,operationRef);
     return this.inputWrite(() => {
@@ -466,8 +472,36 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     }
     return version;
   }
-  verifyPriorCompactionFacts(runId:number):{requiredPersistenceComplete:boolean;unconfirmedItems:string[]} {
+  recoverManualCompactions(instanceId:string,previousProcessExited:boolean,time:string):StoredCompactionOperation[] {
+    checked(OpaqueIdSchema,instanceId);timestamp(time);
+    return this.transactions.immediate(()=>{
+      const rows=this.db.query<{operation_ref:string;session_id:number},[string]>("SELECT operation_ref,session_id FROM business_events s WHERE type='session_compaction_started' AND json_extract(details_json,'$.instanceId')<>? AND NOT EXISTS (SELECT 1 FROM business_events f WHERE f.operation_ref=s.operation_ref AND f.type='session_compaction_finished') ORDER BY id").all(instanceId);
+      const pending:StoredCompactionOperation[]=[];
+      for(const row of rows) {
+        const operation=this.readCompactionOperation({sessionId:row.session_id,operationRef:row.operation_ref})!;
+        if(!previousProcessExited){pending.push(operation);continue;}
+        const error=safeError('runtime_interrupted'),calls=this.compactionCalls(row.operation_ref);
+        for(const call of calls)if(call.state==='started')this.db.query("UPDATE model_calls SET state='failed',ended_at=?,error_json=?,unavailable_reason='call_not_observed' WHERE call_id=? AND state='started'").run(time,JSON.stringify(error),call.call_id);
+        this.commitCompactionInTransaction(null,{contract:'medclaw.compaction/v1',operationRef:row.operation_ref,sessionId:row.session_id,runId:null,reason:'manual',status:'interrupted',nativeGenerated:null,nativeSaved:false,
+          nativeEntryId:null,firstKeptEntryId:null,tokensBefore:null,estimatedTokensAfter:null,baseStorageVersion:operation.frozen.baseStorageVersion,storageVersion:null,activeLeafId:operation.frozen.baseLeafId,
+          callIds:calls.map(call=>call.call_id),continuationEligibleAtCommit:false,cancelRequestedAt:operation.cancelRequestedAt,stoppedAt:time,finishedAt:time,noOpReason:null,error});
+      }
+      return pending;
+    });
+  }
+  verifyPriorCompactionFacts(runId:number,previousProcessExited=false,time?:string):{requiredPersistenceComplete:boolean;unconfirmedItems:string[]} {
     id(runId);
+    if(previousProcessExited) {
+      timestamp(time!);
+      this.transactions.immediate(()=>{
+        const error=safeError('runtime_interrupted',undefined,{runId});
+        for(const call of this.db.query<CallRow,[number]>("SELECT * FROM model_calls WHERE run_id=? AND kind='compaction'").all(runId)) {
+          const model=decoded(call.model_json) as {compaction:unknown},marker=checked(CompactionCallMetadataSchema,model.compaction,'storage_read_failed');
+          if(call.state==='started')this.db.query("UPDATE model_calls SET state='failed',ended_at=?,error_json=?,unavailable_reason='call_not_observed' WHERE call_id=? AND state='started'").run(time!,JSON.stringify(error),call.call_id);
+          if(marker.nativeEntryId===null&&marker.operationEndedAt===null)this.db.query('UPDATE model_calls SET model_json=? WHERE call_id=?').run(JSON.stringify({...model,compaction:{...marker,operationEndedAt:time!,operationError:error}}),call.call_id);
+        }
+      });
+    }
     return this.inputRead(()=>{
       const groups=this.db.query<{operation_ref:string},[number]>("SELECT DISTINCT json_extract(model_json,'$.compaction.operationRef') AS operation_ref FROM model_calls WHERE run_id=? AND kind='compaction'").all(runId);
       const gaps=new Set<string>();
@@ -1406,7 +1440,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if (terminal && (row.status !== "failed" || !isDeepStrictEqual(decoded(row.error_json), error))) fail("state_conflict");
       if(this.p5&&cleanup.inputsSettled&&this.inputs.hasPendingInputsForRun(runId))fail('state_conflict');
       const checkedCleanup = this.validateCleanup(decoded(row.cleanup_json), cleanup);
-      if (checkedCleanup.requiredPersistenceComplete && !this.verifyPriorContextFacts(runId).requiredPersistenceComplete) fail('storage_write_failed');
+      if (checkedCleanup.requiredPersistenceComplete && (!this.verifyPriorContextFacts(runId).requiredPersistenceComplete||!this.verifyPriorCompactionFacts(runId).requiredPersistenceComplete)) fail('storage_write_failed');
       this.db.query("UPDATE runs SET status='failed',error_json=?,ended_at=COALESCE(ended_at,?),cleanup_json=? WHERE id=?")
         .run(json(error), time, json(checkedCleanup), runId);
       if(!terminal)this.runTerminal(row,'failed',error,checkedCleanup,time);
@@ -1420,7 +1454,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const row = this.row(runId);
       if (!row) fail("run_not_found");
       if(this.p5&&cleanup.inputsSettled&&this.inputs.hasPendingInputsForRun(runId))fail('state_conflict');
-      if (cleanup.requiredPersistenceComplete && !this.verifyPriorContextFacts(runId).requiredPersistenceComplete) fail('storage_write_failed');
+      if (cleanup.requiredPersistenceComplete && (!this.verifyPriorContextFacts(runId).requiredPersistenceComplete||!this.verifyPriorCompactionFacts(runId).requiredPersistenceComplete)) fail('storage_write_failed');
       const checkedCleanup = this.validateCleanup(decoded(row.cleanup_json), cleanup);
       this.db.query("UPDATE runs SET cleanup_json=? WHERE id=?").run(json(checkedCleanup), runId);
       this.beforeCommit?.();
@@ -1440,7 +1474,8 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         .get(row.id, cleanup.success && cleanup.data.stopConfirmed === true ? 1 : 0) !== null;
       const inputGap=this.p5&&this.inputs.hasPendingInputsForRun(row.id);
       const contextGap = !this.verifyPriorContextFacts(row.id).requiredPersistenceComplete;
-      return row.status === "created" || row.status === "running" || !released || toolGap || inputGap || contextGap ? [this.view(row)] : [];
+      const compactionGap=!this.verifyPriorCompactionFacts(row.id).requiredPersistenceComplete;
+      return row.status === "created" || row.status === "running" || !released || toolGap || inputGap || contextGap||compactionGap ? [this.view(row)] : [];
     });
   }
 

@@ -12,6 +12,8 @@ import { ModelCallRecorder } from '../../packages/runtime-pi/src/model-call-reco
 import { Application } from '../../packages/core/src/application';
 import { SessionService } from '../../packages/core/src/session/session-service';
 import { SqliteWriteTransactions } from '../../packages/storage/src/write-transactions';
+import { SqliteContextStore } from '../../packages/storage/src/context-store';
+import { ContextService } from '../../packages/core/src/context/context-service';
 import { memoryAssistant, memoryAt, sqliteHistory } from '../fixtures/p9-memory';
 import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
 import type { CompactionCallOwner, CompactionOperationView } from '../../packages/contracts/src/session';
@@ -32,7 +34,7 @@ async function fixture(rich=true,hold=false,credentialFails=false,automatic?:'th
   const credentials=new InMemoryCredentialStore();await credentials.modify('p10-fixture',async()=>({type:'api_key',key:'ENGINEERING'}));
   const runtime=await PiModelRuntime.create({credentials,modelsStore:new InMemoryModelsStore()});
   await runtime.installCustom([{providerId:'p10-fixture',name:'ENGINEERING',api:'openai-completions',baseUrl:`http://127.0.0.1:${server.port}/v1`,models:[{id:'fixture',name:'ENGINEERING',reasoning:false,input:['text'],contextWindow:4096,maxTokens:128,outputLimitConfirmed:true,pricingKnown:false,cost:null}]}]);
-  const history=sqliteHistory(db),repo=new Repositories(db,undefined,undefined,tx,history.store),agent=new PiAgentRuntime(runtime,root,history);
+  const history=sqliteHistory(db),repo=new Repositories(db,undefined,undefined,tx,history.store),contexts=new SqliteContextStore(db),contextService=new ContextService(contexts,{inspectManagedImport:async()=>({status:'valid'})}),agent=new PiAgentRuntime(runtime,root,history,undefined,contextService);
   const describe=agent.describe.bind(agent);spyOn(agent,'describe').mockImplementation(resolved=>({...describe(resolved),compaction:{contract:'medclaw.compaction/v1',enabled:!!automatic,reserveTokens:256,keepRecentTokens:128}}));
   const manager=SessionManager.inMemory(root);manager.appendModelChange('p10-fixture','fixture');manager.appendThinkingLevelChange('off');
   if(rich)for(let index=0;index<6;index++){manager.appendMessage({role:'user',content:`ENGINEERING ${index} ${'x'.repeat(160)}`,timestamp:index*2+1});const assistant={...memoryAssistant('y'.repeat(160),'fixture'),provider:'p10-fixture',timestamp:index*2+2};if(automatic==='pre_threshold'&&index===5)assistant.usage={...assistant.usage,input:3950,totalTokens:3950};manager.appendMessage(assistant);}
@@ -44,7 +46,7 @@ async function fixture(rich=true,hold=false,credentialFails=false,automatic?:'th
   const sessions=new SessionService('host',repo,agent,(input,context)=>app.runs.submitAgent(input,context),()=>app.runs.activeHandle,()=>null,undefined,app.runs,tx);
   cleanup.push(async()=>{release();try{await app.shutdown();}catch{}server.stop(true);db.close();rmSync(root,{recursive:true,force:true});});
   const request={sessionId:1,expectedStorageVersion:2,model:{provider:'p10-fixture',modelId:'fixture',expectedConfigVersion:'1'}};
-  return {root,db,repo,agent,app,sessions,requests,scopes,request,release,runtime,describe};
+  return {root,db,repo,agent,app,sessions,requests,scopes,request,release,runtime,describe,contexts};
 }
 async function waitFor(condition:()=>boolean) {for(let attempt=0;attempt<400;attempt++){if(condition())return;await Bun.sleep(5);}throw new Error('Engineering condition did not settle');}
 async function terminal(f:Awaited<ReturnType<typeof fixture>>,operationRef:string):Promise<CompactionOperationView> {
@@ -81,6 +83,10 @@ test('p10 cancelling a pending manual summary preserves one original cancel requ
   expect(f.requests).toHaveLength(1);expect(f.repo.readSession(1)?.storageVersion).toBe(2);
   expect(await cancel.call(f.sessions,{sessionId:1,operationRef:'manual'},{instanceId:'host',operationRef:'cancel-3'})).toMatchObject({ok:true,data:{disposition:'already_finished'}});
   expect(f.db.query("SELECT id FROM business_events WHERE type='session_compaction_cancel_requested'").all()).toHaveLength(1);
+  const saved=f.repo.readSession(1)!;
+  expect(await f.sessions.restore({sessionId:1,expectedLeafId:'ENGINEERING wrong leaf'},{instanceId:'host',operationRef:'wrong-restore'})).toMatchObject({ok:false});expect(f.app.busy).toBe(true);
+  expect(await f.sessions.restore({sessionId:1,expectedLeafId:saved.leafId},{instanceId:'host',operationRef:'restore'})).toMatchObject({ok:true,data:{session:{storageVersion:2,leafId:saved.leafId}}});
+  expect(f.app.busy).toBe(false);expect(f.requests).toHaveLength(1);
 });
 
 test('p10 credential failure before manual SDK entry saves a failed receipt and releases occupancy without calls',async()=>{
@@ -125,12 +131,28 @@ for(const reason of ['threshold','overflow','success_overflow','pre_threshold','
   expect(accepted).toMatchObject({ok:true});if(!accepted.ok||!accepted.data.runId)throw new Error('ENGINEERING root not accepted');const runId=accepted.data.runId;
   await waitFor(()=>!f.app.busy);
   const read=f.repo.read({runId});expect(read).toMatchObject({kind:'one',run:{status:'completed'}});
-  const calls=f.db.query<{kind:string;run_id:number;input_id:number|null;compaction_json:string|null},[]>("SELECT kind,run_id,input_id,json_extract(model_json,'$.compaction') compaction_json FROM model_calls ORDER BY id").all();
+  const calls=f.db.query<{call_id:string;kind:string;run_id:number;input_id:number|null;compaction_json:string|null},[]>("SELECT call_id,kind,run_id,input_id,json_extract(model_json,'$.compaction') compaction_json FROM model_calls ORDER BY id").all();
   expect(calls.filter(call=>call.kind==='main')).toHaveLength(reason==='overflow'||reason==='length'?2:1);expect(calls.filter(call=>call.kind==='compaction').length).toBeGreaterThan(0);
   for(const call of calls.filter(call=>call.kind==='compaction')){expect(call.run_id).toBe(runId);expect(call.input_id).toBeNull();expect(JSON.parse(call.compaction_json!)).toMatchObject({source:'auto',reason:reason==='threshold'||reason==='pre_threshold'?'threshold':'overflow',nativeEntryId:expect.any(String),savedStorageVersion:expect.any(Number)});}
   expect(f.db.query('SELECT id FROM answers').all()).toHaveLength(1);expect(f.db.query("SELECT id FROM runtime_events WHERE type='compaction_completed'").all()).toHaveLength(1);
   if(reason==='overflow'){expect(JSON.stringify(f.requests.at(-1))).toContain('ENGINEERING summary Shanghai');expect(f.db.query("SELECT id FROM memories WHERE json_extract(entry_json,'$.type')='context_edit'").all()).toHaveLength(1);}
   if(reason==='pre_threshold')expect(JSON.stringify(f.requests[0])).not.toContain('MedClaw trusted runtime feedback');
+  for(const call of calls.filter(call=>call.kind==='compaction'))expect(f.contexts.read({callId:call.call_id})).toMatchObject({kind:'not_recorded',runId,sessionId:1,reason:'not_applicable'});
+  for(const call of calls.filter(call=>call.kind==='main')){
+    const context=f.contexts.read({callId:call.call_id});expect(context).toMatchObject({kind:'snapshot',snapshot:{runId,sessionId:1,nativeRefs:[{kind:'input'}]}});
+    if(context.kind==='snapshot'&&context.deliveries.length)expect(context.evidence).toBe('saved');
+    const row=f.db.query<{context_json:string},[string]>("SELECT json_extract(model_json,'$.context') context_json FROM model_calls WHERE call_id=?").get(call.call_id)!;
+    expect(JSON.parse(row.context_json).nativeHistory).toMatchObject({leafId:expect.any(String),storageVersion:expect.any(Number)});
+  }
+});
+
+test('p10 automatic invalid reserve rejects before starting any summary call',async()=>{
+  const f=await fixture(true,false,false,'pre_threshold');
+  spyOn(f.agent,'describe').mockImplementation(resolved=>({...f.describe(resolved),compaction:{contract:'medclaw.compaction/v1',enabled:true,reserveTokens:4096,keepRecentTokens:128}}));
+  const workspace=f.repo.readWorkspace(),accepted=await f.sessions.submit({sessionId:1,mode:'send',clientSequence:1,text:'ENGINEERING invalid capacity',expectedRevision:workspace.revision,expectedBatchIds:[],expectedQueryId:null,model:f.request.model,referenceDate:'2026-10-06',timezone:'Asia/Shanghai'},{instanceId:'host',operationRef:'invalid-capacity'});
+  expect(accepted.ok).toBe(true);if(!accepted.ok||!accepted.data.runId)throw new Error('ENGINEERING not accepted');await waitFor(()=>!f.app.busy);
+  expect(f.requests).toHaveLength(0);expect(f.db.query("SELECT id FROM model_calls WHERE kind='compaction'").all()).toHaveLength(0);
+  expect(f.repo.read({runId:accepted.data.runId})).toMatchObject({kind:'one',run:{status:'failed',error:{code:'compaction_failed',reason:'compaction_capacity'}}});
 });
 
 for(const reason of ['second_overflow','summary_failure'] as const)test(`p10 automatic ${reason} stops without resetting the original call budget or replaying summaries`,async()=>{
@@ -141,6 +163,90 @@ for(const reason of ['second_overflow','summary_failure'] as const)test(`p10 aut
   expect(f.requests.filter(body=>JSON.stringify(body).includes('MedClaw trusted runtime feedback'))).toHaveLength(reason==='second_overflow'?2:1);
   expect(f.db.query("SELECT id FROM memories WHERE entry_type='compaction'").all()).toHaveLength(reason==='second_overflow'?1:0);
   expect(f.db.query("SELECT id FROM model_calls WHERE kind='compaction'").all()).toHaveLength(2);
+});
+
+test('p10 shutdown cancels the original manual task and returns only after stop and durable call facts',async()=>{
+  const f=await fixture(true,true);
+  expect(await f.sessions.compact(f.request,{instanceId:'host',operationRef:'closing'})).toMatchObject({ok:true});await waitFor(()=>f.requests.length===1);
+  expect(await f.app.shutdown()).toEqual({executionStopped:true});
+  expect(f.repo.readCompactionOperation({sessionId:1,operationRef:'closing'})).toMatchObject({receipt:{status:'cancelled',nativeSaved:false,callIds:[expect.any(String)]}});
+  expect(f.db.query("SELECT state FROM model_calls WHERE kind='compaction'").all()).toEqual([{state:'cancelled'}]);expect(f.requests).toHaveLength(1);
+});
+
+test('p10 failed manual call persistence blocks restore until the exact observed fact is saved, without HTTP replay',async()=>{
+  const f=await fixture(true),finish=f.repo.finishCompactionCall.bind(f.repo);let blocked=true;
+  spyOn(f.repo,'finishCompactionCall').mockImplementation((...args)=>{if(blocked)throw new Error('ENGINEERING durable call unavailable');return finish(...args);});
+  expect(await f.sessions.compact(f.request,{instanceId:'host',operationRef:'call-gap'})).toMatchObject({ok:true});await waitFor(()=>f.requests.length===1);await Bun.sleep(30);
+  const saved=f.repo.readSession(1)!;
+  expect(await f.sessions.restore({sessionId:1,expectedLeafId:saved.leafId},{instanceId:'host',operationRef:'blocked-restore'})).toMatchObject({ok:false});expect(f.app.busy).toBe(true);
+  blocked=false;
+  expect(await f.sessions.restore({sessionId:1,expectedLeafId:saved.leafId},{instanceId:'host',operationRef:'repair-restore'})).toMatchObject({ok:true});
+  expect(f.repo.readCompactionOperation({sessionId:1,operationRef:'call-gap'})).toMatchObject({receipt:{status:'failed',nativeSaved:false,error:{code:'storage_write_failed'}}});
+  expect(f.db.query("SELECT state,input_tokens FROM model_calls WHERE kind='compaction'").all()).toEqual([{state:'completed',input_tokens:10}]);expect(f.requests).toHaveLength(1);expect(f.app.busy).toBe(false);
+});
+
+for(const gap of ['call','history'] as const)test(`p10 automatic ${gap} persistence retry saves only original observed facts and never requests another summary`,async()=>{
+  const f=await fixture(true,false,false,'overflow'),workspace=f.repo.readWorkspace(),finish=f.repo.finishCompactionCall.bind(f.repo);let blocked=true;
+  if(gap==='call')spyOn(f.repo,'finishCompactionCall').mockImplementation((...args)=>{if(blocked)throw new Error('ENGINEERING call save unavailable');return finish(...args);});
+  else f.db.exec("CREATE TEMP TRIGGER fail_compaction BEFORE INSERT ON memories WHEN NEW.entry_type='compaction' BEGIN SELECT RAISE(ABORT,'ENGINEERING history save unavailable'); END;");
+  const accepted=await f.sessions.submit({sessionId:1,mode:'send',clientSequence:1,text:'ENGINEERING continue',expectedRevision:workspace.revision,expectedBatchIds:[],expectedQueryId:null,model:f.request.model,referenceDate:'2026-10-06',timezone:'Asia/Shanghai'},{instanceId:'host',operationRef:`gap-${gap}`});
+  expect(accepted).toMatchObject({ok:true});if(!accepted.ok||!accepted.data.runId)throw new Error('ENGINEERING root not accepted');await waitFor(()=>f.app.persistencePending);
+  const count=f.requests.length;expect(f.app.busy).toBe(true);blocked=false;if(gap==='history')f.db.exec('DROP TRIGGER fail_compaction');
+  expect(await f.app.runs.retrySave(accepted.data.runId)).toMatchObject({ok:true,data:{status:'failed',cleanup:{requiredPersistenceComplete:true,stopConfirmed:true}}});
+  expect(f.requests).toHaveLength(count);expect(f.app.busy).toBe(false);expect(f.db.query("SELECT state FROM model_calls WHERE state='started'").all()).toEqual([]);
+  expect(f.db.query("SELECT id FROM memories WHERE entry_type='compaction'").all()).toHaveLength(gap==='history'?1:0);
+});
+
+test('p10 restart leaves an old manual task blocked until process exit is proven, then records unknown generation and usage without replay',async()=>{
+  const f=await fixture(),resolved=await f.runtime.resolve(f.request.model,'1',null,{timeoutMs:10000,maxRetries:0,maxRetryDelayMs:2000}),base=f.repo.readSession(1)!,at=new Date().toISOString();
+  f.repo.acceptCompaction(f.request,'old',{model:resolved.selection,baseStorageVersion:2,baseLeafId:base.leafId,settings:{enabled:true,reserveTokens:256,keepRecentTokens:128},budget:{maxModelCalls:12,timeoutMs:10000},instanceId:'previous-host',startedAt:at});
+  const unknown=ModelCallRecorder.forCompaction(f.repo,{operationRef:'old',sessionId:1,runId:null,source:'manual',reason:'manual',model:resolved.selection,baseStorageVersion:2,baseLeafId:base.leafId,ordinal:1},at).callId;
+  f.app.runs.recoverInterrupted(false);expect(await f.app.runs.readControl()).toMatchObject({ok:true,data:{acceptingNewRuns:false,blockReasons:expect.arrayContaining([expect.objectContaining({code:'stop_unconfirmed'})])}});
+  expect(f.repo.readCompactionOperation({sessionId:1,operationRef:'old'})?.receipt).toBeNull();
+  f.app.runs.recoverInterrupted(true);
+  expect(f.repo.readCompactionOperation({sessionId:1,operationRef:'old'})).toMatchObject({receipt:{status:'interrupted',nativeGenerated:null,nativeSaved:false,callIds:[unknown],error:{code:'runtime_interrupted'}}});
+  expect(f.db.query("SELECT state,json_extract(model_json,'$.sdkStopReason') sdk_stop_reason,input_tokens,output_tokens FROM model_calls").all()).toEqual([{state:'failed',sdk_stop_reason:null,input_tokens:null,output_tokens:null}]);
+  expect(f.app.busy).toBe(false);expect(f.requests).toHaveLength(0);expect(f.repo.readSession(1)?.storageVersion).toBe(2);
+});
+
+for(const reason of ['threshold','overflow'] as const)test(`p10 automatic ${reason} preserves the SDK queue ordering and saves any generated compaction before the next real request`,async()=>{
+  const f=await fixture(true,true,false,reason),workspace=f.repo.readWorkspace(),request={sessionId:1,mode:'send' as const,clientSequence:1,text:'ENGINEERING root',expectedRevision:workspace.revision,expectedBatchIds:[],expectedQueryId:null,model:f.request.model,referenceDate:'2026-10-06',timezone:'Asia/Shanghai'};
+  const accepted=await f.sessions.submit(request,{instanceId:'host',operationRef:'root'});expect(accepted).toMatchObject({ok:true});if(!accepted.ok||!accepted.data.runId)throw new Error('ENGINEERING root not accepted');await waitFor(()=>f.requests.length===1);
+  expect(await f.sessions.submit({...request,mode:'follow_up',clientSequence:2,text:'ENGINEERING follow-up',targetRunId:accepted.data.runId},{instanceId:'host',operationRef:'follow'})).toMatchObject({ok:true});
+  f.release();await waitFor(()=>!f.app.busy);
+  expect(f.repo.read({runId:accepted.data.runId})).toMatchObject({kind:'one',run:{status:'completed',cleanup:{budgetSummary:{modelCalls:f.requests.length,recoveryAttempts:0}}}});
+  expect(f.requests.filter(body=>JSON.stringify(body).includes('MedClaw trusted runtime feedback'))).toHaveLength(reason==='overflow'?3:2);
+  expect(f.db.query("SELECT id FROM runtime_events WHERE type='compaction_completed'").all()).toHaveLength(1);
+  if(reason==='overflow')expect(JSON.stringify(f.requests.at(-1))).toContain('ENGINEERING summary Shanghai');
+  expect(f.db.query("SELECT status,processing_status FROM session_inputs ORDER BY id").all()).toEqual([{status:'consumed',processing_status:'completed'},{status:'consumed',processing_status:'completed'}]);
+});
+
+test('p10 shutdown reports unknown stop without closing SQLite or inventing a manual terminal receipt',async()=>{
+  const f=await fixture();let release!:()=>void;
+  spyOn(f.agent,'compact').mockImplementation(()=>new Promise(resolve=>{release=()=>resolve({nativeIdle:true,nativeGenerated:false,change:null,result:{nativeEntryId:null,firstKeptEntryId:null,tokensBefore:null,estimatedTokensAfter:null,callIds:[],noOpReason:null,error:null}});}));
+  expect(await f.sessions.compact(f.request,{instanceId:'host',operationRef:'unconfirmed'})).toMatchObject({ok:true});await waitFor(()=>release!==undefined);
+  await expect(f.app.shutdown()).rejects.toMatchObject({code:'stop_unconfirmed'});expect(f.repo.readCompactionOperation({sessionId:1,operationRef:'unconfirmed'})?.receipt).toBeNull();
+  expect(f.db.query('SELECT COUNT(*) n FROM sessions').get()).toEqual({n:1});expect(f.requests).toHaveLength(0);
+  release();await waitFor(()=>f.repo.readCompactionOperation({sessionId:1,operationRef:'unconfirmed'})?.receipt!=null);
+});
+
+test('p10 checkpoints on both sides rebuild exact saved branches with the corresponding original text or native summary',async()=>{
+  const f=await fixture();
+  async function send(sequence:number) {
+    const workspace=f.repo.readWorkspace(),accepted=await f.sessions.submit({sessionId:1,mode:'send',clientSequence:sequence,text:`ENGINEERING checkpoint ${sequence}`,expectedRevision:workspace.revision,expectedBatchIds:[],expectedQueryId:null,model:f.request.model,referenceDate:'2026-10-06',timezone:'Asia/Shanghai'},{instanceId:'host',operationRef:`send-${sequence}`});
+    expect(accepted).toMatchObject({ok:true});await waitFor(()=>!f.app.busy);
+  }
+  await send(1);const before=f.repo.readCheckpoints({sessionId:1}).items[0]!;
+  expect(await f.sessions.compact({...f.request,expectedStorageVersion:f.repo.readSession(1)!.storageVersion},{instanceId:'host',operationRef:'checkpoint-compaction'})).toMatchObject({ok:true});await terminal(f,'checkpoint-compaction');
+  await send(2);const after=f.repo.readCheckpoints({sessionId:1}).items[0]!,entries=f.db.query('SELECT native_entry_id,entry_json FROM memories ORDER BY sequence').all();
+  for(const point of [before,after]) {
+    const session=f.repo.readSession(1)!,workspace=f.repo.readWorkspace(),count=f.requests.length;
+    expect(await f.sessions.restoreCheckpoint({sessionId:1,targetLeafId:point.nativeLeafId,expectedStorageVersion:session.storageVersion,expectedWorkspaceRevision:workspace.revision},{instanceId:'host',operationRef:`restore-${point.answerId}`})).toMatchObject({ok:true,data:{targetLeafId:point.nativeLeafId}});
+    expect(f.requests).toHaveLength(count);expect(f.db.query('SELECT native_entry_id,entry_json FROM memories ORDER BY sequence').all()).toEqual(entries);
+    const binding=Reflect.get(f.agent,'sessions').get(1),context=JSON.stringify(binding.manager.buildSessionContext());
+    expect(binding.manager.getLeafId()).toBe(point.nativeLeafId);expect(context.includes('ENGINEERING summary Shanghai')).toBe(point===after);
+    if(point===before)expect(context).toContain('xxxxxxxxxxxxxxxx');
+  }
 });
 
 test('p10 a generated automatic summary exceeding capacity is saved with a failed Run and no continuation',async()=>{

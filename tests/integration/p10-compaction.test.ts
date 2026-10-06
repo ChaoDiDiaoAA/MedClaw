@@ -13,6 +13,7 @@ import { SqliteWriteTransactions } from '../../packages/storage/src/write-transa
 import type { CompactionReceipt, CompactionCallOwner, CompactionSaveFact } from '../../packages/contracts/src/session';
 import { canonicalRequest, type FinalCallFact } from '../../packages/contracts/src/run';
 import { DEFAULT_REQUEST_POLICY } from '../../packages/contracts/src/model';
+import {SqliteEventStore} from '../../packages/storage/src/event-store';
 import { toWorkspaceContext } from '../../packages/contracts/src/workspace';
 import { SqliteContextStore } from '../../packages/storage/src/context-store';
 
@@ -254,4 +255,19 @@ test('p10 unfinished automatic compaction is an independent recovery gap; a prov
     expect(f.db.query('SELECT id FROM context_snapshots').all()).toEqual([]);
     expect(()=>f.tx.immediate(()=>f.repos.commitCompactionInTransaction(f.change,f.fact))).toThrow('state_conflict');
   } finally {f.close();}
+});
+
+test('p10 committed compaction events prove their original native and call owners, deduplicate, and reject terminal late appends',()=>{
+  const f=savedCompactionFixture('auto');
+  try {
+    f.tx.immediate(()=>f.repos.commitCompactionInTransaction(f.change,f.fact));
+    const events=new SqliteEventStore(f.db,f.tx),range=events.range(f.runId!),event=events.readWindow({runId:f.runId!,afterSequence:0,throughSequence:range.lastSequence,limit:100}).find(value=>value.type==='compaction_completed')!;
+    const {eventId:_id,sequence:_sequence,...draft}=event;
+    expect(f.tx.immediate(()=>events.appendInTransaction(draft))).toEqual(event);expect(events.range(f.runId!)).toEqual(range);
+    expect(()=>f.tx.immediate(()=>events.appendInTransaction({...draft,sessionId:999}))).toThrow();
+    f.db.query("DELETE FROM runtime_events WHERE type='compaction_completed'").run();
+    f.db.query("UPDATE runs SET status='failed' WHERE id=?").run(f.runId!);
+    f.tx.immediate(()=>events.appendInTransaction({runId:f.runId!,sessionId:1,type:'run_failed',payload:{contract:'medclaw.event/v1',answerId:null,errorCode:'runtime_interrupted',stopConfirmed:true},source:'host',sourceConnection:null,sourceSequence:null,toolCallId:null,occurredAt:memoryAt,receivedAt:memoryAt}));
+    expect(()=>f.tx.immediate(()=>events.appendInTransaction(draft))).toThrow('state_conflict');
+  }finally{f.close();}
 });

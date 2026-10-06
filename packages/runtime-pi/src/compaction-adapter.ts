@@ -73,7 +73,7 @@ export class CompactionAdapter {
             nativeEntryId:entry.id,firstKeptEntryId:entry.firstKeptEntryId,tokensBefore:entry.tokensBefore,estimatedTokensAfter:event.result.estimatedTokensAfter??null,
             baseStorageVersion:this.memory.readSavedContext().storageVersion,callIds:[...frame.callIds]};
         }
-      } else if(!event.aborted)frame.error??=safeError('compaction_failed',undefined,{reason:'compaction_model_failed'});
+      } else frame.error??=event.aborted?safeError('tool_cancelled'):safeError('compaction_failed',undefined,{reason:'compaction_model_failed'});
       if(this.source.kind==='auto') {
         const reserve=this.source.input.agentOptions.compaction?.reserveTokens??this.session.settingsManager.getCompactionSettings(this.source.input.resolved.model).reserveTokens;
         if(!event.willRetry&&frame.result?.estimatedTokensAfter!=null&&frame.result.estimatedTokensAfter>=this.source.input.resolved.model.contextWindow-reserve)frame.error=safeError('compaction_failed',undefined,{reason:'compaction_capacity'});
@@ -93,6 +93,8 @@ export class CompactionAdapter {
     try {
       this.checkActive();options?.signal?.throwIfAborted();
       if(model.provider!==this.source.input.resolved.model.provider||model.id!==this.source.input.resolved.model.id)throw safeError('state_conflict');
+      const reserve=this.source.kind==='manual'?this.source.input.frozen.settings.reserveTokens:this.source.input.agentOptions.compaction?.reserveTokens??this.session.settingsManager.getCompactionSettings(model).reserveTokens;
+      if(model.contextWindow<=reserve)throw safeError('compaction_failed',undefined,{reason:'compaction_capacity'});
       if(this.source.kind==='auto')this.source.control.admitCompactionCall();
       else if(this.admitted>=this.source.input.frozen.budget.maxModelCalls)throw new Error('agent_call_limit');
       this.admitted++;

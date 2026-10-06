@@ -3,7 +3,7 @@ import { AppErrorSchema, TimestampSchema, OpaqueIdSchema, PositiveIdSchema } fro
 import { ModelChoiceSchema, ModelSelectionSchema, ReferenceDateSchema, TimezoneSchema } from "./model";
 import { RevisionSchema, WorkspaceViewSchema, WorkspaceContextSchema } from "./workspace";
 import type { WorkspaceView, WorkspaceChange, WorkspaceContext } from "./workspace";
-import { RunScopeSchema } from "./run";
+import { RunScopeSchema,ModelCallViewSchema } from "./run";
 import type { AppError, Result } from "./error";
 import type { StoredOperation, RunHandle, RegisterAgentInput } from "./run";
 import type { ReadSessionMessagesInput, SessionMessagePage } from "./messages";
@@ -44,6 +44,7 @@ export const SessionRuntimeViewSchema = z.strictObject({ availability: z.enum(['
   .refine(value => value.availability === 'blocked' ? value.error !== null : value.error === null, 'Blocked instances require a safe error');
 export type SessionRuntimeView = z.infer<typeof SessionRuntimeViewSchema>;
 export const SessionDetailSchema = z.strictObject({
+  compactionOperation:z.lazy(()=>CompactionOperationViewSchema).nullable().optional(),
   session: SessionViewSchema, runningRunId: PositiveIdSchema.nullable(),
   runtime:SessionRuntimeViewSchema,
   history: z.strictObject({ available: z.boolean(), reason: z.enum(["host_restart", "native_state_invalid", "history_not_recorded"]).nullable(),
@@ -107,6 +108,7 @@ export const CompactionReceiptSchema = z.strictObject({
   if (receipt.status === 'cancelled' && !receipt.cancelRequestedAt) invalid('Cancellation requires its original request');
 });
 export const CompactionOperationViewSchema = z.strictObject({
+  calls:z.array(ModelCallViewSchema).max(50).default([]),
   ...compactionIdentity, status: CompactionStatusSchema, phase: CompactionPhaseSchema, revision: RevisionSchema,
   nativeGenerated: z.boolean().nullable(), nativeSaved: z.boolean(), canContinue: z.boolean(), receipt: CompactionReceiptSchema.nullable(), error: AppErrorSchema.nullable(),
 }).superRefine((view, ctx) => {
@@ -247,6 +249,7 @@ export type NativeSessionBindings = {
   readMessages: (input: ReadSessionMessagesInput) => Promise<SessionMessagePage>;
   ensureLoaded: (sessionId:number)=>Promise<void>;
   restore: (sessionId:number)=>Promise<void>;
+  discardCompactionForRestore?:(proof:Omit<RestoreDiscardProof,'persistentSnapshot'>)=>Promise<void>;
   readAvailability: (sessionId:number)=>SessionRuntimeView;
 };
 /** Product persistence port; native SDK objects stay in the Host's adapter. */

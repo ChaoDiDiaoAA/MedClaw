@@ -21,6 +21,7 @@ const nullableAmount = z.number().finite().nonnegative().nullable();
 const nullableToken = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable();
 const safeLabel = z.string().min(1).max(256);
 export const ModelCallViewSchema = z.strictObject({
+  compaction:z.strictObject({operationRef:OpaqueIdSchema,reason:z.enum(['manual','threshold','overflow']),nativeEntryId:OpaqueIdSchema.nullable(),savedStorageVersion:z.number().int().nonnegative().nullable()}).optional(),
   contextSnapshotId: PositiveIdSchema.nullable().optional(),
   id: PositiveIdSchema, inputId: PositiveIdSchema.nullable().default(null), callId: OpaqueIdSchema, kind: z.enum(["main", "diagnostic", "compaction"]), state: z.enum(["started", "completed", "failed", "cancelled"]),
   granularity: z.literal("logical_request"), attempt: z.literal(1), attemptCountUnknown: z.literal(true), model: ModelSelectionSchema,
@@ -240,7 +241,10 @@ export interface ProviderRunStore {
 }
 export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputStore {
   confirmCompactionSaved?(change:NativeHistoryCommit|null,fact:import('./session').CompactionReceipt|import('./session').CompactionSaveFact):number|null;
-  verifyPriorCompactionFacts?(runId:number):{requiredPersistenceComplete:boolean;unconfirmedItems:string[]};
+  verifyPriorCompactionFacts?(runId:number,previousProcessExited?:boolean,time?:string):{requiredPersistenceComplete:boolean;unconfirmedItems:string[]};
+  recoverManualCompactions?:(instanceId:string,previousProcessExited:boolean,time:string)=>import('./session').StoredCompactionOperation[];
+  latestCompactionOperation?:(sessionId:number)=>import('./session').StoredCompactionOperation|null;
+  readCompactionCalls?:(operationRef:string)=>ModelCallView[];
   finishAutoCompaction?(operationRef:string,runId:number,error:AppError,endedAt:string):void;
   confirmHistorySaved?(change:NativeHistoryCommit):{storageVersion:number}|null;
   verifyPriorContextFacts?(runId: number): { requiredPersistenceComplete: boolean; unconfirmedItems: string[] };

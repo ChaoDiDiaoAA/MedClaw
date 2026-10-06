@@ -20,6 +20,14 @@ export class SqliteEventStore implements EventStore {
    // Writes prove the committing position. Later reads prove the original event, not the current branch.
    if(code==='storage_write_failed'&&(draft.payload.storageVersion!==history.storage_version||draft.payload.nativeLeafId!==history.current_leaf_id))fail(code);
   }
+  if(draft.type==='compaction_completed') {
+   const payload=draft.payload,entry=this.db.query<{entry_json:string;run_id:number|null},[number,string]>("SELECT entry_json,run_id FROM memories WHERE session_id=? AND native_entry_id=? AND entry_type='compaction'").get(draft.sessionId,payload.nativeEntryId);
+   if(!entry||entry.run_id!==draft.runId)fail(code);const native=JSON.parse(entry.entry_json);
+   if(native.firstKeptEntryId!==payload.firstKeptEntryId||native.tokensBefore!==payload.tokensBefore)fail(code);
+   const calls=this.db.query<{state:string;model_json:string;session_id:number|null},[number,string]>("SELECT state,model_json,session_id FROM model_calls WHERE run_id=? AND kind='compaction' AND json_extract(model_json,'$.compaction.operationRef')=?").all(draft.runId,payload.operationRef);
+   if(!calls.length||calls.some(call=>{const marker=JSON.parse(call.model_json).compaction;return call.state==='started'||call.session_id!==draft.sessionId||marker.source!=='auto'||marker.reason!==payload.reason||marker.nativeEntryId!==payload.nativeEntryId||marker.savedStorageVersion!==payload.storageVersion||!marker.operationEndedAt;}))fail(code);
+   if(!this.db.query("SELECT id FROM runtime_events WHERE run_id=? AND session_id=? AND type='history_saved' AND json_extract(payload_json,'$.storageVersion')=?").get(draft.runId,draft.sessionId,payload.storageVersion))fail(code);
+  }
   if(draft.type==='context_delivered'&&!this.db.query(`SELECT d.id FROM context_deliveries d JOIN model_calls c ON c.id=d.model_call_id WHERE d.snapshot_id=? AND c.call_id=? AND d.run_id=? AND d.session_id=?`).get(draft.payload.snapshotId,draft.payload.callId,draft.runId,draft.sessionId))fail(code);
   if('inputId' in p){const row=this.db.query<{run_id:number|null;target_run_id:number|null},[number,number]>('SELECT run_id,target_run_id FROM session_inputs WHERE id=? AND session_id=?').get(p.inputId,draft.sessionId);if(!row||(row.run_id??row.target_run_id)!==draft.runId||p.runId!==null&&row.run_id!==p.runId||p.targetRunId!==null&&row.target_run_id!==p.targetRunId)fail(code);}
   if('answerId' in p&&p.answerId!==null&&!owned('answers',p.answerId))fail(code);
@@ -30,6 +38,11 @@ export class SqliteEventStore implements EventStore {
  }
  appendInTransaction(input:RegisteredEventDraft):StoredRunEvent {
   this.transactions.assertActive();const parsed=RegisteredEventDraftSchema.safeParse(input);if(!parsed.success)fail('storage_write_failed');const draft=parsed.data;this.owner(draft,'storage_write_failed');
+  if(draft.type==='compaction_completed') {
+   const old=this.db.query<Row,[number,string]>("SELECT * FROM runtime_events WHERE run_id=? AND type='compaction_completed' AND json_extract(payload_json,'$.nativeEntryId')=?").get(draft.runId,draft.payload.nativeEntryId);
+   if(old){const {eventId:_id,sequence:_sequence,receivedAt:_received,...fact}=this.project(old),{receivedAt:_newReceived,...incoming}=draft;if(!isDeepStrictEqual(fact,incoming))fail('state_conflict');return this.project(old);}
+   if(this.db.query("SELECT id FROM runtime_events WHERE run_id=? AND type IN ('run_completed','run_failed','run_cancelled') LIMIT 1").get(draft.runId))fail('state_conflict');
+  }
   if(draft.sourceConnection!==null){const old=this.db.query<Row,[string,number]>('SELECT * FROM runtime_events WHERE source_connection=? AND source_sequence=?').get(draft.sourceConnection,draft.sourceSequence!);if(old){const event=this.project(old);const {eventId:_id,sequence:_seq,receivedAt:_received,...fact}=event;const {receivedAt:_newReceived,...incoming}=draft;if(!isDeepStrictEqual(fact,incoming))fail('state_conflict');return event;}}
   const sequence=this.range(draft.runId).lastSequence+1;if(!Number.isSafeInteger(sequence))fail('storage_write_failed');
   try{const row=this.db.query('INSERT INTO runtime_events(run_id,session_id,sequence,type,source,source_connection,source_sequence,tool_call_id,payload_json,occurred_at,received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(draft.runId,draft.sessionId,sequence,draft.type,draft.source,draft.sourceConnection,draft.sourceSequence,draft.toolCallId,JSON.stringify(draft.payload),draft.occurredAt,draft.receivedAt);return StoredRunEventSchema.parse({...draft,eventId:Number(row.lastInsertRowid),sequence});}catch{fail('storage_write_failed');}

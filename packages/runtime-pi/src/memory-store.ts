@@ -126,6 +126,7 @@ export class PiMemoryAdapter {
   private reported=false;
   private lastAcknowledgement:{identity:string;storageVersion:number}|null=null;
   private compaction:string|null=null;
+  get compactionOperationRef():string|null{return this.compaction;}
   constructor(private readonly manager:SessionManager,private readonly options:MemoryOptions) {
     this.saved=validateNativeHistory(options.snapshot);this.observed=this.snapshot();
     if(nativeHistoryJSON(this.saved)!==nativeHistoryJSON(this.observed))invalid();
@@ -263,5 +264,10 @@ export class PiMemoryAdapter {
     for(const [method,{wrapped}]of this.wrappers)if(this.manager[method]!==wrapped)throw safeError('state_conflict');
     for(const [method,{original}]of this.wrappers)Reflect.set(this.manager,method,original);
     this.disposed=true;
+  }
+  discardUncommittedForRestore(proof:import('../../contracts/src/session').RestoreDiscardProof):void {
+    if(proof.sessionId!==this.saved.sessionId||proof.operationRef!==this.compaction||proof.nativeIdle!==true||proof.nativeQueuesEmpty!==true||proof.observersSettled!==true||proof.requiredCallFactsSaved!==true
+      ||this.pending||this.final||this.options.getRunId()!==null||nativeHistoryJSON(validateNativeHistory(proof.persistentSnapshot))!==nativeHistoryJSON(this.saved))throw safeError('storage_write_failed');
+    this.compaction=null;this.heldFrom=null;this.dispose();
   }
 }

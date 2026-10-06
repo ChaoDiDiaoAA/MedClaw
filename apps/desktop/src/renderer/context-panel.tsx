@@ -30,7 +30,7 @@ export function ContextDetails(props: {host:HostView;callId:string;runId:number;
   return <section className="context-detail" data-testid="context-details" data-call-id={props.callId} aria-label={`Context for call ${props.callId}`}>
     <button disabled={props.host.state !== 'ready'} aria-disabled={loading} aria-busy={loading} onClick={() => {if (!loading) void read();}} aria-label={`${result ? 'Refresh' : 'View'} context for call ${props.callId}`}>{loading ? 'Reading context…' : result ? 'Refresh context' : 'View context'}</button>
     {error && <p role="alert" className="error-text">{error}</p>}
-    {result?.kind === 'not_recorded' && <p role="status">{result.reason === 'pre_p8' ? 'Context was not recorded for this pre-P8 call.' : 'Context snapshots do not apply to this Provider or diagnostic call.'}</p>}
+    {result?.kind === 'not_recorded' && <p role="status">{result.reason === 'pre_p8' ? 'Context was not recorded for this pre-P8 call.' : 'Context snapshots do not apply to this Provider, diagnostic or compaction call.'}</p>}
     {result?.kind === 'snapshot' && <>
       <p className="tiny">Snapshot {result.snapshot.id} · Run {result.snapshot.runId} · Session {result.snapshot.sessionId} · Input {result.snapshot.inputId ?? 'Unknown'} · Selection revision {result.snapshot.workspaceContext?.revision ?? 'Unknown'}</p>
       <h4>Selected materials</h4>
