@@ -8,7 +8,8 @@ export const ResourceHashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 export const ResourceIdSchema = z.string().min(1).max(64).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 export const ResourceVersionSchema = z.string().max(32).regex(/^v[1-9][0-9]*$/);
 export const ResourceFileSchema = z.string().min(1).max(256).refine(file =>
-  !/[\\:\u0000-\u001f\u007f]/.test(file) && file.split('/').every(part => part !== '' && part !== '.' && part !== '..' && !/[. ]$/.test(part)), 'Expected a canonical relative resource file');
+  !/[\\:*?"<>|\u0000-\u001f\u007f]/.test(file) && file.split('/').every(part => part !== '' && part !== '.' && part !== '..' && !/[. ]$/.test(part)
+    && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part)), 'Expected a canonical relative resource file');
 export const ResourceRefSchema = z.strictObject({ kind: z.enum(['prompt', 'skill']), id: ResourceIdSchema, version: ResourceVersionSchema, treeHash: ResourceHashSchema });
 export type ResourceRef = z.infer<typeof ResourceRefSchema>;
 export type ResourceKind = ResourceRef['kind'];

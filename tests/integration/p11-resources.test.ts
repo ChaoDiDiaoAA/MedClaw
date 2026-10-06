@@ -1,13 +1,13 @@
 import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { openDatabase } from '../../packages/storage/src/database';
 import { Repositories } from '../../packages/storage/src/repositories';
 import { contextAt } from '../fixtures/p8-context';
-import { DEFAULT_REQUEST_POLICY } from '../../packages/contracts/src/model';
+import { DEFAULT_REQUEST_POLICY, PublishedSettingsSchema } from '../../packages/contracts/src/model';
 import { canonicalRequest } from '../../packages/contracts/src/run';
 import { toWorkspaceContext } from '../../packages/contracts/src/workspace';
 import { SqliteToolStore } from '../../packages/storage/src/tool-store';
@@ -15,6 +15,91 @@ import { SqliteContextStore } from '../../packages/storage/src/context-store';
 import { ResourceSnapshotSchema, type ResourceSnapshot } from '../../packages/contracts/src/resources';
 import { ToolRecorder } from '../../packages/core/src/tools/recorder';
 import { acceptContextInput } from '../fixtures/p8-context';
+import { DefaultResourceLoader, SettingsManager } from '@earendil-works/pi-coding-agent';
+
+function writeAuthor(root: string, snapshots: ResourceSnapshot[]) {
+  mkdirSync(root, { recursive: true });
+  for (const snapshot of snapshots) for (const file of snapshot.files) { const path = join(root, dirname(snapshot.entry), file.file); mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, file.content); }
+  writeFileSync(join(root, 'catalog.json'), JSON.stringify({ contract: 'medclaw.resource-catalog/v1', sdkVersion: '0.87.1', definitions: snapshots.map(s => ({ ...s.ref, entry: s.entry, files: s.files.map(f => f.file), keywords: s.keywords, requiredTools: s.requiredTools, requiredExtensions: s.requiredExtensions })) }));
+}
+function promptSnapshot(): ResourceSnapshot {
+  const content = '---\ndescription: ENGINEERING Prompt\n---\nFacts $ARGUMENTS\n', sha256 = createHash('sha256').update(content).digest('hex');
+  const metadata = { kind: 'prompt', id: 'query', version: 'v1', entry: 'prompts/query/v1/query.md', keywords: [], requiredTools: [], requiredExtensions: [], files: [{ path: 'query.md', bytes: Buffer.byteLength(content), sha256 }] };
+  return ResourceSnapshotSchema.parse({ ref: { kind: 'prompt', id: 'query', version: 'v1', treeHash: createHash('sha256').update(canonicalRequest(metadata)).digest('hex') }, name: 'query', description: 'ENGINEERING Prompt', disableModelInvocation: false,
+    keywords: [], requiredTools: [], requiredExtensions: [], entry: metadata.entry, files: [{ file: 'query.md', content, bytes: Buffer.byteLength(content), sha256 }] });
+}
+
+test('p11 one resource service binds selection reads, frozen input planning and SQL history without a Run or model side effect', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'medclaw-p11-service-')), db = openDatabase(join(root, 'app.sqlite'));
+  try {
+    const repos = new Repositories(db), seed = plannedInput(repos), skill = skillSnapshot(), prompt = promptSnapshot(), author = join(root, 'author'); writeAuthor(author, [skill, prompt]);
+    let settings = PublishedSettingsSchema.parse({ schemaVersion: 'medclaw.settings/p1-v1', configVersion: '1', model: null, customProviders: [], credentialRefs: {}, previous: null, rollbackFromVersion: null,
+      resources: { bySession: { '1': { prompt: prompt.ref, skills: [skill.ref] } } } });
+    const module = await import('../../packages/core/src/resources/resource-service').catch(() => null); expect(module?.ResourceService).toBeFunction();
+    const { createResourceSource, materializeRunResources, verifyRunResourceFiles } = await import('../../packages/runtime-pi/src/resource-loader');
+    const service = new module!.ResourceService(() => settings, repos, createResourceSource(author), () => ['read']);
+    const list = await service.list({ source: 'selection', sessionId: 1 });
+    expect(list.items).toHaveLength(2); expect(list.items.every(i => i.enabled && i.availability === 'ready')).toBe(true);
+    expect((await service.read({ source: 'selection', sessionId: 1, resourceRef: prompt.ref, file: 'query.md' })).content).toBe(prompt.files[0]!.content);
+    await expect(service.read({ source: 'selection', sessionId: 1, resourceRef: skill.ref, file: 'not-listed.txt' })).rejects.toMatchObject({ code: 'access_denied' });
+    await expect(service.validateSelection(1, settings.resources!.bySession['1']!, [])).rejects.toMatchObject({ reason: 'resource_dependency_missing' });
+    const frozen = await service.freeze(1, settings, { ...seed.content.scope, allowedToolNames: ['read'] });
+    expect(frozen.available).toHaveLength(2);
+    const raw = '"quote" C:\\case\n$1', request = { ...seed.originalSubmitInput, text: raw };
+    expect(service.planInput(frozen, request)).toEqual({ kind: 'prompt', resourceRef: prompt.ref, dispatchText: '/query ' + raw.split('"').map(p => '"' + p + '"').join("'\"'") });
+    expect(service.planInput(frozen, { ...request, text: '/skill:query check' })).toMatchObject({ kind: 'skill', resourceRef: skill.ref, dispatchText: '/skill:query check' });
+    expect(service.planInput(frozen, { ...request, mode: 'steer', targetRunId: 1 })).toEqual({ kind: 'plain', resourceRef: null, dispatchText: raw });
+    expect(() => service.planInput(frozen, { ...request, text: '/skill:unselected' })).toThrow();
+    expect(() => service.planInput(frozen, { ...request, text: '\ud800' })).toThrow();
+    expect(db.query('SELECT * FROM runs').all()).toHaveLength(0); expect(db.query('SELECT * FROM model_calls').all()).toHaveLength(0);
+    const plan = { ...seed, content: { ...seed.content, scope: { ...seed.content.scope, allowedToolNames: ['read'], allowedResourceRefs: frozen.available.map(s => `${s.ref.kind}:${s.ref.id}@${s.ref.version}#${s.ref.treeHash}`) }, resourceInputPlan: service.planInput(frozen, seed.originalSubmitInput) },
+      execution: { ...seed.execution, run: { ...seed.execution.run, resources: frozen, scope: { ...seed.content.scope, allowedToolNames: ['read'], allowedResourceRefs: frozen.available.map(s => `${s.ref.kind}:${s.ref.id}@${s.ref.version}#${s.ref.treeHash}`) } } } };
+    const accepted = repos.acceptInput(plan), work = join(root, 'runtime', String(accepted.runId), 'work', 'scratch'); mkdirSync(work, { recursive: true });
+    const paths = await materializeRunResources(accepted.runId!, work, frozen); await verifyRunResourceFiles(work, frozen);
+    expect(paths.skillPaths).toEqual([join(work, 'resources', skill.entry)]); expect(paths.promptPaths).toEqual([join(work, 'resources', prompt.entry)]);
+    const loader = new DefaultResourceLoader({ cwd: work, agentDir: join(root, 'agent'), settingsManager: SettingsManager.inMemory({ packages: [], skills: [], prompts: [], extensions: [], themes: [] }),
+      noSkills: true, noPromptTemplates: true, noExtensions: true, noThemes: true, noContextFiles: true, additionalSkillPaths: paths.skillPaths, additionalPromptTemplatePaths: paths.promptPaths });
+    await loader.reload(); expect(loader.getSkills().skills.map(s => s.filePath)).toEqual(paths.skillPaths); expect(loader.getPrompts().prompts[0]?.content).toBe('Facts $ARGUMENTS');
+    const nextWork = join(root, 'runtime', '2', 'work', 'scratch'); mkdirSync(nextWork, { recursive: true });
+    expect((await materializeRunResources(2, nextWork, frozen)).signature).not.toBe(paths.signature);
+    writeFileSync(paths.skillPaths[0]!, 'changed copy'); await expect(verifyRunResourceFiles(work, frozen)).rejects.toMatchObject({ reason: 'resource_snapshot_invalid' });
+    await expect(materializeRunResources(accepted.runId!, work, frozen)).rejects.toMatchObject({ reason: 'resource_snapshot_invalid' });
+    rmSync(author, { recursive: true }); settings = { ...settings, configVersion: '2', resources: { bySession: {} } };
+    expect((await service.read({ source: 'run', runId: accepted.runId!, resourceRef: prompt.ref, file: 'query.md' })).content).toBe(prompt.files[0]!.content);
+    const history = await service.list({ source: 'run', runId: accepted.runId! }); expect(history.configVersion).toBe('1'); expect(history.selection.prompt).toEqual(prompt.ref);
+    await expect(service.read({ source: 'selection', sessionId: 1, resourceRef: prompt.ref, file: 'query.md' })).rejects.toMatchObject({ code: 'access_denied' });
+    const empty = await service.freeze(1, settings, seed.content.scope); expect(empty.available).toEqual([]); expect(empty.omitted).toEqual([]);
+  } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('p11 optional resource failures preserve selection and only block inputs that require them', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'medclaw-p11-optional-')), db = openDatabase(join(root, 'app.sqlite'));
+  try {
+    const repos = new Repositories(db), seed = plannedInput(repos), skill = skillSnapshot(), prompt = promptSnapshot(), author = join(root, 'author'); writeAuthor(author, [skill, prompt]);
+    let settings = PublishedSettingsSchema.parse({ schemaVersion: 'medclaw.settings/p1-v1', configVersion: '1', model: null, customProviders: [], credentialRefs: {}, previous: null, rollbackFromVersion: null,
+      resources: { bySession: { '1': { prompt: null, skills: [skill.ref] } } } });
+    const { ResourceService } = await import('../../packages/core/src/resources/resource-service'), { createResourceSource } = await import('../../packages/runtime-pi/src/resource-loader');
+    const service = new ResourceService(() => settings, repos, createResourceSource(author), () => ['read']);
+    await expect(service.validateSelection(1, { prompt: null, skills: [{ ...skill.ref, treeHash: 'a'.repeat(64) }] }, ['read'])).rejects.toMatchObject({ reason: 'resource_changed' });
+    const dependent = await service.freeze(1, settings, seed.content.scope);
+    expect(dependent.omitted).toContainEqual(expect.objectContaining({ resourceRef: skill.ref, reason: 'resource_dependency_missing' }));
+    expect(service.planInput(dependent, { ...seed.originalSubmitInput, text: 'unrelated question' })).toMatchObject({ kind: 'plain' });
+    expect(() => service.planInput(dependent, { ...seed.originalSubmitInput, text: '/skill:query' })).toThrow();
+    expect(() => service.planInput(dependent, { ...seed.originalSubmitInput, text: '/query known but unselected' })).toThrow();
+    unlinkSync(join(author, skill.entry)); const missing = await service.freeze(1, settings, { ...seed.content.scope, allowedToolNames: ['read'] });
+    expect(missing.selection.skills).toEqual([skill.ref]); expect(missing.available).toEqual([]); expect(missing.omitted[0]?.reason).toBe('resource_missing');
+    expect(service.planInput(missing, { ...seed.originalSubmitInput, text: 'unrelated' }).dispatchText).toBe('unrelated');
+    writeFileSync(join(author, 'catalog.json'), '{}'); const list = await service.list({ source: 'selection', sessionId: 1 });
+    expect(list.selection.skills).toEqual([skill.ref]); expect(list.catalogError?.reason).toBe('resource_catalog_invalid'); expect(list.items[0]?.description).toBeNull();
+    await expect(service.validateSelection(1, { prompt: null, skills: [] }, [])).resolves.toEqual({ prompt: null, skills: [] });
+    settings = { ...settings, resources: { bySession: {} } }; const empty = await service.freeze(1, settings, seed.content.scope); expect(empty.available).toEqual([]); expect(empty.knownPromptNames).toEqual([]); expect(empty.omitted).toEqual([]);
+    writeAuthor(author, [skill, prompt]); settings = { ...settings, resources: { bySession: { '1': { prompt: prompt.ref, skills: [skill.ref] } } } }; unlinkSync(join(author, prompt.entry));
+    const badPrompt = await service.freeze(1, settings, { ...seed.content.scope, allowedToolNames: ['read'] });
+    expect(() => service.planInput(badPrompt, seed.originalSubmitInput)).toThrow();
+    expect(service.planInput(badPrompt, { ...seed.originalSubmitInput, text: '/skill:query check' }).resourceRef).toEqual(skill.ref);
+    expect(db.query('SELECT * FROM runs').all()).toHaveLength(0); expect(db.query('SELECT * FROM model_calls').all()).toHaveLength(0);
+  } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
+});
 
 function skillSnapshot(): ResourceSnapshot {
   const content = '---\nname: query\ndescription: ENGINEERING query\n---\nUse known facts.\n', sha256 = createHash('sha256').update(content).digest('hex');
