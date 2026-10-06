@@ -4,8 +4,8 @@ import { readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
-export const SCHEMA_VERSION = 10;
-const migrations = ["001_p1.sql", "002_p2.sql", "003_p3.sql", "004_p5.sql", "005_p6.sql", "006_session_lifecycle.sql", "007_batch_deletion.sql", "008_p8.sql", "009_p9.sql", "010_p10.sql"].map(name => {
+export const SCHEMA_VERSION = 11;
+const migrations = ["001_p1.sql", "002_p2.sql", "003_p3.sql", "004_p5.sql", "005_p6.sql", "006_session_lifecycle.sql", "007_batch_deletion.sql", "008_p8.sql", "009_p9.sql", "010_p10.sql", "011_p11.sql"].map(name => {
   const sql = readFileSync(new URL(`./migrations/${name}`, import.meta.url));
   // Git checkout newline conversion changes byte hashes without changing SQL.
   // Accept only these two forms of the current content; retain stored identities.
@@ -236,6 +236,13 @@ export function openDatabase(path: string, beforeMigrationCommit?: (phase?: stri
         db.exec('PRAGMA foreign_keys=ON');
         if (db.query<{foreign_keys:number},[]>('PRAGMA foreign_keys').get()?.foreign_keys !== 1) throw new Error('storage_migration_failed');
       }
+    }
+    if (version <= 10) {
+      db.transaction(() => {
+        db.exec(migrations[10]!.sql);
+        validate(db, 11); beforeMigrationCommit?.('p11_receipt_marker');
+        db.query('INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(11,?,?)').run(migrations[10]!.checksum, new Date().toISOString());
+      }).immediate();
     }
     validate(db, SCHEMA_VERSION);
     return db;

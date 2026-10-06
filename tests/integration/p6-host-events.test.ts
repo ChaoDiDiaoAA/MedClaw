@@ -37,7 +37,7 @@ async function ownerFixture() {
   const window = { id: 1, isDestroyed: () => false, webContents: { id: 10, mainFrame, on: (name: string, fn: (...args: any[]) => void) => contentsListeners.set(name, fn) }, on: (name: string, fn: (...args: any[]) => void) => listeners.set(name, fn) } as unknown as BrowserWindow;
   let instanceId = 'host-1', next: Result<unknown> | null = null, delayed: (() => Promise<Result<unknown>>) | null = null;
   const calls: { method: string; payload: any; instance: string | undefined }[] = [];
-  const host = { read: () => ({ state: 'ready', instanceId, canStart: false, sdkVersion: '0.87.1', schemaVersion:10, error: null }), request: async (method: string, payload: any, _operation?: string, _request?: string, expected?: string) => {
+  const host = { read: () => ({ state: 'ready', instanceId, canStart: false, sdkVersion: '0.87.1', schemaVersion:11, error: null }), request: async (method: string, payload: any, _operation?: string, _request?: string, expected?: string) => {
     calls.push({ method, payload, instance: expected });
     if (expected && expected !== instanceId) return { ok: false, error: safeError('host_interrupted') };
     if (payload.action === 'close') return { ok: true, data: { action: 'close', subscriptionId: payload.subscriptionId, closed: true } };
@@ -171,7 +171,7 @@ test('host_requests_read_and_open_close_use_p6_contract_and_never_reexecute', as
   atomicWriteJson(host.paths.settingsPath, PublishedSettingsSchema.parse({ ...initial, model: { provider: 'p6-fixture', modelId: 'fixture' }, customProviders: [{ definition, credentialRef: null }] }));
   try {
     expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion: DATABASE_SCHEMA_VERSION, sdkVersion: '0.87.1' });
-    expect(unwrap(await host.request('diagnostics.read', { categories: ['runtime'] }))).toMatchObject({ versions: { protocolVersion: HOST_PROTOCOL_VERSION, schemaVersion:10, sdkVersion: '0.87.1' } });
+    expect(unwrap(await host.request('diagnostics.read', { categories: ['runtime'] }))).toMatchObject({ versions: { protocolVersion: HOST_PROTOCOL_VERSION, schemaVersion:11, sdkVersion: '0.87.1' } });
     const workspace = () => host.request('workspace.read', {}).then(result => WorkspaceViewSchema.parse(unwrap(result)));
     const session = NewSessionResultSchema.parse(unwrap(await host.request('session.create', { expectedWorkspaceRevision: (await workspace()).revision }, 'create-stream'))).session;
     const accepted = SubmitResultSchema.parse(unwrap(await host.request('session.submit', { sessionId: session.id, clientSequence: 1, text: 'P6 original input', mode: 'send', expectedRevision: (await workspace()).revision, expectedBatchIds: [], expectedQueryId: null,

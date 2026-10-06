@@ -4,6 +4,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { ContextSnapshotBodySchema, ContextSnapshotSchema, ContextDeliverySchema, ContextReadResultSchema, ContextProjectionSchema, ReadContextInputSchema, PrepareContextInputSchema, RegisterContextDeliveryInputSchema, ModelCallContextSchema, CONTEXT_READ_BYTES, CONTEXT_MATERIAL_PREFIX, type ContextStore, type ContextSnapshot, type ContextDelivery, type ContextReadResult, type PrepareContextInput, type SaveContextSelection, type RegisterContextDeliveryInput, type ReadContextInput, type ContextRef, type ContextSource, type NativeContextRef } from '../../contracts/src/context';
 import { InputContentSchema } from '../../contracts/src/session';
+import { CallResourceContextSchema, FrozenRunResourcesSchema, resourceRefKey } from '../../contracts/src/resources';
 import { ToolSdkDeliverySchema } from '../../contracts/src/tool';
 import { canonicalRequest, RunScopeSchema } from '../../contracts/src/run';
 import { normalizeToolConfiguration } from '../../contracts/src/tool-config';
@@ -48,9 +49,12 @@ export class SqliteContextStore implements ContextStore {
       if (!row || row.session_id !== input.sessionId || row.run_id !== input.runId || row.target_run_id !== input.runId || row.status !== 'consumed' || row.native_entry_id !== input.nativeEntryId) fail('state_conflict');
       const content = checked(InputContentSchema, JSON.parse(row.content_json));
       if (!isDeepStrictEqual(content.workspaceContext, input.workspaceContext) || content.referenceDate !== run.reference_date || content.timezone !== run.timezone) fail('access_denied');
-      const materialScope = freezeWorkspaceScope(this.db, input.workspaceContext, content.scope.allowedToolNames);
+      const config = JSON.parse(run.config_json), resources = config.agent?.resources ? checked(FrozenRunResourcesSchema, config.agent.resources) : null;
+      if (resources ? resources.sessionId !== input.sessionId || resources.configVersion !== content.model.configVersion
+        || !isDeepStrictEqual(resources.available.map(s => resourceRefKey(s.ref)), rootScope.allowedResourceRefs) : content.scope.allowedResourceRefs.length || rootScope.allowedResourceRefs.length) fail('resource_unavailable');
+      const materialScope = { ...freezeWorkspaceScope(this.db, input.workspaceContext, content.scope.allowedToolNames), allowedResourceRefs: rootScope.allowedResourceRefs };
       if (!isDeepStrictEqual(content.scope, materialScope) || materialScope.batchIds.some(id => !rootScope.batchIds.includes(id)) || rootScope.deviceIds !== null && (materialScope.deviceIds === null || materialScope.deviceIds.some(id => !rootScope.deviceIds!.includes(id))) || materialScope.allowedToolNames.some(name => !rootScope.allowedToolNames.includes(name)) || materialScope.artifactIds.some(id => !rootScope.artifactIds.includes(id)) || rootScope.readOnly && !materialScope.readOnly) fail('access_denied');
-      if (content.scope.allowedResourceRefs.length || rootScope.allowedResourceRefs.length) fail('resource_unavailable');
+      if (content.resourceInputPlan && !content.nativeInput || content.nativeInput && hash(content.nativeInput.text) !== content.nativeInput.sha256) fail('storage_read_failed');
       const catalog = new SqliteCatalogStore(this.db), tools = new SqliteToolStore(this.db), materials: Material[] = [], selectedRefs: ContextRef[] = [];
       const add = (kind: ContextRef['kind'], id: number, version: string, value: unknown, source: ContextSource, provenance: Material['provenance'] = null, fieldOrigins: unknown = {}) => {
         const ref = { kind, id: String(id), version, hash: digest(value), channel: 'product_projection' as const }; selectedRefs.push(ref);
@@ -84,7 +88,7 @@ export class SqliteContextStore implements ContextStore {
         const item = evidence.find(item => item.id === Number(selected.targetId)); if (!item) fail('access_denied');
         add('evidence',item.id,item.calculationVersion,selected.rowKey === null ? item : {...item,snapshotIds:[Number(selected.rowKey.slice(9))],sourceRowRefs:[]},'program_query_fact',item.provenance ?? 'synthetic-derived');
       }
-      const inputRef: NativeContextRef = {kind:'input',id:input.inputId,nativeEntryId:input.nativeEntryId,contentHash:hash(content.text),nativeToolCallId:null,originSnapshotId:null};
+      const inputRef: NativeContextRef = {kind:'input',id:input.inputId,nativeEntryId:input.nativeEntryId,contentHash:hash(content.nativeInput?.text ?? content.text),nativeToolCallId:null,originSnapshotId:null};
       const nativeRefs = [inputRef];
       for (const ref of input.nativeRefs) {
         if (ref.kind === 'input') { if (!isDeepStrictEqual(ref,inputRef)) fail('access_denied'); continue; }
@@ -95,7 +99,7 @@ export class SqliteContextStore implements ContextStore {
         if (nativeRefs.some(prior => prior.kind === ref.kind && prior.id === ref.id)) fail('state_conflict'); nativeRefs.push(ref);
       }
       for (const ref of nativeRefs) selectedRefs.push({kind:ref.kind === 'input' ? 'input' : 'tool_result',id:String(ref.id),version:ref.kind === 'input' ? 'medclaw.session-input/v1' : 'medclaw.tool-delivery/v1',hash:ref.contentHash,channel:'native_history'});
-      const config = JSON.parse(run.config_json), projectionLimitBytes = Math.min(normalizeToolConfiguration(config).maxResultBytes, CONTEXT_READ_BYTES / 2);
+      const projectionLimitBytes = Math.min(normalizeToolConfiguration(config).maxResultBytes, CONTEXT_READ_BYTES / 2);
       const omitted: SaveContextSelection['body']['omitted'] = [];
       if (optional && query && query.rows.length > 20) omitted.push({kind:'query',id:String(query.id),reason:'capacity',omittedRows:query.rows.length - 20});
       const render = () => CONTEXT_MATERIAL_PREFIX + canonicalRequest(checked(ContextProjectionSchema,JSON.parse(JSON.stringify({contract:'medclaw.context-projection/v1',executionScope:rootScope,materialScope,referenceDate:run.reference_date,timezone:run.timezone,materials,omitted}))));
@@ -104,7 +108,8 @@ export class SqliteContextStore implements ContextStore {
         (optional.value as {rows:unknown[]}).rows.pop(); const prior = omitted.find(item => item.kind === 'query'); if (prior) prior.omittedRows++; else omitted.push({kind:'query',id:optional.ref.id,reason:'capacity',omittedRows:1}); renderedProjection = render();
       }
       if (Buffer.byteLength(renderedProjection + input.runtimeFeedback,'utf8') > projectionLimitBytes) fail('context_projection_too_large');
-      const body = checked(ContextSnapshotBodySchema,{contract:'medclaw.context/v1',workspaceContext:input.workspaceContext,selectedRefs,projectionHash:hash(renderedProjection),renderedProjection,runtimeFeedback:input.runtimeFeedback,feedbackHash:hash(input.runtimeFeedback),resourceVersions:{},nativeRefs,omitted,projectionLimitBytes},'context_projection_too_large');
+      const resourceVersions = Object.fromEntries((resources?.available ?? []).map(s => [`${s.ref.kind}:${s.ref.id}`, `${s.ref.version}#${s.ref.treeHash}`]));
+      const body = checked(ContextSnapshotBodySchema,{contract:'medclaw.context/v1',workspaceContext:input.workspaceContext,selectedRefs,projectionHash:hash(renderedProjection),renderedProjection,runtimeFeedback:input.runtimeFeedback,feedbackHash:hash(input.runtimeFeedback),resourceVersions,nativeRefs,omitted,projectionLimitBytes},'context_projection_too_large');
       const artifacts = materialScope.artifactIds.map(id => this.db.query('SELECT * FROM artifacts WHERE id=?').get(id));
       return {input,body,sourceFingerprint:digest({runId:run.id,sessionId:run.session_id,config:run.config_json,scope:run.scope_json,input:row.content_json,body,artifacts})};
     }).deferred(), 'storage_read_failed');
@@ -123,7 +128,8 @@ export class SqliteContextStore implements ContextStore {
   }
   private matchesObservation(call: CallRow, snapshot: SnapshotRow, observation: RegisterContextDeliveryInput['observation']): boolean {
     const model = JSON.parse(call.model_json), context = checked(ModelCallContextSchema,model.context), body = this.body(snapshot);
-    return call.run_id === snapshot.run_id && call.session_id === snapshot.session_id && call.input_id === snapshot.input_id && context.snapshotId === snapshot.id && context.inputId === snapshot.input_id && model.selection?.api === observation.api && body.projectionHash === observation.projectionHash && body.feedbackHash === observation.feedbackHash && observation.verifiedNativeRefs.every(ref => body.nativeRefs.some(native => native.kind === ref.kind && native.id === ref.id && native.contentHash === ref.contentHash));
+    const resourceMatch = context.resources ? observation.resources !== undefined && CallResourceContextSchema.safeParse({expected:context.resources.expected,payload:observation.resources}).success : observation.resources === undefined;
+    return resourceMatch && call.run_id === snapshot.run_id && call.session_id === snapshot.session_id && call.input_id === snapshot.input_id && context.snapshotId === snapshot.id && context.inputId === snapshot.input_id && model.selection?.api === observation.api && body.projectionHash === observation.projectionHash && body.feedbackHash === observation.feedbackHash && observation.verifiedNativeRefs.every(ref => body.nativeRefs.some(native => native.kind === ref.kind && native.id === ref.id && native.contentHash === ref.contentHash));
   }
   private delivery(call: CallRow, row: {snapshot_id:number;run_id:number;session_id:number;delivered_at:string}): ContextDelivery {
     const context = checked(ModelCallContextSchema,JSON.parse(call.model_json).context);
@@ -143,7 +149,7 @@ export class SqliteContextStore implements ContextStore {
       if (prior) { const saved = this.delivery(call,prior); if (!isDeepStrictEqual(saved.observation,input.observation)) fail('state_conflict'); return saved; }
       if (context.observation !== null) fail('state_conflict');
       this.db.query('INSERT INTO context_deliveries(model_call_id,snapshot_id,run_id,session_id,delivered_at) VALUES(?,?,?,?,?)').run(call.id,snapshot.id,input.runId,input.sessionId,input.observation.observedAt);
-      model.context = checked(ModelCallContextSchema,{...context,payloadVerified:true,responseStatus:input.observation.httpStatus,observation:input.observation});
+      model.context = checked(ModelCallContextSchema,{...context,payloadVerified:true,responseStatus:input.observation.httpStatus,observation:input.observation,...(context.resources ? {resources:{expected:context.resources.expected,payload:input.observation.resources}} : {})});
       this.db.query('UPDATE model_calls SET model_json=? WHERE id=?').run(JSON.stringify(model),call.id);
       if (['created','running'].includes(run.status)) this.events.appendInTransaction({type:'context_delivered',payload:{contract:'medclaw.event/v1',snapshotId:snapshot.id,callId:call.call_id},runId:input.runId,sessionId:input.sessionId,source:'pi',sourceConnection:null,sourceSequence:null,toolCallId:null,occurredAt:input.observation.observedAt,receivedAt:new Date().toISOString()});
       return this.delivery({...call,model_json:JSON.stringify(model)},{snapshot_id:snapshot.id,run_id:input.runId,session_id:input.sessionId,delivered_at:input.observation.observedAt});

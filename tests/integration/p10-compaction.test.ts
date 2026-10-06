@@ -46,9 +46,9 @@ function schema9() {
 test('p10 schema9 migration preserves complete old rows and native/P8 references while admitting only explicit manual ownership', () => {
   const f = schema9(); let db = f.db;
   try {
-    db.close(); db = openDatabase(f.path); expect(SCHEMA_VERSION).toBe(10);
+    db.close(); db = openDatabase(f.path); expect(SCHEMA_VERSION).toBe(11);
     for (const [i,name] of f.tables.entries()) expect(db.query(`SELECT * FROM ${name} ORDER BY id`).all()).toEqual(f.rows[i]);
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(10);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(11);
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]); expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
     expect(db.query('PRAGMA foreign_keys').get()).toEqual({foreign_keys:1});
     const metadata = { compaction: { contract: 'medclaw.compaction/v1', operationRef: 'manual', source: 'manual', reason: 'manual', ordinal: 1 } };

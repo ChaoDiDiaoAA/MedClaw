@@ -1,5 +1,7 @@
 import { z } from "zod";
-import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } from "./error";
+import { AppErrorSchema, ConfigVersionSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } from "./error";
+import { ResourceSettingsSchema } from './resources';
+export { ConfigVersionSchema } from './error';
 import type { AppError } from "./error";
 import type { ProviderOutcome } from "./run";
 import { StoredToolConfigurationSchema, normalizeToolConfiguration } from './tool-config';
@@ -12,7 +14,6 @@ const nonblank = (max: number) => z.string().min(1).max(max).refine(value => val
 export const ProviderIdSchema = nonblank(128);
 export const ModelIdSchema = nonblank(256);
 export const ApiIdSchema = nonblank(128);
-export const ConfigVersionSchema = z.string().max(128).regex(/^(0|[1-9][0-9]*)$/);
 export const CredentialRefSchema = OpaqueIdSchema;
 export const SecretInputTokenSchema = OpaqueIdSchema;
 export type SecretInputToken = z.infer<typeof SecretInputTokenSchema>;
@@ -199,6 +200,7 @@ export const SettingsSnapshotObjectSchema = z.strictObject({
   agentPolicy: AgentPolicySchema.optional(),
   runtimeConfiguration: RuntimeConfigurationSchema.optional(),
   toolConfiguration: StoredToolConfigurationSchema.optional(),
+  resources: ResourceSettingsSchema.optional(),
   ui: DesktopDisplayPreferencesSchema.default(DEFAULT_DISPLAY_PREFERENCES),
 }).refine(settings => new Set(settings.customProviders.map(provider => provider.definition.providerId)).size === settings.customProviders.length, "Duplicate custom provider ID");
 function normalizeSettings<T extends z.infer<typeof SettingsSnapshotObjectSchema>>(settings: T, context: z.RefinementCtx) {

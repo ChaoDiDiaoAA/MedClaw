@@ -18,6 +18,8 @@ import { CompactSessionInputSchema, ReadCompactionInputSchema, CompactionOperati
   type CompactSessionInput,type ReadCompactionInput,type CompactionOperationView,type CompactionPhase,type CompactionReceipt,type StoredCompactionOperation,type NativeCompactionObservation } from '../../../contracts/src/session';
 import type { FinalCallFact } from '../../../contracts/src/run';
 import { toWorkspaceContext } from '../../../contracts/src/workspace';
+import type { ResourceService } from '../resources/resource-service';
+import { RESOURCE_LIMITS, resourceRefKey } from '../../../contracts/src/resources';
 
 type Execution = { handle: RunHandle; operationRef: string; abort: AbortController; nativeTerminal: boolean; cause: "user" | "deadline" | "shutdown" | null;
   cancelAt: string | null; stopped: boolean; executionStarted: boolean | null; fact: FinalProviderFact | FinalAgentFact | null;
@@ -33,6 +35,11 @@ type ManualExecution={operation:StoredCompactionOperation;abort:AbortController;
   observed:NativeCompactionObservation|null;error:AppError|null;pendingCalls:Map<string,{owner:CompactionCallOwner;fact:FinalCallFact}>;
   task:Promise<void>;deadlineAt:number;timer:ReturnType<typeof setTimeout>|null;released:boolean};
 const now = () => new Date().toISOString();
+function receiptBudget(content: InputContent, instanceId: string, startedAt: string) {
+  return content.resourceInputPlan ? Math.min(RESOURCE_LIMITS.nativeReceiptBytes, RESOURCE_LIMITS.inputSavedBytes
+    - new TextEncoder().encode(JSON.stringify({ ...content, deliveryAttempt: { instanceId, startedAt } })).byteLength
+    - new TextEncoder().encode(',"nativeInput":').byteLength) : undefined;
+}
 
 /** The one owner of root admission and lifecycle, shared by Provider and Agent. */
 export class RuntimeService<Resolved extends ResolvedProviderSelection> {
@@ -48,7 +55,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     private readonly store: RuntimeRunStore, private readonly credentials: CredentialScope, private readonly startCall: ModelCallStarter,
     private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void,
     private readonly agent: (AgentRuntimePort<Resolved> & NativeSessionBindings) | undefined, private readonly modelControlBusy: () => boolean,
-    private readonly stream?: (snapshot: StreamSnapshot) => void,private readonly transactions?:WriteTransactions) {}
+    private readonly stream?: (snapshot: StreamSnapshot) => void,private readonly transactions?:WriteTransactions,private readonly resources?:ResourceService) {}
   get activeHandle(): RunHandle | null { return this.execution?.handle ?? null; }
   get persistencePending() { return (this.execution?.pendingSave ?? this.recoveries.size > 0)||!!this.manual?.error||this.manualRecoveries.size>0; }
   get stopPending() { return !!this.execution?.cause && !this.execution.stopped||!!this.manual?.abort.signal.aborted&&!this.manual.nativeIdle; }
@@ -312,6 +319,10 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
           config.credentialRefs[request.model.provider] ?? null, config.requestPolicy, true);
         this.recheck(context.operationRef, config.configVersion);
         const workspace = this.store.readWorkspace(), scope = this.store.freezeAgentScope(workspace, this.agent.toolNames ?? []);
+        const resources = await this.resources?.freeze(request.sessionId, config, scope), inputPlan = resources ? this.resources!.planInput(resources, request) : undefined;
+        this.recheck(context.operationRef, config.configVersion);
+        if (!isDeepStrictEqual(this.store.readWorkspace(), workspace)) throw safeError('state_conflict', undefined, { reason: 'workspace_revision_mismatch' });
+        if (resources) scope.allowedResourceRefs = resources.available.map(snapshot => resourceRefKey(snapshot.ref));
         const toolConfiguration = normalizeToolConfiguration(config);
         const runtimeConfiguration = normalizeRuntimeConfiguration(config);
         const agentPolicy = projectRuntimePolicies(runtimeConfiguration).agentPolicy;
@@ -320,10 +331,11 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const fields = { sessionId: request.sessionId, text: request.text, model: resolved.selection, policy: resolved.policy, goal: "answer" as const,
           workspace: toWorkspaceContext(workspace), scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: resolved.policy.timeoutMs,
           agentPolicy, runtimeConfiguration, toolConfiguration, ...(profiles ? structuredClone(profiles) : {}),
-          agentOptions: this.agent.describe(resolved), ...(this.agent.contextContract ? {contextContract:this.agent.contextContract} : {}),...(this.agent.historyContract?{historyContract:this.agent.historyContract}:{}) };
+          ...(resources ? { resources, inputPlan } : {}), agentOptions: this.agent.describe(resolved), ...(this.agent.contextContract ? {contextContract:this.agent.contextContract} : {}),...(this.agent.historyContract?{historyContract:this.agent.historyContract}:{}) };
         const createdAt = now(), content: InputContent = { contract: 'medclaw.session-input/v1', originalSubmitInput: request, text: request.text,
           workspaceContext: toWorkspaceContext(workspace), scope: structuredClone(scope), model: structuredClone(resolved.selection),
-          referenceDate: request.referenceDate, timezone: request.timezone, deliveryAttempt: null };
+          referenceDate: request.referenceDate, timezone: request.timezone, deliveryAttempt: null, ...(inputPlan ? { resourceInputPlan: inputPlan } : {}) };
+        const nativeReceiptLimitBytes = receiptBudget(content, this.instanceId, createdAt);
         const accepted = this.store.acceptInput({ operationRef: context.operationRef, originalSubmitInput: request, content, createdAt,
           execution: { mode: 'send', run: { ...fields, instanceId: this.instanceId, createdAt } } });
         if (accepted.inputId === null || accepted.runId === null) throw new Error('state_conflict');
@@ -331,7 +343,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         execution.rootInputId = accepted.inputId; execution.agentFields = fields;
         execution.scope = structuredClone(scope); execution.referenceDate = request.referenceDate; execution.timezone = request.timezone;
         execution.acceptingInputs = true; this.reservation = null;
-        execution.task = this.runAgent(execution, { ...fields, inputId: accepted.inputId, submission: null, resolved });
+        execution.task = this.runAgent(execution, { ...fields, nativeReceiptLimitBytes, inputId: accepted.inputId, submission: null, resolved });
         return accepted;
       } finally { if (this.reservation?.operationRef === context.operationRef) this.reservation = null; }
     }, "storage_write_failed", { operationRef: context.operationRef, sessionId: input.sessionId });
@@ -378,10 +390,13 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       || workspace.batchRefs.some(batch => !fields.scope.batchIds.includes(batch.id))
       || fields.scope.deviceIds !== null && (!workspace.deviceIds.length || workspace.deviceIds.some(id => !fields.scope.deviceIds!.includes(id))))
       throw new Error('state_conflict');
+    if (fields.resources && !this.resources) throw safeError('state_conflict');
+    const inputPlan = fields.resources ? this.resources!.planInput(fields.resources, request) : undefined;
     const content: InputContent = { contract: 'medclaw.session-input/v1', originalSubmitInput: request, text: request.text,
       workspaceContext: toWorkspaceContext(workspace), scope: structuredClone(fields.scope), model: structuredClone(fields.model),
-      referenceDate: fields.referenceDate, timezone: fields.timezone, deliveryAttempt: null };
-    const accepted = this.store.acceptInput({ operationRef: context.operationRef, originalSubmitInput: request, content, createdAt: now(),
+      referenceDate: fields.referenceDate, timezone: fields.timezone, deliveryAttempt: null, ...(inputPlan ? { resourceInputPlan: inputPlan } : {}) };
+    const createdAt = now(), nativeReceiptLimitBytes = receiptBudget(content, this.instanceId, createdAt);
+    const accepted = this.store.acceptInput({ operationRef: context.operationRef, originalSubmitInput: request, content, createdAt,
       execution: { mode: request.mode, targetRunId: request.targetRunId } });
     if (accepted.inputId === null) throw new Error('state_conflict');
     // The database commit proves acceptance. Delivery failure remains queryable under this Input.
@@ -390,7 +405,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       this.store.beginInputDelivery(accepted.inputId, this.instanceId, now());
       dispatched = true;
       await this.agent.inputAdapter.deliver({ inputId: accepted.inputId, sessionId: request.sessionId, targetRunId: request.targetRunId,
-        mode: request.mode, text: request.text, stopEpoch: execution.stopEpoch, workspaceContext: content.workspaceContext });
+        mode: request.mode, text: request.text, stopEpoch: execution.stopEpoch, workspaceContext: content.workspaceContext, inputPlan, nativeReceiptLimitBytes });
     } catch (native) {
       execution.acceptingInputs = false;
       const error = safeError(dispatched ? 'input_delivery_unknown' : 'storage_write_failed', native);
@@ -548,6 +563,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         entered = true;
         return this.agent!.execute({
         runId: execution.handle.runId, sessionId: input.sessionId, inputId: input.inputId, text: input.text, resolved: input.resolved, agentOptions: input.agentOptions,
+        resources: input.resources, inputPlan: input.inputPlan, nativeReceiptLimitBytes: input.nativeReceiptLimitBytes,
         scope: input.scope, workspaceContext: toWorkspaceContext(input.workspace), referenceDate: input.referenceDate, timezone: input.timezone, signal: execution.abort.signal, deadlineAt,
         agentPolicy: input.agentPolicy, runtimeConfiguration: input.runtimeConfiguration, toolConfiguration: input.toolConfiguration, measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot }, {
         startCall: (time,context) => this.startCall(execution.handle.runId, "main", time,context), preview: text => this.preview(execution, text),

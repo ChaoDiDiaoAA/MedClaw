@@ -10,7 +10,7 @@ import { DataCatalogSchema } from '../../packages/contracts/src/data';
 // Only the external desktop bridge is substituted. These tests run the actual
 // renderer and assert user-visible admission and results, not fixture call counts.
 const root = resolve(import.meta.dirname, '../..'), bun = process.env.MEDCLAW_BUN_EXECUTABLE ?? 'bun';
-const ready = { instanceId: 'startup-renderer-instance', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion:10, error: null };
+const ready = { instanceId: 'startup-renderer-instance', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion:11, error: null };
 const directory = ModelDirectoryViewSchema.parse({ configVersion: '0', selection: null, customApis: [],
   providers: [{ id: 'offline-provider', name: 'Offline provider', source: 'pi_builtin', loginTypes: ['api_key'],
     auth: { providerId: 'offline-provider', state: 'unavailable', type: null, source: null, checkKind: 'snapshot', checkedAt: '2026-10-04T00:00:00Z' } }],
@@ -71,7 +71,7 @@ async function launch(config: Fixture = {}) {
       if(method==='session.list')return ok({sessions,nextBeforeSessionId:null});
       if(method==='session.create'){const id=sessions.length+1,value=session(id);sessions.push(value);workspace={...workspace,sessionId:id,revision:workspace.revision+1};return ok({session:value,workspace});}
       if(method==='session.select'){workspace={...workspace,sessionId:payload.sessionId,revision:workspace.revision+1};return ok(workspace);}
-      if(method==='session.read')return ok({session:sessions.find(s=>s.id===payload.sessionId),runningRunId:null,history:{available:true,reason:null,messages:[],truncated:false}});
+      if(method==='session.read')return ok({session:sessions.find(s=>s.id===payload.sessionId),runningRunId:null,runtime:{availability:'ready',error:null},history:{available:true,reason:null,messages:[],truncated:false}});
       if(method==='session.messages.read')return ok({sessionId:payload.sessionId,nativeSessionId:'native-'+payload.sessionId,leafId:null,source:'native_memory',items:[],nextEntryId:null,hasMore:false});
       if(method==='session.listInputs')return ok({sessionId:payload.sessionId,items:inputs.filter(input=>input.sessionId===payload.sessionId),nextClientSequence:null,hasMore:false});
       if(method==='session.submit'){const id=inputs.length+1;inputs.push({id,sessionId:payload.sessionId,clientSequence:payload.clientSequence,mode:payload.mode,text:payload.text,textInfo:{totalChars:payload.text.length,truncated:false},workspaceContext:frozenWorkspace,status:'queued',processingStatus:'pending',targetRunId:7,runId:null,nativeEntryId:null,deliveredAt:null,processedAt:null,createdAt:'2026-10-04T00:00:00Z',updatedAt:'2026-10-04T00:00:00Z',error:null});return ok({sessionId:payload.sessionId,clientSequence:payload.clientSequence,inputId:id,runId:7});}

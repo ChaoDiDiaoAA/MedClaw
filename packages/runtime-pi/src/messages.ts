@@ -9,6 +9,74 @@ import { safePreview } from "../../contracts/src/run";
 import type { ToolSdkDelivery } from "../../contracts/src/tool";
 import { isDeepStrictEqual } from "node:util";
 import type { ContextSnapshot } from '../../contracts/src/context';
+import type { ResourceDeliveryRef, ResourcePayloadObservation } from '../../contracts/src/resources';
+import { ResourcePayloadObservationSchema } from '../../contracts/src/resources';
+import { createHash } from 'node:crypto';
+import { canonicalRequest } from '../../contracts/src/run';
+import { getSystemMessageText } from '@earendil-works/pi-ai';
+
+export type ExpectedResource = {fact:ResourceDeliveryRef;text:string;userIndex?:number;toolIndex?:number};
+
+/** Verify only the SDK's known wire slots; ordinals preserve equal historical entries and transformed Tool IDs. */
+export function matchProviderResources(payload: unknown, api: string, expected: readonly ExpectedResource[]): ResourcePayloadObservation {
+  const body = object(payload), users: string[] = [], systems: string[] = [], tools: {id:unknown;text:string|null}[] = [], calls: {id:unknown;name:unknown}[] = [];
+  let messages: unknown;
+  const system = (value:unknown) => {const text = contextMessageText(value);if(text !== null)systems.push(text);};
+  if (!body) throw safeError('context_payload_mismatch');
+  switch (api) {
+    case 'openai-completions': case 'mistral-conversations': messages = body.messages; break;
+    case 'openai-responses': case 'azure-openai-responses': messages = body.input; break;
+    case 'openai-codex-responses': messages = body.input; system(body.instructions); break;
+    case 'anthropic-messages': case 'bedrock-converse-stream': messages = body.messages; system(body.system); break;
+    case 'pi-messages': messages = object(body.context)?.messages; break;
+    default: throw safeError('context_delivery_unsupported');
+  }
+  if (!Array.isArray(messages)) throw safeError('context_payload_mismatch');
+  for (const item of messages) {
+    const m = object(item); if (!m) continue;
+    if (m.role === 'system' || m.role === 'developer') {
+      const sections = object(m.sections);
+      if (api === 'pi-messages' && typeof m.content === 'string' && sections && Object.values(sections).every(v => v === null || typeof v === 'string'))
+        systems.push(getSystemMessageText({role:'system',content:m.content,sections:sections as Record<string,string|null>,timestamp:0}));
+      else system(m.content);
+    }
+    if (m.role === 'user') {
+      if (api === 'anthropic-messages' || api === 'bedrock-converse-stream') {
+        if (typeof m.content === 'string') users.push(m.content);
+        for (const value of Array.isArray(m.content) ? m.content : []) {const block = object(value);
+          if (block && (block.type === 'text' || api === 'bedrock-converse-stream' && typeof block.text === 'string')) users.push(block.text as string);
+        }
+      } else {const text = contextMessageText(m.content);if(text !== null)users.push(text);}
+    }
+    if (m.role === 'tool') tools.push({id:m.tool_call_id ?? m.toolCallId,text:contextMessageText(m.content)});
+    if (m.role === 'toolResult') tools.push({id:m.toolCallId,text:contextMessageText(m.content)});
+    if (m.type === 'function_call_output') tools.push({id:m.call_id,text:contextMessageText(m.output)});
+    if (m.type === 'function_call') calls.push({id:m.call_id,name:m.name});
+    const toolCalls = m.tool_calls ?? m.toolCalls;
+    if (m.role === 'assistant') for (const value of Array.isArray(toolCalls) ? toolCalls : []) {
+      const call = object(value); if(call)calls.push({id:call.id,name:object(call.function)?.name});
+    }
+    for (const value of Array.isArray(m.content) ? m.content : []) {
+      const b = object(value); if (!b) continue;
+      if (m.role === 'assistant' && b.type === 'toolCall') calls.push({id:b.id,name:b.name});
+      if (m.role === 'assistant' && b.type === 'tool_use') calls.push({id:b.id,name:b.name});
+      if (m.role === 'assistant' && b.toolUse) {const call = object(b.toolUse)!;calls.push({id:call.toolUseId,name:call.name});}
+      if (m.role === 'user' && b.type === 'tool_result') tools.push({id:b.tool_use_id,text:contextMessageText(b.content)});
+      if (m.role === 'user' && b.toolResult) {const result = object(b.toolResult)!;tools.push({id:result.toolUseId,text:contextMessageText(result.content)});}
+    }
+  }
+  for (const e of expected) {
+    let verified = false;
+    if (e.fact.kind === 'skill_index') verified = systems.reduce((count,text) => count + text.split(e.text).length - 1,0) === 1;
+    else if (e.fact.kind === 'native_read') {
+      const t = e.toolIndex === undefined ? undefined : tools[e.toolIndex];
+      verified = !!t && typeof t.id === 'string' && t.text === (api === 'mistral-conversations' ? e.text.trim() : e.text)
+        && tools.filter(other => other.id === t.id).length === 1 && calls.filter(call => call.id === t.id && call.name === 'read').length === 1;
+    } else verified = e.userIndex !== undefined && users[e.userIndex] === e.text;
+    if (!verified) throw safeError('context_payload_mismatch');
+  }
+  return ResourcePayloadObservationSchema.parse({payloadHash:createHash('sha256').update(canonicalRequest(payload)).digest('hex'),verified:expected.map(e => e.fact)});
+}
 
 const encoder = new TextEncoder();
 const markers = {

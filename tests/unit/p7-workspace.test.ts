@@ -90,7 +90,7 @@ test('protocol rejects pre-P7 frames and restore requires write uncertainty hand
   expect(HostRequestSchema.safeParse({ ...frame, protocolVersion: 'medclaw.host/p6-v1' }).success).toBe(false);
   expect(isReadOnlyMethod('workspace.restore')).toBe(false);
   expect(isReadOnlyMethod('workspace.read')).toBe(true);
-  expect(DATABASE_SCHEMA_VERSION).toBe(10); expect(SDK_VERSION).toBe('0.87.1');
+  expect(DATABASE_SCHEMA_VERSION).toBe(11); expect(SDK_VERSION).toBe('0.87.1');
 });
 
 test('P7 runner discovers all categories and refuses empty discovery or zero execution', async () => {

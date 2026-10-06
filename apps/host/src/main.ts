@@ -1,4 +1,5 @@
 import { open, readFile, unlink, realpath } from "node:fs/promises";
+import { createResourceSource } from '@medclaw/runtime-pi/resource-loader';
 import { dirname, isAbsolute, relative, resolve, sep, join } from "node:path";
 import { HostHelloSchema, HostRequestSchema, HostPrivateRequestSchema, PrivateCredentialReplySchema, NoticeFrameSchema, encodeHostFrame, publicMethodSchemas, createPublicMethodSchemas, hostPrivateMethodSchemas, isReadOnlyMethod, MAX_FRAME_BYTES, HOST_PROTOCOL_VERSION, type HostHello, type HostRequest, type RuntimeNotice, type PrivateCredentialMethod } from "../../../packages/contracts/src/protocol.ts";
 import { PublishedSettingsSchema } from "../../../packages/contracts/src/model.ts";
@@ -212,7 +213,7 @@ async function initialize(raw: unknown) {
     (context, action) => credentialStore.withContext(context, action),
     Object.assign((...args:Parameters<ModelCallStarter>) => new ModelCallRecorder(repositories, ...args),
       {forCompaction:(owner:CompactionCallOwner,time:string)=>ModelCallRecorder.forCompaction(repositories!,owner,time)}),
-    notice, error => errorLog.add(error), agent, events,transactions);
+    notice, error => errorLog.add(error), agent, events,transactions, createResourceSource(resolve(import.meta.dir, '../../../resources')));
   application.runs.recoverInterrupted(true); // The writer lock proves that the previous owning process exited.
   sessions = new SessionService(config.instanceId, repositories, agent, (input, context) => application!.runs.submitAgent(input, context),
     () => application!.runs.activeHandle, sessionId => application!.runs.readInputControl(sessionId),
@@ -273,6 +274,8 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case "model.diagnose": return app.submitProvider(request, "diagnostic");
     case "run.read": return unwrap(await app.runs.read(request.payload));
     case 'context.read': return unwrap(contexts.read(request.payload));
+    case 'resources.list': return app.resources!.list(request.payload);
+    case 'resources.read': return app.resources!.read(request.payload);
     case 'event.read': return unwrap(events!.read(request.payload));
     case 'event.subscribe': {
       const input = request.payload;

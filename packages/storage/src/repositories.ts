@@ -10,7 +10,8 @@ import type { SqliteMemoryStore } from './memory-store';
 import { SqliteEventStore } from './event-store';
 import { SqliteWriteTransactions } from './write-transactions';
 import { verifyPriorContextFacts } from './context-store';
-import { ModelCallContextSchema, type StartCallContext } from '../../contracts/src/context';
+import { ModelCallContextSchema, ContextSnapshotBodySchema, type StartCallContext } from '../../contracts/src/context';
+import { FrozenRunResourcesSchema, ResourceEvidenceSchema, ResourceReadFactSchema, resourceRefKey, type FrozenRunResources, type ResourceEvidence } from '../../contracts/src/resources';
 import type { EventWriter, RegisteredEventDraft, RegisteredEventPayload } from '../../contracts/src/event';
 import { RegisteredEventPayloadSchema } from '../../contracts/src/event';
 import { NATIVE_HISTORY_FORMAT, InputContentSchema, type NativeHistoryCommit, type InitialNativeHistory, type PreparedInput, type InputStore, type InputCancelProof, type InputSettlementProof, type ReadInputRequest, type ListInputsRequest } from "../../contracts/src/session";
@@ -71,6 +72,7 @@ const agentConfigSchema = z.strictObject({ selection: ModelSelectionSchema, poli
   measurementContext: MeasurementContextSchema.optional(),
   toolProfileSnapshot: ToolProfileSnapshotSchema.optional(),
   referenceDate: z.string(), timezone: z.string(), agent: P2AgentOptionsSchema.extend({ stage: z.enum(["P2", "P3"]), nativeSessionId: OpaqueIdSchema,
+    resources: FrozenRunResourcesSchema.optional(),
     tools: z.array(z.string()), autoCompaction: z.boolean(), autoRetry: z.literal(false), cacheWarming: z.literal("off"), contextContract: z.literal('medclaw.context/v1').optional(),historyContract:z.literal('medclaw.history/p9-v1').optional() }) })
   .refine(config => config.agent.autoCompaction === (config.agent.compaction?.enabled ?? false), 'Frozen compaction configuration mismatch');
 const commonConfigSchema = z.object({ selection: ModelSelectionSchema, policy: RequestPolicySchema });
@@ -78,6 +80,7 @@ const savedDeliverySchema = z.object({ contract: z.literal("medclaw.tool-deliver
   nativeEntryId: OpaqueIdSchema.nullable(), deliveredAt: TimestampSchema.nullable(), nextModelCallId: z.string().min(1).nullable(), consumedAt: TimestampSchema.nullable(),
   error: AppErrorSchema.nullable(), message: ToolSdkDeliverySchema.optional(), control: ToolControlObservationSchema.optional(),
   consumptionEvidence: z.literal("provider_input_verified").optional(),
+  resourceRead: ResourceReadFactSchema.optional(),
 });
 const scope = { batchIds: [], deviceIds: null, allowedToolNames: [], allowedResourceRefs: [], artifactIds: [], readOnly: true };
 type RunRow = {
@@ -173,13 +176,107 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       for(const entry of new Set(entryIds)){const row=this.db.query<import('./input-store').InputRow,[number,string]>('SELECT * FROM session_inputs WHERE session_id=? AND native_entry_id=? AND status=\'consumed\'').get(sessionId,entry);if(row){this.inputs.projection(row);links.set(entry,{inputId:row.id,runId:row.run_id!});}}return links;
     });
   }
+  private checkedResources(value: unknown, sessionId: number, configVersion: string): FrozenRunResources {
+    const frozen = checked(FrozenRunResourcesSchema, value, 'storage_read_failed');
+    if (frozen.sessionId !== sessionId || frozen.configVersion !== configVersion) fail('storage_read_failed');
+    for (const snapshot of frozen.available) {
+      for (const file of snapshot.files) if (createHash('sha256').update(file.content).digest('hex') !== file.sha256) fail('storage_read_failed');
+      const { kind, id, version } = snapshot.ref;
+      const metadata = { kind, id, version, entry: snapshot.entry, keywords: [...snapshot.keywords].sort(), requiredTools: [...snapshot.requiredTools].sort(),
+        requiredExtensions: [...snapshot.requiredExtensions].sort(), files: snapshot.files.map(f => ({ path: f.file, bytes: f.bytes, sha256: f.sha256 })).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0) };
+      if (createHash('sha256').update(canonicalRequest(metadata)).digest('hex') !== snapshot.ref.treeHash) fail('storage_read_failed');
+    }
+    return frozen;
+  }
+  readRunResources(runId: number): FrozenRunResources | null {
+    id(runId); return this.inputRead(() => {
+      const row = this.row(runId); if (!row) fail('run_not_found');
+      if (row.kind !== 'agent') return null;
+      const config = checked(agentConfigSchema, decoded(row.config_json), 'storage_read_failed');
+      return config.agent.resources ? this.checkedResources(config.agent.resources, row.session_id!, config.selection.configVersion) : null;
+    });
+  }
+  readResourceOrigins(sessionId: number, nativeEntryIds: readonly string[]): ResourceEvidence[] {
+    id(sessionId); if (nativeEntryIds.length > 1000) fail('resource_too_large');
+    const entries = new Set(nativeEntryIds), runs = new Set<number>();
+    for (const entry of entries) {
+      checked(OpaqueIdSchema, entry);
+      const row = this.db.query<{run_id:number|null}, [number,string]>('SELECT run_id FROM memories WHERE session_id=? AND native_entry_id=?').get(sessionId, entry);
+      if (row?.run_id !== null && row?.run_id !== undefined) runs.add(row.run_id);
+    }
+    const facts: ResourceEvidence[] = [];
+    for (const runId of runs) {
+      for (let page = 1; ; page++) {
+        const result = this.readResourceEvidence(runId, page, 100, false);
+        facts.push(...result.items.filter(f => f.nativeEntryId !== null && entries.has(f.nativeEntryId)));
+        if (page * 100 >= result.totalRows) break;
+      }
+    }
+    return facts;
+  }
+  readResourceEvidence(runId: number, page: number, pageSize: number, includeDeliveries = true): { items: ResourceEvidence[]; totalRows: number } {
+    id(runId); id(page); id(pageSize); if (pageSize > 100 || !Number.isSafeInteger(page * pageSize)) fail('invalid_argument');
+    return this.inputRead(() => {
+      const run = this.row(runId); if (!run) fail('run_not_found');
+      const frozen = this.readRunResources(runId); if (!frozen) return { items: [], totalRows: 0 };
+      const facts: ResourceEvidence[] = [];
+      const originFile = (originRunId: number, ref: import('../../contracts/src/resources').ResourceRef, file: string | null) => {
+        const origin = this.row(originRunId); if (!origin || origin.session_id !== run.session_id) fail('storage_read_failed');
+        const saved = this.readRunResources(originRunId), snapshot = saved?.available.find(s => resourceRefKey(s.ref) === resourceRefKey(ref));
+        if (!snapshot || file !== null && !snapshot.files.some(f => f.file === file)) fail('storage_read_failed');
+        return snapshot;
+      };
+      for (const input of this.inputs.rowsForRun(runId)) {
+        const content = this.inputs.content(input), plan = content.resourceInputPlan;
+        if (input.status !== 'consumed' || !plan?.resourceRef || !content.nativeInput) continue;
+        const snapshot = originFile(runId, plan.resourceRef, null), file = snapshot.entry.split('/').at(-1)!;
+        const time = input.delivered_at ?? this.db.query<{ occurred_at: string }, [number, number]>("SELECT occurred_at FROM runtime_events WHERE run_id=? AND type='input_delivered' AND json_extract(payload_json,'$.phase')='native_consumed' AND json_extract(payload_json,'$.inputId')=? ORDER BY sequence LIMIT 1").get(runId, input.id)?.occurred_at;
+        if (!time || !input.native_entry_id) fail('storage_read_failed');
+        facts.push(checked(ResourceEvidenceSchema, { resourceRef: plan.resourceRef, originRunId: runId, file, kind: 'sdk_expansion', inputId: input.id,
+          nativeEntryId: input.native_entry_id, toolCallId: null, modelCallId: null, contentHash: content.nativeInput.sha256, payloadHash: null, observedAt: time, coverage: 'complete' }, 'storage_read_failed'));
+      }
+      const tools = new SqliteToolStore(this.db);
+      const toolRows = this.db.query<{ id: number; native_tool_call_id: string; context_snapshot_id: number | null; call_id: string | null; input_id: number | null; snapshot_json: string | null }, [number, number]>(`SELECT t.id,t.native_tool_call_id,t.context_snapshot_id,c.call_id,s.input_id,s.snapshot_json
+        FROM tool_calls t LEFT JOIN model_calls c ON c.id=t.model_call_id LEFT JOIN context_snapshots s ON s.id=t.context_snapshot_id WHERE t.run_id=? AND t.session_id=? ORDER BY t.id`).all(runId, run.session_id!);
+      for (const row of toolRows) {
+        const workspace = row.snapshot_json ? checked(ContextSnapshotBodySchema, decoded(row.snapshot_json), 'storage_read_failed').workspaceContext : null;
+        const record = tools.readCall({ runId, sessionId: run.session_id!, nativeToolCallId: row.native_tool_call_id, scope: checked(RunScopeSchema, decoded(run.scope_json)),
+          referenceDate: run.reference_date, timezone: run.timezone, signal: new AbortController().signal,
+          ...(row.context_snapshot_id !== null && workspace ? { contextSnapshotId: row.context_snapshot_id, modelCallId: row.call_id!, workspaceContext: workspace, workspaceInputId: row.input_id,
+            basedOnQueryId: workspace.queryId, workspaceRevision: workspace.revision } : {}) });
+        if (!record?.resourceRead) continue;
+        const read = record.resourceRead, snapshot = originFile(runId, read.resourceRef, read.file);
+        if (!record.nativeEntryId || !record.sdkDelivery || record.sdkDelivery.isError || snapshot.files.find(f => f.file === read.file)!.sha256 !== read.fileHash
+          || createHash('sha256').update(canonicalRequest(record.sdkDelivery.content)).digest('hex') !== read.returnedContentHash) fail('storage_read_failed');
+        facts.push(checked(ResourceEvidenceSchema, { resourceRef: read.resourceRef, originRunId: runId, file: read.file, kind: 'native_read', inputId: null,
+          nativeEntryId: record.nativeEntryId, toolCallId: record.id, modelCallId: null, contentHash: read.returnedContentHash, payloadHash: null, observedAt: read.observedAt, coverage: read.coverage }, 'storage_read_failed'));
+      }
+      const calls = this.db.query<{ call_id: string; model_json: string; delivered_at: string }, [number, number]>(`SELECT c.call_id,c.model_json,d.delivered_at FROM model_calls c JOIN context_deliveries d ON d.model_call_id=c.id
+        WHERE c.run_id=? AND c.session_id=? AND c.kind='main' ORDER BY c.id`).all(runId, run.session_id!);
+      for (const call of includeDeliveries ? calls : []) {
+        const context = checked(ModelCallContextSchema, (decoded(call.model_json) as { context: unknown }).context, 'storage_read_failed');
+        const observation = context.observation?.resources; if (!observation) continue;
+        if (call.delivered_at !== context.observation!.observedAt) fail('storage_read_failed');
+        for (const ref of observation.verified) {
+          originFile(ref.originRunId, ref.resourceRef, ref.file);
+          if (ref.kind === 'skill_index' && ref.originRunId !== runId) fail('storage_read_failed');
+          if (ref.inputId !== null && !this.db.query('SELECT id FROM session_inputs WHERE id=? AND session_id=? AND run_id=? AND native_entry_id=?').get(ref.inputId, run.session_id, ref.originRunId, ref.nativeEntryId)) fail('storage_read_failed');
+          if (ref.toolCallId !== null && !this.db.query("SELECT id FROM tool_calls WHERE id=? AND session_id=? AND run_id=? AND json_extract(delivery_json,'$.nativeEntryId')=?").get(ref.toolCallId, run.session_id, ref.originRunId, ref.nativeEntryId)) fail('storage_read_failed');
+          facts.push(checked(ResourceEvidenceSchema, { ...ref, kind: 'provider_delivery', modelCallId: call.call_id, payloadHash: observation.payloadHash, observedAt: call.delivered_at }, 'storage_read_failed'));
+        }
+      }
+      // ponytail: scan one bounded Run's facts before paging; use SQL projection if measured Run histories outgrow memory.
+      const distinct = [...new Map(facts.map(f => [canonicalRequest(f), f])).values()].sort((a, b) => a.observedAt.localeCompare(b.observedAt) || canonicalRequest(a).localeCompare(canonicalRequest(b)));
+      return { items: distinct.slice((page - 1) * pageSize, page * pageSize), totalRows: distinct.length };
+    });
+  }
   acceptInput(plan:PreparedInput):SubmitResult {
     const request=checked(SubmitInputSchema,plan.originalSubmitInput),operationRef=checked(OpaqueIdSchema,plan.operationRef);
     return this.inputWrite(()=>{
       const operation=this.findOperation(operationRef),sequence=this.findSubmission({sessionId:request.sessionId,clientSequence:request.clientSequence});
       if(operation||sequence){if(!operation||operation.method!=='session.submit'||!sequence||operation.result.inputId!==sequence.inputId||operation.result.runId!==sequence.runId||operation.result.sessionId!==sequence.sessionId||operation.result.clientSequence!==sequence.clientSequence||canonicalRequest(operation.originalRequest)!==canonicalRequest(request))fail('state_conflict');return sequence;}
       const content=checked(InputContentSchema,plan.content);timestamp(plan.createdAt);
-      if(canonicalRequest(content.originalSubmitInput)!==canonicalRequest(request)||content.deliveryAttempt!==null||content.text!==request.text||content.referenceDate!==request.referenceDate||content.timezone!==request.timezone||content.model.provider!==request.model.provider||content.model.modelId!==request.model.modelId||content.model.configVersion!==request.model.expectedConfigVersion||plan.execution.mode!==request.mode)fail('invalid_argument');
+      if(canonicalRequest(content.originalSubmitInput)!==canonicalRequest(request)||content.nativeInput!==undefined||content.deliveryAttempt!==null||content.text!==request.text||content.referenceDate!==request.referenceDate||content.timezone!==request.timezone||content.model.provider!==request.model.provider||content.model.modelId!==request.model.modelId||content.model.configVersion!==request.model.expectedConfigVersion||plan.execution.mode!==request.mode)fail('invalid_argument');
       const session=this.readSession(request.sessionId);if(!session)fail('session_not_found');this.assertSessionActive(session);
       if(request.clientSequence<session.nextSubmissionSequence||request.clientSequence===Number.MAX_SAFE_INTEGER)fail('state_conflict');
       const workspace=this.readWorkspace();if(workspace.sessionId!==session.id||workspace.revision!==request.expectedRevision||!isDeepStrictEqual(toWorkspaceContext(workspace),content.workspaceContext)||!isDeepStrictEqual(workspace.batchRefs.map(b=>b.id),request.expectedBatchIds)||workspace.queryId!==request.expectedQueryId)fail('workspace_revision_mismatch');
@@ -192,19 +289,23 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       let target:number|null=null;
       if(plan.execution.mode==='send'){
         if(this.active())fail('runtime_busy');const run=plan.execution.run;
-        if(run.sessionId!==session.id||run.goal!=='answer'||run.text!==content.text||run.referenceDate!==content.referenceDate||run.timezone!==content.timezone||run.timeoutMs!==run.policy.timeoutMs||!isDeepStrictEqual(toWorkspaceContext(run.workspace),frozenWorkspace)||!isDeepStrictEqual(run.scope,content.scope)||!isDeepStrictEqual(run.model,content.model)||!isDeepStrictEqual(this.freezeAgentScope(workspace,run.scope.allowedToolNames),run.scope))fail('invalid_argument');
+        const resources = run.resources ? this.checkedResources(run.resources, session.id, run.model.configVersion) : null;
+        if(!!resources!==!!content.resourceInputPlan || content.resourceInputPlan?.resourceRef && !resources!.available.some(s=>resourceRefKey(s.ref)===resourceRefKey(content.resourceInputPlan!.resourceRef!)))fail('invalid_argument');
+        const expectedScope = { ...this.freezeAgentScope(workspace,run.scope.allowedToolNames), allowedResourceRefs: resources?.available.map(s=>resourceRefKey(s.ref)) ?? [] };
+        if(run.sessionId!==session.id||run.goal!=='answer'||run.text!==content.text||run.referenceDate!==content.referenceDate||run.timezone!==content.timezone||run.timeoutMs!==run.policy.timeoutMs||!isDeepStrictEqual(toWorkspaceContext(run.workspace),frozenWorkspace)||!isDeepStrictEqual(run.scope,content.scope)||!isDeepStrictEqual(run.model,content.model)||!isDeepStrictEqual(expectedScope,run.scope))fail('invalid_argument');
       }else{
         if(request.mode==='send'||request.targetRunId!==plan.execution.targetRunId)fail('invalid_argument');target=plan.execution.targetRunId;const run=this.row(target),active=this.active();
         if(!run||run.kind!=='agent'||run.session_id!==session.id||!active||active.runId!==target)fail('state_conflict');
         const root=checked(agentConfigSchema,decoded(run.config_json),'storage_read_failed'),scope=checked(RunScopeSchema,decoded(run.scope_json),'storage_read_failed');
-        if(!isDeepStrictEqual(this.freezeAgentScope(workspace,scope.allowedToolNames),content.scope))fail('access_denied');
+        if(!isDeepStrictEqual({...this.freezeAgentScope(workspace,scope.allowedToolNames),allowedResourceRefs:scope.allowedResourceRefs},content.scope))fail('access_denied');
+        if(!!root.agent.resources!==!!content.resourceInputPlan || content.resourceInputPlan?.resourceRef && !root.agent.resources!.available.some(s=>resourceRefKey(s.ref)===resourceRefKey(content.resourceInputPlan!.resourceRef!)))fail('access_denied');
         if(!isDeepStrictEqual(root.selection,content.model)||run.reference_date!==content.referenceDate||run.timezone!==content.timezone||content.scope.batchIds.some(b=>!scope.batchIds.includes(b))||scope.deviceIds!==null&&(content.scope.deviceIds===null||content.scope.deviceIds.some(d=>!scope.deviceIds!.includes(d)))||content.scope.allowedToolNames.some(t=>!scope.allowedToolNames.includes(t))||content.scope.allowedResourceRefs.some(r=>!scope.allowedResourceRefs.includes(r))||content.scope.artifactIds.some(a=>!scope.artifactIds.includes(a))||scope.readOnly&&!content.scope.readOnly)fail('access_denied');
       }
       const saved=this.db.query("INSERT INTO session_inputs(session_id,client_sequence,operation_ref,mode,status,content_json,target_run_id,run_id,error_json,created_at,delivered_at,processed_at,updated_at,processing_status,native_entry_id) VALUES(?,?,?,?,'queued',?,?,NULL,NULL,?,NULL,NULL,?,'pending',NULL)").run(session.id,request.clientSequence,operationRef,request.mode,canonicalRequest(content),target,plan.createdAt,plan.createdAt);
       const inputId=Number(saved.lastInsertRowid);
       if(plan.execution.mode==='send'){
         const run=plan.execution.run;checked(OpaqueIdSchema,run.instanceId);timestamp(run.createdAt);
-        const config=checked(agentConfigSchema,{selection:run.model,policy:run.policy,referenceDate:run.referenceDate,timezone:run.timezone,...(run.agentPolicy?{agentPolicy:run.agentPolicy}:{}),...(run.runtimeConfiguration?{runtimeConfiguration:run.runtimeConfiguration}:{}),...(run.toolConfiguration?{toolConfiguration:run.toolConfiguration}:{}),...(run.measurementContext?{measurementContext:run.measurementContext}:{}),...(run.toolProfileSnapshot?{toolProfileSnapshot:run.toolProfileSnapshot}:{}),agent:{...run.agentOptions,stage:run.scope.allowedToolNames.length?'P3':'P2',nativeSessionId:session.nativeSessionId,tools:run.scope.allowedToolNames,autoCompaction:run.agentOptions.compaction?.enabled??false,autoRetry:false,cacheWarming:'off',...(run.contextContract?{contextContract:run.contextContract}:{}),...(run.historyContract?{historyContract:run.historyContract}:{})}});
+        const config=checked(agentConfigSchema,{selection:run.model,policy:run.policy,referenceDate:run.referenceDate,timezone:run.timezone,...(run.agentPolicy?{agentPolicy:run.agentPolicy}:{}),...(run.runtimeConfiguration?{runtimeConfiguration:run.runtimeConfiguration}:{}),...(run.toolConfiguration?{toolConfiguration:run.toolConfiguration}:{}),...(run.measurementContext?{measurementContext:run.measurementContext}:{}),...(run.toolProfileSnapshot?{toolProfileSnapshot:run.toolProfileSnapshot}:{}),agent:{...run.agentOptions,stage:run.scope.allowedToolNames.length?'P3':'P2',nativeSessionId:session.nativeSessionId,tools:run.scope.allowedToolNames,autoCompaction:run.agentOptions.compaction?.enabled??false,autoRetry:false,cacheWarming:'off',...(run.resources?{resources:run.resources}:{}),...(run.contextContract?{contextContract:run.contextContract}:{}),...(run.historyContract?{historyContract:run.historyContract}:{})}});
         const r=this.db.query("INSERT INTO runs(session_id,input_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at) VALUES(?,?,'agent',?,NULL,NULL,NULL,'created','answer',?,?,?,?,?,?,?)").run(session.id,inputId,run.instanceId,content.text,JSON.stringify(config),JSON.stringify(run.scope),JSON.stringify(frozenWorkspace),run.referenceDate,run.timezone,run.createdAt);target=Number(r.lastInsertRowid);
         this.db.query('UPDATE session_inputs SET target_run_id=? WHERE id=? AND target_run_id IS NULL').run(target,inputId);
         this.runLifecycle(this.row(target)!, 'run_created', run.createdAt);
@@ -1075,7 +1176,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   }
 
   registerAgent(input: RegisterAgentInput): Extract<SubmitResult,{inputId:null}> {
-    if(input.submission === null || input.inputId !== null) fail("invalid_argument");
+    if(input.submission === null || input.inputId !== null || input.resources !== undefined) fail("invalid_argument");
     const request = checked(SubmitInputSchema, input.submission.originalSubmitInput), operationRef = checked(OpaqueIdSchema, input.submission.operationRef); timestamp(input.createdAt);
     return this.transactions.immediate(() => {
       const operation = this.findOperation(operationRef), sequence = this.findSubmission({ sessionId: request.sessionId, clientSequence: request.clientSequence });

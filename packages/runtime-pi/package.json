@@ -8,7 +8,8 @@
     "./model-call-recorder": "./src/model-call-recorder.ts",
     "./agent-runtime": "./src/agent-runtime.ts",
     "./messages": "./src/messages.ts",
-    "./pi-tool-adapter": "./src/pi-tool-adapter.ts"
+    "./pi-tool-adapter": "./src/pi-tool-adapter.ts",
+    "./resource-loader": "./src/resource-loader.ts"
   },
   "dependencies": {
     "@medclaw/contracts": "workspace:*",
