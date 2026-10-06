@@ -227,7 +227,7 @@ test("safe text projection never changes native content or exposes hidden blocks
   const result = manager.appendMessage({ role: "toolResult", toolName: "read", toolCallId: "provider/call+id", content: [{ type: "text", text: secret }], details: { path: secret }, isError: false, timestamp: 3 });
   manager.appendCustomEntry(secret, { private: secret }); manager.appendCustomMessageEntry(secret, secret, true, { details: secret });
   manager.appendThinkingLevelChange(secret); manager.appendModelChange(secret, secret); manager.appendSessionInfo(secret);
-  manager.appendCompaction(secret, null, 42, { private: secret }); manager.appendLabelChange(answer, secret); manager.appendContextEdit(answer, { content: [{ type: "text", text: secret }] });
+  const compaction=manager.appendCompaction('ENGINEERING visible summary', null, 42, { private: secret }); manager.appendLabelChange(answer, secret); manager.appendContextEdit(answer, { content: [{ type: "text", text: secret }] });
   const before = structuredClone(manager.getEntries()), page = project(manager, request(), new Map());
   expect(JSON.stringify(page)).not.toContain(secret); expect(manager.getEntries()).toEqual(before);
   expect(page.items.find(item => item.displayRole === "user")).toMatchObject({ text: "ordinary user", textInfo: { totalChars: 13, truncated: false, redacted: true } });
@@ -235,6 +235,7 @@ test("safe text projection never changes native content or exposes hidden blocks
   expect(page.items.find(item => item.nativeEntryId === result)).toMatchObject({ displayRole: "tool_result", toolCallRef: "provider/call+id", text: null, textInfo: { totalChars: null, truncated: false, redacted: true } });
   expect(page.items[0]).toMatchObject({ text: "System instructions omitted", textInfo: { totalChars: 27, truncated: false, redacted: true } });
   expect(page.items.filter(item => item.displayRole === "history_marker")).toHaveLength(6);
+  expect(page.items.find(item=>item.nativeEntryId===compaction)).toMatchObject({displayRole:'history_marker',text:'History compacted\nENGINEERING visible summary',textInfo:{redacted:false}});
 });
 
 test("UTF-8 page budget stops before an oversized next item and keeps a progressing cursor", async () => {

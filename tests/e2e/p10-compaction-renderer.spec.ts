@@ -13,7 +13,7 @@ test.beforeAll(async()=>{
   writeFileSync(entry,`import React from ${JSON.stringify(require.resolve('react'))};import{createRoot}from ${JSON.stringify(require.resolve('react-dom/client'))};import{SessionCompaction}from ${JSON.stringify(resolve('apps/desktop/src/renderer/chat.tsx'))};
     const root=createRoot(document.getElementById('root'));globalThis.__pending=[];globalThis.__verified=[];globalThis.__listeners=[];
     window.medclaw={subscribe:listener=>{globalThis.__listeners.push(listener);return()=>{};},request:(method,input,operationRef)=>new Promise((resolve,reject)=>globalThis.__pending.push({method,input,operationRef,resolve,reject,done:false}))};
-    globalThis.__render=(sessionId=1,instanceId='HostA',blocked=null)=>root.render(React.createElement(SessionCompaction,{host:{state:'ready',instanceId},session:{session:{id:sessionId,leafId:'saved-'+sessionId,storageVersion:7},runtime:{availability:'ready'}},model:{provider:'ENGINEERING',modelId:'fixture',expectedConfigVersion:'1'},visible:true,blockedReason:blocked,control:{acceptingNewRuns:true},
+    globalThis.__render=(sessionId=1,instanceId='HostA',blocked=null,accepting=true)=>root.render(React.createElement(SessionCompaction,{host:{state:'ready',instanceId},session:{session:{id:sessionId,leafId:'saved-'+sessionId,storageVersion:7},runtime:{availability:'ready'}},model:{provider:'ENGINEERING',modelId:'fixture',expectedConfigVersion:'1'},visible:true,blockedReason:blocked,control:{acceptingNewRuns:accepting},
       onRestoreSession:input=>window.medclaw.request('session.restore',input),onHistoryVerified:async(sessionId,operationRef)=>{globalThis.__verified.push({sessionId,operationRef});}}));globalThis.__render();`);
   execFileSync('bun',['build',entry,'--target=browser',`--outfile=${bundle}`],{cwd:resolve('.'),stdio:'pipe'});
   server=createServer((request,response)=>{response.setHeader('content-type',request.url==='/fixture.js'?'text/javascript':'text/html');response.end(request.url==='/fixture.js'?readFileSync(bundle):'<main id="root"></main><script type="module" src="/fixture.js"></script>');});
@@ -47,4 +47,14 @@ test('p10 lost acceptance keeps its identity until a new Host confirms absence, 
   await page.evaluate(()=>Reflect.get(globalThis,'__render')(1,'HostB'));await reply(page,'session.compaction.read',{ok:true,data:null});await expect(page.getByRole('button',{name:'Compact context',exact:true})).toBeEnabled();
   expect(await requests(page,'session.compact')).toHaveLength(1);await expect(page.getByTestId('session-compaction')).toContainText('not recorded in this Host');
   await page.evaluate(()=>Reflect.get(globalThis,'__render')(1,'HostB','ENGINEERING blocked'));await expect(page.getByRole('button',{name:'Compact context',exact:true})).toBeDisabled();await expect(page.getByTestId('session-compaction')).toContainText('ENGINEERING blocked');
+});
+
+test('p10 a saved receipt with an acknowledgement gap still exposes original explicit restore',async({page})=>{
+  await page.goto(url);await page.clock.install();await page.clock.pauseAt(new Date());await page.getByRole('button',{name:'Compact context',exact:true}).click();
+  const command=(await requests(page,'session.compact'))[0]!,blocked={...view(command.operationRef,'completed',true),phase:'blocked',canContinue:false,error:{code:'storage_write_failed'}};
+  await reply(page,'session.compact',{ok:true,data:blocked});await reply(page,'session.compaction.read',{ok:true,data:blocked});
+  await page.evaluate(()=>Reflect.get(globalThis,'__render')(1,'HostA','ENGINEERING saved gap',false));
+  await expect(page.getByRole('button',{name:'Restore compaction session',exact:true})).toBeVisible();await page.getByRole('button',{name:'Restore compaction session',exact:true}).click();
+  await expect.poll(async()=>(await requests(page,'session.restore')).length).toBe(1);expect((await requests(page,'session.restore'))[0]!.input).toEqual({sessionId:1,expectedLeafId:'saved-1'});
+  expect(await requests(page,'session.compact')).toHaveLength(1);
 });

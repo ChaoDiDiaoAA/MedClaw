@@ -68,6 +68,7 @@ test('p10 actual desktop saves native compaction, preserves drafts, cancels and 
     const count=received.length;await page.getByRole('button',{name:'Settings',exact:true}).click();await page.getByRole('button',{name:'Restart Host',exact:true}).click();await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible({timeout:30000});await page.getByRole('button',{name:'Chat',exact:true}).click();
     await expect(panel).toContainText('Compaction · failed');expect(received).toHaveLength(count);
     writeFileSync(auto,'ENGINEERING auto threshold');await send('ENGINEERING automatic '+ 'w'.repeat(500));
+    expect(JSON.stringify(received.findLast(value=>JSON.stringify(value.messages).includes('ENGINEERING automatic')&&JSON.stringify(value.messages).includes('MedClaw trusted runtime feedback'))?.messages)).toContain('ENGINEERING native summary Shanghai');
     expect(sql("SELECT id FROM runtime_events WHERE type='compaction_completed'")).toHaveLength(1);
     const autoCalls=sql("SELECT run_id,input_id,json_extract(model_json,'$.compaction.nativeEntryId') native_id FROM model_calls WHERE kind='compaction' AND run_id IS NOT NULL");expect(autoCalls.length).toBeGreaterThan(0);for(const call of autoCalls)expect(call).toMatchObject({run_id:expect.any(Number),input_id:null,native_id:expect.any(String)});
     // Full window restart discovers the original manual operation through session.read.

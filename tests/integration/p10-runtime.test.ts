@@ -120,6 +120,18 @@ test('p10 lost acceptance and commit returns recover the original durable manual
   expect(f.requests).toHaveLength(1);expect(f.db.query("SELECT id FROM business_events WHERE type='session_compaction_finished'").all()).toHaveLength(1);
 });
 
+test('p10 committed manual history with an unconfirmed acknowledgement is released only by original proof and explicit restore',async()=>{
+  const f=await fixture(),ack=f.agent.acknowledgeCompactionSaved.bind(f.agent);let fail=true;
+  spyOn(f.agent,'acknowledgeCompactionSaved').mockImplementation((...args)=>{if(fail)throw new Error('ENGINEERING acknowledgement lost');return ack(...args);});
+  expect(await f.sessions.compact(f.request,{instanceId:'host',operationRef:'ack-gap'})).toMatchObject({ok:true});
+  await waitFor(()=>f.repo.readCompactionOperation({sessionId:1,operationRef:'ack-gap'})?.receipt?.nativeSaved===true);
+  await waitFor(()=>f.app.runs.readCompaction({sessionId:1,operationRef:'ack-gap'})?.phase==='blocked');
+  expect(f.app.busy).toBe(true);expect(f.app.runs.readCompaction({sessionId:1,operationRef:'ack-gap'})).toMatchObject({status:'completed',nativeGenerated:true,nativeSaved:true,canContinue:false});
+  const calls=f.requests.length,version=f.repo.readSession(1)!.storageVersion;fail=false;
+  expect(await f.sessions.restore({sessionId:1,expectedLeafId:f.repo.readSession(1)!.leafId},{instanceId:'host',operationRef:'ack-restore'})).toMatchObject({ok:true});
+  expect(f.app.busy).toBe(false);expect(f.requests).toHaveLength(calls);expect(f.repo.readSession(1)!.storageVersion).toBe(version);
+});
+
 test('p10 production description enables the installed SDK effective defaults',async()=>{
   const f=await fixture(false),resolved=await f.runtime.resolve(f.request.model,'1',null,{timeoutMs:10000,maxRetries:0,maxRetryDelayMs:2000});
   expect(f.describe(resolved).compaction).toEqual({contract:'medclaw.compaction/v1',enabled:true,reserveTokens:16384,keepRecentTokens:20000});

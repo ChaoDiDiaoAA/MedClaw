@@ -273,7 +273,7 @@ export function SessionCompaction(props:{host:HostView;session:SessionDetail|nul
     <div aria-live="polite" aria-atomic="true">{view&&<p>Compaction · {view.status} · {view.phase}</p>}{message?.sessionId===sessionId&&<p role="status">{message.text}</p>}</div>
     {view&&<><dl className="facts"><dt>Native generated</dt><dd>{view.nativeGenerated===null?'Unknown':view.nativeGenerated?'Yes':'No'}</dd><dt>Native saved</dt><dd>{view.nativeSaved?'Yes':'No'}</dd><dt>Can continue</dt><dd>{view.canContinue?'Yes':'No'}</dd></dl>{view.receipt&&<p className="tiny">SDK context tokens before {view.receipt.tokensBefore??'Unknown'} · estimated after {view.receipt.estimatedTokensAfter??'Unknown'} · saved version {view.receipt.storageVersion??'None'}</p>}{view.error&&<p role="alert" className="error-text">{errorMessage(view.error)}</p>}
       {view.calls.map(call=><p key={call.callId} className="tiny">Compaction call <code>{call.callId}</code> · {call.state} · input / output tokens {call.inputTokens??'Unknown'} / {call.outputTokens??'Unknown'} · cost {call.cost??'Unknown'}{call.unavailableReason?' · '+call.unavailableReason:''}</p>)}
-      {(view.receipt||view.phase==='blocked')&&!view.nativeSaved&&!props.control?.acceptingNewRuns&&view.error?.code!=='stop_unconfirmed'&&<button disabled={working||props.host.state!=='ready'} onClick={()=>void restore()}>Restore compaction session</button>}
+      {(view.phase==='blocked'||view.receipt&&!view.nativeSaved)&&!props.control?.acceptingNewRuns&&view.error?.code!=='stop_unconfirmed'&&<button disabled={working||props.host.state!=='ready'} onClick={()=>void restore()}>Restore compaction session</button>}
     </>}
   </section>;
 }
