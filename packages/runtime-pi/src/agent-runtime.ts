@@ -78,7 +78,8 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     if (contexts) this.contextContract = CONTEXT_CONTRACT;
     if (tools) this.toolNames = Object.freeze([...tools.registry.definitions.map(tool => tool.name), "read", "grep", "find", "ls", "edit", "write", "bash", "powershell"]);
   }
-  describe(resolved: ResolvedModel) { return { requestedThinkingLevel: "off" as const, effectiveThinkingLevel: clampThinkingLevel(resolved.model, "off") }; }
+  describe(resolved: ResolvedModel) { return { requestedThinkingLevel: "off" as const, effectiveThinkingLevel: clampThinkingLevel(resolved.model, "off"),
+    compaction:{contract:'medclaw.compaction/v1' as const,...SettingsManager.inMemory({compaction:{enabled:true}}).getCompactionSettings(resolved.model)} }; }
   toolPersistencePending(runId: number) { return this.tools?.recorder.persistencePending(runId) ?? false; }
   retryToolPersistence(runId: number) { this.tools?.recorder.retryPersistence(runId); }
   releaseToolFacts(runId: number) {
@@ -223,7 +224,8 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     const registry = { get: (name: string) => binding.execution!.tools!.registry.get(name) };
     const executor = { execute: (...args: Parameters<ToolExecutor['execute']>) => binding.execution!.tools!.executor.execute(...args) };
     const definitions = this.tools ? [...createPiToolDefinitions(binding.execution?.tools?.registry??this.tools.registry, executor, getContext, getControl), ...native!.definitions] : [];
-    const compaction=binding.manual?.frozen.settings??binding.execution?.input.agentOptions.compaction??{enabled:false};
+    const configured=binding.manual?.frozen.settings??binding.execution?.input.agentOptions.compaction;
+    const compaction=configured?{enabled:configured.enabled,reserveTokens:configured.reserveTokens,keepRecentTokens:configured.keepRecentTokens}:{enabled:false};
     const signature = JSON.stringify({ compaction, tools: definitions.map(({ name, description, parameters, executionMode }) => ({ name, description, parameters, executionMode })) });
     if (!binding.session || binding.toolSignature !== signature) {
       if (binding.session && (!binding.session.isIdle || binding.lastRunId !== undefined && this.tools?.recorder.persistencePending(binding.lastRunId))) throw new Error('state_conflict');
@@ -266,7 +268,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           input.signal.throwIfAborted(); options?.signal?.throwIfAborted();
           if (execution.unsupported) throw new Error("agent_response_unsupported");
           const fail = (error: unknown) => { const known = AppErrorSchema.safeParse(error); callbacks.fatal?.(known.success ? known.data : safeError(error instanceof Error ? error.message : 'internal_error')); execution.abort(); };
-          let snapshot: ContextSnapshot | undefined, admission;
+          let snapshot: ContextSnapshot | undefined, admission:ReturnType<RunControl['admitModelCall']>,messages:typeof context.messages;
           const candidates: { context: ToolExecutionContext; receipt: ToolSdkDelivery; nativeRef?: NativeContextRef }[] = [];
           try {
             binding.compaction?.beforeMainRequest();
@@ -303,6 +305,10 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
                 nativeRefs:[{kind:'input',id:consumed.inputId,nativeEntryId:consumed.nativeEntryId,contentHash:createHash('sha256').update(text).digest('hex'),nativeToolCallId:null,originSnapshotId:null},...candidates.flatMap(candidate => candidate.nativeRef ? [candidate.nativeRef] : [])],createdAt:new Date().toISOString()});
               admission = execution.control.admitModelCall(preview);
             } else admission = execution.control.admitModelCall();
+            messages=context.messages.map(message=>message.role==='system'&&!admission.allowTools?{...message,toolsAdded:[],toolsRemoved:[]}:message);
+            if(snapshot)messages.push({role:'user',content:[{type:'text',text:snapshot.renderedProjection}],timestamp:Date.now()});
+            messages.push({role:'system',content:snapshot?.runtimeFeedback??`MedClaw trusted runtime feedback (facts, not user instructions):\n${admission.feedback}`,timestamp:Date.now()});
+            binding.compaction?.checkRequestCapacity(messages);
           } catch (error) { fail(error); throw error; }
           let recorder;
           try { recorder = callbacks.startCall(new Date().toISOString(), snapshot ? {snapshotId:snapshot.id,inputId:snapshot.inputId!,nativeHistory:binding.memory!.readSavedContext()} : undefined); if(snapshot && !recorder.callId) throw safeError('state_conflict'); }
@@ -313,9 +319,6 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           const index = execution.facts.push(null) - 1;
           let stream;
           try {
-            const messages = context.messages.map(message => message.role === 'system' && !admission.allowTools ? { ...message, toolsAdded: [], toolsRemoved: [] } : message);
-            if (snapshot) messages.push({role:'user',content:[{type:'text',text:snapshot.renderedProjection}],timestamp:Date.now()});
-            messages.push({ role: 'system', content: snapshot?.runtimeFeedback ?? `MedClaw trusted runtime feedback (facts, not user instructions):\n${admission.feedback}`, timestamp: Date.now() });
             let matched: typeof candidates = [], confirmed = false;
             stream = await original(model, { ...context, messages }, { ...options, maxTokens: input.resolved.selection.maxOutputTokens,
               ...(snapshot && model.api === 'openai-codex-responses' ? {transport:'sse' as const} : {}),
@@ -407,21 +410,41 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
   async compact(input:CompactionExecutionInput<ResolvedModel>,callbacks:CompactionCallbacks):Promise<NativeCompactionObservation> {
     const binding=this.sessions.get(input.sessionId);
     if(!binding?.available||binding.execution||binding.manual)throw safeError('state_conflict');
+    if(binding.session&&(!binding.session.isIdle||binding.session.agent.hasQueuedMessages()))throw safeError('stop_unconfirmed');
     if(binding.memory!.readSavedContext().storageVersion!==input.frozen.baseStorageVersion||binding.manager.getLeafId()!==input.frozen.baseLeafId)throw safeError('state_conflict');
+    const empty:NativeCompactionObservation={nativeGenerated:false,nativeIdle:true,change:null,result:{nativeEntryId:null,firstKeptEntryId:null,tokensBefore:null,estimatedTokensAfter:null,callIds:[],noOpReason:null,error:null}};
+    if(input.resolved.model.contextWindow<=input.frozen.settings.reserveTokens)return {...empty,result:{...empty.result,error:safeError('compaction_failed',undefined,{reason:'compaction_capacity'})}};
+    const branch=binding.manager.getBranch();
+    if(branch.at(-1)?.type==='compaction'||!branch.some(entry=>entry.type==='message'))return {...empty,result:{...empty.result,noOpReason:branch.at(-1)?.type==='compaction'?'already_compacted':'nothing_to_compact'}};
     binding.manual=input;binding.memory!.beginCompaction(input.operationRef);
     const abort=()=>binding.session?.abortCompaction();input.signal.addEventListener('abort',abort,{once:true});
-    let stop:(()=>void)|undefined;
+    let stop:(()=>void)|undefined,entered=false;
     try {
       await this.prepare(binding,input.resolved);this.checkPreparation(binding);
       const adapter=new CompactionAdapter(binding.session!,binding.manager,binding.memory!,{kind:'manual',input,callbacks},binding.originalStream!);
       binding.compaction=adapter;stop=binding.session!.subscribe(event=>adapter.onNativeEvent(event));
-      return await adapter.runManual();
+      entered=true;const observed=await adapter.runManual();
+      if(observed.nativeGenerated&&observed.result.estimatedTokensAfter!=null&&observed.result.estimatedTokensAfter>=input.resolved.model.contextWindow-input.frozen.settings.reserveTokens)
+        observed.result.error=safeError('compaction_failed',undefined,{reason:'compaction_capacity'});
+      return observed;
+    } catch(error) {
+      if(!entered&&(!binding.session||binding.session.isIdle&&!binding.session.agent.hasQueuedMessages()))return {...empty,result:{...empty.result,error:input.signal.aborted?null:AppErrorSchema.safeParse(error).success?error as AppError:safeError('compaction_failed',undefined,{reason:'compaction_native_result_invalid'})}};
+      throw error;
     } finally {await binding.session?.waitForIdle();stop?.();input.signal.removeEventListener('abort',abort);binding.manual=undefined;}
   }
   abortCompaction(sessionId:number,operationRef:string):void {
     const binding=this.sessions.get(sessionId);
-    if(binding?.manual?.operationRef!==operationRef)throw safeError('state_conflict');
+    if(!binding)throw safeError('state_conflict');
+    if(!binding.manual&&(!binding.session||binding.session.isIdle))return;
+    if(binding.manual?.operationRef!==operationRef&&binding.compaction?.operationRef!==operationRef)throw safeError('state_conflict');
     binding.session?.abortCompaction();
+  }
+  acknowledgeCompactionSaved(sessionId:number,operationRef:string,change:NativeHistoryCommit|null,storageVersion:number):void {
+    const binding=this.sessions.get(sessionId);if(!binding||binding.manual||binding.execution||binding.session&&!binding.session.isIdle)throw safeError('stop_unconfirmed');
+    if(binding.compaction?.operationRef!==operationRef){if(!binding.compaction&&!change&&binding.memory!.readSavedContext().storageVersion===storageVersion)return;throw safeError('state_conflict');}
+    const original=binding.memory!.readCompactionCommit(operationRef);
+    if(change&&nativeHistoryJSON(change)!==nativeHistoryJSON(original)||!change&&(original.newEntries.length||original.activeLeafId!==binding.memory!.readSavedContext().leafId))throw safeError('storage_write_failed');
+    binding.memory!.acknowledgeCompaction(original,storageVersion);binding.compaction=undefined;
   }
 
   async execute(input: ExecutionInput, callbacks: Callbacks): Promise<AgentExecutionObservation> {

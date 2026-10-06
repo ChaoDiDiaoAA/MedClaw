@@ -1,4 +1,4 @@
-import type { AgentSession, AgentSessionEvent, SessionManager, CompactionResult } from '@earendil-works/pi-coding-agent';
+import { estimateTokens,type AgentSession,type AgentSessionEvent,type SessionManager,type CompactionResult } from '@earendil-works/pi-coding-agent';
 import { performance } from 'node:perf_hooks';
 import { AppErrorSchema, safeError, type AppError } from '../../contracts/src/error';
 import type { AgentRuntimePort, FinalCallFact, ProviderOutcome } from '../../contracts/src/run';
@@ -37,11 +37,16 @@ export class CompactionAdapter {
     if(event.type==='compaction_start') {
       if(this.isSummarizing)throw safeError('state_conflict');
       if((event.reason==='manual')!==(this.source.kind==='manual'))throw safeError('state_conflict');
-      this.checkActive();
+      if(this.source.kind==='auto')this.checkActive();
       const operationRef=this.source.kind==='manual'?this.source.input.operationRef:this.source.callbacks.begin(event.reason as 'threshold'|'overflow',now());
       this.memory.beginCompaction(operationRef);
       this.frame={operationRef,reason:event.reason,from:this.manager.getEntries().length,callIds:[],ended:false,saved:false,error:null,result:null,saveFact:null,nativeEntryId:null};
-      this.frames.push(this.frame);this.progress('summarizing');
+      this.frames.push(this.frame);
+      if(this.source.input.signal.aborted||performance.now()>=this.source.input.deadlineAt) {
+        if(!this.source.input.signal.aborted)this.frame.error=safeError('run_timeout');
+        this.session.abortCompaction();this.progress('stopping');return;
+      }
+      this.progress('summarizing');
     } else if(event.type==='compaction_end') {
       const frame=this.frame;
       // SDK's second overflow can report exhaustion without starting another compaction.
@@ -69,7 +74,11 @@ export class CompactionAdapter {
             baseStorageVersion:this.memory.readSavedContext().storageVersion,callIds:[...frame.callIds]};
         }
       } else if(!event.aborted)frame.error??=safeError('compaction_failed',undefined,{reason:'compaction_model_failed'});
-      if(frame.error&&this.source.kind==='auto')this.source.callbacks.failed(frame.operationRef,frame.error,now());
+      if(this.source.kind==='auto') {
+        const reserve=this.source.input.agentOptions.compaction?.reserveTokens??this.session.settingsManager.getCompactionSettings(this.source.input.resolved.model).reserveTokens;
+        if(!event.willRetry&&frame.result?.estimatedTokensAfter!=null&&frame.result.estimatedTokensAfter>=this.source.input.resolved.model.contextWindow-reserve)frame.error=safeError('compaction_failed',undefined,{reason:'compaction_capacity'});
+        if(frame.error)this.source.callbacks.failed(frame.operationRef,frame.error,now(),frame.saveFact!==null);
+      }
       this.progress(frame.error?'blocked':'saving');
     }
   }
@@ -114,6 +123,7 @@ export class CompactionAdapter {
       }
     }).catch(error=>{frame.error=failure(error);this.session.abortCompaction();throw error;});
     this.observers.push(observed);
+    void observed.catch(()=>{}); // The owner awaits the original rejection during settle().
     return stream;
   }
   beforeMainRequest():void {
@@ -132,6 +142,12 @@ export class CompactionAdapter {
     }
   }
   async settle():Promise<void>{await Promise.all(this.observers);}
+  checkRequestCapacity(messages:Parameters<Stream>[1]['messages']):void {
+    if(this.source.kind!=='auto'||!this.frame?.result)return;
+    const reserve=this.source.input.agentOptions.compaction?.reserveTokens??this.session.settingsManager.getCompactionSettings(this.source.input.resolved.model).reserveTokens;
+    // SDK character estimates include the actual P8 projection, feedback and tool definitions here.
+    if(messages.reduce((total,message)=>total+estimateTokens(message),0)>=this.source.input.resolved.model.contextWindow-Math.max(reserve,this.source.input.resolved.selection.maxOutputTokens))throw safeError('compaction_failed',undefined,{reason:'compaction_capacity'});
+  }
   readSaveFacts():CompactionSaveFact[]{return this.frames.flatMap(frame=>frame.saveFact?[structuredClone(frame.saveFact)]:[]);}
   async runManual():Promise<NativeCompactionObservation> {
     if(this.source.kind!=='manual')throw safeError('state_conflict');

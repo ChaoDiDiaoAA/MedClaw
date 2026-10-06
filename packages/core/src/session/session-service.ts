@@ -11,6 +11,7 @@ import { ReadSessionMessagesInputSchema, SessionMessagePageSchema, type ReadSess
 import { ReadSessionCheckpointsInputSchema, RestoreSessionCheckpointInputSchema, RestoreSessionInputSchema,
   type ReadSessionCheckpointsInput,type RestoreSessionCheckpointInput,type RestoreSessionInput,type SessionCheckpointReceipt } from '../../../contracts/src/session';
 import type { WriteTransactions } from '../../../contracts/src/event';
+import type { CompactSessionInput,ReadCompactionInput,CompactionOperationView,CancelCompactionResult } from '../../../contracts/src/session';
 
 export class SessionService {
   constructor(private readonly instanceId: string, private readonly store: SessionStore, private readonly native: NativeSessionBindings,
@@ -19,7 +20,20 @@ export class SessionService {
     private readonly inputControl: (sessionId: number) => InputControl | null = () => null,
     private readonly cancelAgentInput?: (inputId: number, context: CommandContext) => Promise<Result<SessionInput>>,
     private readonly runtime?: { assertOperationAvailable(operationRef: string): void; withSessionDeletion<T>(sessionId: number, write: () => T): T;
+      compactSession?:(input:CompactSessionInput,context:CommandContext)=>Promise<CompactionOperationView>;
+      readCompaction?:(input:ReadCompactionInput)=>CompactionOperationView|null;
+      cancelCompaction?:(input:ReadCompactionInput,context:CommandContext)=>CancelCompactionResult;
       assertNoHistoryMutation?():void;withHistoryMutation?<T>(operationRef:string,sessionId:number,action:()=>T|Promise<T>):Promise<T> },private readonly transactions?:WriteTransactions) {}
+
+  compact(input:CompactSessionInput,context:CommandContext):Promise<Result<CompactionOperationView>> {
+    return serviceResult(()=>{this.validateContext(context);if(!this.runtime?.compactSession)throw safeError('state_conflict');return this.runtime.compactSession(input,context);},'storage_write_failed',{sessionId:input.sessionId,operationRef:context.operationRef});
+  }
+  readCompaction(input:ReadCompactionInput):Promise<Result<CompactionOperationView|null>> {
+    return serviceResult(()=>{if(!this.runtime?.readCompaction)throw safeError('state_conflict');return this.runtime.readCompaction(input);},'storage_read_failed',{sessionId:input.sessionId,operationRef:input.operationRef});
+  }
+  cancelCompaction(input:ReadCompactionInput,context:CommandContext):Promise<Result<CancelCompactionResult>> {
+    return serviceResult(()=>{this.validateContext(context);if(!this.runtime?.cancelCompaction)throw safeError('state_conflict');return this.runtime.cancelCompaction(input,context);},'storage_write_failed',{sessionId:input.sessionId,operationRef:input.operationRef});
+  }
 
   create(input: NewSessionInput, context: CommandContext): Promise<Result<NewSessionResult>> {
     return serviceResult(() => {

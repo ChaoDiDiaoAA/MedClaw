@@ -188,6 +188,7 @@ export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: Provide
 export type AgentRuntimePort<Resolved> = {
   compact?: (input: import('./session').CompactionExecutionInput<Resolved>, callbacks: import('./session').CompactionCallbacks) => Promise<import('./session').NativeCompactionObservation>;
   abortCompaction?: (sessionId: number, operationRef: string) => void;
+  acknowledgeCompactionSaved?:(sessionId:number,operationRef:string,change:NativeHistoryCommit|null,storageVersion:number)=>void;
   readonly historyContract?: 'medclaw.history/p9-v1';
   hasPendingHistoryPersistence?: (runId: number) => boolean;
   retryHistoryPersistence?: (runId: number) => void;

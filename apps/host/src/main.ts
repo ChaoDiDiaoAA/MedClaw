@@ -297,6 +297,9 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case 'session.checkpoints.read': return unwrap(await sessions!.readCheckpoints(request.payload));
     case 'session.restoreCheckpoint': return unwrap(await sessions!.restoreCheckpoint(request.payload,request));
     case 'session.restore': return unwrap(await sessions!.restore(request.payload,request));
+    case 'session.compact': return unwrap(await sessions!.compact(request.payload,request));
+    case 'session.compaction.read': return unwrap(await sessions!.readCompaction(request.payload));
+    case 'session.compaction.cancel': return unwrap(await sessions!.cancelCompaction(request.payload,request));
     case "session.readSubmission": return unwrap(await sessions!.readSubmission(request.payload));
     case "session.readInput": return unwrap(await sessions!.readInput(request.payload));
     case "session.listInputs": return unwrap(await sessions!.listInputs(request.payload));

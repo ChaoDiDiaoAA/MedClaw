@@ -143,7 +143,7 @@ export type NativeCompactionObservation = { nativeGenerated: boolean; nativeIdle
 export type CompactionExecutionInput<Resolved> = { operationRef: string; sessionId: number; resolved: Resolved; frozen: FrozenCompaction; signal: AbortSignal; deadlineAt: number };
 export type CompactionCallbacks = { startCall: (time: string, ordinal: number) => import('./run').ModelCallRecorderPort; finishCall: (fact: import('./run').FinalCallFact) => void; progress: (phase: CompactionPhase) => void };
 export type AutoCompactionCallbacks = { begin: (reason: 'threshold' | 'overflow', time: string) => string; startCall: (operationRef: string, time: string, ordinal: number) => import('./run').ModelCallRecorderPort;
-  finishCall: (operationRef: string, fact: import('./run').FinalCallFact) => void; save: (change: NativeHistoryCommit, fact: CompactionSaveFact) => number; failed: (operationRef: string, error: AppError, endedAt: string) => void; progress: (operationRef: string, phase: CompactionPhase) => void };
+  finishCall: (operationRef: string, fact: import('./run').FinalCallFact) => void; save: (change: NativeHistoryCommit, fact: CompactionSaveFact) => number; failed: (operationRef: string, error: AppError, endedAt: string, nativeGenerated?:boolean) => void; progress: (operationRef: string, phase: CompactionPhase) => void };
 export type RestoreDiscardProof = { sessionId: number; operationRef: string; nativeIdle: true; nativeQueuesEmpty: true; observersSettled: true; requiredCallFactsSaved: true; persistentSnapshot: NativeHistorySnapshot };
 export const InputStatusSchema = z.enum(["queued", "consumed", "failed", "cancelled", "delivery_unknown"]);
 export const InputProcessingStatusSchema = z.enum(["pending", "completed", "failed", "cancelled"]);
