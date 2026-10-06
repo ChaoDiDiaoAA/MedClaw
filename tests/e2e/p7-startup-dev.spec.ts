@@ -67,7 +67,7 @@ test('S02 actual dev migrates an LF legacy root on Windows and preserves its ori
     await expect(desktop.page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
     await expect(desktop.page.getByRole('button', { name: 'New Session', exact: true })).toBeEnabled();
     const after = readStartupFacts(dataRoot);
-    expect(after.migrations.map(row => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8,9]);
+    expect(after.migrations.map(row => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     expect(after.migrations.slice(0, 3)).toEqual(before.migrations);
     expect(after.sessions).toEqual(before.sessions);
     expect(after.workspace).toEqual(before.workspace);

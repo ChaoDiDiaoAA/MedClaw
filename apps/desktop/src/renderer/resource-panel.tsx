@@ -72,7 +72,7 @@ export function ResourcePanel(props:{host:HostView;source:ResourceSourceInput|nu
               {items.map(i=><option key={resourceRefKey(i.ref)} value={JSON.stringify(i.ref)} disabled={i.availability!=='ready'&&!selected(i.ref)}>{i.ref.version} · {i.availability}</option>)}
             </select></label><p>{enabled?'Enabled':'Disabled'} · {item.availability}</p>
             {item.disableModelInvocation&&<p>Automatic discovery hidden; explicit Skill invocation remains available.</p>}
-            <p>Required tools: {item.requiredTools?.join(', ')||'None'} · Required extensions: {item.requiredExtensions?.join(', ')||'None'}</p>
+            <p>Required tools: {item.requiredTools===null?'Unknown':item.requiredTools.join(', ')||'None'} · Required extensions: {item.requiredExtensions===null?'Unknown':item.requiredExtensions.join(', ')||'None'}</p>
             {props.source?.source==='selection'&&<button disabled={!ready||busy===key||!enabled&&item.availability!=='ready'} onClick={()=>choose(item.ref,!enabled)}>{enabled?'Disable':'Enable'} {item.ref.id}</button>}
             {item.files.map(file=><button key={file.file} disabled={!ready||busy===key||props.source?.source==='selection'&&!selected(item.ref)} onClick={()=>props.source&&void read(props.source,item.ref,file.file)}>Read {item.ref.id} {file.file}</button>)}
           </article>;

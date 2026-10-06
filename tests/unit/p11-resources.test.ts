@@ -135,6 +135,8 @@ test('p11 resource HTTP observations cannot certify a different or incomplete ex
     projectionHash: 'e'.repeat(64), feedbackHash: 'f'.repeat(64), verifiedNativeRefs: [], resources: payload };
   const call = { contract: 'medclaw.context-call/v1', snapshotId: 1, inputId: 1, observation, responseStatus: 200, payloadVerified: true, resources: { expected: [fact], payload } };
   expect(ModelCallContextSchema.safeParse(call).success).toBe(true);
+  const overBudget = Array.from({length:1001},(_,i)=>({...fact,originRunId:i+1}));
+  expect(ModelCallContextSchema.safeParse({...call,resources:{expected:overBudget,payload:null}}).success).toBe(false);
   expect(ModelCallContextSchema.safeParse({ ...call, resources: { expected: [fact], payload: { ...payload, verified: [] } }, observation: { ...observation, resources: { ...payload, verified: [] } } }).success).toBe(false);
   expect(ModelCallContextSchema.safeParse({ ...call, observation: { ...observation, resources: { ...payload, payloadHash: 'a'.repeat(64) } } }).success).toBe(false);
   expect(ModelCallContextSchema.safeParse({ ...call, responseStatus: 400 }).success).toBe(false);

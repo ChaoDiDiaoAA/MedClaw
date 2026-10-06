@@ -34,7 +34,8 @@ test('p11 English resource entrances, versions and confirmed publication stay di
   await expect(page.getByText('Published configuration 2',{exact:true})).toBeVisible();await expect(page.getByRole('button',{name:'Disable query',exact:true})).toBeVisible();
   await page.getByLabel('query version').selectOption(JSON.stringify(ref('v2')));await reply(page,'resources.select',{ok:false,error:{code:'config_version_conflict'}});
   await expect(page.getByRole('alert')).toBeVisible();await expect(page.getByRole('button',{name:'Disable query',exact:true})).toBeVisible();
-  await page.getByRole('button',{name:'Refresh resources',exact:true}).click();const broken={...list(1,'3',true),catalogError:{code:'resource_unavailable'},items:[]};await reply(page,'resources.list',{ok:true,data:broken});
+  await page.getByRole('button',{name:'Refresh resources',exact:true}).click();const broken={...list(1,'3',true),catalogError:{code:'resource_unavailable'},items:[{...list(1,'3',true).items[0]!,name:null,description:null,requiredTools:null,requiredExtensions:null,availability:'invalid',files:[],disableModelInvocation:null}]};await reply(page,'resources.list',{ok:true,data:broken});
+  await expect(page.getByText('Required tools: Unknown · Required extensions: Unknown',{exact:true})).toBeVisible();
   await page.getByRole('button',{name:'Clear selection',exact:true}).click();await reply(page,'resources.select',{ok:false,error:{code:'operation_result_unknown'}});
   await expect(page.getByRole('alert').filter({hasText:'Refresh'})).toBeVisible();expect(await page.evaluate(()=>Reflect.get(globalThis,'__published'))).toBe(1);
 });

@@ -12,11 +12,33 @@ import type { ToolRecorder } from "../../core/src/tools/recorder";
 import type { RunControl } from '../../core/src/runtime/run-control';
 import type { ToolControlObservation } from '../../contracts/src/model';
 import { resolve } from 'node:path';
+import { realpath } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { canonicalRequest } from '../../contracts/src/run';
 import type { FrozenRunResources } from '../../contracts/src/resources';
 import { verifyRunResourceFiles } from './resource-loader';
 import { contextMessageText } from './messages';
+
+// Pi 0.87.1 path aliases, used only for attribution; its public tool still performs the actual read.
+async function canonicalReadPath(input: string, cwd: string): Promise<string | null> {
+  let path = input.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g,' ').replace(/^@/,'');
+  if (process.platform === 'win32' && path.startsWith('/') && !path.startsWith('//') && !path.includes('\\')) {
+    const drive = /^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i.exec(path);
+    if (drive) path = `${drive[1]!.toUpperCase()}:\\${drive[2]?.replaceAll('/','\\') ?? ''}`;
+  }
+  if (path === '~') path = homedir();
+  else if (path.startsWith('~/') || process.platform === 'win32' && path.startsWith('~\\')) path = resolve(homedir(),path.slice(2));
+  try {
+    if (path.startsWith('file://')) path = fileURLToPath(path);
+    path = resolve(cwd,path);
+    for (const candidate of [path,path.replace(/ (AM|PM)\./gi,'\u202F$1.'),path.normalize('NFD'),path.replace(/'/g,'\u2019'),path.normalize('NFD').replace(/'/g,'\u2019')]) {
+      try { return await realpath(candidate); } catch {}
+    }
+  } catch {}
+  return null;
+}
 
 export type ToolContextFactory = (nativeToolCallId: string, signal?: AbortSignal) => ToolExecutionContext;
 
@@ -389,10 +411,11 @@ export function createPiNativeTools(
     const saveRead = async (context: ToolExecutionContext, message: ToolResultMessage) => {
       const frozen = getResources?.(), input = attempts.get(message.toolCallId);
       if (!frozen || message.toolName !== 'read' || message.isError || !input || typeof input !== 'object' || !('path' in input) || typeof input.path !== 'string') return;
-      const requested = resolve(getWorkdir(), input.path);
+      const requested = await canonicalReadPath(input.path,getWorkdir());
+      if (requested === null) return;
       for (const snapshot of frozen.available) for (const file of snapshot.files) {
         const path = resolve(getWorkdir(), 'resources', snapshot.ref.kind === 'skill' ? 'skills' : 'prompts', snapshot.ref.id, snapshot.ref.version, file.file);
-        if (requested !== path) continue;
+        if (requested !== await realpath(path).catch(() => null)) continue;
         await verifyRunResourceFiles(getWorkdir(), frozen);
         const args = input as {offset?:number;limit?:number}, lines = file.content.split('\n'), start = Math.max(0, (args.offset ?? 1) - 1);
         const selected = lines.slice(start, args.limit === undefined ? undefined : start + args.limit), text = contextMessageText(message.content);

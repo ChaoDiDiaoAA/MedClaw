@@ -1,7 +1,9 @@
 import { expect, test } from 'bun:test';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, relative } from 'node:path';
+import { homedir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
 import { PiModelRuntime } from '../../packages/runtime-pi/src/model-runtime';
@@ -33,6 +35,7 @@ import type {ModelCallStarter} from '../../packages/contracts/src/run';
 import type {CompactionCallOwner} from '../../packages/contracts/src/session';
 import { parseSkillBlock } from '@earendil-works/pi-coding-agent';
 import { sqliteHistory } from '../fixtures/p9-memory';
+import { restoreNativeManager } from '../../packages/runtime-pi/src/memory-store';
 
 async function fixture(respond?: (index: number, payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>) {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p11-runtime-')), author = join(root, 'author'); cpSync(resolve('resources'), author, { recursive: true });
@@ -352,6 +355,45 @@ test('p11 actual manual compaction mentions a Skill name without inventing deliv
     expect((await f.app.resources!.list({source:'run',runId:original})).evidence.some(e=>e.kind==='provider_delivery'&&e.inputId!==null)).toBe(true);expect(f.errors).toEqual([]);
   }finally{await f.close();}
 },15000);
+
+test('p11 more than 1000 ordinary history entries do not block a plain Run or lose its older resource origin', async () => {
+  const f = await fixture();
+  try {
+    const original = await f.app.runs.submitAgent(f.request('/skill:query ENGINEERING original'),{instanceId:'host',operationRef:'long-original'});
+    if (!original.ok || !original.data.runId) throw new Error('No original Run'); await f.settle();
+    const saved = await f.history.store.load(1); if (!saved.ok) throw saved.error;
+    const manager = restoreNativeManager(saved.data, f.root);
+    for (let i = 0; i < 1001; i++) manager.appendMessage({role:'user',content:`ENGINEERING ordinary ${i}`,timestamp:1000+i});
+    f.history.commitSync({sessionId:1,runId:null,expectedStorageVersion:saved.data.storageVersion,header:manager.getHeader(),newEntries:manager.getEntries().slice(saved.data.entries.length),activeLeafId:manager.getLeafId()});
+    await f.agent.restore(1);
+    const {previous,rollbackFromVersion,...old}=f.app.config;
+    await f.app.prepareConfig('long-history-empty',{...f.app.config,configVersion:'2',previous:old,resources:{bySession:{'1':{prompt:null,skills:[]}}}}); f.app.commitConfig('long-history-empty','2');
+    const next = await f.app.runs.submitAgent(f.request('ENGINEERING plain after ordinary history'),{instanceId:'host',operationRef:'long-next'});
+    if (!next.ok || !next.data.runId) throw new Error('No next Run'); await f.settle();
+    expect(f.repos.read({runId:next.data.runId})).toMatchObject({kind:'one',run:{status:'completed'}});
+    expect(f.requests).toHaveLength(2); expect(f.requests[1]!.messages).toEqual(expect.arrayContaining([expect.objectContaining({role:'user',content:'ENGINEERING ordinary 1000'})]));
+    const proof = await f.app.resources!.list({source:'run',runId:next.data.runId,evidencePageSize:100});
+    expect(proof.items).toHaveLength(0); expect(proof.evidence).toEqual(expect.arrayContaining([expect.objectContaining({kind:'provider_delivery',originRunId:original.data.runId,resourceRef:f.skill})]));
+    expect(f.errors).toHaveLength(0);
+  } finally { await f.close(); }
+}, 20000);
+
+for (const alias of ['at','file_url','home',...(process.platform==='win32'?['case','shell']:[])]) test(`p11 SDK read ${alias} alias preserves real frozen read and request delivery evidence`, async () => {
+  const f = await fixture((index,payload) => {
+    if (index !== 1) return {role:'assistant',content:'ENGINEERING alias read completed.'};
+    const location = /<location>(.*?)<\/location>/.exec((payload.messages as {role:string;content:string}[]).find(m=>m.role==='system')!.content)![1]!;
+    const path = alias==='at'?'@'+location:alias==='file_url'?pathToFileURL(location).href:alias==='home'?'~/'+relative(homedir(),location).replaceAll('\\','/'):alias==='case'?location.replace('SKILL.md','skill.md'):'/'+location[0]!.toLowerCase()+location.slice(2).replaceAll('\\','/');
+    return {role:'assistant',tool_calls:[{index:0,id:'alias-read',type:'function',function:{name:'read',arguments:JSON.stringify({path})}}]};
+  });
+  try {
+    const accepted=await f.app.runs.submitAgent(f.request('ENGINEERING read Skill through a standard SDK alias'),{instanceId:'host',operationRef:'alias-'+alias});
+    if(!accepted.ok||!accepted.data.runId)throw new Error('No Run'); await f.settle();
+    expect(f.repos.read({runId:accepted.data.runId})).toMatchObject({kind:'one',run:{status:'completed'}}); expect(f.requests).toHaveLength(2);
+    const proof=await f.app.resources!.list({source:'run',runId:accepted.data.runId,evidencePageSize:100}), reads=proof.evidence.filter(e=>e.kind==='native_read');
+    expect(reads).toHaveLength(1); expect(reads[0]).toMatchObject({resourceRef:f.skill,file:'SKILL.md',coverage:'complete'});
+    expect(proof.evidence).toEqual(expect.arrayContaining([expect.objectContaining({kind:'provider_delivery',toolCallId:reads[0]!.toolCallId,nativeEntryId:reads[0]!.nativeEntryId})])); expect(f.errors).toHaveLength(0);
+  } finally { await f.close(); }
+}, 20000);
 
 test('p11 resource capture rechecks the published configuration before creating any Run or Input', async () => {
   const f = await fixture(); let release!: () => void, entered!: () => void;

@@ -300,9 +300,11 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
               if (firstKept < 0) throw safeError('session_history_invalid');
               const kept = branch.slice(firstKept);
               const entries = kept.filter(e => e.type === 'message' && (e.message.role === 'user' || e.message.role === 'toolResult'));
-              if (entries.length > 1000) throw safeError('resource_unavailable', undefined, {reason:'resource_too_large'});
-              const facts = callbacks.inputStore.readResourceOrigins(input.sessionId, entries.map(e => e.id));
+              const facts = [];
+              for (let start = 0; start < entries.length; start += 1000)
+                facts.push(...callbacks.inputStore.readResourceOrigins(input.sessionId, entries.slice(start,start+1000).map(e => e.id)));
               let after = -1, userIndex = 0, toolIndex = 0;
+              // ponytail: ordered branch scans are quadratic; index native entry keys if measured long-history cost dominates.
               for (const message of context.messages) {
                 if (message.role !== 'user' && message.role !== 'toolResult') continue;
                 const text = contextMessageText(message.content), ordinal = message.role === 'user' ? userIndex++ : toolIndex++;
@@ -325,6 +327,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
                 resourceExpected.push({text,fact:{resourceRef:ref,originRunId:input.runId,file:null,inputId:null,nativeEntryId:null,toolCallId:null,
                   contentHash:createHash('sha256').update(text).digest('hex'),coverage:'index',kind:'skill_index'}});
               }
+              if (resourceExpected.length > 1000) throw safeError('resource_unavailable', undefined, {reason:'resource_too_large'});
               resourceContext = CallResourceContextSchema.parse({expected:resourceExpected.map(e => e.fact),payload:null});
             }
             if (this.contexts && !(CONTEXT_HTTP_APIS as readonly string[]).includes(model.api)) throw safeError('context_delivery_unsupported');
