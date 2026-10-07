@@ -261,6 +261,7 @@ export type NativeSessionBindings = {
 };
 /** Product persistence port; native SDK objects stay in the Host's adapter. */
 export interface SessionStore extends Pick<InputStore, "readInput" | "listInputs"> {
+  readChildIdentity?: (runId: number) => import('./subagent').BoundChildIdentity | null;
   acceptCompaction(request: CompactSessionInput, operationRef: string, frozen: FrozenCompaction): StoredCompactionOperation;
   readCompactionOperation(input: ReadCompactionInput): StoredCompactionOperation | null;
   requestCompactionCancel(input: ReadCompactionInput, requestedAt: string): boolean;

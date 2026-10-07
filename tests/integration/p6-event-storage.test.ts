@@ -41,9 +41,9 @@ test('schema4_to_latest_preserves_old_rows_and_checksums_with_only_lifecycle_met
   expect(db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations'").all()).toHaveLength(22);
   names.forEach((n,i)=>expect(db.query(`SELECT * FROM ${n} ORDER BY id`).all()).toEqual(n==='sessions'
    ? before[i]!.map(row=>({...row as Record<string,unknown>,metadata_json:'{"titleOrigin":"user"}',metadata_revision:0,deleted_at:null,native_header_json:null,current_leaf_id:null,history_format_version:null}))
-   : n==='tool_calls'?before[i]!.map(row=>({...row as Record<string,unknown>,context_snapshot_id:null})):n==='batches'?before[i]!.map(row=>({...row as Record<string,unknown>,status:'active',deleted_at:null,deletion_operation_ref:null,cohort_json:'[{"deviceId":1,"sourceDeviceId":"device"}]'})):before[i]));
+   : n==='tool_calls'?before[i]!.map(row=>({...row as Record<string,unknown>,context_snapshot_id:null})):n==='batches'?before[i]!.map(row=>({...row as Record<string,unknown>,status:'active',deleted_at:null,deletion_operation_ref:null,cohort_json:'[{"deviceId":1,"sourceDeviceId":"device"}]'})):n==='runs'?before[i]!.map(row=>({...row as Record<string,unknown>,parent_run_id:null,origin_tool_call_id:null,child_result_json:null})):before[i]));
   expect(db.query('SELECT * FROM schema_migrations ORDER BY version').all().slice(0,4)).toEqual(markers);
-  expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([1,2,3,4,5,6,7,8,9,10,11].map(version=>({version})));
+  expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([1,2,3,4,5,6,7,8,9,10,11,12].map(version=>({version})));
   expect(db.query('SELECT * FROM runtime_events').all()).toEqual([]);
   expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
  }finally{db.close();rmSync(root,{recursive:true,force:true});}

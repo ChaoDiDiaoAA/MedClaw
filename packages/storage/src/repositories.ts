@@ -13,6 +13,7 @@ import { verifyPriorContextFacts } from './context-store';
 import { ModelCallContextSchema, ContextSnapshotBodySchema, type StartCallContext } from '../../contracts/src/context';
 import { FrozenRunResourcesSchema, ResourceEvidenceSchema, ResourceReadFactSchema, resourceRefKey, type FrozenRunResources, type ResourceEvidence } from '../../contracts/src/resources';
 import { FrozenRunExtensionsSchema, type FrozenRunExtensions } from '../../contracts/src/extensions';
+import { FrozenChildConfigSchema, ChildResultSchema, BoundChildIdentitySchema, type BoundChildIdentity } from '../../contracts/src/subagent';
 import type { EventWriter, RegisteredEventDraft, RegisteredEventPayload } from '../../contracts/src/event';
 import { RegisteredEventPayloadSchema } from '../../contracts/src/event';
 import { NATIVE_HISTORY_FORMAT, InputContentSchema, type NativeHistoryCommit, type InitialNativeHistory, type PreparedInput, type InputStore, type InputCancelProof, type InputSettlementProof, type ReadInputRequest, type ListInputsRequest } from "../../contracts/src/session";
@@ -86,7 +87,8 @@ const savedDeliverySchema = z.object({ contract: z.literal("medclaw.tool-deliver
 });
 const scope = { batchIds: [], deviceIds: null, allowedToolNames: [], allowedResourceRefs: [], artifactIds: [], readOnly: true };
 type RunRow = {
-  input_id: number | null; kind: "provider" | "agent"; session_id: number | null; submission_operation_ref: string | null;
+  input_id: number | null; kind: "provider" | "agent" | "child"; session_id: number | null; submission_operation_ref: string | null;
+  parent_run_id?: number | null; origin_tool_call_id?: number | null; child_result_json?: string | null;
   submission_client_sequence: number | null; submission_request_json: string | null;
   id: number; instance_id: string; status: RunView["status"]; goal: "answer" | "verify";
   input_text: string; output_text: string | null; config_json: string; prior_run_id: number | null;
@@ -376,8 +378,12 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     const calls = this.calls(row.id);
     if (callOffset > calls.length) fail("invalid_argument");
     const agent = row.kind === "agent" ? checked(agentConfigSchema, decoded(row.config_json), "storage_read_failed") : null;
+    const child = row.kind === 'child' ? checked(FrozenChildConfigSchema, (decoded(row.config_json) as { subagent: unknown }).subagent, 'storage_read_failed') : null;
+    const childResult = child && row.child_result_json ? checked(ChildResultSchema, decoded(row.child_result_json), 'storage_read_failed') : null;
+    const childDelivery = child ? this.db.query<{ delivery_json: string | null }, [number]>('SELECT delivery_json FROM tool_calls WHERE id=?').get(child.originToolCallId) : null;
+    const delivery = childDelivery?.delivery_json ? checked(savedDeliverySchema, decoded(childDelivery.delivery_json), 'storage_read_failed') : null;
     return checked(RunViewSchema, {
-      id: row.id, kind: row.kind, status: row.status, operationRef: row.kind === "provider" ? this.providerConfig(row).providerRequest.operationRef : rootInput?.operation_ref ?? row.submission_operation_ref,
+      id: row.id, kind: row.kind, status: row.status, operationRef: child ? `internal-child:${child.originToolCallId}` : row.kind === "provider" ? this.providerConfig(row).providerRequest.operationRef : rootInput?.operation_ref ?? row.submission_operation_ref,
       instanceId: row.instance_id, sessionId: row.session_id, inputId: row.input_id, goal: row.goal, inputText: inputPage.text, inputPage,
       model: config.selection, policy: config.policy, priorRunId: row.prior_run_id,
       ...(row.kind === 'provider' ? { runtimeConfiguration: this.providerConfig(row).runtimeConfiguration ?? null } : {}),
@@ -387,6 +393,10 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       answerRef: this.p3 ? this.db.query<{ id: number }, [number]>("SELECT id FROM answers WHERE run_id=?").get(row.id)?.id ?? null : null,
       output,
       calls: row.kind === "provider" ? calls : calls.slice(callOffset, callOffset + callLimit), persistence: "committed",
+      ...(child ? { parentRunId: child.parentRunId, originToolCallId: child.originToolCallId, pluginAgentId: child.pluginAgentId, nativeSessionId: child.nativeSessionId,
+        nextCallOffset: callOffset + callLimit < calls.length ? callOffset + callLimit : null,
+        childResult: childResult ? (() => { const { originalReply, ...view } = childResult; return { ...view, text: childResult.outcome === 'completed' ? safePreview(view.text, 32768).text : AppErrorSchema.safeParse(decoded(row.error_json)).data?.message ?? 'Child execution did not complete.' }; })() : null,
+        delivery: delivery ? { resultRecorded: delivery.resultRecorded, sdkReturned: delivery.sdkReturned, nativeEntryId: delivery.nativeEntryId, nextModelCallId: delivery.nextModelCallId, consumedAt: delivery.consumedAt, error: delivery.error } : null } : {}),
       ...(agent ? { clientSequence: rootInput?.client_sequence ?? row.submission_client_sequence, nativeSessionId: agent.agent.nativeSessionId,
         answerNativeLeafId:this.p3 ? this.db.query<{native_leaf_id:string|null},[number]>('SELECT native_leaf_id FROM answers WHERE run_id=?').get(row.id)?.native_leaf_id??null : null,
         nextCallOffset: callOffset + callLimit < calls.length ? callOffset + callLimit : null,
@@ -887,10 +897,22 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   readSession(sessionId: number): SessionView | null {
     id(sessionId);
     const row = this.db.query<{ id: number; native_session_id: string; title: string; kind: string; status: string; storage_version: number; current_leaf_id?:string|null; metadata_json:string; metadata_revision?:number; deleted_at?:string|null }, [number]>("SELECT * FROM sessions WHERE id=?").get(sessionId);
-    if (!row) return null;
+    if (!row || row.kind !== 'user') return null;
     const sequence = this.db.query<{ n: number | null }, [number]>(this.p5 ? "SELECT MAX(n) AS n FROM (SELECT submission_client_sequence AS n FROM runs WHERE session_id=?1 UNION ALL SELECT client_sequence AS n FROM session_inputs WHERE session_id=?1)" : "SELECT MAX(submission_client_sequence) AS n FROM runs WHERE session_id=?").get(sessionId)?.n ?? 0;
     return checked(SessionViewSchema, { id: row.id, title: this.sessionTitle(row), metadataRevision:row.metadata_revision??0, deletedAt:row.deleted_at??null, nativeSessionId: row.native_session_id, kind: row.kind, status: row.status,
       inputControl: null, storageVersion: row.storage_version, leafId: row.current_leaf_id??null, nextSubmissionSequence: sequence + 1 }, "storage_read_failed");
+  }
+
+  readChildIdentity(runId: number): BoundChildIdentity | null {
+    id(runId);
+    const row = this.row(runId); if (!row || row.kind !== 'child') return null;
+    const frozen = checked(FrozenChildConfigSchema, (decoded(row.config_json) as { subagent: unknown }).subagent, 'storage_read_failed');
+    const session = this.db.query<{ native_session_id: string; kind: string }, [number]>('SELECT native_session_id,kind FROM sessions WHERE id=?').get(frozen.childSessionId);
+    const parent = this.row(frozen.parentRunId);
+    if (!session || session.kind !== 'child' || session.native_session_id !== frozen.nativeSessionId
+      || row.id !== frozen.childRunId || row.session_id !== frozen.childSessionId || row.parent_run_id !== frozen.parentRunId
+      || row.origin_tool_call_id !== frozen.originToolCallId || !parent || parent.kind !== 'agent' || parent.session_id !== frozen.parentSessionId || parent.instance_id !== frozen.instanceId) fail('storage_read_failed');
+    return checked(BoundChildIdentitySchema, Object.fromEntries(Object.keys(BoundChildIdentitySchema.shape).map(key => [key, frozen[key as keyof typeof frozen]])), 'storage_read_failed');
   }
 
   private sessionTitle(row:{id:number;title:string;metadata_json:string}):string {
@@ -1700,9 +1722,12 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   read(request: z.input<typeof ReadRunRequestSchema>): ReadRunResult {
     const input = checked(ReadRunRequestSchema, request);
     if ("recent" in input) {
-      const rows = this.db.query<RunRow, [number, number | null, number | null, string | null, string | null, number]>(
-        "SELECT * FROM runs WHERE id<? AND (? IS NULL OR session_id=?) AND (? IS NULL OR kind=?) ORDER BY id DESC LIMIT ?",
-      ).all(input.beforeRunId ?? Number.MAX_SAFE_INTEGER, input.sessionId ?? null, input.sessionId ?? null, input.kind ?? null, input.kind ?? null, input.limit + 1);
+      if ('parentRunId' in input && this.row(input.parentRunId)?.kind !== 'agent') fail('access_denied');
+      const rows = 'parentRunId' in input
+        ? this.db.query<RunRow, [number, number, number]>("SELECT * FROM runs WHERE kind='child' AND parent_run_id=? AND id<? ORDER BY id DESC LIMIT ?").all(input.parentRunId, input.beforeRunId ?? Number.MAX_SAFE_INTEGER, input.limit + 1)
+        : this.db.query<RunRow, [number, number | null, number | null, string | null, string | null, number]>(
+          "SELECT * FROM runs WHERE kind IN ('provider','agent') AND id<? AND (? IS NULL OR session_id=?) AND (? IS NULL OR kind=?) ORDER BY id DESC LIMIT ?",
+        ).all(input.beforeRunId ?? Number.MAX_SAFE_INTEGER, input.sessionId ?? null, input.sessionId ?? null, input.kind ?? null, input.kind ?? null, input.limit + 1);
       const page = rows.slice(0, input.limit);
       return { kind: "recent", runs: page.map((row) => {
         const { output, calls, inputPage, cleanup, ...summary } = this.view(row);
@@ -1723,7 +1748,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   }
 
   active(): { runId: number; kind: "provider" | "agent"; sessionId: number | null } | null {
-    const row = this.db.query<{ id: number; kind: "provider" | "agent"; session_id: number | null }, []>("SELECT id,kind,session_id FROM runs WHERE status IN ('created','running')").get();
+    const row = this.db.query<{ id: number; kind: "provider" | "agent"; session_id: number | null }, []>("SELECT id,kind,session_id FROM runs WHERE kind IN ('provider','agent') AND status IN ('created','running')").get();
     return row ? { runId: row.id, kind: row.kind, sessionId: row.session_id } : null;
   }
 

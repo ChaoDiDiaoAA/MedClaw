@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { RunScopeSchema } from "../../packages/contracts/src/run";
-import { safeError } from "../../packages/contracts/src/error";
-import type { AnyToolDefinition, ToolCallRecord, ToolCallStore, ToolExecutionContext, ToolExecutionMode, ToolResult, ToolSdkDelivery } from "../../packages/contracts/src/tool";
+import { safeError, type AppError } from "../../packages/contracts/src/error";
+import type { AnyToolDefinition, ToolCallIdentity, ToolCallRecord, ToolCallStore, ToolExecutionContext, ToolExecutionMode, ToolResult, ToolSdkDelivery } from "../../packages/contracts/src/tool";
 import { PiModelRuntime } from "../../packages/runtime-pi/src/model-runtime";
 import { DEFAULT_AGENT_POLICY, type ToolControlObservation } from '../../packages/contracts/src/model';
 import { RunControl } from '../../packages/core/src/runtime/run-control';
@@ -25,7 +25,7 @@ class CallStore implements ToolCallStore {
   assertContext(context: ToolExecutionContext) {
     if (context.runId !== 41 || context.sessionId !== 7 || context.scope.batchIds[0] !== 13) throw safeError("access_denied");
   }
-  request(tool: AnyToolDefinition, input: unknown, context: ToolExecutionContext) {
+  request(tool: ToolCallIdentity, input: unknown, context: ToolExecutionContext) {
     this.assertContext(context);
     const previous = this.readCall(context);
     if (previous) {
@@ -36,6 +36,10 @@ class CallStore implements ToolCallStore {
       nativeToolCallId: context.nativeToolCallId, name: tool.name, version: tool.version, executionMode: tool.executionMode,
       input: structuredClone(input), status: "requested", data: null, error: null, sdkReturned: false, nativeEntryId: null };
     this.calls.set(key(context), call); return call;
+  }
+  recordFailedRequest(tool: ToolCallIdentity, input: unknown, context: ToolExecutionContext, error: AppError, requestedAt: string) {
+    const call = this.request(tool, input, context);
+    call.status = 'failed'; call.error = error; call.stoppedAt = requestedAt;
   }
   readCall(context: ToolExecutionContext) { return this.calls.get(key(context)) ?? null; }
   mergeControl(context: ToolExecutionContext, control: Partial<ToolControlObservation>) {

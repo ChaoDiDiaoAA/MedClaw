@@ -10,6 +10,7 @@ import type { WorkspaceView, WorkspaceContext } from "./workspace";
 import { StoredToolConfigurationSchema, type ToolConfiguration } from './tool-config';
 import { RuntimeConfigurationSchema, type RuntimeConfiguration } from './runtime-config';
 import { ExtensionAssemblyProofSchema } from './extensions';
+import { ChildResultViewSchema } from './subagent';
 
 export const RunStatusSchema = z.enum(["created", "running", "completed", "failed", "cancelled"]);
 export const SdkStopReasonSchema = z.enum(["stop", "length", "toolUse", "error", "aborted", "deferred"]);
@@ -71,7 +72,15 @@ export const AgentRunViewSchema = z.strictObject({ ...runFields, inputId: Positi
     toolProfileSnapshot: ToolProfileSnapshotSchema.nullable(),
   }).nullable().optional(),
 });
-export const RunViewSchema = z.discriminatedUnion("kind", [ProviderRunViewSchema, AgentRunViewSchema]);
+export const ChildRunViewSchema = z.strictObject({ ...runFields, kind: z.literal('child'), sessionId: PositiveIdSchema,
+  goal: z.literal('answer'), answerRef: z.null(), parentRunId: PositiveIdSchema, originToolCallId: PositiveIdSchema,
+  pluginAgentId: OpaqueIdSchema, nativeSessionId: OpaqueIdSchema, childResult: ChildResultViewSchema.nullable(),
+  calls: z.array(ModelCallViewSchema).max(50), nextCallOffset: z.number().int().nonnegative().safe().nullable(),
+  delivery: z.strictObject({ resultRecorded: z.boolean(), sdkReturned: z.boolean(), nativeEntryId: OpaqueIdSchema.nullable(),
+    nextModelCallId: OpaqueIdSchema.nullable(), consumedAt: TimestampSchema.nullable(), error: AppErrorSchema.nullable() }).nullable(),
+});
+export type ChildRunView = z.infer<typeof ChildRunViewSchema>;
+export const RunViewSchema = z.discriminatedUnion("kind", [ProviderRunViewSchema, AgentRunViewSchema, ChildRunViewSchema]);
 const outputPaging = { outputOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).default(0), outputLimit: z.number().int().min(1).max(32768).default(16384) };
 const onePaging = { ...outputPaging, inputOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).default(0),
   inputLimit: z.number().int().min(1).max(65536).default(65536), callOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).default(0),
@@ -81,11 +90,13 @@ export const ReadRunRequestSchema = z.union([
   z.strictObject({ operationRef: OpaqueIdSchema, ...onePaging }),
   z.strictObject({ recent: z.literal(true), beforeRunId: PositiveIdSchema.optional(), limit: z.number().int().min(1).max(50).default(20),
     sessionId: PositiveIdSchema.optional(), kind: z.enum(["provider", "agent"]).optional() }),
+  z.strictObject({ recent: z.literal(true), parentRunId: PositiveIdSchema, beforeRunId: PositiveIdSchema.optional(), limit: z.number().int().min(1).max(50).default(20) }),
 ]);
 const recentFields = { inputText: z.string().max(2048), cleanupSummary: RunCleanupSummarySchema.nullable() };
 export const RecentRunViewSchema = z.discriminatedUnion("kind", [
   ProviderRunViewSchema.omit({ output: true, inputPage: true, calls: true, cleanup: true }).extend(recentFields),
   AgentRunViewSchema.omit({ output: true, inputPage: true, calls: true, cleanup: true, nextCallOffset: true }).extend(recentFields),
+  ChildRunViewSchema.omit({ output: true, inputPage: true, calls: true, cleanup: true, nextCallOffset: true }).extend(recentFields),
 ]);
 export const ReadRunResultSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("one"), run: RunViewSchema.nullable() }),

@@ -15,8 +15,8 @@ const terminal = { answerId: PositiveIdSchema.nullable(), errorCode: errorCode.n
 const tool = { callId: PositiveIdSchema, nativeToolCallId: ToolCallRecordSchema.shape.nativeToolCallId, status: z.enum(['requested', 'running', 'succeeded', 'failed', 'cancelled']), queryIds: ids, errorCode: errorCode.nullable() };
 const variant = <T extends string, S extends z.ZodRawShape>(type: T, fields: S) => z.strictObject({ type: z.literal(type), payload: z.strictObject({ ...contract, ...fields }) });
 export const RegisteredEventPayloadSchema = z.discriminatedUnion('type', [
-  variant('run_created', { sessionId: PositiveIdSchema, kind: z.literal('agent'), configVersion: ConfigVersionSchema }),
-  variant('run_started', { sessionId: PositiveIdSchema, kind: z.literal('agent'), configVersion: ConfigVersionSchema }),
+  variant('run_created', { sessionId: PositiveIdSchema, kind: z.enum(['agent', 'child']), configVersion: ConfigVersionSchema }),
+  variant('run_started', { sessionId: PositiveIdSchema, kind: z.enum(['agent', 'child']), configVersion: ConfigVersionSchema }),
   variant('run_cancel_requested', { reason: errorCode }),
   variant('run_completed', { ...terminal, errorCode: z.null() }),
   variant('run_failed', { ...terminal, errorCode }),

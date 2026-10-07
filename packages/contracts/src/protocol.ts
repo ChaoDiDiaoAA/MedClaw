@@ -18,7 +18,7 @@ import { BUSINESS_RULES, createQuerySchemas, EvidenceViewSchema, PageSchema, Que
 import { TOOL_READ_RULES, RunToolsViewSchema } from './tool';
 import { StoredToolConfigurationSchema, normalizeToolConfiguration } from './tool-config';
 import { RuntimeConfigurationSchema, normalizeRuntimeConfiguration, projectRuntimePolicies } from './runtime-config';
-import { ReadSessionMessagesInputSchema, SessionMessagePageSchema } from "./messages";
+import { ReadSessionMessagesRequestSchema, SessionMessagePageSchema } from "./messages";
 import { ReadContextInputSchema, ContextReadResultSchema } from './context';
 import { ReadSessionCheckpointsInputSchema, RestoreSessionCheckpointInputSchema, SessionCheckpointPageSchema, SessionCheckpointReceiptSchema, RestoreSessionInputSchema } from './session';
 import { CompactSessionInputSchema, ReadCompactionInputSchema, CompactionOperationViewSchema, CancelCompactionResultSchema, CompactionPhaseSchema } from './session';
@@ -28,8 +28,8 @@ import { ExtensionAssemblyProofSchema, ExtensionDescriptorSchema, ExtensionSelec
 
 import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, EventSubscribeResultSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema } from './event';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p12-v1" as const;
-export const DATABASE_SCHEMA_VERSION = 11 as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p13-v1" as const;
+export const DATABASE_SCHEMA_VERSION = 12 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
@@ -154,7 +154,7 @@ export const publicMethodSchemas = {
   "session.readManagementOperation": { input: ReadManagementOperationInputSchema, output: SessionManagementReceiptSchema.nullable() },
   "session.list": { input: ListSessionsRequestSchema, output: SessionPageSchema },
   "session.read": { input: z.strictObject({ sessionId: PositiveIdSchema }), output: SessionDetailSchema.nullable() },
-  "session.messages.read": { input: ReadSessionMessagesInputSchema, output: SessionMessagePageSchema },
+  "session.messages.read": { input: ReadSessionMessagesRequestSchema, output: SessionMessagePageSchema },
   "session.checkpoints.read": { input: ReadSessionCheckpointsInputSchema, output: SessionCheckpointPageSchema },
   "session.restoreCheckpoint": { input: RestoreSessionCheckpointInputSchema, output: SessionCheckpointReceiptSchema },
   "session.restore": { input: RestoreSessionInputSchema, output: SessionDetailSchema },

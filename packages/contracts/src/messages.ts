@@ -8,13 +8,19 @@ export const MAX_MESSAGE_PAGE_BYTES = 3 * 1024 * 1024;
 const encoder = new TextEncoder();
 const withinPageBudget = (value: unknown) => encoder.encode(JSON.stringify(value)).byteLength <= MAX_MESSAGE_PAGE_BYTES;
 
-export const ReadSessionMessagesInputSchema = z.strictObject({
-  sessionId: PositiveIdSchema,
+const messagePaging = {
   leafId: OpaqueIdSchema.nullable().default(null),
   afterEntryId: OpaqueIdSchema.nullable().default(null),
   limit: z.number().int().min(1).max(100).default(50),
-}).refine(withinPageBudget, "Message input exceeds the UTF-8 JSON budget");
+};
+export const ReadSessionMessagesInputSchema = z.strictObject({ sessionId: PositiveIdSchema, ...messagePaging })
+  .refine(withinPageBudget, "Message input exceeds the UTF-8 JSON budget");
 export type ReadSessionMessagesInput = z.infer<typeof ReadSessionMessagesInputSchema>;
+export const ReadSessionMessagesRequestSchema = z.union([
+  ReadSessionMessagesInputSchema,
+  z.strictObject({ childRunId: PositiveIdSchema, ...messagePaging }).refine(withinPageBudget, 'Message input exceeds the UTF-8 JSON budget'),
+]);
+export type ReadSessionMessagesRequest = z.infer<typeof ReadSessionMessagesRequestSchema>;
 
 const ReferenceSchema = z.string().max(32).regex(/^(run|tool|query|evidence):[1-9][0-9]*$/)
   .refine(reference => Number.isSafeInteger(Number(reference.slice(reference.indexOf(":") + 1))), "Expected a positive safe ID reference");

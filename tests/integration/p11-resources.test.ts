@@ -171,7 +171,7 @@ test('p11 consumption failure rolls back receipt, owner state and original nativ
   } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
-test('p11 schema10 migration changes only its receipt trigger and marker, preserving original facts and rollback', () => {
+test('p11 schema10 migration preserves original facts through the current schema and rolls back its receipt boundary', () => {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p11-migration-')), path = join(root, 'app.sqlite'); let db = new Database(path, { strict: true });
   try {
     const migrations = ['001_p1.sql', '002_p2.sql', '003_p3.sql', '004_p5.sql', '005_p6.sql', '006_session_lifecycle.sql', '007_batch_deletion.sql', '008_p8.sql', '009_p9.sql', '010_p10.sql'];
@@ -183,7 +183,7 @@ test('p11 schema10 migration changes only its receipt trigger and marker, preser
     }
     db.exec('PRAGMA foreign_keys=ON'); const f = acceptContextInput(db);
     const names = db.query<{ name: string }, []>("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(r => r.name);
-    const before = new Map(names.map(n => [n, db.query(`SELECT * FROM ${n}`).all()]));
+    const before = new Map(names.map(n => [n, db.query<Record<string, unknown>, []>(`SELECT * FROM ${n}`).all()]));
     const trigger = db.query<{ sql: string }, []>("SELECT sql FROM sqlite_schema WHERE name='session_inputs_identity_immutable'").get()!.sql;
     db.close();
     expect(() => openDatabase(path, phase => { if (phase === 'p11_receipt_marker') throw new Error('ENGINEERING migration failure'); })).toThrow('storage_migration_failed');
@@ -192,9 +192,13 @@ test('p11 schema10 migration changes only its receipt trigger and marker, preser
     for (const n of names) expect(db.query(`SELECT * FROM ${n}`).all()).toEqual(before.get(n)!);
     db.close(); db = openDatabase(path);
     expect(db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(r => (r as { name: string }).name)).toEqual(names);
-    for (const n of names.filter(n => n !== 'schema_migrations')) expect(db.query(`SELECT * FROM ${n}`).all()).toEqual(before.get(n)!);
+    for (const n of names.filter(n => n !== 'schema_migrations')) {
+      const rows = db.query<Record<string, unknown>, []>(`SELECT * FROM ${n}`).all();
+      expect(rows.map((row, i) => Object.fromEntries(Object.keys(before.get(n)![i]!).map(key => [key, row[key]])))).toEqual(before.get(n)!);
+    }
+    expect(db.query<Record<string, unknown>, []>('SELECT parent_run_id,origin_tool_call_id,child_result_json FROM runs').all().every(row => Object.values(row).every(value => value === null))).toBe(true);
     expect(db.query('SELECT * FROM schema_migrations ORDER BY version').all().slice(0, 10)).toEqual(before.get('schema_migrations')!);
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(11);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(12);
     expect(new Repositories(db).readInput({ inputId: f.input.inputId })).toMatchObject({ text: 'Why did this decline?', status: 'consumed' });
     expect(new Repositories(db).readRunResources(f.input.runId)).toBeNull();
   } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
@@ -286,6 +290,6 @@ test('p11 run snapshot and input plan commit together and reject invalid owner',
     const accepted = repos.acceptInput(acceptance);
     expect(Reflect.get(repos, 'readRunResources')).toBeFunction();
     expect(repos.readRunResources(accepted.runId!)).toEqual(resources);
-    expect(db.query<{ n: number }, []>('SELECT MAX(version) n FROM schema_migrations').get()!.n).toBe(11);
+    expect(db.query<{ n: number }, []>('SELECT MAX(version) n FROM schema_migrations').get()!.n).toBe(12);
   } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
 });

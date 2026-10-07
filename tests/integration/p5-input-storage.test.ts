@@ -34,10 +34,11 @@ test('schema3 upgrades all original columns and checksums to latest schema witho
   `);
   const names=db.query<{name:string},[]>("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(x=>x.name);
   const before=Object.fromEntries(names.map(n=>[n,db.query(`SELECT * FROM ${n}`).all()])); db.close(); db=openDatabase(path);
-  expect(Object.values(before).every(rows=>rows.length>0)).toBe(true);expect(SCHEMA_VERSION).toBe(11); expect(db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'").all()).toHaveLength(23);
+  expect(Object.values(before).every(rows=>rows.length>0)).toBe(true);expect(SCHEMA_VERSION).toBe(12); expect(db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'").all()).toHaveLength(23);
   for(const n of names) {
    const expected=n==='sessions'?before[n]!.map(row=>({...row as Record<string,unknown>,metadata_json:'{"titleOrigin":"user"}',metadata_revision:0,deleted_at:null,native_header_json:null,current_leaf_id:null,history_format_version:null})):n==='batches'?before[n]!.map(row=>({...row as Record<string,unknown>,status:'active',deleted_at:null,deletion_operation_ref:null,cohort_json:'[{"deviceId":1,"sourceDeviceId":"device"}]'})):n==='tool_calls'?before[n]!.map(row=>({...row as Record<string,unknown>,context_snapshot_id:null})):before[n];
-   expect(db.query(`SELECT * FROM ${n}`).all().slice(0,before[n]!.length)).toEqual(expected);
+   const withChildColumns = n === 'runs' ? expected!.map(row => ({ ...row as Record<string, unknown>, parent_run_id: null, origin_tool_call_id: null, child_result_json: null })) : expected;
+   expect(db.query(`SELECT * FROM ${n}`).all().slice(0,before[n]!.length)).toEqual(withChildColumns);
   }
   expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]); expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
   expect(new Repositories(db).readInput({inputId:999})).toBeNull();
@@ -129,7 +130,7 @@ test('schema4 copy, rename and marker faults roll back to reopenable schema3 wit
   const schema=db.query('SELECT name,sql FROM sqlite_schema ORDER BY name').all();db.close();
   let failed=false;try{openDatabase(path,(point?:string)=>{if(point===phase)throw new Error(phase);}).close();}catch(error){failed=(error as Error).message==='storage_migration_failed';}expect(failed).toBe(true);
   db=new Database(path);expect(db.query('SELECT name,sql FROM sqlite_schema ORDER BY name').all()).toEqual(schema);expect(db.query('SELECT COUNT(*) AS n FROM schema_migrations').get()).toEqual({n:3});db.close();
-  db=openDatabase(path);expect(db.query('SELECT COUNT(*) AS n FROM schema_migrations').get()).toEqual({n:11});
+  db=openDatabase(path);expect(db.query('SELECT COUNT(*) AS n FROM schema_migrations').get()).toEqual({n:12});
  }finally{db.close();rmSync(root,{recursive:true,force:true});}
  }
 });

@@ -10,7 +10,7 @@ import { DataCatalogSchema } from '../../packages/contracts/src/data';
 // Only the external desktop bridge is substituted. These tests run the actual
 // renderer and assert user-visible admission and results, not fixture call counts.
 const root = resolve(import.meta.dirname, '../..'), bun = process.env.MEDCLAW_BUN_EXECUTABLE ?? 'bun';
-const ready = { instanceId: 'startup-renderer-instance', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion:11, error: null };
+const ready = { instanceId: 'startup-renderer-instance', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion:12, error: null };
 const directory = ModelDirectoryViewSchema.parse({ configVersion: '0', selection: null, customApis: [],
   providers: [{ id: 'offline-provider', name: 'Offline provider', source: 'pi_builtin', loginTypes: ['api_key'],
     auth: { providerId: 'offline-provider', state: 'unavailable', type: null, source: null, checkKind: 'snapshot', checkedAt: '2026-10-04T00:00:00Z' } }],
