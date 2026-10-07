@@ -13,7 +13,7 @@ import { verifyPriorContextFacts } from './context-store';
 import { ModelCallContextSchema, ContextSnapshotBodySchema, type StartCallContext } from '../../contracts/src/context';
 import { FrozenRunResourcesSchema, ResourceEvidenceSchema, ResourceReadFactSchema, resourceRefKey, type FrozenRunResources, type ResourceEvidence } from '../../contracts/src/resources';
 import { FrozenRunExtensionsSchema, type FrozenRunExtensions } from '../../contracts/src/extensions';
-import { FrozenChildConfigSchema, ChildResultSchema, BoundChildIdentitySchema, childScopeWithin, type BoundChildIdentity, type RegisterChildInput } from '../../contracts/src/subagent';
+import { FrozenChildConfigSchema, ChildResultSchema, BoundChildIdentitySchema, childScopeWithin, type BoundChildIdentity, type RegisterChildInput, type FinalChildFact, type ChildResult } from '../../contracts/src/subagent';
 import { readFrozenChild } from './child-identity';
 import type { EventWriter, RegisteredEventDraft, RegisteredEventPayload } from '../../contracts/src/event';
 import { RegisteredEventPayloadSchema } from '../../contracts/src/event';
@@ -196,6 +196,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   readRunResources(runId: number): FrozenRunResources | null {
     id(runId); return this.inputRead(() => {
       const row = this.row(runId); if (!row) fail('run_not_found');
+      if (row.kind==='child') {const child=readFrozenChild(this.db,runId);return child.resources?this.checkedResources(child.resources,child.parentSessionId,child.model.configVersion):null;}
       if (row.kind !== 'agent') return null;
       const config = checked(agentConfigSchema, decoded(row.config_json), 'storage_read_failed');
       return config.agent.resources ? this.checkedResources(config.agent.resources, row.session_id!, config.selection.configVersion) : null;
@@ -1310,6 +1311,26 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     });
   }
 
+  findChild(parentRunId:number,originToolCallId:number,expected?:RegisterChildInput):BoundChildIdentity|null {
+    id(parentRunId);id(originToolCallId);
+    return this.inputRead(()=>this.db.transaction(()=>{
+    const row=this.db.query<{id:number},[number,number]>("SELECT id FROM runs WHERE kind='child' AND parent_run_id=? AND origin_tool_call_id=?").get(parentRunId,originToolCallId);
+    if(!row)return null;
+    const identity=this.readChildIdentity(row.id)!;
+    if(expected) {
+      const stored=this.row(row.id)!,frozen=readFrozenChild(this.db,row.id),initial=this.memory?.loadInTransaction(identity.childSessionId);
+      if(canonicalRequest(frozen)!==canonicalRequest({...expected.frozen,childRunId:identity.childRunId,childSessionId:identity.childSessionId})||stored.input_text!==expected.prompt
+        ||!initial||initial.storageVersion!==1||canonicalRequest(initial.header)!==canonicalRequest(expected.initialHistory.header)||canonicalRequest(initial.entries)!==canonicalRequest(expected.initialHistory.entries)||initial.activeLeafId!==expected.initialHistory.activeLeafId)fail('storage_read_failed');
+    }
+    return identity;
+    }).deferred());
+  }
+  readChildHistoryBase(runId:number):{storageVersion:number;leafId:string|null} {
+    id(runId);const frozen=readFrozenChild(this.db,runId);
+    const row=this.db.query<{storage_version:number;current_leaf_id:string|null},[number]>('SELECT storage_version,current_leaf_id FROM sessions WHERE id=?').get(frozen.childSessionId);
+    if(!row)fail('storage_read_failed');return {storageVersion:row.storage_version,leafId:row.current_leaf_id};
+  }
+
   registerProvider(input: RegisterProviderInput): ProviderAccepted {
     const originalRequest = input.method === "model.request" ? checked(ProviderRequestSchema, input.originalRequest) : checked(DiagnoseRequestSchema, input.originalRequest);
     if (!input.operationRef || input.operationRef.length > 512) fail("invalid_argument");
@@ -1398,6 +1419,22 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   finalizeAgent(runId: number, fact: FinalAgentFact): RunView {
     return this.finalize(runId, fact, fact.calls, "agent");
   }
+  childResultReferences(runId:number):Pick<ChildResult,'queryRefs'|'evidenceIds'> {
+    id(runId);const child=readFrozenChild(this.db,runId);
+    const queries=this.db.query<{id:number;result_hash:string},[number,number]>('SELECT id,result_hash FROM queries WHERE run_id=? AND session_id=? ORDER BY id').all(runId,child.childSessionId);
+    const evidence=this.db.query<{id:number},[number,number]>('SELECT e.id FROM query_evidence e JOIN queries q ON q.id=e.query_id WHERE q.run_id=? AND q.session_id=? ORDER BY e.id').all(runId,child.childSessionId);
+    return {queryRefs:queries.map(row=>({queryId:row.id,resultHash:row.result_hash})),evidenceIds:evidence.map(row=>row.id)};
+  }
+  private childFinalEnvelope(runId:number,fact:FinalChildFact):FinalAgentFact & {childResult:ChildResult} {
+    const row=this.row(runId);if(!row||row.kind!=='child')fail('access_denied');
+    return {...fact,stoppedAt:fact.cleanup.executionStarted===false?null:fact.endedAt,
+      cancelRequestedAt:fact.status==='cancelled'?row.cancel_requested_at??fact.endedAt:row.cancel_requested_at};
+  }
+  finalizeChild(runId:number,fact:FinalChildFact) {
+    const result=this.finalize(runId,this.childFinalEnvelope(runId,fact),fact.calls,'child');
+    if(result.kind!=='child')fail('state_conflict');return result;
+  }
+  isChildFinalSaved(runId:number,fact:FinalChildFact):boolean {return this.isFinalSaved(runId,this.childFinalEnvelope(runId,fact));}
   confirmHistorySaved(change:NativeHistoryCommit) {if(!this.memory)fail('storage_read_failed');return this.memory.confirmCommitted(change);}
   private answerReferences(row:RunRow, requireAvailable:boolean):number[] {
     try {
@@ -1501,7 +1538,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     }
     return next;
   }
-  private finalize(runId: number, fact: FinalProviderFact, finalCalls: import("../../contracts/src/run").FinalCallFact[], kind: "provider" | "agent"): RunView {
+  private finalize(runId: number, fact: FinalProviderFact, finalCalls: import("../../contracts/src/run").FinalCallFact[], kind: "provider" | "agent" | "child"): RunView {
     id(runId); timestamp(fact.endedAt); timestamp(fact.stoppedAt); timestamp(fact.cancelRequestedAt ?? null);
     if (!["completed", "failed", "cancelled"].includes(fact.status)) fail("invalid_argument");
     checked(z.string().nullable(), fact.outputText);
@@ -1511,8 +1548,8 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     return this.transactions.immediate(() => {
       const row = this.row(runId);
       if (!row || row.kind !== kind) fail("state_conflict");
-      const history=kind==='agent'?(fact as FinalAgentFact).history:undefined;
-      const historyRequired=kind==='agent'&&checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.historyContract==='medclaw.history/p9-v1';
+      const history=kind==='agent'||kind==='child'?(fact as FinalAgentFact).history:undefined;
+      const historyRequired=kind==='child'||kind==='agent'&&checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.historyContract==='medclaw.history/p9-v1';
       if(historyRequired&&fact.status==='completed'&&!history)fail('session_history_invalid');
       if(history) {
         if(history.sessionId!==row.session_id||history.runId!==runId)fail('access_denied');
@@ -1530,6 +1567,14 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         else this.memory.commitInTransaction(history);
         for(const compaction of compactions)if(compaction!==pending[0]&&this.confirmCompactionSaved(history,compaction)===null)fail('storage_write_failed');
         if(historyRequired&&fact.status==='completed')this.validateFinalAnswer(row,fact as FinalAgentFact);
+      }
+      if(kind==='child') {
+        const result=checked(ChildResultSchema,(fact as FinalAgentFact & {childResult:ChildResult}).childResult);
+        const identity=this.readChildIdentity(runId)!,base=this.readChildHistoryBase(runId),refs=this.childResultReferences(runId);
+        if(!history||Object.entries(identity).filter(([key])=>key!=='instanceId'&&key!=='parentSessionId'&&key!=='originNativeToolCallId').some(([key,value])=>result[key as keyof ChildResult]!==value)
+          ||result.outcome!==fact.status||result.text!==fact.outputText||result.storageVersion!==base.storageVersion||result.finalLeafId!==base.leafId||result.committedAt!==fact.endedAt
+          ||result.originalReplyHash!==createHash('sha256').update(canonicalRequest(result.originalReply)).digest('hex')||!isDeepStrictEqual(result.queryRefs,refs.queryRefs)||!isDeepStrictEqual(result.evidenceIds,refs.evidenceIds)
+          ||row.child_result_json!=null&&!isDeepStrictEqual(decoded(row.child_result_json),result))fail('state_conflict');
       }
       const calls = this.calls(runId);
       if (calls.length !== finalCalls.length || new Set(finalCalls.map(call => call.callId)).size !== finalCalls.length) fail("state_conflict");
@@ -1573,9 +1618,9 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       }
       if (cleanup && 'contract' in cleanup && cleanup.requiredPersistenceComplete && (!this.verifyPriorContextFacts(runId).requiredPersistenceComplete||!this.verifyPriorCompactionFacts(runId).requiredPersistenceComplete)) fail('storage_write_failed');
       this.db.query(`UPDATE runs SET status=?,output_text=?,stopped_at=COALESCE(stopped_at,?),ended_at=COALESCE(ended_at,?),cancel_requested_at=?,
-        error_json=?,cleanup_json=?,usage_json=? WHERE id=?`)
+        error_json=?,cleanup_json=?,usage_json=?,child_result_json=COALESCE(child_result_json,?) WHERE id=?`)
         .run(terminal ? row.status : fact.status, row.output_text ?? fact.outputText, fact.stoppedAt, fact.endedAt, cancelRequestedAt,
-          terminal ? row.error_json : json(error), json(cleanup), row.usage_json ?? json(usage), runId);
+          terminal ? row.error_json : json(error), json(cleanup), row.usage_json ?? json(usage),kind==='child'?canonicalRequest((fact as FinalAgentFact & {childResult:ChildResult}).childResult):null, runId);
       if (this.p3 && row.kind === "agent" && fact.status === "completed" && (historyRequired||checked(agentConfigSchema, decoded(row.config_json), "storage_read_failed").agent.stage === "P3")) {
         const frozen = checked(RunScopeSchema, decoded(row.scope_json), "storage_read_failed");
         const queries = this.db.query<{ id: number; session_id: number; batch_ids_json: string; result_json: string }, [number]>(
@@ -1612,7 +1657,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     const expectedCleanup = fact.cleanup && 'contract' in fact.cleanup && savedCleanup.success
       ? { ...fact.cleanup, ...(fact.cleanup.budgetSummary == null && savedCleanup.data.budgetSummary != null ? { budgetSummary: savedCleanup.data.budgetSummary } : {}) }
       : fact.cleanup ?? null;
-    if (!row || row.kind !== ("calls" in fact ? "agent" : "provider") || row.status !== fact.status
+    if (!row || row.kind !== ("childResult" in fact ? "child" : "calls" in fact ? "agent" : "provider") || row.status !== fact.status
       || row.output_text !== fact.outputText || row.stopped_at !== fact.stoppedAt || row.ended_at !== fact.endedAt
       || row.cancel_requested_at !== (fact.cancelRequestedAt ?? null) || !isDeepStrictEqual(decoded(row.error_json), fact.error)
       || !isDeepStrictEqual(decoded(row.usage_json), fact.usage ?? null) || !isDeepStrictEqual(decoded(row.cleanup_json), expectedCleanup)) return false;
@@ -1642,6 +1687,10 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if (!answer || answer.text !== (fact.outputText ?? "")) return false;
     }
     if(this.p5&&row.kind==='agent'&&this.inputs.hasPendingInputsForRun(runId))return false;
+    if('childResult' in fact) {
+      if(!isDeepStrictEqual(decoded(row.child_result_json??null),fact.childResult)||!this.db.query('SELECT id FROM runtime_events WHERE run_id=? AND type=?').get(runId,`run_${fact.status}`)
+        ||this.db.query('SELECT id FROM answers WHERE run_id=?').get(runId))return false;
+    }
     const saved = this.calls(runId), expected = "calls" in fact ? fact.calls : fact.call ? [fact.call] : [];
     return saved.length === expected.length && expected.every(call => {
       const original = saved.find(item => item.callId === call.callId);

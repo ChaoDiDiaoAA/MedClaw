@@ -6,6 +6,8 @@ import { StoredToolConfigurationSchema } from './tool-config';
 import { FrozenRunResourcesSchema } from './resources';
 import { RunScopeSchema, type RunScope, type FinalCallFact, type RunCleanupRecord } from './run';
 import type { NativeHistoryCommit, CompactionSaveFact, InitialNativeHistory } from './session';
+import type { StartCallContext } from './context';
+import type { ModelCallRecorderPort, ProviderOutcome } from './run';
 
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
 export function childScopeWithin(child: RunScope, parent: RunScope): boolean {
@@ -64,6 +66,20 @@ export type RegisterChildInput = {
   parentRunId: number; originToolCallId: number; pluginAgentId: string; nativeSessionId: string;
   prompt: string; initialHistory: InitialNativeHistory; createdAt: string;
   frozen: Omit<FrozenChildConfig, 'childRunId' | 'childSessionId'>;
+};
+export type ChildExecutionObservation = {
+  identity: BoundChildIdentity; nativeIdle: true; calls: FinalCallFact[]; history: NativeHistoryCommit;
+  cleanup: RunCleanupRecord; outcome: ProviderOutcome | null; error: AppError | null; compactions: CompactionSaveFact[];
+};
+// Internal to the original plugin factory; no public spawn or Session input entry.
+export type ChildRuntimeCallbacks = {
+  own(pluginAgentId: string, stop: () => Promise<void>): () => void;
+  register(input: RegisterChildInput): BoundChildIdentity;
+  startCall(runId: number, time: string, context?: StartCallContext): ModelCallRecorderPort;
+  compaction?(identity: BoundChildIdentity): import('./session').AutoCompactionCallbacks;
+  stream?(snapshot: import('./event').StreamSnapshot): void;
+  finish(identity: BoundChildIdentity, observation: ChildExecutionObservation, reply: NativeAgentReply): CommittedChildResult;
+  released(identity: BoundChildIdentity): void;
 };
 export type FinalChildFact = {
   status: 'completed' | 'failed' | 'cancelled'; endedAt: string; outputText: string; error: AppError | null;

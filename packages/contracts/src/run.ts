@@ -243,7 +243,8 @@ export type AgentRuntimePort<Resolved> = {
     workspaceContext?: WorkspaceContext; scope?: RunScope; referenceDate?: string; timezone?: string; agentPolicy?: AgentPolicy; runtimeConfiguration?: RuntimeConfiguration; toolConfiguration?: ToolConfiguration; measurementContext?: MeasurementContext; toolProfileSnapshot?: ToolProfileSnapshot },
     callbacks: { stream?: (snapshot: StreamSnapshot) => void; startCall: (time: string, context?: StartCallContext) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
       fatal?: (error: AppError) => void; extensionProof?: (proof: import('./extensions').ExtensionAssemblyProof) => void;
-      inputStore?: InputStore; admissionClosed?: () => void; compaction?: import('./session').AutoCompactionCallbacks }) => Promise<AgentExecutionObservation>;
+      inputStore?: InputStore; admissionClosed?: () => void; compaction?: import('./session').AutoCompactionCallbacks;
+      subagents?: import('./subagent').ChildRuntimeCallbacks }) => Promise<AgentExecutionObservation>;
 };
 export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit; compactions?: import('./session').CompactionSaveFact[] };
 export type StoredOperation = ProviderOperation
@@ -269,6 +270,11 @@ export interface ProviderRunStore {
 }
 export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputStore {
   registerChild?(input: import('./subagent').RegisterChildInput): import('./subagent').BoundChildIdentity;
+  findChild?(parentRunId: number, originToolCallId: number, expected?: import('./subagent').RegisterChildInput): import('./subagent').BoundChildIdentity | null;
+  readChildHistoryBase?(runId: number): { storageVersion: number; leafId: string | null };
+  childResultReferences?(runId: number): Pick<import('./subagent').ChildResult,'queryRefs'|'evidenceIds'>;
+  finalizeChild?(runId: number, fact: import('./subagent').FinalChildFact): ChildRunView;
+  isChildFinalSaved?(runId: number, fact: import('./subagent').FinalChildFact): boolean;
   readRunExtensions?(runId: number): import('./extensions').FrozenRunExtensions | null;
   readRunResources?(runId: number): import('./resources').FrozenRunResources | null;
   readResourceEvidence?(runId: number, page: number, pageSize: number): { items: import('./resources').ResourceEvidence[]; totalRows: number };

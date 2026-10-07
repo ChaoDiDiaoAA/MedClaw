@@ -324,8 +324,9 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       if (record.resourceRead) { if (!isDeepStrictEqual(record.resourceRead, fact)) fail('state_conflict'); return; }
       if (record.name !== 'read' || record.status !== 'succeeded' || !record.sdkReturned || !record.nativeEntryId || !record.sdkDelivery || record.sdkDelivery.isError) fail('state_conflict');
       const config = this.db.query<{ config_json: string }, [number, number]>('SELECT config_json FROM runs WHERE id=? AND session_id=?').get(context.runId, context.sessionId);
-      const frozen = FrozenRunResourcesSchema.safeParse((config ? decode(config.config_json) as { agent?: { resources?: unknown } } : null)?.agent?.resources);
-      if (!frozen.success || frozen.data.sessionId !== context.sessionId) fail('state_conflict');
+      const child=context.delegationSource?readFrozenChild(this.db,context.runId):null;
+      const frozen = FrozenRunResourcesSchema.safeParse(child?.resources??(config ? decode(config.config_json) as { agent?: { resources?: unknown } } : null)?.agent?.resources);
+      if (!frozen.success || frozen.data.sessionId !== (child?.parentSessionId??context.sessionId)) fail('state_conflict');
       const snapshot = frozen.data.available.find(s => resourceRefKey(s.ref) === resourceRefKey(fact.resourceRef)), file = snapshot?.files.find(f => f.file === fact.file);
       if (!file || file.sha256 !== fact.fileHash || createHash('sha256').update(file.content).digest('hex') !== file.sha256
         || createHash('sha256').update(canonicalRequest(record.sdkDelivery.content)).digest('hex') !== fact.returnedContentHash) fail('state_conflict');

@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -20,6 +20,104 @@ import { CatalogService } from '../../packages/core/src/data/catalog-service';
 import { SqliteCatalogStore } from '../../packages/storage/src/catalog-store';
 import { createPiNativeTools } from '../../packages/runtime-pi/src/pi-tool-adapter';
 import { ToolRecorder } from '../../packages/core/src/tools/recorder';
+import { PiAgentRuntime } from '../../packages/runtime-pi/src/agent-runtime';
+import { PiModelRuntime } from '../../packages/runtime-pi/src/model-runtime';
+import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
+import { ContextService } from '../../packages/core/src/context/context-service';
+import { RunControl } from '../../packages/core/src/runtime/run-control';
+import { ToolRegistry } from '../../packages/core/src/tools/registry';
+import { ToolExecutor } from '../../packages/core/src/tools/executor';
+import { createReadDataScopeTool } from '../../packages/core/src/tools/business-tools/read-data-scope';
+import { ModelCallRecorder } from '../../packages/runtime-pi/src/model-call-recorder';
+import { performance } from 'node:perf_hooks';
+import type { AgentSession } from '@earendil-works/pi-coding-agent';
+import { RuntimeService } from '../../packages/core/src/runtime/runtime-service';
+import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
+
+test('p13 product child factory binds SQLite identity, explicit SDK and business tools before the first real HTTP request', async () => {
+  const root=mkdtempSync(join(tmpdir(),'medclaw-p13-factory-')),db=openDatabase(join(root,'app.sqlite')),history=sqliteHistory(db);
+  const repos=new Repositories(db,undefined,undefined,undefined,history.store),contexts=new SqliteContextStore(db),tools=new SqliteToolStore(db);
+  const controller=new AbortController(),errors:unknown[]=[],requests:unknown[]=[];let owned=new Map<string,unknown>();
+  let child:AgentSession|undefined,childId:number|undefined;const nativePath=join(root,'sdk-read.txt');writeFileSync(nativePath,'ENGINEERING native read');
+  const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
+    const payload=await request.json();requests.push(payload);
+    const row=db.query<{id:number;session_id:number;scope_json:string},[]>("SELECT id,session_id,scope_json FROM runs WHERE kind='child'").get()!;
+    expect(row).toBeDefined();expect(owned.size).toBe(1);expect(row.id).not.toBe(1);childId=row.id;
+    expect(db.query('SELECT run_id,input_id FROM model_calls WHERE run_id=?').get(row.id)).toEqual({run_id:row.id,input_id:null});
+    expect(db.query('SELECT run_id,input_id FROM context_snapshots WHERE run_id=?').get(row.id)).toEqual({run_id:row.id,input_id:null});
+    expect(db.query('SELECT id FROM session_inputs WHERE session_id=?').all(row.session_id)).toEqual([]);
+    const delta=requests.length===1?{role:'assistant',tool_calls:[{index:0,id:'child-business',type:'function',function:{name:'read_data_scope',arguments:'{}'}}]}:requests.length===2?{role:'assistant',tool_calls:[{index:0,id:'child-native-read',type:'function',function:{name:'read',arguments:JSON.stringify({path:nativePath})}}]}:{role:'assistant',content:'ENGINEERING verified child'};
+    return new Response(`data: ${JSON.stringify({id:'fixture',model:'fixture',choices:[{index:0,delta,finish_reason:'tool_calls' in delta?'tool_calls':'stop'}]})}\n\ndata: [DONE]\n\n`,{headers:{'content-type':'text/event-stream'}});
+  }});
+  try {
+    const credentials=new InMemoryCredentialStore();await credentials.modify('p13-fixture',async()=>({type:'api_key',key:'fixture'}));
+    const runtime=await PiModelRuntime.create({credentials,modelsStore:new InMemoryModelsStore()});
+    await runtime.installCustom([{providerId:'p13-fixture',name:'Fixture',api:'openai-completions',baseUrl:`http://127.0.0.1:${server.port}/v1`,models:[{id:'fixture',name:'Fixture',input:['text'],reasoning:false,contextWindow:32768,maxTokens:1024,outputLimitConfirmed:true,pricingKnown:false,cost:null}]}]);
+    const resolved=await runtime.resolve({provider:'p13-fixture',modelId:'fixture',expectedConfigVersion:'1'},'1',null,{timeoutMs:15000,maxRetries:0,maxRetryDelayMs:2000});
+    const f=acceptContextInput(db,{repositories:repos,model:resolved.selection,toolNames:['Agent','read','read_data_scope']});
+    db.query("UPDATE runs SET config_json=json_set(config_json,'$.policy',json(?)) WHERE id=?").run(JSON.stringify(resolved.policy),f.input.runId);
+    const snapshot=contexts.save(contexts.select(f.input));
+    repos.startCall(f.input.runId,'parent-fixture','main',contextAt,{inputId:f.input.inputId,snapshotId:snapshot.id});
+    const context={runId:f.input.runId,sessionId:f.input.sessionId,nativeToolCallId:'original-Agent',scope:f.input.scope,referenceDate:f.request.referenceDate,timezone:f.request.timezone,signal:controller.signal,
+      modelCallId:'parent-fixture',contextSnapshotId:snapshot.id,workspaceContext:f.input.workspaceContext,workspaceInputId:f.input.inputId,basedOnQueryId:null,workspaceRevision:f.input.workspaceContext.revision};
+    tools.request({name:'Agent',version:'fixture',effect:'READ',executionMode:'sequential'},p13AgentInput,context);
+    const catalog=new CatalogService(new SqliteCatalogStore(db)),registry=new ToolRegistry([createReadDataScopeTool({catalog})]),recorder=new ToolRecorder(tools,error=>errors.push(error));
+    const agent=new PiAgentRuntime(runtime,root,history,{registry,recorder,executor:new ToolExecutor(registry,recorder)},new ContextService(contexts,{inspectManagedImport:async()=>({status:'valid'})}));
+    const input={runId:f.input.runId,sessionId:f.input.sessionId,inputId:f.input.inputId,text:f.request.text,resolved,agentOptions:agent.describe(resolved),instanceId:'host',scope:f.input.scope,referenceDate:f.request.referenceDate,timezone:f.request.timezone,signal:controller.signal,deadlineAt:performance.now()+15000};
+    const control=new RunControl({...input,totalTimeoutMs:15000});
+    const settings=PublishedSettingsSchema.parse({schemaVersion:'medclaw.settings/p1-v1',configVersion:'1',model:null,customProviders:[],credentialRefs:{},requestPolicy:resolved.policy,previous:null,rollbackFromVersion:null});
+    const core=new RuntimeService('host',()=>settings,runtime,repos,(_context,action)=>action(),(runId,kind,at,context)=>new ModelCallRecorder(repos,runId,kind,at,context),()=>{},()=>{},agent,()=>false);
+    // Component probe: the parent original call/snapshot is a persisted engineering fixture; no claim of the complete parent plugin loop.
+    const rootExecution=Reflect.get(core,'begin').call(core,{runId:f.input.runId,sessionId:f.input.sessionId,kind:'agent'},'factory-probe');
+    const callbacks=Reflect.get(core,'childCallbacks').call(core,rootExecution);owned=rootExecution.children;
+    const parent={input,control,callbacks:{fatal:(error:unknown)=>errors.push(error),subagents:callbacks},children:new Map()};
+    const open=Reflect.get(agent,'openManagedChild');expect(typeof open).toBe('function');
+    db.exec("CREATE TEMP TRIGGER fail_child_registration BEFORE INSERT ON runs WHEN NEW.kind='child' BEGIN SELECT RAISE(ABORT,'ENGINEERING registration failure'); END;");
+    await expect(open.call(agent,parent,context,{pluginAgentId:'failed-factory-fixture',prompt:p13AgentInput.prompt,signal:controller.signal})).rejects.toMatchObject({code:'storage_write_failed'});
+    expect(requests).toHaveLength(0);expect(owned.size).toBe(0);expect(parent.children.size).toBe(0);
+    expect(db.query("SELECT id FROM runs WHERE kind='child'").all()).toEqual([]);expect(db.query("SELECT id FROM sessions WHERE kind='child'").all()).toEqual([]);
+    db.exec('DROP TRIGGER fail_child_registration');
+    // Lost return after COMMIT: reconcile by exact original identity and frozen initial history, never by recency.
+    const register=repos.registerChild.bind(repos);let lost=true;
+    repos.registerChild=request=>{const identity=register(request);if(lost){lost=false;throw new Error('ENGINEERING lost registration return');}return identity;};
+    const pending=open.call(agent,parent,context,{pluginAgentId:'real-factory-fixture',prompt:p13AgentInput.prompt,signal:controller.signal});
+    expect(requests).toHaveLength(0);child=await pending;
+    expect(child!.getAllTools().map(t=>t.name).sort()).toEqual(['read','read_data_scope']);
+    expect(child!.getActiveToolNames().sort()).toEqual(['read','read_data_scope']);
+    const workspace=repos.readWorkspace();await child!.prompt(p13AgentInput.prompt,{expandPromptTemplates:false});
+    const observed=await Reflect.get(agent,'settleManagedChild').call(agent,parent,'real-factory-fixture');
+    expect(errors).toEqual([]);expect(requests).toHaveLength(3);expect(observed.identity.childRunId).toBe(childId);expect(observed.calls).toHaveLength(3);
+    rootExecution.stopped=true;
+    expect(Reflect.get(core,'cleanup').call(core,rootExecution,true)).toMatchObject({stopConfirmed:false,requiredPersistenceComplete:false,resourcesReleased:false,unconfirmedItems:expect.arrayContaining(['child_cleanup'])});
+    expect(core.activeHandle?.runId).toBe(f.input.runId);
+    expect(db.query('SELECT t.run_id,t.session_id,s.input_id FROM tool_calls t JOIN context_snapshots s ON s.id=t.context_snapshot_id WHERE t.native_tool_call_id=?').get('child-business')).toEqual({run_id:childId,session_id:observed.identity.childSessionId,input_id:null});
+    expect(db.query('SELECT run_id,session_id,tool_version FROM tool_calls WHERE native_tool_call_id=?').get('child-native-read')).toEqual({run_id:childId,session_id:observed.identity.childSessionId,tool_version:'0.87.1'});
+    expect(repos.readWorkspace()).toEqual(workspace);expect(observed.history.sessionId).toBe(observed.identity.childSessionId);
+    const reply={content:[{type:'text' as const,text:'ENGINEERING factory result'}],details:{fixture:true}};
+    const state=()=>[['sessions','id',observed.identity.childSessionId],['runs','id',childId],['model_calls','run_id',childId],['memories','session_id',observed.identity.childSessionId],['runtime_events','run_id',childId]]
+      .map(([table,column,value])=>db.query(`SELECT * FROM ${table} WHERE ${column}=? ORDER BY id`).all(value as number));
+    const prefix=state();
+    for(const [table,operation,condition]of [['memories','INSERT',`NEW.run_id=${childId}`],['sessions','UPDATE',`NEW.id=${observed.identity.childSessionId}`],['model_calls','UPDATE',`NEW.run_id=${childId}`],['runs','UPDATE',`NEW.id=${childId}`],['runtime_events','INSERT',`NEW.run_id=${childId} AND NEW.type='run_completed'`]]) {
+      db.exec(`CREATE TEMP TRIGGER fail_child_final BEFORE ${operation} ON ${table} WHEN ${condition} BEGIN SELECT RAISE(ABORT,'ENGINEERING final failure'); END;`);
+      expect(()=>callbacks.finish(observed.identity,observed,reply)).toThrow();expect(state()).toEqual(prefix);
+      expect(core.activeHandle?.runId).toBe(f.input.runId);expect(owned.size).toBe(1);expect(requests).toHaveLength(3);
+      db.exec('DROP TRIGGER fail_child_final');
+    }
+    const finalize=repos.finalizeChild.bind(repos);let lostFinal=true;
+    repos.finalizeChild=(runId,fact)=>{const result=finalize(runId,fact);if(lostFinal){lostFinal=false;throw new Error('ENGINEERING lost final return');}return result;};
+    const committed=callbacks.finish(observed.identity,observed,reply);
+    expect(callbacks.finish(observed.identity,observed,reply)).toEqual(committed);expect(requests).toHaveLength(3);
+    expect(db.query("SELECT id FROM runtime_events WHERE run_id=? AND type='run_completed'").all(childId!)).toHaveLength(1);
+    expect(repos.read({runId:childId!})).toMatchObject({kind:'one',run:{status:'completed',answerRef:null,childResult:{storageVersion:committed.result.storageVersion}}});
+    expect(db.query('SELECT id FROM answers WHERE run_id=?').all(childId!)).toEqual([]);
+    agent.acknowledgeHistorySaved(observed.history,committed.result.storageVersion);
+    let lateError:unknown;
+    try{history.commitSync({...observed.history,expectedStorageVersion:committed.result.storageVersion,newEntries:[{id:'late',type:'label',parentId:observed.history.activeLeafId,timestamp:new Date().toISOString(),targetId:observed.history.activeLeafId,label:'ENGINEERING late'}],activeLeafId:'late'});}catch(error){lateError=error;}
+    expect(lateError).toMatchObject({code:'state_conflict'});
+    await Reflect.get(agent,'releaseManagedChild').call(agent,parent,'real-factory-fixture');expect(owned.size).toBe(0);
+    control.dispose();
+  } finally {await child?.abort();await child?.waitForIdle();child?.dispose();server.stop(true);db.close();rmSync(root,{recursive:true,force:true});}
+},20000);
 
 function frozenFixture(f: ReturnType<typeof acceptContextInput>, origin: { id: number; nativeToolCallId: string }, snapshotId: number,
   native: ReturnType<typeof memoryNativeFixture>, childRunId: number, childSessionId: number, pluginAgentId = 'plugin-child') {

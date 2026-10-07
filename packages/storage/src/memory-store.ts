@@ -93,6 +93,8 @@ export class SqliteMemoryStore implements MemoryStore {
         if(!this.db.query("SELECT id FROM runs WHERE id=? AND session_id=? AND kind=?").get(change.runId,session.id,session.kind==='child'?'child':'agent'))throw safeError('access_denied');
       } else if(session.kind==='child')throw safeError('access_denied');
       const old=this.read(session), oldById=new Map(old.entries.map(value=>[(value as EntryIdentity).id,value]));
+      if(session.kind==='child'&&this.db.query("SELECT id FROM runs WHERE session_id=? AND kind='child' AND child_result_json IS NOT NULL").get(session.id)
+        &&(change.newEntries.length||change.activeLeafId!==old.activeLeafId))throw safeError('state_conflict');
       if(!Array.isArray(change.newEntries))invalid();
       const incoming=new Map<string,unknown>();
       for(const value of change.newEntries) {
