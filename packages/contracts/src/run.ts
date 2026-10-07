@@ -274,7 +274,7 @@ export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputSt
   registerChild?(input: import('./subagent').RegisterChildInput): import('./subagent').BoundChildIdentity;
   findChild?(parentRunId: number, originToolCallId: number, expected?: import('./subagent').RegisterChildInput): import('./subagent').BoundChildIdentity | null;
   readChildHistoryBase?(runId: number): { storageVersion: number; leafId: string | null };
-  childResultReferences?(runId: number): Pick<import('./subagent').ChildResult,'queryRefs'|'evidenceIds'>;
+  childResultReferences?(runId: number): Pick<import('./subagent').ChildResult,'queryRefs'|'evidenceIds'|'gaps'>;
   finalizeChild?(runId: number, fact: import('./subagent').FinalChildFact): ChildRunView;
   isChildFinalSaved?(runId: number, fact: import('./subagent').FinalChildFact): boolean;
   readRunExtensions?(runId: number): import('./extensions').FrozenRunExtensions | null;

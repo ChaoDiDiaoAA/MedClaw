@@ -607,9 +607,14 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const status=cancellationWon?'cancelled':observation.error===null&&outcome?.callState==='completed'&&['stop','length'].includes(outcome.sdkStopReason)?'completed':outcome?.callState==='cancelled'||observation.error?.code==='tool_cancelled'?'cancelled':'failed';
         const endedAt=slot.pendingFinal?.endedAt??now(),error=status==='completed'?null:observation.error??safeError(status==='cancelled'?'tool_cancelled':'internal_error',undefined,{reason:'subagent_execution_failed'});
         const base=this.store.readChildHistoryBase!(identity.childRunId);
+        const refs=this.store.childResultReferences(identity.childRunId);
+        const nativeErrors=observation.history.newEntries.flatMap(entry=>{
+          const message=(entry as {type:string;message?:{role:string;isError?:boolean;toolCallId?:string}}).message;
+          return message?.role==='toolResult'&&message.isError&&message.toolCallId?['tool_result_error:'+message.toolCallId]:[];
+        });
         const childResult=ChildResultSchema.parse({contract:'medclaw.child-result/v1',childRunId:identity.childRunId,childSessionId:identity.childSessionId,parentRunId:identity.parentRunId,
           originToolCallId:identity.originToolCallId,pluginAgentId:identity.pluginAgentId,nativeSessionId:identity.nativeSessionId,outcome:status,text:outcome?.text??'',
-          ...this.store.childResultReferences(identity.childRunId),gaps:error?[error.code]:[],truncated:false,originalReply,originalReplyHash:createHash('sha256').update(canonicalRequest(originalReply)).digest('hex'),
+          ...refs,gaps:[...new Set([...(error?[error.code]:[]),...refs.gaps,...nativeErrors])],truncated:false,originalReply,originalReplyHash:createHash('sha256').update(canonicalRequest(originalReply)).digest('hex'),
           finalLeafId:observation.history.activeLeafId,storageVersion:observation.history.expectedStorageVersion+(observation.history.newEntries.length||observation.history.activeLeafId!==base.leafId?1:0),committedAt:endedAt});
         const candidate:FinalChildFact={status,endedAt,outputText:childResult.text,error,calls:observation.calls,history:observation.history,compactions:observation.compactions,childResult,
           cleanup:{...observation.cleanup,stopConfirmed:true,requiredPersistenceComplete:true,inputsSettled:true,resourcesReleased:false,unconfirmedItems:['resources'],verifiedAt:null}};
@@ -831,6 +836,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       this.saveRecovery(recovery);
       if (this.recoveries.has(runId)) throw new Error("storage_write_failed");
     } else {
+      if(execution?.handle.runId===runId&&execution.cause&&!execution.stopped)throw safeError('stop_unconfirmed',undefined,{runId});
       if (!execution || execution.handle.runId !== runId || !execution.pendingSave || !execution.stopped || !execution.fact) throw new Error("run_save_unavailable");
       if (!execution.finalCommitted && execution.handle.kind === 'agent') {
         for(const [callId,pending]of execution.pendingCompactionCalls??[]){this.store.finishCompactionCall(pending.owner,pending.fact);execution.pendingCompactionCalls!.delete(callId);}

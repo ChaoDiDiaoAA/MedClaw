@@ -37,6 +37,7 @@ import { agentRuntimeFixture } from '../fixtures/agent-runtime';
 import { canReadRelatedQuery } from '../../packages/storage/src/child-identity';
 import { SessionService } from '../../packages/core/src/session/session-service';
 import { SubmitInputSchema } from '../../packages/contracts/src/session';
+import { canonicalRequest } from '../../packages/contracts/src/run';
 
 for (const audit of [false,true])for (const delegate of [false,true]) test('p13 original product Agent registration '+(audit?'with P12 audit ':'')+(delegate?'delegates through the plugin and returns committed child result':'starts no child without a real tool call'),async()=>{
   const f=await agentRuntimeFixture(index=>index===1&&delegate
@@ -278,6 +279,22 @@ test('p13 parent cancellation records child cancellation and waits for its real 
   }finally{resume();if(f.app.runs.activeHandle)await f.app.runs.retrySave(f.app.runs.activeHandle.runId);await f.close();}
 },20000);
 
+test('p13 unconfirmed child SDK idle keeps stop and root admission pending until the original wait settles',async()=>{
+  let entered!:()=>void,resumeResponse!:()=>void,resumeIdle!:()=>void;
+  const requested=new Promise<void>(resolve=>{entered=resolve;}),responseGate=new Promise<void>(resolve=>{resumeResponse=resolve;}),idleGate=new Promise<void>(resolve=>{resumeIdle=resolve;});
+  const f=await agentRuntimeFixture(async index=>{if(index===1)return {role:'assistant',tool_calls:[{index:0,id:'idle-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]};entered();await responseGate;return {role:'assistant',content:'ENGINEERING aborted original child'};});
+  try{
+    const open=Reflect.get(f.agent,'openManagedChild').bind(f.agent);
+    Reflect.set(f.agent,'openManagedChild',async(...args:unknown[])=>{const session:AgentSession=await open(...args),idle=session.waitForIdle.bind(session);session.waitForIdle=async()=>{await idle();await idleGate;};return session;});
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING wait for exact child idle'),{instanceId:'host',operationRef:'p13-idle-gap'});if(!result.ok||!result.data.runId)throw new Error('No Run');
+    await requested;expect(await f.app.runs.cancel(result.data.runId)).toMatchObject({ok:true,data:{stopped:false}});expect(f.app.runs.stopPending).toBe(true);expect(f.app.runs.busy).toBe(true);
+    expect(f.db.query("SELECT child_result_json FROM runs WHERE kind='child'").get()).toEqual({child_result_json:null});
+    expect(await f.app.runs.submitAgent(f.request('ENGINEERING cannot start new root'),{instanceId:'host',operationRef:'p13-idle-denied'})).toMatchObject({ok:false});
+    expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:false,error:{code:'stop_unconfirmed'}});expect(f.requests).toHaveLength(2);
+    resumeResponse();resumeIdle();await f.settle();expect(f.requests).toHaveLength(2);expect(f.app.runs.stopPending).toBe(false);
+  }finally{resumeResponse();resumeIdle();await f.close();}
+},20000);
+
 test('p13 child cancellation committed before final wins without replaying the original child execution',async()=>{
   const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'race-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING original child finished'});
   const finalize=f.repos.finalizeChild.bind(f.repos);let injected=false;
@@ -291,6 +308,61 @@ test('p13 child cancellation committed before final wins without replaying the o
     expect(f.db.query("SELECT status,json_extract(child_result_json,'$.outcome') AS outcome FROM runs WHERE kind='child'").get()).toEqual({status:'cancelled',outcome:'cancelled'});
     expect(f.requests).toHaveLength(2);
   }finally{f.repos.finalizeChild=finalize;if(f.app.runs.activeHandle)await f.app.runs.retrySave(f.app.runs.activeHandle.runId);await f.close();}
+},20000);
+
+for(const read of ['none','read_query','read_query_evidence','list_query_evidence'] as const)test('p13 frozen parent Query references follow the actual child read '+read,async()=>{
+  let parentQueryId=0,evidenceId=0;
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'frozen-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:
+    index===2&&read!=='none'?{role:'assistant',tool_calls:[{index:0,id:'frozen-read',type:'function',function:{name:read,arguments:JSON.stringify(read==='read_query_evidence'?{evidenceId}:{queryId:parentQueryId})}}]}:{role:'assistant',content:'ENGINEERING verified original parent Query'});
+  try{
+    const seeded=seedWorkspaceQueries(f.db,f.repos);parentQueryId=seeded.current.id;evidenceId=seeded.evidenceId;
+    f.repos.updateWorkspace({queryId:parentQueryId},f.repos.readWorkspace().revision,new Date().toISOString());const workspace=f.repos.readWorkspace();
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING frozen parent Query verification'),{instanceId:'host',operationRef:'p13-frozen-read'});
+    expect(result.ok).toBe(true);await f.settle();expect(f.requests).toHaveLength(read==='none'?3:4);
+    const child=f.db.query<{id:number;child_result_json:string},[]>("SELECT id,child_result_json FROM runs WHERE kind='child'").get()!;
+    expect(JSON.parse(child.child_result_json).queryRefs).toEqual(read==='none'?[]:[{queryId:parentQueryId,resultHash:seeded.current.resultHash}]);
+    expect(JSON.parse(child.child_result_json).evidenceIds).toEqual(['read_query_evidence','list_query_evidence'].includes(read)?[evidenceId]:[]);
+    expect(f.db.query('SELECT id FROM queries WHERE run_id=?').all(child.id)).toEqual([]);
+    expect(f.db.query('SELECT session_id,run_id FROM queries WHERE id=?').get(parentQueryId)).toEqual({session_id:1,run_id:10});
+    expect(f.repos.readWorkspace()).toEqual(workspace);
+  }finally{await f.close();}
+},20000);
+
+for(const denied of ['Agent','bash','extension_runtime_status','unfrozen_query','outside_batch'] as const)test('p13 actual child rejects '+denied+' and retains the observed gap',async()=>{
+  let otherQueryId=0;
+  const tool=denied==='unfrozen_query'?'read_query':denied==='outside_batch'?'query_current_devices':denied;
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'deny-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:
+    index===2?{role:'assistant',tool_calls:[{index:0,id:'denied-child',type:'function',function:{name:tool,arguments:JSON.stringify(denied==='unfrozen_query'?{queryId:otherQueryId}:denied==='outside_batch'?{batchIds:[999],time:{start:'2026-10-04',endExclusive:'2026-10-05'}}:{})}}]}:
+    {role:'assistant',content:'ENGINEERING stopped verification; no claim of completeness'},true);
+  try{
+    const seeded=seedWorkspaceQueries(f.db,f.repos);otherQueryId=seeded.secondQueryId;
+    f.repos.updateWorkspace({queryId:seeded.current.id},f.repos.readWorkspace().revision,new Date().toISOString());
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING deny child capability expansion'),{instanceId:'host',operationRef:'p13-denied-'+denied});
+    expect(result.ok).toBe(true);await f.settle();expect(f.requests).toHaveLength(4);
+    const children=f.db.query<{id:number;child_result_json:string},[]>("SELECT id,child_result_json FROM runs WHERE kind='child'").all();expect(children).toHaveLength(1);
+    expect(JSON.parse(children[0]!.child_result_json).queryRefs).toEqual([]);
+    expect(JSON.parse(children[0]!.child_result_json).gaps).toContain('tool_result_error:denied-child');
+    expect(f.db.query('SELECT id FROM queries WHERE run_id=?').all(children[0]!.id)).toEqual([]);
+    const message=(f.requests[2]!.messages as {role:string;tool_call_id?:string}[]).find(value=>value.role==='tool'&&value.tool_call_id==='denied-child');expect(message).toBeDefined();
+    if(['unfrozen_query','outside_batch'].includes(denied))expect(f.db.query('SELECT status,json_extract(error_json,\'$.code\') AS code FROM tool_calls WHERE run_id=? AND native_tool_call_id=?').get(children[0]!.id,'denied-child')).toEqual({status:'failed',code:'access_denied'});
+    for(const name of ['Agent','bash','extension_runtime_status'])expect((f.requests[1]!.tools as {function:{name:string}}[]).map(value=>value.function.name)).not.toContain(name);
+  }finally{await f.close();}
+},20000);
+
+test('p13 oversized child result rejects the whole final transaction without replacing its original reply',async()=>{
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'size-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING bounded child'});
+  const finalize=f.repos.finalizeChild.bind(f.repos);let checked=false;
+  try{
+    f.repos.finalizeChild=(id,fact)=>{
+      const originalReply={...fact.childResult.originalReply,content:[{type:'text' as const,text:'x'.repeat(300000)}]},before=f.db.query('SELECT * FROM memories WHERE run_id=?').all(id);
+      expect(()=>finalize(id,{...fact,childResult:{...fact.childResult,originalReply,originalReplyHash:createHash('sha256').update(canonicalRequest(originalReply)).digest('hex')}})).toThrow('tool_result_too_large');
+      expect(f.db.query('SELECT * FROM memories WHERE run_id=?').all(id)).toEqual(before);
+      expect(f.db.query('SELECT child_result_json,status FROM runs WHERE id=?').get(id)).toEqual({child_result_json:null,status:'running'});checked=true;
+      return finalize(id,fact);
+    };
+    expect(await f.app.runs.submitAgent(f.request('ENGINEERING reject oversized storage envelope'),{instanceId:'host',operationRef:'p13-size'})).toMatchObject({ok:true});
+    await f.settle();expect(checked).toBe(true);expect(f.requests).toHaveLength(3);
+  }finally{f.repos.finalizeChild=finalize;await f.close();}
 },20000);
 
 test('p13 committed child survives parent Agent execution-row save failure and retry records original facts only',async()=>{
@@ -313,6 +385,21 @@ test('p13 committed child survives parent Agent execution-row save failure and r
     const origin=f.db.query<{status:string;result_json:string;delivery_json:string},[]>("SELECT status,result_json,delivery_json FROM tool_calls WHERE tool_name='Agent'").get()!;
     expect(origin.status).toBe('succeeded');expect(JSON.parse(origin.result_json)).toEqual(JSON.parse(saved).originalReply);
     expect(JSON.parse(origin.delivery_json)).toMatchObject({sdkReturned:true,message:{isError:true},error:{code:'tool_delivery_failed'}});
+  }finally{reject=false;f.toolStore.transition=transition;if(f.app.runs.activeHandle)await f.app.runs.retrySave(f.app.runs.activeHandle.runId);await f.close();}
+},20000);
+
+test('p13 child ToolCall persistence failure immediately closes the original root admission',async()=>{
+  let reject=true;
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'save-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:
+    index===2?{role:'assistant',tool_calls:[{index:0,id:'save-child-tool',type:'function',function:{name:'read_data_scope',arguments:'{}'}}]}:{role:'assistant',content:'ENGINEERING must not continue across save failure'});
+  const transition=f.toolStore.transition.bind(f.toolStore);
+  try{
+    f.toolStore.transition=(...args)=>{if(reject&&args[2]==='succeeded'&&f.db.query<{native_tool_call_id:string},[number]>('SELECT native_tool_call_id FROM tool_calls WHERE id=?').get(args[0])?.native_tool_call_id==='save-child-tool')throw new Error('ENGINEERING child ToolCall save fault');return transition(...args);};
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING child tool save gate'),{instanceId:'host',operationRef:'p13-child-tool-save'});if(!result.ok||!result.data.runId)throw new Error('No Run');
+    await Reflect.get(f.app.runs,'execution').task;expect(f.requests).toHaveLength(2);expect(f.app.runs.busy).toBe(true);
+    expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:false});reject=false;
+    expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:true});expect(f.app.runs.busy).toBe(false);expect(f.requests).toHaveLength(2);
+    expect(f.db.query("SELECT status,json_extract(result_json,'$.scope.readOnly') AS read_only FROM tool_calls WHERE native_tool_call_id='save-child-tool'").get()).toEqual({status:'succeeded',read_only:1});
   }finally{reject=false;f.toolStore.transition=transition;if(f.app.runs.activeHandle)await f.app.runs.retrySave(f.app.runs.activeHandle.runId);await f.close();}
 },20000);
 
