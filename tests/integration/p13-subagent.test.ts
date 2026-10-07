@@ -35,6 +35,8 @@ import { RuntimeService } from '../../packages/core/src/runtime/runtime-service'
 import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
 import { agentRuntimeFixture } from '../fixtures/agent-runtime';
 import { canReadRelatedQuery } from '../../packages/storage/src/child-identity';
+import { SessionService } from '../../packages/core/src/session/session-service';
+import { SubmitInputSchema } from '../../packages/contracts/src/session';
 
 for (const audit of [false,true])for (const delegate of [false,true]) test('p13 original product Agent registration '+(audit?'with P12 audit ':'')+(delegate?'delegates through the plugin and returns committed child result':'starts no child without a real tool call'),async()=>{
   const f=await agentRuntimeFixture(index=>index===1&&delegate
@@ -207,6 +209,184 @@ for(const mode of ['summary','read','unverified-read'] as const)test('p13 parent
     }
     expect(f.repos.readWorkspace()).toEqual(workspace);
   }finally{await f.close();}
+},20000);
+
+test('p13 browsing B and rejected B Send or Steer keep the real child on original A and independent event sequences',async()=>{
+  let entered!:()=>void,resume!:()=>void;
+  const childRequest=new Promise<void>(resolve=>{entered=resolve;}),gate=new Promise<void>(resolve=>{resume=resolve;});
+  const f=await agentRuntimeFixture(async index=>{
+    if(index===1)return {role:'assistant',tool_calls:[{index:0,id:'A-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]};
+    if(index===2){entered();await gate;}
+    return {role:'assistant',content:'ENGINEERING original A result '+index};
+  });
+  const sessions=new SessionService('host',f.repos,f.agent,(input,context)=>f.app.runs.submitAgent(input,context),()=>f.app.runs.activeHandle,id=>f.app.runs.readInputControl(id),undefined,f.app.runs);
+  try{
+    const created=await sessions.create({expectedWorkspaceRevision:f.repos.readWorkspace().revision},{instanceId:'host',operationRef:'p13-create-B'});
+    if(!created.ok)throw new Error('No B');const B=created.data.session.id;
+    expect(await sessions.select({sessionId:1,expectedWorkspaceRevision:f.repos.readWorkspace().revision})).toMatchObject({ok:true});
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING A frozen ownership'),{instanceId:'host',operationRef:'p13-AB'});
+    if(!result.ok||!result.data.runId)throw new Error('No Run');
+    await childRequest;
+    const child=f.db.query<{id:number;session_id:number;config_json:string},[]>("SELECT id,session_id,config_json FROM runs WHERE kind='child'").get()!,frozen=JSON.parse(child.config_json).subagent;
+    expect(await sessions.select({sessionId:B,expectedWorkspaceRevision:f.repos.readWorkspace().revision})).toMatchObject({ok:true});
+    for(const mode of ['send','steer'] as const)expect(await sessions.submit(SubmitInputSchema.parse({...f.request('ENGINEERING B '+mode),sessionId:B,clientSequence:1,mode,...(mode==='steer'?{targetRunId:result.data.runId}:{})}),{instanceId:'host',operationRef:'p13-B-'+mode})).toMatchObject({ok:false});
+    expect((await sessions.list({}))).toMatchObject({ok:true,data:{sessions:expect.arrayContaining([expect.objectContaining({id:1}),expect.objectContaining({id:B})])}});
+    expect(f.repos.listSessions({}).sessions.map(session=>session.id)).not.toContain(child.session_id);
+    resume();await f.settle();expect(f.requests).toHaveLength(3);
+    expect(JSON.parse(f.db.query<{config_json:string},[number]>('SELECT config_json FROM runs WHERE id=?').get(child.id)!.config_json).subagent).toEqual(frozen);
+    expect(frozen).toMatchObject({parentRunId:result.data.runId,parentSessionId:1});expect(f.repos.readWorkspace().sessionId).toBe(B);
+    for(const id of [result.data.runId,child.id]){
+      const events=f.db.query<{sequence:number},[number]>('SELECT sequence FROM runtime_events WHERE run_id=? ORDER BY sequence').all(id);
+      expect(events.length).toBeGreaterThan(0);expect(events.map(event=>event.sequence)).toEqual(events.map((_,index)=>index+1));
+    }
+    expect(f.db.query('SELECT id FROM session_inputs WHERE session_id=?').all(B)).toEqual([]);
+  }finally{resume();await f.close();}
+},20000);
+
+test('p13 child history verification rejects damaged saved prefixes rather than treating child as pre-history',async()=>{
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'history-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING saved prefix'});
+  try{
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING child history proof'),{instanceId:'host',operationRef:'p13-child-history-proof'});
+    expect(result.ok).toBe(true);await f.settle();
+    const child=f.db.query<{id:number;session_id:number},[]>("SELECT id,session_id FROM runs WHERE kind='child'").get()!;
+    expect(f.repos.verifyPriorHistoryFacts(child.id)).toEqual({requiredPersistenceComplete:true,unconfirmedItems:[]});
+    const rollback=new Error('ENGINEERING restore saved history');
+    expect(()=>f.db.transaction(()=>{f.db.query('DELETE FROM memories WHERE session_id=?').run(child.session_id);
+      expect(f.repos.verifyPriorHistoryFacts(child.id)).toEqual({requiredPersistenceComplete:false,unconfirmedItems:['history_persistence']});throw rollback;
+    })()).toThrow(rollback);
+  }finally{await f.close();}
+},20000);
+
+test('p13 parent cancellation records child cancellation and waits for its real SDK idle before releasing root',async()=>{
+  let entered!:()=>void,resume!:()=>void;
+  const childRequest=new Promise<void>(resolve=>{entered=resolve;}),gate=new Promise<void>(resolve=>{resume=resolve;});
+  const f=await agentRuntimeFixture(async index=>{
+    if(index===1)return {role:'assistant',tool_calls:[{index:0,id:'stop-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]};
+    entered();await gate;return {role:'assistant',content:'ENGINEERING cancelled child response'};
+  });
+  try{
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING cancel owned child'),{instanceId:'host',operationRef:'p13-child-cancel'});
+    if(!result.ok||!result.data.runId)throw new Error('No Run');
+    await childRequest;const task=Reflect.get(f.app.runs,'execution').task;
+    await f.app.runs.cancel(result.data.runId);resume();await task;
+    expect(f.requests).toHaveLength(2);expect(f.app.runs.busy).toBe(false);
+    const child=f.db.query<{id:number;status:string;cancel_requested_at:string;cleanup_json:string},[]>("SELECT * FROM runs WHERE kind='child'").get()!;
+    expect(child.status).toBe('cancelled');expect(child.cancel_requested_at).not.toBeNull();
+    expect(JSON.parse(child.cleanup_json)).toMatchObject({stopConfirmed:true,requiredPersistenceComplete:true,resourcesReleased:true});
+    expect(f.db.query('SELECT type FROM runtime_events WHERE run_id=? AND type=?').all(child.id,'run_cancel_requested')).toHaveLength(1);
+    expect(f.db.query('SELECT id FROM answers WHERE run_id=?').all(child.id)).toEqual([]);
+  }finally{resume();if(f.app.runs.activeHandle)await f.app.runs.retrySave(f.app.runs.activeHandle.runId);await f.close();}
+},20000);
+
+test('p13 child cancellation committed before final wins without replaying the original child execution',async()=>{
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'race-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING original child finished'});
+  const finalize=f.repos.finalizeChild.bind(f.repos);let injected=false;
+  try{
+    f.repos.finalizeChild=(id,fact)=>{if(!injected){injected=true;f.repos.requestCancel(id,new Date().toISOString());}return finalize(id,fact);};
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING cancellation transaction race'),{instanceId:'host',operationRef:'p13-cancel-commit'});
+    if(!result.ok||!result.data.runId)throw new Error('No Run');
+    await Reflect.get(f.app.runs,'execution').task;
+    if(f.app.runs.busy)expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:true});
+    expect(f.app.runs.busy).toBe(false);
+    expect(f.db.query("SELECT status,json_extract(child_result_json,'$.outcome') AS outcome FROM runs WHERE kind='child'").get()).toEqual({status:'cancelled',outcome:'cancelled'});
+    expect(f.requests).toHaveLength(2);
+  }finally{f.repos.finalizeChild=finalize;if(f.app.runs.activeHandle)await f.app.runs.retrySave(f.app.runs.activeHandle.runId);await f.close();}
+},20000);
+
+test('p13 committed child survives parent Agent execution-row save failure and retry records original facts only',async()=>{
+  let reject=true;
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'row-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING committed before parent save'});
+  const transition=f.toolStore.transition.bind(f.toolStore);
+  try{
+    f.toolStore.transition=(...args)=>{if(reject&&args[2]==='succeeded'&&f.db.query<{tool_name:string},[number]>('SELECT tool_name FROM tool_calls WHERE id=?').get(args[0])?.tool_name==='Agent')throw new Error('ENGINEERING parent ToolCall save fault');return transition(...args);};
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING parent original ToolCall save'),{instanceId:'host',operationRef:'p13-parent-save-gap'});
+    if(!result.ok||!result.data.runId)throw new Error('No Run');
+    await Reflect.get(f.app.runs,'execution').task;
+    expect(f.app.runs.busy).toBe(true);expect(f.requests).toHaveLength(2);
+    const saved=f.db.query<{child_result_json:string},[]>("SELECT child_result_json FROM runs WHERE kind='child'").get()!.child_result_json;
+    expect(JSON.parse(saved).outcome).toBe('completed');
+    expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:false});
+    reject=false;
+    expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:true,data:{status:'failed'}});
+    expect(f.app.runs.busy).toBe(false);expect(f.requests).toHaveLength(2);
+    expect(f.db.query("SELECT child_result_json FROM runs WHERE kind='child'").get()).toEqual({child_result_json:saved});
+    const origin=f.db.query<{status:string;result_json:string;delivery_json:string},[]>("SELECT status,result_json,delivery_json FROM tool_calls WHERE tool_name='Agent'").get()!;
+    expect(origin.status).toBe('succeeded');expect(JSON.parse(origin.result_json)).toEqual(JSON.parse(saved).originalReply);
+    expect(JSON.parse(origin.delivery_json)).toMatchObject({sdkReturned:true,message:{isError:true},error:{code:'tool_delivery_failed'}});
+  }finally{reject=false;f.toolStore.transition=transition;if(f.app.runs.activeHandle)await f.app.runs.retrySave(f.app.runs.activeHandle.runId);await f.close();}
+},20000);
+
+test('p13 parent manager teardown failure holds root after the child is already released',async()=>{
+  let reject=true;
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'teardown-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING teardown '+index});
+  const prepare=Reflect.get(f.agent,'prepare').bind(f.agent);
+  try{
+    Reflect.set(f.agent,'prepare',async(...args:unknown[])=>{await prepare(...args);const subagent=Reflect.get(args[0] as object,'execution').subagent,close=subagent.close;subagent.close=async()=>{if(reject)throw new Error('ENGINEERING manager teardown fault');await close();};});
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING manager cleanup'),{instanceId:'host',operationRef:'p13-manager-cleanup'});
+    if(!result.ok||!result.data.runId)throw new Error('No Run');
+    await Reflect.get(f.app.runs,'execution').task;
+    expect(f.app.runs.busy).toBe(true);expect(f.requests).toHaveLength(3);
+    expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:false});
+    reject=false;
+    expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:true,data:{cleanup:{resourcesReleased:true}}});
+    expect(f.app.runs.busy).toBe(false);expect(f.requests).toHaveLength(3);
+  }finally{reject=false;if(f.app.runs.activeHandle)await f.app.runs.retrySave(f.app.runs.activeHandle.runId);Reflect.set(f.agent,'prepare',prepare);await f.close();}
+},20000);
+
+for(const boundary of ['final','release'] as const)test('p13 child '+boundary+' save gap holds the root and retries only original persistence',async()=>{
+  let reject=true;
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'gap-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING save gap'});
+  const finalize=f.repos.finalizeChild.bind(f.repos),cleanup=f.repos.saveRunCleanup.bind(f.repos);
+  try{
+    if(boundary==='final')f.repos.finalizeChild=(...args)=>{if(reject)throw new Error('ENGINEERING child final fault');return finalize(...args);};
+    else f.repos.saveRunCleanup=(id,fact)=>{if(reject&&fact.resourcesReleased&&f.db.query<{kind:string},[number]>('SELECT kind FROM runs WHERE id=?').get(id)?.kind==='child')throw new Error('ENGINEERING child release fault');return cleanup(id,fact);};
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING original child persistence'),{instanceId:'host',operationRef:'p13-gap-'+boundary});
+    if(!result.ok||!result.data.runId)throw new Error('No Run');
+    await Reflect.get(f.app.runs,'execution').task;
+    expect(f.app.runs.busy).toBe(true);expect(f.requests).toHaveLength(2);
+    expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:false});
+    expect(await f.app.runs.submitAgent(f.request('ENGINEERING blocked next root'),{instanceId:'host',operationRef:'p13-blocked-'+boundary})).toMatchObject({ok:false});
+    reject=false;
+    expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:true,data:{status:'failed',cleanup:{stopConfirmed:true,requiredPersistenceComplete:true,resourcesReleased:true}}});
+    expect(f.app.runs.busy).toBe(false);expect(f.requests).toHaveLength(2);
+    expect(f.db.query("SELECT status,json_extract(child_result_json,'$.outcome') AS outcome,json_extract(cleanup_json,'$.resourcesReleased') AS released FROM runs WHERE kind='child'").get()).toEqual({status:'completed',outcome:'completed',released:1});
+    expect(f.db.query("SELECT id FROM runs WHERE kind='child'").all()).toHaveLength(1);
+  }finally{reject=false;f.repos.finalizeChild=finalize;f.repos.saveRunCleanup=cleanup;if(f.app.runs.activeHandle)await f.app.runs.retrySave(f.app.runs.activeHandle.runId);await f.close();}
+},20000);
+
+for(const committed of [false,true])test('p13 unknown child registration reconciles exact saved identity before storage-only cleanup '+committed,async()=>{
+  let unreadable=true;
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'unknown-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING unknown registration'});
+  const register=f.repos.registerChild.bind(f.repos),find=f.repos.findChild.bind(f.repos);
+  try{
+    f.repos.registerChild=input=>{if(committed)register(input);throw new Error('ENGINEERING registration return unknown');};
+    f.repos.findChild=(...args)=>{if(unreadable)throw new Error('ENGINEERING read unavailable');return find(...args);};
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING reconcile child identity'),{instanceId:'host',operationRef:'p13-registration-unknown-'+committed});
+    if(!result.ok||!result.data.runId)throw new Error('No Run');
+    await Reflect.get(f.app.runs,'execution').task;
+    expect(f.app.runs.busy).toBe(true);expect(f.requests).toHaveLength(1);
+    expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:false});
+    unreadable=false;
+    expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:true,data:{status:'failed',cleanup:{resourcesReleased:true,requiredPersistenceComplete:true}}});
+    expect(f.app.runs.busy).toBe(false);expect(f.requests).toHaveLength(1);
+    const children=f.db.query<{status:string;child_result_json:string},[]>("SELECT status,child_result_json FROM runs WHERE kind='child'").all();
+    expect(children).toHaveLength(committed?1:0);
+    if(committed){expect(children[0]!.status).toBe('failed');expect(JSON.parse(children[0]!.child_result_json)).toMatchObject({outcome:'failed',queryRefs:[]});}
+  }finally{unreadable=false;f.repos.registerChild=register;f.repos.findChild=find;if(f.app.runs.activeHandle)await f.app.runs.retrySave(f.app.runs.activeHandle.runId);await f.close();}
+},20000);
+
+test('p13 known child registration rollback releases the real plugin manager without inventing a child',async()=>{
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'rollback-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING acknowledged binding failure'});
+  const register=f.repos.registerChild.bind(f.repos);
+  try{
+    f.repos.registerChild=()=>{throw new Error('ENGINEERING known registration rollback');};
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING binding rollback'),{instanceId:'host',operationRef:'p13-binding-rollback'});
+    if(!result.ok||!result.data.runId)throw new Error('No Run');
+    await Reflect.get(f.app.runs,'execution').task;
+    expect(f.app.runs.busy).toBe(false);expect(f.requests).toHaveLength(1);
+    expect(f.db.query("SELECT id FROM runs WHERE kind='child'").all()).toEqual([]);
+    expect(f.db.query("SELECT status FROM tool_calls WHERE tool_name='Agent'").get()).toEqual({status:'failed'});
+  }finally{f.repos.registerChild=register;await f.close();}
 },20000);
 
 test('p13 product child factory binds SQLite identity, explicit SDK and business tools before the first real HTTP request', async () => {

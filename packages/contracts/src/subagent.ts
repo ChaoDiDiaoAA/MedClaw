@@ -75,6 +75,7 @@ export type ChildExecutionObservation = {
 export type ChildRuntimeCallbacks = {
   own(pluginAgentId: string, stop: () => Promise<void>): () => void;
   register(input: RegisterChildInput): BoundChildIdentity;
+  reconcile?(pluginAgentId:string):BoundChildIdentity|null;
   startCall(runId: number, time: string, context?: StartCallContext): ModelCallRecorderPort;
   compaction?(identity: BoundChildIdentity): import('./session').AutoCompactionCallbacks;
   stream?(snapshot: import('./event').StreamSnapshot): void;

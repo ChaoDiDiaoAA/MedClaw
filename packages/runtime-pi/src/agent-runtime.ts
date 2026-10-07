@@ -67,6 +67,9 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
   private readonly inputs = new Map<number, PiInputAdapter>();
   private readonly inputStartFailures = new Map<number, { save: () => void; pending: boolean; proof: InputSettlementProof }>();
   private readonly contextReceipts = new Map<number, Map<string, RegisterContextDeliveryInput>>();
+  private readonly subagentCleanup = new Map<number,()=>Promise<void>>();
+  hasPendingSubagentPersistence(runId:number) {return this.subagentCleanup.has(runId);}
+  async retrySubagentPersistence(runId:number) {await this.subagentCleanup.get(runId)?.();}
   readonly contextContract?: typeof CONTEXT_CONTRACT;
   hasPendingContextPersistence(runId: number) { return (this.contextReceipts.get(runId)?.size ?? 0) > 0; }
   retryContextPersistence(runId: number) {
@@ -330,12 +333,18 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     }
   }
 
-  private async settleManagedChild(parent:NonNullable<Binding['execution']>,pluginAgentId:string):Promise<ChildExecutionObservation> {
-    const child=parent.children?.get(pluginAgentId);if(!child?.identity)throw safeError('state_conflict');
+  private async settleManagedChild(parent:NonNullable<Binding['execution']>,pluginAgentId:string):Promise<ChildExecutionObservation|null> {
+    const child=parent.children?.get(pluginAgentId);if(!child)return null;
+    if(!child.identity)throw safeError('storage_read_failed');
     if(child.observation)return structuredClone(child.observation);
     const {binding,identity}=child,execution=binding.execution;
     await binding.session!.waitForIdle();await Promise.all(execution?.observers??[]);await binding.compaction?.settle();
     if(!binding.session!.isIdle||binding.session!.agent.hasQueuedMessages())throw safeError('stop_unconfirmed');
+    if(!binding.memory){
+      const saved=await this.history.store.load(identity.childSessionId);if(!saved.ok)throw saved.error;
+      binding.ownerRunId=identity.childRunId;binding.lastRunId=identity.childRunId;this.sessions.set(identity.childSessionId,binding);
+      this.attachMemory(identity.childSessionId,binding,saved.data);
+    }
     const history=binding.memory!.freezeFinal(identity.childRunId);
     child.observation={identity,nativeIdle:true,calls:execution?.facts.flatMap(fact=>fact?[fact]:[])??[],history,outcome:execution?.lastOutcome??null,error:child.error??execution?.lastOutcome?.error??null,
       compactions:binding.compaction?.readSaveFacts()??[],cleanup:{contract:'medclaw.run-cleanup/v1',executionStarted:(execution?.facts.length??0)>0,stopConfirmed:true,requiredPersistenceComplete:false,inputsSettled:true,resourcesReleased:false,
@@ -747,7 +756,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           getMaxTurns:()=>Math.max(0,control.readBudget().modelCalls.remaining-1),
           open:(context,request)=>this.openManagedChild(execution,context,request),settle:id=>this.settleManagedChild(execution,id),
           finish:(observed,reply)=>callbacks.subagents!.finish(observed.identity,observed,reply),
-          acknowledge:(observed,version)=>this.acknowledgeHistorySaved(observed.history,version),release:id=>this.releaseManagedChild(execution,id)});
+          acknowledge:(observed,version)=>this.acknowledgeHistorySaved(observed.history,version),release:id=>this.releaseManagedChild(execution,id),fatal:error=>callbacks.fatal?.(error)});
         execution.tools=this.tools.configure(control.configuration,[...(binding.extension?.definitions??[]),...execution.subagent.definitions]);
       }
       const preparing=this.prepare(binding,input.resolved);
@@ -828,11 +837,30 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           this.inputStartFailures.set(input.runId, failed); inputSettlement = { ...proof, pendingPersistence: failed.pending };
         }
         terminal();
-        if(execution.subagent)await execution.subagent.close();
-        if(binding.extension){const originalSession=binding.session;await binding.extension.close(()=>{
-          if(binding.session===originalSession){binding.session=undefined;binding.commandPrompt=undefined;}
-        });}
-        else if(execution.subagent){binding.session?.dispose();binding.session=undefined;binding.commandPrompt=undefined;}
+        const close=async()=>{
+          if(execution.subagent)await execution.subagent.close();
+          if(binding.extension){const originalSession=binding.session;await binding.extension.close(()=>{
+            if(binding.session===originalSession){binding.session=undefined;binding.commandPrompt=undefined;}
+          });}
+          else if(execution.subagent){binding.session?.dispose();binding.session=undefined;binding.commandPrompt=undefined;}
+        };
+        if(execution.subagent){
+          try{await close();}catch(error){
+            let retrying:Promise<void>|undefined;
+            this.subagentCleanup.set(input.runId,()=>retrying??(retrying=(async()=>{
+              for(const [pluginId,child] of execution.children??[]){
+                if(!child.identity){
+                  if(!callbacks.subagents?.reconcile)throw safeError('storage_read_failed');
+                  const identity=callbacks.subagents.reconcile(pluginId);await child.stop();
+                  if(!identity){child.binding.session?.dispose();child.unown();child.released=true;execution.children!.delete(pluginId);continue;}
+                  child.identity=identity;await this.settleManagedChild(execution,pluginId);
+                }
+                this.retryContextPersistence(child.identity.childRunId);this.retryToolPersistence(child.identity.childRunId);this.retryHistoryPersistence(child.identity.childRunId);}
+              await execution.subagent!.retryPersistence();await close();this.subagentCleanup.delete(input.runId);
+            })().finally(()=>{retrying=undefined;})));
+            callbacks.fatal?.(safeError('storage_write_failed',error));
+          }
+        }else await close();
       } finally { unsubscribe?.(); unsubscribeTools?.(); unsubscribeMessages?.();unsubscribeCompaction?.(); input.signal.removeEventListener("abort", abort); binding.lastRunId = input.runId; binding.execution = undefined;binding.compaction=undefined; }
     }
     return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []), budgetSummary: control.summary(), history:binding.memory!.freezeFinal(input.runId),...(activeCompaction?{compactions:activeCompaction.readSaveFacts()}:{}), ...(inputSettlement ? { inputSettlement } : {}),...(this.extensions.has(input.runId)?{extensions:this.readExtensionCleanup(input.runId)!}:{}) };

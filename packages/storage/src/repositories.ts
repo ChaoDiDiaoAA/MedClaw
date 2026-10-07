@@ -1607,6 +1607,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if (fact.cancelRequestedAt && row.cancel_requested_at && fact.cancelRequestedAt !== row.cancel_requested_at) fail("state_conflict");
       if (fact.status === "cancelled" && !cancelRequestedAt || fact.status === "completed" && !calls.length) fail("invalid_argument");
       const terminal = row.status !== "created" && row.status !== "running";
+      if(kind==='child'&&!terminal&&row.cancel_requested_at&&fact.status==='completed')fail('state_conflict');
       if (terminal && (row.status !== fact.status || row.output_text !== null && row.output_text !== fact.outputText
         || row.stopped_at !== null && row.stopped_at !== fact.stoppedAt || !isDeepStrictEqual(decoded(row.error_json), error)
         || row.usage_json !== null && !isDeepStrictEqual(decoded(row.usage_json), usage))) fail("state_conflict");
@@ -1832,7 +1833,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   verifyPriorHistoryFacts(runId:number) {
     id(runId);return this.inputRead(()=>this.db.transaction(()=>{
       const row=this.row(runId);if(!row)fail('run_not_found');
-      if(row.kind!=='agent'||checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.historyContract!=='medclaw.history/p9-v1')return {requiredPersistenceComplete:true,unconfirmedItems:[] as string[]};
+      if(row.kind!=='child'&&(row.kind!=='agent'||checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.historyContract!=='medclaw.history/p9-v1'))return {requiredPersistenceComplete:true,unconfirmedItems:[] as string[]};
       try {
         if(!this.memory||row.session_id===null)fail('session_history_invalid');
         const snapshot=this.memory.loadInTransaction(row.session_id),ids=new Set(snapshot.entries.map(value=>(value as {id:string}).id));

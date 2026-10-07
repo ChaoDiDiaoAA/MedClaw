@@ -4,7 +4,7 @@ export { createManagedAgentExtension };
 export type { ManagedAgentSessionBridge, ManagedAgentExtension } from '@tintinweb/pi-subagents/managed';
 import { wrapRegisteredTool, type AgentSession, type DefaultResourceLoader, type ExtensionFactory, type RegisteredTool } from '@earendil-works/pi-coding-agent';
 import { z } from 'zod';
-import { safeError } from '@medclaw/contracts/error';
+import { AppErrorSchema, safeError, type AppError } from '@medclaw/contracts/error';
 import type { AnyToolDefinition, ToolExecutionContext } from '@medclaw/contracts/tool';
 import { NativeAgentReplySchema, type ChildExecutionObservation, type CommittedChildResult } from '@medclaw/contracts/subagent';
 import { nativeHistoryJSON } from './memory-store';
@@ -20,14 +20,31 @@ const AgentInputSchema=z.strictObject({prompt:z.string().min(1).max(65536),descr
 /** One managed extension per parent execution; only its original registered tool can open a child. */
 export function createRunSubagent(input:{runId:number;sessionId:number;getSession():AgentSession|undefined;getMaxTurns():number;
   open(context:ToolExecutionContext,request:Parameters<ManagedAgentSessionBridge['openSession']>[0]):Promise<AgentSession>;
-  settle(id:string):Promise<ChildExecutionObservation>;
+  settle(id:string):Promise<ChildExecutionObservation|null>;
   finish(observation:ChildExecutionObservation,reply:z.infer<typeof NativeAgentReplySchema>):CommittedChildResult;
-  acknowledge(observation:ChildExecutionObservation,version:number):void;release(id:string):Promise<void>}) {
+  acknowledge(observation:ChildExecutionObservation,version:number):void;release(id:string):Promise<void>;fatal(error:AppError):void}) {
   let origin:ToolExecutionContext|undefined,id:string|undefined,registered:RegisteredTool|undefined,closed=false,released=false;
+  let observation:ChildExecutionObservation|undefined,reply:z.infer<typeof NativeAgentReplySchema>|undefined,openError:unknown,retrying:Promise<void>|undefined;
   const managed=createManagedAgentExtension({getMaxTurns:input.getMaxTurns,openSession:async request=>{
     if(!origin||id||closed)throw safeError('state_conflict');id=request.pluginAgentId;
-    return input.open(origin,request);
+    try{return await input.open(origin,request);}catch(error){openError=error;throw error;}
   }});
+  const persist=async()=>{
+    if(!id||!reply)throw safeError('state_conflict');
+    if(!released)await managed.control.waitForSettled(id);
+    const settled=observation??await input.settle(id);
+    if(!settled){
+      await managed.control.release(id);released=true;origin=undefined;id=undefined;
+      throw openError??safeError('internal_error',undefined,{reason:'subagent_binding_failed'});
+    }
+    observation??=settled;
+    const committed=input.finish(observation,reply);
+    input.acknowledge(observation,committed.result.storageVersion);
+    if(!released){await managed.control.release(id);released=true;}
+    await input.release(id);
+    origin=undefined;id=undefined;
+    return committed;
+  };
   const factory:ExtensionFactory=pi=>managed.factory(new Proxy(pi,{get(target,key){
     if(key==='registerTool')return (definition:RegisteredTool['definition'])=>{
       if(definition.name!=='Agent')throw safeError('extension_conflict');target.registerTool(definition);
@@ -49,28 +66,24 @@ export function createRunSubagent(input:{runId:number;sessionId:number;getSessio
       if(closed||origin||context.runId!==input.runId||context.sessionId!==input.sessionId||context.delegationSource)throw safeError('state_conflict');
       context.checkActive?.();context.signal.throwIfAborted();
       const session=input.getSession();if(!registered||!session?.extensionRunner)throw safeError('extension_unavailable');
-      origin=context;released=false;
+      origin=context;released=false;observation=undefined;reply=undefined;openError=undefined;
       try {
         const original=await wrapRegisteredTool(registered,session.extensionRunner).execute(context.nativeToolCallId,args,context.signal);
         if(!id)throw safeError('state_conflict');
-        await managed.control.waitForSettled(id);
-        const observation=await input.settle(id);
-        const reply=NativeAgentReplySchema.parse(JSON.parse(nativeHistoryJSON(original)));
-        const committed=input.finish(observation,reply);
-        input.acknowledge(observation,committed.result.storageVersion);
-        await managed.control.release(id);released=true;
-        await input.release(id);
-        origin=undefined;id=undefined;
-        if(committed.result.outcome!=='completed')throw observation.error??safeError('internal_error',undefined,{reason:'subagent_execution_failed'});
+        reply=NativeAgentReplySchema.parse(JSON.parse(nativeHistoryJSON(original)));
+        const committed=await persist();
+        if(committed.result.outcome!=='completed')throw observation!.error??safeError('internal_error',undefined,{reason:'subagent_execution_failed'});
         return reply;
       }catch(error){
         // A registered child with an unconfirmed save or release still owns this execution.
-        if(!id){origin=undefined;await managed.control.dispose();closed=true;}
+        if(!id)origin=undefined;
+        else {const known=AppErrorSchema.safeParse(error);input.fatal(known.success?known.data:safeError('stop_unconfirmed',error));}
         throw error;
       }
     }}];
   return {factory,override,definitions,
     cancel:()=>{if(id&&!released)managed.control.cancel(id);},
+    retryPersistence:()=>retrying??(retrying=(async()=>{if(origin)try{await persist();}catch(error){if(origin)throw error;}})().finally(()=>{retrying=undefined;})),
     close:async()=>{closed=true;if(origin)throw safeError('stop_unconfirmed');await managed.control.dispose();},
   };
 }
