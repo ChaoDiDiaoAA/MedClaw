@@ -9,12 +9,14 @@
     "./agent-runtime": "./src/agent-runtime.ts",
     "./messages": "./src/messages.ts",
     "./pi-tool-adapter": "./src/pi-tool-adapter.ts",
-    "./resource-loader": "./src/resource-loader.ts"
+    "./resource-loader": "./src/resource-loader.ts",
+    "./subagent-adapter": "./src/subagent-adapter.ts"
   },
   "dependencies": {
-    "@medclaw/contracts": "workspace:*",
-    "zod": "4.6.5",
+    "@earendil-works/pi-ai": "0.87.1",
     "@earendil-works/pi-coding-agent": "0.87.1",
-    "@earendil-works/pi-ai": "0.87.1"
+    "@medclaw/contracts": "workspace:*",
+    "@tintinweb/pi-subagents": "0.19.0",
+    "zod": "4.6.5"
   }
 }

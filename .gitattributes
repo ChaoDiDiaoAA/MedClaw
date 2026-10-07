@@ -1,2 +1,1 @@
-# Resource versions hash their actual bytes; keep checkout bytes stable.
-resources/** text eol=lf
+patches/*.patch text eol=lf
