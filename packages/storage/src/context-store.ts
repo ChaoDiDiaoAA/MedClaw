@@ -15,6 +15,8 @@ import { SqliteEventStore } from './event-store';
 import { SqliteCatalogStore } from './catalog-store';
 import { SqliteToolStore } from './tool-store';
 import { freezeWorkspaceScope, resolveQueryRow, readWorkspaceQuery } from './workspace-selection';
+import { PrepareChildContextInputSchema, type PrepareChildContextInput } from '../../contracts/src/context';
+import { readFrozenChild } from './child-identity';
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const digest = (value: unknown) => hash(canonicalRequest(value));
@@ -114,9 +116,56 @@ export class SqliteContextStore implements ContextStore {
       return {input,body,sourceFingerprint:digest({runId:run.id,sessionId:run.session_id,config:run.config_json,scope:run.scope_json,input:row.content_json,body,artifacts})};
     }).deferred(), 'storage_read_failed');
   }
+  selectChild(raw: PrepareChildContextInput): SaveContextSelection {
+    return protect(()=>this.db.transaction(()=>{
+      const input=checked(PrepareChildContextInputSchema,raw,'invalid_argument'),run=this.run(input.runId),frozen=readFrozenChild(this.db,run.id),source=input.delegationSource;
+      if(run.session_id!==input.sessionId||!isDeepStrictEqual(frozen.scope,input.scope)
+        ||source.parentRunId!==frozen.parentRunId||source.originToolCallId!==frozen.originToolCallId||source.parentSnapshotId!==frozen.originSnapshotId
+        ||source.parentInputId!==frozen.parentInputId||source.promptHash!==frozen.promptHash)fail('access_denied');
+      if(!['created','running'].includes(run.status))fail('state_conflict');
+      const origin=this.db.query<SnapshotRow,[number]>('SELECT * FROM context_snapshots WHERE id=?').get(frozen.originSnapshotId);
+      if(!origin||origin.run_id!==frozen.parentRunId||origin.session_id!==frozen.parentSessionId||origin.input_id!==frozen.parentInputId)fail('access_denied');
+      const parent=this.body(origin),projection=checked(ContextProjectionSchema,JSON.parse(parent.renderedProjection.slice(CONTEXT_MATERIAL_PREFIX.length)));
+      const native=this.db.query<{entry_json:string},[number,string,number]>("SELECT entry_json FROM memories WHERE session_id=? AND native_entry_id=? AND run_id=? AND entry_type='message'").get(input.sessionId,source.nativeEntryId,run.id);
+      const entry=native&&JSON.parse(native.entry_json),content=entry?.message?.content;
+      const prompt=typeof content==='string'?content:Array.isArray(content)&&content.every(block=>block.type==='text'&&typeof block.text==='string')?content.map(block=>block.text).join('\n'):null;
+      if(entry?.message?.role!=='user'||prompt===null||hash(prompt)!==source.promptHash)fail('access_denied');
+      const scope=frozen.scope,catalog=new SqliteCatalogStore(this.db),tools=new SqliteToolStore(this.db);
+      const permitted=(ref:ContextRef|Material['ref']):boolean=>{
+        const id=Number(ref.id);
+        if(ref.kind==='batch')return scope.batchIds.includes(id);
+        if(ref.kind==='query') { const query=tools.readQuery(id);return !!query&&query.sessionId===frozen.parentSessionId&&query.batchIds.every(id=>scope.batchIds.includes(id))
+          &&(scope.deviceIds===null||query.scopeDeviceIds!==null&&query.scopeDeviceIds.every(id=>scope.deviceIds!.includes(id))); }
+        if(ref.kind==='snapshot') { const value=catalog.readSnapshot(id);return !!value&&scope.batchIds.includes(value.batchId)&&(scope.deviceIds===null||scope.deviceIds.includes(value.deviceId)); }
+        if(ref.kind==='change')return catalog.readChanges(scope.batchIds,scope.batchIds,scope.deviceIds).some(change=>change.id===id);
+        if(ref.kind==='evidence') { const evidence=tools.readEvidence(id);return !!evidence&&permitted({kind:'query',id:String(evidence.queryId),version:ref.version,hash:ref.hash}); }
+        return false; // Parent native inputs and tool messages are never copied into child context.
+      };
+      const selectedRefs=parent.selectedRefs.filter(ref=>ref.channel==='product_projection'&&permitted(ref));
+      const materials=projection.materials.filter(material=>permitted(material.ref));
+      const nativeRefs:NativeContextRef[]=[];
+      for(const ref of input.nativeRefs) {
+        if(ref.kind!=='tool_result'||nativeRefs.some(prior=>prior.id===ref.id))fail('access_denied');
+        const tool=this.db.query<{run_id:number;session_id:number;native_tool_call_id:string;context_snapshot_id:number;delivery_json:string|null},[number]>('SELECT * FROM tool_calls WHERE id=?').get(ref.id);
+        const delivery=tool?.delivery_json?JSON.parse(tool.delivery_json):null,receipt=checked(ToolSdkDeliverySchema,delivery?.message);
+        const saved=this.db.query<{entry_json:string},[number,string,number]>('SELECT entry_json FROM memories WHERE session_id=? AND native_entry_id=? AND run_id=?').get(input.sessionId,ref.nativeEntryId,run.id);
+        if(!tool||tool.run_id!==run.id||tool.session_id!==input.sessionId||tool.native_tool_call_id!==ref.nativeToolCallId||tool.context_snapshot_id!==ref.originSnapshotId
+          ||delivery?.sdkReturned!==true||delivery.nativeEntryId!==ref.nativeEntryId||digest(receipt.content)!==ref.contentHash||!saved||!isDeepStrictEqual(JSON.parse(saved.entry_json).message,receipt))fail('access_denied');
+        nativeRefs.push(ref);selectedRefs.push({kind:'tool_result',id:String(ref.id),version:'medclaw.tool-delivery/v1',hash:ref.contentHash,channel:'native_history'});
+      }
+      const omitted=projection.omitted.filter(item=>selectedRefs.some(ref=>ref.kind===item.kind&&ref.id===item.id));
+      const renderedProjection=CONTEXT_MATERIAL_PREFIX+canonicalRequest(checked(ContextProjectionSchema,{...projection,executionScope:scope,materialScope:scope,materials,omitted}));
+      const projectionLimitBytes=Math.min(normalizeToolConfiguration(frozen.toolConfiguration).maxResultBytes,parent.projectionLimitBytes);
+      const resourceVersions=Object.fromEntries((frozen.resources?.available??[]).filter(resource=>scope.allowedResourceRefs.includes(resourceRefKey(resource.ref)))
+        .map(resource=>[`${resource.ref.kind}:${resource.ref.id}`,`${resource.ref.version}#${resource.ref.treeHash}`]));
+      const body=checked(ContextSnapshotBodySchema,{contract:'medclaw.context/v1',workspaceContext:null,selectedRefs,projectionHash:hash(renderedProjection),renderedProjection,
+        runtimeFeedback:input.runtimeFeedback,feedbackHash:hash(input.runtimeFeedback),resourceVersions,nativeRefs,omitted,projectionLimitBytes,delegationSource:source},'context_projection_too_large');
+      return {input,body,sourceFingerprint:digest({child:run.config_json,parent:origin.snapshot_json,prompt:native!.entry_json,body})};
+    }).deferred(),'storage_read_failed');
+  }
   save(selection: SaveContextSelection): ContextSnapshot {
     return protect(() => this.transactions.immediate(() => {
-      const current = this.select(selection.input);
+      const current = selection.input.inputId===null?this.selectChild(selection.input):this.select(selection.input);
       if (current.sourceFingerprint !== selection.sourceFingerprint || !isDeepStrictEqual(current.body,selection.body)) fail('state_conflict');
       const sequence = this.db.query<{n:number},[number]>('SELECT COALESCE(MAX(sequence),0)+1 n FROM context_snapshots WHERE run_id=?').get(selection.input.runId)!.n;
       const provisional = {...selection.body,id:Number.MAX_SAFE_INTEGER,runId:selection.input.runId,sessionId:selection.input.sessionId,inputId:selection.input.inputId,sequence,createdAt:selection.input.createdAt,deliveredCallIds:['x'.repeat(256)]};
@@ -129,7 +178,7 @@ export class SqliteContextStore implements ContextStore {
   private matchesObservation(call: CallRow, snapshot: SnapshotRow, observation: RegisterContextDeliveryInput['observation']): boolean {
     const model = JSON.parse(call.model_json), context = checked(ModelCallContextSchema,model.context), body = this.body(snapshot);
     const resourceMatch = context.resources ? observation.resources !== undefined && CallResourceContextSchema.safeParse({expected:context.resources.expected,payload:observation.resources}).success : observation.resources === undefined;
-    return resourceMatch && call.run_id === snapshot.run_id && call.session_id === snapshot.session_id && call.input_id === snapshot.input_id && context.snapshotId === snapshot.id && context.inputId === snapshot.input_id && model.selection?.api === observation.api && body.projectionHash === observation.projectionHash && body.feedbackHash === observation.feedbackHash && observation.verifiedNativeRefs.every(ref => body.nativeRefs.some(native => native.kind === ref.kind && native.id === ref.id && native.contentHash === ref.contentHash));
+    return resourceMatch && isDeepStrictEqual(context.delegationSource,body.delegationSource) && call.run_id === snapshot.run_id && call.session_id === snapshot.session_id && call.input_id === snapshot.input_id && context.snapshotId === snapshot.id && context.inputId === snapshot.input_id && model.selection?.api === observation.api && body.projectionHash === observation.projectionHash && body.feedbackHash === observation.feedbackHash && observation.verifiedNativeRefs.every(ref => body.nativeRefs.some(native => native.kind === ref.kind && native.id === ref.id && native.contentHash === ref.contentHash));
   }
   private delivery(call: CallRow, row: {snapshot_id:number;run_id:number;session_id:number;delivered_at:string}): ContextDelivery {
     const context = checked(ModelCallContextSchema,JSON.parse(call.model_json).context);
@@ -142,8 +191,9 @@ export class SqliteContextStore implements ContextStore {
       const input = checked(RegisterContextDeliveryInputSchema,raw,'invalid_argument'), run = this.run(input.runId);
       const call = this.db.query<CallRow,[string]>('SELECT * FROM model_calls WHERE call_id=?').get(input.callId);
       const snapshot = this.db.query<SnapshotRow,[number]>('SELECT * FROM context_snapshots WHERE id=?').get(input.snapshotId);
-      if (!call || !snapshot || run.kind !== 'agent' || call.kind !== 'main' || call.run_id !== input.runId || call.session_id !== input.sessionId || snapshot.run_id !== input.runId || snapshot.session_id !== input.sessionId || snapshot.input_id !== input.inputId || call.input_id !== input.inputId) fail('access_denied');
+      if (!call || !snapshot || !['agent','child'].includes(run.kind) || call.kind !== 'main' || call.run_id !== input.runId || call.session_id !== input.sessionId || snapshot.run_id !== input.runId || snapshot.session_id !== input.sessionId || snapshot.input_id !== input.inputId || call.input_id !== input.inputId) fail('access_denied');
       const model = JSON.parse(call.model_json), context = checked(ModelCallContextSchema,model.context);
+      if(!isDeepStrictEqual(input.delegationSource,context.delegationSource))fail('access_denied');
       if (!this.matchesObservation(call,snapshot,input.observation)) fail('state_conflict');
       const prior = this.db.query<{snapshot_id:number;run_id:number;session_id:number;delivered_at:string},[number,number]>('SELECT * FROM context_deliveries WHERE model_call_id=? AND snapshot_id=?').get(call.id,snapshot.id);
       if (prior) { const saved = this.delivery(call,prior); if (!isDeepStrictEqual(saved.observation,input.observation)) fail('state_conflict'); return saved; }
@@ -164,7 +214,7 @@ export class SqliteContextStore implements ContextStore {
         if (call.kind === 'compaction') return checked(ContextReadResultSchema,{kind:'not_recorded',runId:call.run_id,sessionId:call.session_id,callId:call.call_id,reason:'not_applicable'});
         if (call.run_id === null) fail('storage_read_failed');
         const run = this.run(call.run_id), model = JSON.parse(call.model_json);
-        if (run.kind !== 'agent' || call.kind !== 'main') return {kind:'not_recorded' as const,runId:run.id,sessionId:run.session_id,callId:call.call_id,reason:'not_applicable' as const};
+        if (!['agent','child'].includes(run.kind) || call.kind !== 'main') return {kind:'not_recorded' as const,runId:run.id,sessionId:run.session_id,callId:call.call_id,reason:'not_applicable' as const};
         if (!model.context) { if (JSON.parse(run.config_json).agent?.contextContract === 'medclaw.context/v1') fail('storage_read_failed'); return {kind:'not_recorded' as const,runId:run.id,sessionId:run.session_id,callId:call.call_id,reason:'pre_p8' as const}; }
         const context = checked(ModelCallContextSchema,model.context);
         observed = context.observation !== null;
@@ -189,7 +239,8 @@ export class SqliteContextStore implements ContextStore {
 export function verifyPriorContextFacts(db: Database, runId: number) {
   return protect(() => {
     const run = db.query<RunRow,[number]>('SELECT * FROM runs WHERE id=?').get(runId); if (!run) fail('run_not_found');
-    if (run.kind !== 'agent' || JSON.parse(run.config_json).agent?.contextContract !== 'medclaw.context/v1') return {requiredPersistenceComplete:true,unconfirmedItems:[]};
+    if (run.kind !== 'child' && (run.kind !== 'agent' || JSON.parse(run.config_json).agent?.contextContract !== 'medclaw.context/v1')) return {requiredPersistenceComplete:true,unconfirmedItems:[]};
+    if(run.kind==='child')readFrozenChild(db,runId);
     const cleanup = run.cleanup_json ? JSON.parse(run.cleanup_json) : null;
     const priorGap = cleanup?.unconfirmedItems?.some((item: string) => item.startsWith('context_')) ?? false;
     const contexts = new SqliteContextStore(db), unconfirmedItems: string[] = [];

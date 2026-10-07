@@ -5,6 +5,7 @@ import { MeasurementContextSchema, ReferenceDateSchema, TimezoneSchema, ToolCont
 import type { ToolConfiguration } from './tool-config';
 import { WorkspaceContextSchema, RevisionSchema, type WorkspaceContext } from './workspace';
 import { ResourceReadFactSchema, type ResourceReadFact } from './resources';
+import { DelegationSourceSchema, type DelegationSource } from './subagent';
 
 export const TOOL_READ_RULES = Object.freeze({
   defaultPage: 1,
@@ -41,6 +42,7 @@ export type ToolExecutionContext = {
   workspaceInputId?: number | null;
   basedOnQueryId?: number | null;
   workspaceRevision?: number;
+  delegationSource?: DelegationSource;
 };
 export const ToolContextFieldsSchema = z.object({
   contextSnapshotId: PositiveIdSchema.nullable().optional(), modelCallId: OpaqueIdSchema.optional(),
@@ -48,9 +50,15 @@ export const ToolContextFieldsSchema = z.object({
   scope: RunScopeSchema, referenceDate: ReferenceDateSchema, timezone: TimezoneSchema,
   workspaceContext: WorkspaceContextSchema.nullable().optional(), workspaceInputId: PositiveIdSchema.nullable().optional(),
   basedOnQueryId: PositiveIdSchema.nullable().optional(), workspaceRevision: RevisionSchema.optional(),
+  delegationSource: DelegationSourceSchema.optional(),
 });
 export const ToolContextIdentitySchema = ToolContextFieldsSchema.superRefine((identity, ctx) => {
   if ((identity.contextSnapshotId != null) !== (identity.modelCallId !== undefined)) ctx.addIssue({ code: 'custom', message: 'Context requires both original call and snapshot' });
+  if(identity.delegationSource) {
+    if(identity.workspaceContext!==null||identity.workspaceInputId!==null||identity.basedOnQueryId!==null||identity.workspaceRevision!==undefined
+      ||identity.contextSnapshotId==null||identity.modelCallId===undefined)ctx.addIssue({code:'custom',message:'Delegated tool requires its own context and no user Workspace'});
+    return;
+  }
   const keys = ['workspaceContext', 'workspaceInputId', 'basedOnQueryId', 'workspaceRevision'] as const;
   if (!keys.some(key => identity[key] !== undefined)) return;
   if (keys.some(key => identity[key] === undefined) || !identity.workspaceContext) {

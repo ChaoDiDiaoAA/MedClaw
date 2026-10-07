@@ -55,7 +55,10 @@ export const ContextReadResultSchema = z.discriminatedUnion('kind', [
 export type ContextReadResult = z.infer<typeof ContextReadResultSchema>;
 export const PrepareContextInputSchema = z.strictObject({ runId: PositiveIdSchema, sessionId: PositiveIdSchema, inputId: PositiveIdSchema, nativeEntryId: OpaqueIdSchema, workspaceContext: WorkspaceContextSchema, scope: RunScopeSchema, runtimeFeedback: z.string(), nativeRefs: z.array(NativeContextRefSchema).max(1000), createdAt: TimestampSchema });
 export type PrepareContextInput = z.infer<typeof PrepareContextInputSchema>;
-export type SaveContextSelection = { input: PrepareContextInput; body: ContextSnapshotBody; sourceFingerprint: string };
+export const PrepareChildContextInputSchema = z.strictObject({ runId: PositiveIdSchema, sessionId: PositiveIdSchema, inputId: z.null(), delegationSource: DelegationSourceSchema,
+  scope: RunScopeSchema, runtimeFeedback: z.string(), nativeRefs: z.array(NativeContextRefSchema).max(1000), createdAt: TimestampSchema });
+export type PrepareChildContextInput = z.infer<typeof PrepareChildContextInputSchema>;
+export type SaveContextSelection = { input: PrepareContextInput | PrepareChildContextInput; body: ContextSnapshotBody; sourceFingerprint: string };
 const contextDeliveryFields = { runId: PositiveIdSchema, sessionId: PositiveIdSchema, callId: OpaqueIdSchema, snapshotId: PositiveIdSchema, observation: ContextDeliveryObservationSchema };
 export const RegisterContextDeliveryInputSchema = z.union([
   z.strictObject({ ...contextDeliveryFields, inputId: PositiveIdSchema, delegationSource: z.never().optional() }),
@@ -67,6 +70,7 @@ export type StartCallContext = { snapshotId: number; nativeHistory?: NativeHisto
 export type ModelAdmissionPreview = { revision: number; preparedAt: number; allowTools: boolean; feedback: string };
 export interface ContextStore {
   select(input: PrepareContextInput): SaveContextSelection;
+  selectChild?(input: PrepareChildContextInput): SaveContextSelection;
   save(selection: SaveContextSelection): ContextSnapshot;
   recordDelivery(input: RegisterContextDeliveryInput): ContextDelivery;
   read(input: ReadContextInput): ContextReadResult;

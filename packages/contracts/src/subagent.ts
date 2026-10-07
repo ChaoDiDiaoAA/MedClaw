@@ -4,10 +4,17 @@ import { ModelSelectionSchema, AgentPolicySchema, RequestPolicySchema } from './
 import { RuntimeConfigurationSchema } from './runtime-config';
 import { StoredToolConfigurationSchema } from './tool-config';
 import { FrozenRunResourcesSchema } from './resources';
-import { RunScopeSchema, type FinalCallFact, type RunCleanupRecord } from './run';
-import type { NativeHistoryCommit, CompactionSaveFact } from './session';
+import { RunScopeSchema, type RunScope, type FinalCallFact, type RunCleanupRecord } from './run';
+import type { NativeHistoryCommit, CompactionSaveFact, InitialNativeHistory } from './session';
 
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
+export function childScopeWithin(child: RunScope, parent: RunScope): boolean {
+  return child.readOnly && child.batchIds.every(id => parent.batchIds.includes(id))
+    && (parent.deviceIds === null || child.deviceIds !== null && child.deviceIds.every(id => parent.deviceIds!.includes(id)))
+    && child.allowedToolNames.every(name => parent.allowedToolNames.includes(name))
+    && child.allowedResourceRefs.every(ref => parent.allowedResourceRefs.includes(ref))
+    && child.artifactIds.every(id => parent.artifactIds.includes(id));
+}
 export const BoundChildIdentitySchema = z.strictObject({
   instanceId: OpaqueIdSchema, parentRunId: PositiveIdSchema, parentSessionId: PositiveIdSchema,
   originToolCallId: PositiveIdSchema, originNativeToolCallId: OpaqueIdSchema,
@@ -51,8 +58,13 @@ export const FrozenChildConfigSchema = BoundChildIdentitySchema.safeExtend({
   model: ModelSelectionSchema, policy: RequestPolicySchema, agentPolicy: AgentPolicySchema,
   runtimeConfiguration: RuntimeConfigurationSchema, toolConfiguration: StoredToolConfigurationSchema,
   resources: FrozenRunResourcesSchema.optional(),
-}).refine(c => c.scope.readOnly && c.toolNames.every(name => c.scope.allowedToolNames.includes(name)), 'Frozen tools must match child scope');
+}).refine(c => c.scope.readOnly && c.toolNames.length===c.scope.allowedToolNames.length && c.toolNames.every(name => c.scope.allowedToolNames.includes(name)), 'Frozen tools must match child scope');
 export type FrozenChildConfig = z.infer<typeof FrozenChildConfigSchema>;
+export type RegisterChildInput = {
+  parentRunId: number; originToolCallId: number; pluginAgentId: string; nativeSessionId: string;
+  prompt: string; initialHistory: InitialNativeHistory; createdAt: string;
+  frozen: Omit<FrozenChildConfig, 'childRunId' | 'childSessionId'>;
+};
 export type FinalChildFact = {
   status: 'completed' | 'failed' | 'cancelled'; endedAt: string; outputText: string; error: AppError | null;
   calls: FinalCallFact[]; history: NativeHistoryCommit; cleanup: RunCleanupRecord;

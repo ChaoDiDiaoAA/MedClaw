@@ -13,7 +13,8 @@ import { verifyPriorContextFacts } from './context-store';
 import { ModelCallContextSchema, ContextSnapshotBodySchema, type StartCallContext } from '../../contracts/src/context';
 import { FrozenRunResourcesSchema, ResourceEvidenceSchema, ResourceReadFactSchema, resourceRefKey, type FrozenRunResources, type ResourceEvidence } from '../../contracts/src/resources';
 import { FrozenRunExtensionsSchema, type FrozenRunExtensions } from '../../contracts/src/extensions';
-import { FrozenChildConfigSchema, ChildResultSchema, BoundChildIdentitySchema, type BoundChildIdentity } from '../../contracts/src/subagent';
+import { FrozenChildConfigSchema, ChildResultSchema, BoundChildIdentitySchema, childScopeWithin, type BoundChildIdentity, type RegisterChildInput } from '../../contracts/src/subagent';
+import { readFrozenChild } from './child-identity';
 import type { EventWriter, RegisteredEventDraft, RegisteredEventPayload } from '../../contracts/src/event';
 import { RegisteredEventPayloadSchema } from '../../contracts/src/event';
 import { NATIVE_HISTORY_FORMAT, InputContentSchema, type NativeHistoryCommit, type InitialNativeHistory, type PreparedInput, type InputStore, type InputCancelProof, type InputSettlementProof, type ReadInputRequest, type ListInputsRequest } from "../../contracts/src/session";
@@ -135,11 +136,11 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   }
 
   private event(row: RunRow, fact: RegisteredEventPayload, at: string, source: RegisteredEventDraft['source'] = 'application', toolCallId: number | null = null): void {
-    if (!this.events || row.kind !== 'agent' || row.session_id === null) return;
+    if (!this.events || !['agent','child'].includes(row.kind) || row.session_id === null) return;
     this.events.appendInTransaction({...fact,runId:row.id,sessionId:row.session_id,source,sourceConnection:null,sourceSequence:null,toolCallId,occurredAt:at,receivedAt:at});
   }
   private runLifecycle(row: RunRow, type: 'run_created'|'run_started', at: string): void {
-    if(row.kind==='agent'&&row.session_id!==null)this.event(row,{type,payload:{contract:'medclaw.event/v1',sessionId:row.session_id,kind:'agent',configVersion:this.config(row).selection.configVersion}},at);
+    if((row.kind==='agent'||row.kind==='child')&&row.session_id!==null)this.event(row,{type,payload:{contract:'medclaw.event/v1',sessionId:row.session_id,kind:row.kind,configVersion:this.config(row).selection.configVersion}},at);
   }
   private runTerminal(row: RunRow, status: 'completed'|'failed'|'cancelled', error: AppError|null, cleanup: unknown, at: string): void {
     const saved = RunCleanupRecordSchema.safeParse(cleanup);
@@ -485,7 +486,11 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         const model = decoded(row.model_json) as {selection:unknown;compaction:unknown}, metadata = checked(CompactionCallMetadataSchema,model.compaction,'storage_read_failed');
         if (metadata.source !== owner.source || metadata.reason !== owner.reason || metadata.baseStorageVersion !== owner.baseStorageVersion || metadata.baseLeafId !== owner.baseLeafId || !isDeepStrictEqual(model.selection,owner.model) || metadata.operationEndedAt) fail('state_conflict');
       }
-      const session = this.readSession(owner.sessionId); if (!session) fail('session_not_found'); this.assertSessionActive(session);
+      const child=owner.source==='auto'&&this.row(owner.runId!)?.kind==='child';
+      if(child) {
+        if(readFrozenChild(this.db,owner.runId!).childSessionId!==owner.sessionId||!this.memory)fail('access_denied');
+        this.memory!.loadInTransaction(owner.sessionId);
+      } else { const session = this.readSession(owner.sessionId); if (!session) fail('session_not_found'); this.assertSessionActive(session); }
       if (owner.source === 'manual') {
         const operation = this.readCompactionOperation({sessionId:owner.sessionId,operationRef:owner.operationRef});
         if (!operation || operation.receipt || operation.cancelRequestedAt || owner.ordinal > operation.frozen.budget.maxModelCalls
@@ -493,7 +498,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       } else {
         if (!existing.length && this.findOperation(owner.operationRef)) fail('state_conflict');
         const run = this.row(owner.runId!);
-        if (!run || run.kind !== 'agent' || run.session_id !== owner.sessionId || !['created','running'].includes(run.status) || run.cancel_requested_at || !isDeepStrictEqual(this.config(run).selection,owner.model)) fail('state_conflict');
+        if (!run || !['agent','child'].includes(run.kind) || run.session_id !== owner.sessionId || !['created','running'].includes(run.status) || run.cancel_requested_at || !isDeepStrictEqual(this.config(run).selection,owner.model)) fail('state_conflict');
       }
       const metadata = checked(CompactionCallMetadataSchema,{contract:'medclaw.compaction/v1',operationRef:owner.operationRef,source:owner.source,reason:owner.reason,ordinal:owner.ordinal,baseStorageVersion:owner.baseStorageVersion,baseLeafId:owner.baseLeafId,
         nativeEntryId:null,savedStorageVersion:null,operationEndedAt:null,operationError:null});
@@ -535,7 +540,8 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if(!entry||entry.type!=='compaction'||entry.firstKeptEntryId!==fact.firstKeptEntryId||entry.tokensBefore!==fact.tokensBefore)fail('session_history_invalid');
       if(!manual) {
         const run=this.row(fact.runId!);
-        if(!run||run.kind!=='agent'||run.session_id!==fact.sessionId||!['created','running'].includes(run.status))fail('state_conflict');
+        if(!run||!['agent','child'].includes(run.kind)||run.session_id!==fact.sessionId||!['created','running'].includes(run.status))fail('state_conflict');
+        if(run.kind==='child')readFrozenChild(this.db,run.id);
       }
       version=this.memory.commitInTransaction(change!).storageVersion;
       if(manual&&(manual.storageVersion!==version||manual.activeLeafId!==change!.activeLeafId))fail('state_conflict');
@@ -662,7 +668,8 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   finishAutoCompaction(operationRef:string,runId:number,error:AppError,endedAt:string):void {
     id(runId);checked(OpaqueIdSchema,operationRef);checked(AppErrorSchema,error);timestamp(endedAt);
     this.inputWrite(()=>{
-      const run=this.row(runId);if(!run||run.kind!=='agent')fail('state_conflict');
+      const run=this.row(runId);if(!run||!['agent','child'].includes(run.kind))fail('state_conflict');
+      if(run.kind==='child')readFrozenChild(this.db,runId);
       const calls=this.compactionCalls(operationRef);
       if(calls.some(call=>call.run_id!==runId||call.session_id!==run.session_id||call.state==='started'))fail('storage_write_failed');
       for(const call of calls) {
@@ -906,12 +913,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   readChildIdentity(runId: number): BoundChildIdentity | null {
     id(runId);
     const row = this.row(runId); if (!row || row.kind !== 'child') return null;
-    const frozen = checked(FrozenChildConfigSchema, (decoded(row.config_json) as { subagent: unknown }).subagent, 'storage_read_failed');
-    const session = this.db.query<{ native_session_id: string; kind: string }, [number]>('SELECT native_session_id,kind FROM sessions WHERE id=?').get(frozen.childSessionId);
-    const parent = this.row(frozen.parentRunId);
-    if (!session || session.kind !== 'child' || session.native_session_id !== frozen.nativeSessionId
-      || row.id !== frozen.childRunId || row.session_id !== frozen.childSessionId || row.parent_run_id !== frozen.parentRunId
-      || row.origin_tool_call_id !== frozen.originToolCallId || !parent || parent.kind !== 'agent' || parent.session_id !== frozen.parentSessionId || parent.instance_id !== frozen.instanceId) fail('storage_read_failed');
+    const frozen = readFrozenChild(this.db, runId);
     return checked(BoundChildIdentitySchema, Object.fromEntries(Object.keys(BoundChildIdentitySchema.shape).map(key => [key, frozen[key as keyof typeof frozen]])), 'storage_read_failed');
   }
 
@@ -1270,6 +1272,44 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     });
   }
 
+  registerChild(input: RegisterChildInput): BoundChildIdentity {
+    id(input.parentRunId); id(input.originToolCallId); timestamp(input.createdAt);
+    checked(OpaqueIdSchema,input.pluginAgentId); checked(OpaqueIdSchema,input.nativeSessionId);
+    if(!this.memory)fail('session_history_invalid');
+    return this.transactions.immediate(() => {
+      const parent=this.row(input.parentRunId);
+      if(!parent||parent.kind!=='agent'||parent.session_id===null)fail('access_denied');
+      if(!['created','running'].includes(parent.status)||parent.cancel_requested_at!==null)fail('state_conflict');
+      if(this.db.query('SELECT id FROM runs WHERE origin_tool_call_id=?').get(input.originToolCallId))fail('state_conflict');
+      if(this.db.query("SELECT id FROM runs WHERE parent_run_id=? AND status IN ('created','running')").get(parent.id))fail('runtime_busy');
+      const origin=this.db.query<{native_tool_call_id:string;context_snapshot_id:number;input_id:number|null},[number,number,number]>(`SELECT t.native_tool_call_id,t.context_snapshot_id,s.input_id FROM tool_calls t JOIN context_snapshots s ON s.id=t.context_snapshot_id
+        WHERE t.id=? AND t.run_id=? AND t.session_id=? AND t.tool_name='Agent' AND t.status IN ('requested','running') AND s.run_id=t.run_id AND s.session_id=t.session_id`).get(input.originToolCallId,parent.id,parent.session_id);
+      const childRunId=(this.db.query<{n:number},[]>('SELECT COALESCE(MAX(id),0)+1 n FROM runs').get()!).n;
+      const childSessionId=(this.db.query<{n:number},[]>('SELECT COALESCE(MAX(id),0)+1 n FROM sessions').get()!).n;
+      const frozen=checked(FrozenChildConfigSchema,{...input.frozen,childRunId,childSessionId});
+      if(!origin||frozen.parentRunId!==parent.id||frozen.parentSessionId!==parent.session_id||frozen.instanceId!==parent.instance_id
+        ||frozen.originToolCallId!==input.originToolCallId||frozen.originNativeToolCallId!==origin.native_tool_call_id
+        ||frozen.originSnapshotId!==origin.context_snapshot_id||frozen.parentInputId!==origin.input_id
+        ||frozen.pluginAgentId!==input.pluginAgentId||frozen.nativeSessionId!==input.nativeSessionId
+        ||frozen.promptHash!==createHash('sha256').update(input.prompt).digest('hex')
+        ||!isDeepStrictEqual(frozen.model,this.config(parent).selection)||!isDeepStrictEqual(frozen.policy,this.config(parent).policy)
+        ||!childScopeWithin(frozen.scope,checked(RunScopeSchema,decoded(parent.scope_json),'storage_read_failed')))fail('access_denied');
+      const header=checked(z.object({type:z.literal('session'),version:z.literal(3),id:OpaqueIdSchema,timestamp:TimestampSchema,cwd:z.string()}).passthrough(),input.initialHistory.header,'session_history_invalid');
+      if(header.id!==input.nativeSessionId||!Array.isArray(input.initialHistory.entries)
+        ||input.initialHistory.entries.some(entry=>!entry||typeof entry!=='object'||Reflect.get(entry,'type')==='message'))fail('session_history_invalid');
+      const creation={contract:'medclaw.child-creation/v1',parentRunId:parent.id,originToolCallId:input.originToolCallId,pluginAgentId:input.pluginAgentId};
+      this.db.query(`INSERT INTO sessions(id,native_session_id,kind,creation_operation_ref,creation_request_json,creation_result_json,title,storage_version,native_header_json,history_format_version,created_at,updated_at)
+        VALUES(?,?,'child',?,?,NULL,'Subagent',1,?,?,?,?)`).run(childSessionId,input.nativeSessionId,`internal-child:${input.originToolCallId}`,canonicalRequest(creation),canonicalRequest(header),NATIVE_HISTORY_FORMAT,input.createdAt,input.createdAt);
+      this.db.query(`INSERT INTO runs(id,session_id,kind,parent_run_id,origin_tool_call_id,instance_id,status,goal,input_text,config_json,scope_json,reference_date,timezone,created_at)
+        VALUES(?,?,'child',?,?,?,'created','answer',?,?,?,?,?,?)`).run(childRunId,childSessionId,parent.id,input.originToolCallId,parent.instance_id,input.prompt,
+          canonicalRequest({selection:frozen.model,policy:frozen.policy,subagent:frozen}),canonicalRequest(frozen.scope),parent.reference_date,parent.timezone,input.createdAt);
+      this.memory!.initializeChildInTransaction(childSessionId,childRunId,input.initialHistory);
+      this.runLifecycle(this.row(childRunId)!,'run_created',input.createdAt);
+      this.beforeCommit?.();
+      return this.readChildIdentity(childRunId)!;
+    });
+  }
+
   registerProvider(input: RegisterProviderInput): ProviderAccepted {
     const originalRequest = input.method === "model.request" ? checked(ProviderRequestSchema, input.originalRequest) : checked(DiagnoseRequestSchema, input.originalRequest);
     if (!input.operationRef || input.operationRef.length > 512) fail("invalid_argument");
@@ -1308,12 +1348,22 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     if (!callId || callId.length > 512) fail("invalid_argument");
     this.transactions.immediate(() => {
       const row = this.row(runId);
-      if (!row || row.status !== "created" && !(row.kind === "agent" && row.status === "running")) fail("state_conflict");
+      if (!row || row.status !== "created" && !(['agent','child'].includes(row.kind) && row.status === "running")) fail("state_conflict");
       if (row.kind === "provider" && this.calls(runId).length) fail("state_conflict");
       if (kind !== (row.goal === "verify" ? "diagnostic" : "main")) fail("invalid_argument");
-      const requiresContext = row.kind === 'agent' && checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.contextContract === 'medclaw.context/v1';
-      if (requiresContext && !context || context && (row.kind !== 'agent' || kind !== 'main')) fail('state_conflict');
-      if (context && !this.db.query('SELECT id FROM context_snapshots WHERE id=? AND run_id=? AND session_id=? AND input_id=?').get(context.snapshotId,runId,row.session_id,context.inputId)) fail('access_denied');
+      const requiresContext = row.kind==='child' || row.kind === 'agent' && checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.contextContract === 'medclaw.context/v1';
+      if (requiresContext && !context || context && (!['agent','child'].includes(row.kind) || kind !== 'main')) fail('state_conflict');
+      if (context) {
+        const snapshot=this.db.query<{snapshot_json:string},[number,number,number|null,number|null]>('SELECT snapshot_json FROM context_snapshots WHERE id=? AND run_id=? AND session_id=? AND input_id IS ?').get(context.snapshotId,runId,row.session_id,context.inputId);
+        if(!snapshot)fail('access_denied');
+        const body=checked(ContextSnapshotBodySchema,decoded(snapshot.snapshot_json),'storage_read_failed');
+        if(row.kind==='child') {
+          const frozen=readFrozenChild(this.db,runId);
+          if(context.inputId!==null||!isDeepStrictEqual(context.delegationSource,body.delegationSource)
+            ||context.delegationSource.parentRunId!==frozen.parentRunId||context.delegationSource.originToolCallId!==frozen.originToolCallId
+            ||context.delegationSource.parentSnapshotId!==frozen.originSnapshotId||context.delegationSource.promptHash!==frozen.promptHash)fail('access_denied');
+        } else if(context.inputId===null||body.delegationSource)fail('access_denied');
+      }
       if (row.status === "created") {
         const changed = this.db.query("UPDATE runs SET status='running',started_at=? WHERE id=? AND status='created'").run(time, runId);
         if (changed.changes !== 1) fail("state_conflict");

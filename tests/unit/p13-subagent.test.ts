@@ -7,6 +7,36 @@ import { publicMethodSchemas, PublicHostRequestSchema, HOST_PROTOCOL_VERSION } f
 import { safeError } from '../../packages/contracts/src/error';
 import { ModelCallContextSchema, RegisterContextDeliveryInputSchema } from '../../packages/contracts/src/context';
 import { ChildResultSchema, ChildResultViewSchema, BoundChildIdentitySchema } from '../../packages/contracts/src/subagent';
+import { RunControl } from '../../packages/core/src/runtime/run-control';
+import { normalizeRuntimeConfiguration } from '../../packages/contracts/src/runtime-config';
+import { performance } from 'node:perf_hooks';
+
+test('p13 child control shares root limits, reserves a parent call and isolates native attempt identities', () => {
+  const scope = { batchIds: [1], deviceIds: [2], allowedToolNames: ['read'], allowedResourceRefs: [], artifactIds: [], readOnly: true };
+  const rootAbort = new AbortController(), childAbort = new AbortController();
+  const configuration = normalizeRuntimeConfiguration();
+  configuration.runBudget.maxModelCalls = 4; configuration.runBudget.maxToolCalls = 2;
+  const root = new RunControl({ runId: 1, scope, signal: rootAbort.signal, deadlineAt: performance.now() + 60000, runtimeConfiguration: configuration });
+  root.admitModelCall();
+  const child = root.createChild(2, scope, childAbort.signal);
+  expect(() => child.createChild(3, scope, new AbortController().signal)).toThrow('access_denied');
+  expect(() => root.createChild(3, { ...scope, batchIds: [1, 9] }, new AbortController().signal)).toThrow('access_denied');
+  const staleParentPreview = root.previewModelCall();
+  child.admitModelCall();
+  expect(() => root.admitModelCall(staleParentPreview)).toThrow('state_conflict');
+  child.admitCompactionCall();
+  expect(() => child.admitModelCall()).toThrow('agent_call_limit');
+  expect(() => root.createChild(3, scope, new AbortController().signal)).toThrow('agent_call_limit');
+  root.admitModelCall();
+  expect(root.readBudget().modelCalls).toMatchObject({ used: 4, remaining: 0 });
+  expect(child.summary().modelCalls).toBe(2);
+  expect(root.summary().modelCalls).toBe(2);
+  root.observeToolAttempt('same-native-id', 'read', { path: 'parent' });
+  child.observeToolAttempt('same-native-id', 'read', { path: 'child' });
+  expect(root.readBudget().toolCalls).toMatchObject({ used: 2, remaining: 0 });
+  expect(root.summary().toolCalls).toBe(1); expect(child.summary().toolCalls).toBe(1);
+  rootAbort.abort(); expect(() => child.checkActive()).toThrow('tool_cancelled');
+});
 
 test('p13 runner rejects empty execution, required skips and discovery errors', async () => {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p13-runner-'));

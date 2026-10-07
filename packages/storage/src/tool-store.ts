@@ -16,6 +16,7 @@ import { InputContentSchema } from '../../contracts/src/session';
 import { WorkspaceContextSchema } from '../../contracts/src/workspace';
 import { ModelCallContextSchema, ContextSnapshotBodySchema } from '../../contracts/src/context';
 import { FrozenRunResourcesSchema, ResourceReadFactSchema, resourceRefKey, type ResourceReadFact } from '../../contracts/src/resources';
+import { readFrozenChild } from './child-identity';
 
 const knownErrors = new Set(["invalid_argument", "access_denied", "state_conflict", "operation_not_found", "runtime_interrupted", "storage_read_failed", "storage_write_failed"]);
 function fail(code: string): never { throw new Error(code); }
@@ -114,12 +115,29 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
     const { signal: _signal, ...identity } = context;
     if (!("nativeToolCallId" in identity ? ToolContextIdentitySchema : ToolContextFieldsSchema.omit({ nativeToolCallId: true })).safeParse(identity).success) fail("invalid_argument");
     if ("source" in context && (!["agent_tool", "intent", "user_form"].includes(context.source) || !context.callRef)) fail("invalid_argument");
-    const run = this.db.query<{ input_id?:number|null; config_json:string; workspace_json: string | null; session_id: number; status: string; scope_json: string; reference_date: string; timezone: string }, [number]>(
+    const run = this.db.query<{ kind:string; input_id?:number|null; config_json:string; workspace_json: string | null; session_id: number; status: string; scope_json: string; reference_date: string; timezone: string }, [number]>(
       "SELECT * FROM runs WHERE id=?").get(context.runId);
     if (!run || run.session_id !== context.sessionId || run.reference_date !== context.referenceDate || run.timezone !== context.timezone) fail("access_denied");
     if('inputId' in context && context.inputId !== (run.input_id ?? null)) fail('access_denied');
     const scope = RunScopeSchema.safeParse(decode(run.scope_json));
     if (!scope.success || !isDeepStrictEqual(scope.data, context.scope)) fail("access_denied");
+    if(run.kind==='child') {
+      const frozen=readFrozenChild(this.db,context.runId);
+      if(!('nativeToolCallId' in context)||!context.delegationSource||context.workspaceContext!==null||context.workspaceInputId!==null||context.basedOnQueryId!==null||context.workspaceRevision!==undefined
+        ||context.contextSnapshotId==null||!context.modelCallId)fail('access_denied');
+      const owner=this.db.query<{snapshot_json:string;input_id:number|null;model_json:string},[number,string,number,number]>(`SELECT s.snapshot_json,s.input_id,c.model_json FROM context_snapshots s JOIN model_calls c ON c.run_id=s.run_id AND c.session_id=s.session_id
+        WHERE s.id=? AND c.call_id=? AND s.run_id=? AND s.session_id=? AND c.input_id IS NULL`).get(context.contextSnapshotId,context.modelCallId,context.runId,context.sessionId);
+      if(!owner)fail('access_denied');
+      const body=ContextSnapshotBodySchema.safeParse(decode(owner.snapshot_json)),model=decode(owner.model_json) as {context?:unknown},marker=ModelCallContextSchema.safeParse(model.context);
+      if(!body.success||!marker.success)fail('storage_read_failed');
+      if(owner.input_id!==null||marker.data.inputId!==null||marker.data.snapshotId!==context.contextSnapshotId||body.data.workspaceContext!==null
+        ||!isDeepStrictEqual(body.data.delegationSource,context.delegationSource)||!isDeepStrictEqual(marker.data.delegationSource,context.delegationSource)
+        ||context.delegationSource.parentRunId!==frozen.parentRunId||context.delegationSource.originToolCallId!==frozen.originToolCallId
+        ||context.delegationSource.parentSnapshotId!==frozen.originSnapshotId||context.delegationSource.promptHash!==frozen.promptHash)fail('access_denied');
+      if(active&&run.status!=='running')fail('state_conflict');
+      return;
+    }
+    if('delegationSource' in context&&context.delegationSource!==undefined)fail('access_denied');
     const p8 = this.p3 && this.db.query("SELECT id FROM runs WHERE id=? AND json_extract(config_json,'$.agent.contextContract')='medclaw.context/v1'").get(context.runId) !== null;
     if (p8 && 'nativeToolCallId' in context) {
       if (context.contextSnapshotId == null || !context.modelCallId || !context.workspaceContext || context.workspaceInputId == null) fail('state_conflict');
@@ -422,6 +440,20 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   }
   readEvidence(evidenceId: number): Evidence | null {
     return protect(() => { id(evidenceId); const row = this.db.query<EvidenceRow, [number]>("SELECT * FROM query_evidence WHERE id=?").get(evidenceId); return row ? this.evidence(row) : null; }, "storage_read_failed");
+  }
+  readChildQuery(queryId: number, context: ToolExecutionContext): QueryRecord | null {
+    return protect(()=>{
+      id(queryId);this.identity(context,false);
+      const frozen=readFrozenChild(this.db,context.runId),record=this.readQuery(queryId);
+      if(!record)return null;
+      if(record.sessionId===context.sessionId)return record.runId===context.runId?record:null;
+      if(record.sessionId!==frozen.parentSessionId)return null;
+      const row=this.db.query<{snapshot_json:string},[number,number,number]>('SELECT snapshot_json FROM context_snapshots WHERE id=? AND run_id=? AND session_id=?').get(frozen.originSnapshotId,frozen.parentRunId,frozen.parentSessionId);
+      if(!row)fail('storage_read_failed');
+      const snapshot=ContextSnapshotBodySchema.parse(decode(row.snapshot_json));
+      const savedHash=createHash('sha256').update(canonicalRequest(record)).digest('hex');
+      return snapshot.selectedRefs.some(ref=>ref.kind==='query'&&ref.channel==='product_projection'&&ref.id===String(record.id)&&ref.version===record.resultHash&&ref.hash===savedHash)?record:null;
+    },'storage_read_failed');
   }
   listEvidence(queryId: number): Evidence[] {
     return protect(() => { id(queryId); return this.db.query<EvidenceRow, [number]>("SELECT * FROM query_evidence WHERE query_id=? ORDER BY id").all(queryId).map(row => this.evidence(row)); }, "storage_read_failed");

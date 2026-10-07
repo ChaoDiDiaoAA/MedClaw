@@ -52,6 +52,7 @@ export function createFrozenToolContextFactory(readContext: ToolContextFactory,
     const context = readContext(nativeToolCallId, signal);
     const frozen = { ...context, scope: structuredClone(context.scope),
       ...(context.workspaceContext === undefined ? {} : { workspaceContext: structuredClone(context.workspaceContext) }),
+      ...(context.delegationSource === undefined ? {} : { delegationSource: structuredClone(context.delegationSource) }),
       ...(context.toolConfiguration === undefined ? {} : { toolConfiguration: structuredClone(context.toolConfiguration) }) };
     cache.set(nativeToolCallId, frozen);
     return frozen;

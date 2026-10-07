@@ -268,6 +268,7 @@ export interface ProviderRunStore {
   active(): RunHandle | null;
 }
 export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputStore {
+  registerChild?(input: import('./subagent').RegisterChildInput): import('./subagent').BoundChildIdentity;
   readRunExtensions?(runId: number): import('./extensions').FrozenRunExtensions | null;
   readRunResources?(runId: number): import('./resources').FrozenRunResources | null;
   readResourceEvidence?(runId: number, page: number, pageSize: number): { items: import('./resources').ResourceEvidence[]; totalRows: number };
