@@ -38,7 +38,7 @@ import type { AnyToolDefinition } from '../../contracts/src/tool';
 import { ExtensionOwnerSchema, type ExtensionAssemblyProof, type ExtensionsCommandInput } from '../../contracts/src/extensions';
 import type { BoundChildIdentity, DelegationSource, ChildExecutionObservation } from '../../contracts/src/subagent';
 import { projectRuntimePolicies } from '../../contracts/src/runtime-config';
-import { SUBAGENT_BUILD, type ManagedAgentSessionBridge } from './subagent-adapter';
+import { SUBAGENT_BUILD, createRunSubagent, type ManagedAgentSessionBridge } from './subagent-adapter';
 type RunExtension = Awaited<ReturnType<typeof loadRunExtension>>;
 
 type ExecutionInput = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[0];
@@ -50,7 +50,7 @@ type Binding = { manager: SessionManager; nativeSessionId: string; memory?:PiMem
   manual?:CompactionExecutionInput<ResolvedModel>;compaction?:CompactionAdapter;originalStream?:AgentSession['agent']['streamFunction'];execution?: { input: ExecutionInput; callbacks: Callbacks; toolCalls: Set<string>;
   observers: Promise<void>[]; facts: (FinalCallFact | null)[]; lastOutcome: ProviderOutcome | null; unsupported: boolean;
   registrationFailed: boolean; currentModelCallId: string | null; abort: () => void; control: RunControl; resourcePaths?: Awaited<ReturnType<typeof materializeRunResources>>; tools?: RunTools; toolContexts: Map<string, ToolExecutionContext>; toolOrigins: Map<string, { callId: string; snapshot: ContextSnapshot }>;
-  delegation?: Omit<DelegationSource,'nativeEntryId'>; children?: Map<string,ManagedChild> } };
+  delegation?: Omit<DelegationSource,'nativeEntryId'>; children?: Map<string,ManagedChild>; subagent?:ReturnType<typeof createRunSubagent> } };
 const unobservedFailure = (code: string): ProviderOutcome => ({ sdkStopReason: "pending", text: "", responseModel: null, callState: "failed",
   usage: { inputTokens: null, outputTokens: null, cost: null, costCurrency: null, source: null, unavailableReason: "call_not_observed" }, error: safeError(code) });
 
@@ -91,7 +91,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
     private readonly extensionRoot?: string) {
     if (!isAbsolute(dataRoot)) throw new Error("invalid_argument");
     if (contexts) this.contextContract = CONTEXT_CONTRACT;
-    if (tools) this.toolNames = Object.freeze([...tools.registry.definitions.map(tool => tool.name), "read", "grep", "find", "ls", "edit", "write", "bash", "powershell"]);
+    if (tools) this.toolNames = Object.freeze([...tools.registry.definitions.map(tool => tool.name), "read", "grep", "find", "ls", "edit", "write", "bash", "powershell",...(tools.configure&&contexts?['Agent']:[])]);
   }
   async readExtensionDescriptor() { return this.extensionRoot ? readExtensionDescriptor(this.extensionRoot) : null; }
   async validateExtensions(sessionId: number, settings: PublishedSettings) { await this.freezeExtensions(sessionId, settings); }
@@ -380,12 +380,23 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
     const native = this.tools ? createPiNativeTools(workdir, this.tools.recorder, getContext, {}, getControl, () => binding.execution?.input.resources) : null;
     const registry = { get: (name: string) => binding.execution!.tools!.registry.get(name) };
     const executor = { execute: (...args: Parameters<ToolExecutor['execute']>) => binding.execution!.tools!.executor.execute(...args) };
-    const definitions = this.tools ? [...createPiToolDefinitions(binding.execution?.tools?.registry??this.tools.registry, executor, getContext, getControl), ...native!.definitions] : [];
+    const businessDefinitions=(binding.execution?.tools?.registry??this.tools?.registry)?.definitions??[];
+    const definitions = this.tools ? [...createPiToolDefinitions({definitions:businessDefinitions.filter(tool=>tool.name!=='Agent')}, executor, getContext, getControl),
+      ...createPiToolDefinitions({definitions:businessDefinitions.filter(tool=>tool.name==='Agent')},executor,getContext,getControl,{preserveNativeResult:true}),...native!.definitions] : [];
     const configured=binding.manual?.frozen.settings??binding.execution?.input.agentOptions.compaction;
     const compaction=configured?{enabled:configured.enabled,reserveTokens:configured.reserveTokens,keepRecentTokens:configured.keepRecentTokens}:{enabled:false};
     const paths = binding.execution?.resourcePaths;
     const extension=binding.execution?binding.extension:undefined;
-    const signature = JSON.stringify({ compaction, extensions:extension?.proof.assemblyId??null,resources: paths?.signature ?? null, tools: definitions.map(({ name, description, parameters, executionMode }) => ({ name, description, parameters, executionMode })) });
+    const subagent=binding.execution?.subagent;
+    const extensionFactories=[...(extension?[{name:'tool-audit@v1',factory:extension.factory}]:[]),...(subagent?[{name:'medclaw-subagent@0.19.0',factory:subagent.factory}]:[])];
+    const override:NonNullable<ConstructorParameters<typeof DefaultResourceLoader>[0]['extensionsOverride']>=base=>{
+      if(!subagent)return extension!.override(base);
+      if(base.extensions.length!==extensionFactories.length||base.errors.length)throw safeError('extension_conflict');
+      const managed=subagent.override(base),others=base.extensions.filter(item=>!item.tools.has('Agent'));
+      const audit=extension?extension.override({...base,extensions:others}):{...base,extensions:[]};
+      return {...base,extensions:[...audit.extensions,...managed.extensions]};
+    };
+    const signature = JSON.stringify({ compaction, extensions:extension?.proof.assemblyId??null,subagent:subagent?binding.execution!.input.runId:null,resources: paths?.signature ?? null, tools: definitions.map(({ name, description, parameters, executionMode }) => ({ name, description, parameters, executionMode })) });
     if (!binding.session || binding.toolSignature !== signature) {
       if (binding.session && (!binding.session.isIdle || binding.lastRunId !== undefined && this.tools?.recorder.persistencePending(binding.lastRunId))) throw new Error('state_conflict');
       let candidate: AgentSession | undefined;
@@ -394,8 +405,8 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           defaultTools: [], packages: [], extensions: [], skills: [], prompts: [], themes: [], enableAnalytics: false, enableInstallTelemetry: false });
         const resourceLoader = new DefaultResourceLoader({ cwd: this.dataRoot, agentDir: join(this.dataRoot, "runtime", "pi"), settingsManager,
           noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-          additionalExtensionPaths: [], additionalSkillPaths: paths?.skillPaths ?? [], additionalPromptTemplatePaths: paths?.promptPaths ?? [], additionalThemePaths: [], extensionFactories: extension?[{name:'tool-audit@v1',factory:extension.factory}]:[],
-          ...(extension?{extensionsOverride:extension.override}:{}),
+          additionalExtensionPaths: [], additionalSkillPaths: paths?.skillPaths ?? [], additionalPromptTemplatePaths: paths?.promptPaths ?? [], additionalThemePaths: [], extensionFactories,
+          ...(extension||subagent?{extensionsOverride:override}:{}),
           systemPrompt: this.productSystemPrompt(), appendSystemPrompt: [] });
         await (extension?extension.track(resourceLoader.reload()):resourceLoader.reload()); binding.execution?.control.checkActive();extension?.assertLive();
         if(extension&&resourceLoader.getPrompts().prompts.some(prompt=>prompt.name==='extension_status'))throw safeError('extension_conflict');
@@ -407,7 +418,11 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           customTools: definitions, resourceLoader, sessionManager: binding.manager, settingsManager });
         const {session}=await (extension?extension.track(creating.then(result=>{candidate=result.session;extension.bindSession(result.session);return result;})):creating);
         candidate = session;
-        if(extension){await extension.track(session.bindExtensions({onError:()=>extension.onError()}));extension.active(session);binding.commandPrompt=session.prompt.bind(session);}
+        if(extension||subagent){
+          const bound=session.bindExtensions({onError:()=>{if(extension)extension.onError();else throw safeError('extension_hook_failed');}});
+          if(extension){await extension.track(bound);extension.active(session);binding.commandPrompt=session.prompt.bind(session);}else await bound;
+          if(subagent&&!session.getActiveToolNames().includes('Agent'))throw safeError('extension_conflict');
+        }
         binding.execution?.control.checkActive();
         let bindTools: Binding['bindTools'];
         if (this.tools) {
@@ -689,7 +704,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
     if(binding.extension&&!binding.extension.proof.resourcesReleased)throw safeError('stop_unconfirmed');
     if (binding.execution||binding.manual||binding.compaction) throw new Error("state_conflict");
     let abortTask: Promise<void> | null = null, unsubscribe: (() => void) | undefined, unsubscribeTools: (() => void) | undefined, unsubscribeMessages: (() => void) | undefined, unsubscribeCompaction:(()=>void)|undefined,activeCompaction:CompactionAdapter|undefined, terminalEmitted = false;
-    const abort = () => { this.inputs.get(input.runId)?.stop(); if (binding.session && !abortTask) abortTask = binding.session.abort(); };
+    const abort = () => { this.inputs.get(input.runId)?.stop(); binding.execution?.subagent?.cancel();if (binding.session && !abortTask) abortTask = binding.session.abort(); };
     const control = new RunControl({ runId: input.runId, toolConfiguration: input.toolConfiguration, runtimeConfiguration: input.runtimeConfiguration, policy: input.agentPolicy,
       scope: input.scope ?? { batchIds: [], deviceIds: null, allowedToolNames: [], allowedResourceRefs: [], artifactIds: [], readOnly: true },
       signal: input.signal, deadlineAt: input.deadlineAt, totalTimeoutMs: input.resolved.policy.timeoutMs,
@@ -726,6 +741,14 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         const interruption=new Promise<never>((_,reject)=>{cancelled=()=>reject(new Error('Operation aborted'));input.signal.addEventListener('abort',cancelled,{once:true});if(input.signal.aborted)cancelled();});
         let extension:RunExtension;try{extension=await Promise.race([loading,interruption]);}finally{input.signal.removeEventListener('abort',cancelled);}
         binding.extension=extension;execution.tools=this.tools.configure(control.configuration,extension.definitions);
+      }
+      if(callbacks.subagents&&this.tools?.configure&&this.contexts&&input.scope?.allowedToolNames.includes('Agent')) {
+        execution.subagent=createRunSubagent({runId:input.runId,sessionId:input.sessionId,getSession:()=>binding.session,
+          getMaxTurns:()=>Math.max(0,control.readBudget().modelCalls.remaining-1),
+          open:(context,request)=>this.openManagedChild(execution,context,request),settle:id=>this.settleManagedChild(execution,id),
+          finish:(observed,reply)=>callbacks.subagents!.finish(observed.identity,observed,reply),
+          acknowledge:(observed,version)=>this.acknowledgeHistorySaved(observed.history,version),release:id=>this.releaseManagedChild(execution,id)});
+        execution.tools=this.tools.configure(control.configuration,[...(binding.extension?.definitions??[]),...execution.subagent.definitions]);
       }
       const preparing=this.prepare(binding,input.resolved);
       if(binding.extension){
@@ -805,9 +828,11 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           this.inputStartFailures.set(input.runId, failed); inputSettlement = { ...proof, pendingPersistence: failed.pending };
         }
         terminal();
+        if(execution.subagent)await execution.subagent.close();
         if(binding.extension){const originalSession=binding.session;await binding.extension.close(()=>{
           if(binding.session===originalSession){binding.session=undefined;binding.commandPrompt=undefined;}
         });}
+        else if(execution.subagent){binding.session?.dispose();binding.session=undefined;binding.commandPrompt=undefined;}
       } finally { unsubscribe?.(); unsubscribeTools?.(); unsubscribeMessages?.();unsubscribeCompaction?.(); input.signal.removeEventListener("abort", abort); binding.lastRunId = input.runId; binding.execution = undefined;binding.compaction=undefined; }
     }
     return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []), budgetSummary: control.summary(), history:binding.memory!.freezeFinal(input.runId),...(activeCompaction?{compactions:activeCompaction.readSaveFacts()}:{}), ...(inputSettlement ? { inputSettlement } : {}),...(this.extensions.has(input.runId)?{extensions:this.readExtensionCleanup(input.runId)!}:{}) };

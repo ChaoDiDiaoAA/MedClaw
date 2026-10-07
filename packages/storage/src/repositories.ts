@@ -13,7 +13,8 @@ import { verifyPriorContextFacts } from './context-store';
 import { ModelCallContextSchema, ContextSnapshotBodySchema, type StartCallContext } from '../../contracts/src/context';
 import { FrozenRunResourcesSchema, ResourceEvidenceSchema, ResourceReadFactSchema, resourceRefKey, type FrozenRunResources, type ResourceEvidence } from '../../contracts/src/resources';
 import { FrozenRunExtensionsSchema, type FrozenRunExtensions } from '../../contracts/src/extensions';
-import { FrozenChildConfigSchema, ChildResultSchema, BoundChildIdentitySchema, childScopeWithin, type BoundChildIdentity, type RegisterChildInput, type FinalChildFact, type ChildResult } from '../../contracts/src/subagent';
+import { FrozenChildConfigSchema, ChildResultSchema, BoundChildIdentitySchema, childScopeWithin, type BoundChildIdentity, type RegisterChildInput, type FinalChildFact, type ChildResult, type CommittedChildExecutionProof } from '../../contracts/src/subagent';
+import type { ToolExecutionContext } from '../../contracts/src/tool';
 import { readFrozenChild } from './child-identity';
 import type { EventWriter, RegisteredEventDraft, RegisteredEventPayload } from '../../contracts/src/event';
 import { RegisteredEventPayloadSchema } from '../../contracts/src/event';
@@ -266,10 +267,12 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const toolRows = this.db.query<{ id: number; native_tool_call_id: string; context_snapshot_id: number | null; call_id: string | null; input_id: number | null; snapshot_json: string | null }, [number, number]>(`SELECT t.id,t.native_tool_call_id,t.context_snapshot_id,c.call_id,s.input_id,s.snapshot_json
         FROM tool_calls t LEFT JOIN model_calls c ON c.id=t.model_call_id LEFT JOIN context_snapshots s ON s.id=t.context_snapshot_id WHERE t.run_id=? AND t.session_id=? ORDER BY t.id`).all(runId, run.session_id!);
       for (const row of toolRows) {
-        const workspace = row.snapshot_json ? checked(ContextSnapshotBodySchema, decoded(row.snapshot_json), 'storage_read_failed').workspaceContext : null;
+        const contextSnapshot = row.snapshot_json ? checked(ContextSnapshotBodySchema, decoded(row.snapshot_json), 'storage_read_failed') : null;
+        const workspace=contextSnapshot?.workspaceContext??null;
         const record = tools.readCall({ runId, sessionId: run.session_id!, nativeToolCallId: row.native_tool_call_id, scope: checked(RunScopeSchema, decoded(run.scope_json)),
           referenceDate: run.reference_date, timezone: run.timezone, signal: new AbortController().signal,
-          ...(row.context_snapshot_id !== null && workspace ? { contextSnapshotId: row.context_snapshot_id, modelCallId: row.call_id!, workspaceContext: workspace, workspaceInputId: row.input_id,
+          ...(run.kind==='child'&&contextSnapshot?.delegationSource?{contextSnapshotId:row.context_snapshot_id!,modelCallId:row.call_id!,workspaceContext:null,workspaceInputId:null,basedOnQueryId:null,delegationSource:contextSnapshot.delegationSource}:
+            row.context_snapshot_id !== null && workspace ? { contextSnapshotId: row.context_snapshot_id, modelCallId: row.call_id!, workspaceContext: workspace, workspaceInputId: row.input_id,
             basedOnQueryId: workspace.queryId, workspaceRevision: workspace.revision } : {}) });
         if (!record?.resourceRead) continue;
         const read = record.resourceRead, snapshot = originFile(runId, read.resourceRef, read.file);
@@ -1329,6 +1332,27 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     id(runId);const frozen=readFrozenChild(this.db,runId);
     const row=this.db.query<{storage_version:number;current_leaf_id:string|null},[number]>('SELECT storage_version,current_leaf_id FROM sessions WHERE id=?').get(frozen.childSessionId);
     if(!row)fail('storage_read_failed');return {storageVersion:row.storage_version,leafId:row.current_leaf_id};
+  }
+
+  findCommittedChild(context:ToolExecutionContext):CommittedChildExecutionProof|null {
+    return this.inputRead(()=>this.db.transaction(()=>{
+      const parent=this.row(context.runId);
+      if(!parent||parent.kind!=='agent'||parent.session_id!==context.sessionId||context.delegationSource)fail('access_denied');
+      const origin=this.db.query<{id:number;tool_name:string},[number,number,string]>('SELECT id,tool_name FROM tool_calls WHERE run_id=? AND session_id=? AND native_tool_call_id=?').get(context.runId,context.sessionId,context.nativeToolCallId);
+      if(!origin||origin.tool_name!=='Agent')return null;
+      const row=this.db.query<RunRow,[number,number]>("SELECT * FROM runs WHERE kind='child' AND parent_run_id=? AND origin_tool_call_id=?").get(context.runId,origin.id);
+      if(!row||row.status!=='completed'||!row.child_result_json)return null;
+      const frozen=readFrozenChild(this.db,row.id),result=checked(ChildResultSchema,decoded(row.child_result_json),'storage_read_failed');
+      const cleanup=checked(RunCleanupRecordSchema,decoded(row.cleanup_json),'storage_read_failed');
+      const history=this.memory?.loadInTransaction(frozen.childSessionId);
+      if(!history||cleanup.stopConfirmed!==true||cleanup.requiredPersistenceComplete!==true
+        ||result.childRunId!==row.id||result.parentRunId!==context.runId||result.originToolCallId!==origin.id
+        ||history.storageVersion!==result.storageVersion||history.activeLeafId!==result.finalLeafId||checked(z.object({id:OpaqueIdSchema}),history.header,'storage_read_failed').id!==result.nativeSessionId
+        ||createHash('sha256').update(canonicalRequest(result.originalReply)).digest('hex')!==result.originalReplyHash
+        ||!verifyPriorContextFacts(this.db,row.id).requiredPersistenceComplete)fail('storage_read_failed');
+      return {parentRunId:context.runId,originToolCallId:origin.id,childRunId:row.id,childOutcome:'completed' as const,originalReplyHash:result.originalReplyHash,
+        finalLeafId:result.finalLeafId,storageVersion:result.storageVersion};
+    }).deferred());
   }
 
   registerProvider(input: RegisterProviderInput): ProviderAccepted {

@@ -1,6 +1,3 @@
-diff --git a/node_modules/@tintinweb/pi-subagents/.bun-tag-fdf6a5836c922e8f b/.bun-tag-fdf6a5836c922e8f
-new file mode 100644
-index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/package.json b/package.json
 index 1688e534299805699fad79692340a62601039349..d008360e74d0a35fd81bd67a43a0cec0194b8328 100644
 --- a/package.json
@@ -110,7 +107,7 @@ index 8c973b6ac4d28b06c9a2c71ef992bec00b96ae2a..324fa6ee04fb3ed3c7201a08e7cf3820
      clearInterval(this.cleanupInterval);
      // Clear queue — via dequeue, so anyone blocked in spawnAndWait is woken
 diff --git a/src/agent-runner.ts b/src/agent-runner.ts
-index 6752eca0269ce30853a5cf5a3afd0d4bd463614c..8a3e164957934ed74a01cbddb76eef5b6628dd02 100644
+index 6752eca0269ce30853a5cf5a3afd0d4bd463614c..f269d94b02caef8f04e448b3e3da6042e202d932 100644
 --- a/src/agent-runner.ts
 +++ b/src/agent-runner.ts
 @@ -394,7 +394,14 @@ export interface ToolActivity {
@@ -163,6 +160,15 @@ index 6752eca0269ce30853a5cf5a3afd0d4bd463614c..8a3e164957934ed74a01cbddb76eef5b
    options.onSessionCreated?.(session);
  
    // Track turns for graceful max_turns enforcement
+@@ -1055,7 +1075,7 @@ export async function runAgent(
+     if (event.type === "turn_end") {
+       turnCount++;
+       options.onTurnEnd?.(turnCount);
+-      if (maxTurns != null) {
++      if (maxTurns != null && (!options.managedSessionBridge || event.message.stopReason === "toolUse")) {
+         if (!softLimitReached && turnCount >= maxTurns) {
+           softLimitReached = true;
+           session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
 diff --git a/src/index.ts b/src/index.ts
 index 4989968c98e186b3c94194ae8c05c7651374fcb6..0bb6d656284041706119144847635210f5760ff3 100644
 --- a/src/index.ts

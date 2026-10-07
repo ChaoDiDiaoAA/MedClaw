@@ -311,7 +311,8 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
         return;
       }
       this.db.query("UPDATE tool_calls SET delivery_json=? WHERE id=?").run(json({ ...this.delivery(row), contract: "medclaw.tool-delivery/v1", resultRecorded: true, sdkReturned: true, nativeEntryId,
-        deliveredAt: new Date().toISOString(), nextModelCallId: null, consumedAt: null, error: null,
+        deliveredAt: new Date().toISOString(), nextModelCallId: null, consumedAt: null,
+        error:row.tool_name==='Agent'&&row.status==='succeeded'&&message?.isError?safeError('tool_delivery_failed',undefined,{runId:row.run_id,sessionId:row.session_id,toolCallId:row.id}):null,
         ...(message !== undefined ? { message } : {}) }), row.id);
     }), "storage_write_failed");
   }

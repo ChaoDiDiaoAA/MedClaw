@@ -195,6 +195,7 @@ async function initialize(raw: unknown) {
   const configure = (_configuration?:ToolConfiguration,extraDefinitions:readonly AnyToolDefinition[]=[]) => {
     const registry = new ToolRegistry([...createBusinessTools({ catalog: catalogService, queries, evidence }),...extraDefinitions]);
     const executor = new ToolExecutor(registry, recorder, {
+      findCommittedChild:context=>repositories.findCommittedChild(context),
       findCommittedQuery: context => {
         const saved = toolStore.findQuery(`${context.runId}:${context.nativeToolCallId}`);
         return saved && (saved.kind === 'current' || saved.kind === 'changes')

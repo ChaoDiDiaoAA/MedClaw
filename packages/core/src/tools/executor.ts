@@ -6,6 +6,9 @@ import { TOOL_CONFIG } from '@medclaw/contracts/tool-config';
 import { ToolRecorder } from "./recorder";
 import { ToolRegistry } from "./registry";
 import type { RunControl } from '../runtime/run-control';
+import type { CommittedChildExecutionProof } from '@medclaw/contracts/subagent';
+import { createHash } from 'node:crypto';
+import { canonicalRequest } from '@medclaw/contracts/run';
 
 type DeliveryResult = {
   result: { content: { type: string; text?: string; [key: string]: unknown }[]; details?: unknown; usage?: unknown; [key: string]: unknown };
@@ -14,7 +17,8 @@ type DeliveryResult = {
 
 export class ToolExecutor {
   constructor(private readonly registry: ToolRegistry, private readonly recorder: ToolRecorder,
-    private readonly options: { findCommittedQuery?: (context: ToolExecutionContext) => { id: number; runId: number; sessionId: number; kind: 'current' | 'changes'; callRef: string } | null } = {}) {}
+    private readonly options: { findCommittedQuery?: (context: ToolExecutionContext) => { id: number; runId: number; sessionId: number; kind: 'current' | 'changes'; callRef: string } | null;
+      findCommittedChild?: (context:ToolExecutionContext)=>CommittedChildExecutionProof|null } = {}) {}
 
   static beforeToolUse(phase: 'hook_preflight' | 'sdk_admission' | 'execution', name: string, input: unknown, context: ToolExecutionContext,
     recorder: Pick<ToolRecorder, 'blocked'>, control?: RunControl, tool?: ToolCallIdentity): ToolExecutionContext {
@@ -81,18 +85,21 @@ export class ToolExecutor {
     let valid = parsed.success && !(options.wasError && !options.isError);
     try { JSON.parse(JSON.stringify(result)); } catch { valid = false; }
     const record = options.record;
+    const committedAgent=record?.name==='Agent'&&record.status==='succeeded';
+    const deliveryCode=committedAgent?'tool_delivery_failed':'tool_postprocess_failed';
     const queryId = record?.data && typeof record.data === 'object' && 'queryId' in record.data && typeof record.data.queryId === 'number' ? record.data.queryId : null;
-    if (!valid) {
+    if (!valid||committedAgent&&options.isError) {
       control?.updateObservation(id, { postflightStatus: 'failed', hookFailure: { stage: 'afterToolCall', code: 'tool_postprocess_failed' } });
-      control?.noteFailure(id, { code: 'tool_postprocess_failed', stage: 'after_hook', recordId: record?.id, queryId });
-      return { result: { content: [{ type: 'text', text: JSON.stringify({ status: 'failed', error: safeError('tool_postprocess_failed') }) }] }, isError: true };
+      control?.noteFailure(id, { code: deliveryCode, stage: 'after_hook', recordId: record?.id, queryId });
+      return { result: { content: [{ type: 'text', text: JSON.stringify({ status: 'failed', error: safeError(deliveryCode) }) }] }, isError: true };
     }
     const final = parsed.data!;
     const bytes = final.content.reduce((total, item) => total + (item.type === 'text' ? Buffer.byteLength(item.text, 'utf8') : 0), 0);
     const limit = options.maxResultBytes ?? control?.configuration.maxResultBytes ?? context.toolConfiguration?.maxResultBytes ?? TOOL_CONFIG.maxResultBytes;
     if (bytes <= limit) return { result: result as typeof final, isError: options.isError ?? false };
-    control?.noteFailure(id, { code: 'tool_result_too_large', stage: 'sdk_delivery', recordId: record?.id, queryId });
-    return { result: { ...final, content: [{ type: 'text', text: JSON.stringify({ status: 'failed', error: safeError('tool_result_too_large') }) },
+    const overflowCode=committedAgent?'tool_delivery_failed':'tool_result_too_large';
+    control?.noteFailure(id, { code: overflowCode, stage: 'sdk_delivery', recordId: record?.id, queryId });
+    return { result: { ...final, content: [{ type: 'text', text: JSON.stringify({ status: 'failed', error: safeError(overflowCode) }) },
       ...final.content.filter(item => item.type !== 'text')] }, isError: true };
   }
   private failure(code: string, context: ToolExecutionContext): ToolResult<unknown> {
@@ -155,6 +162,18 @@ export class ToolExecutor {
           const settled = await serviceResult(() => ToolExecutor.afterToolUse('execution_settlement', { status: 'succeeded', data: executed.data },
             executionContext, control, { outputSchema: tool.outputSchema }), 'tool_output_invalid');
           result = settled.ok ? settled.data : { status: 'failed', error: settled.error };
+          if(name==='Agent'&&this.options.findCommittedChild) {
+            const proof=await serviceResult(()=>this.options.findCommittedChild!(context),'storage_read_failed');
+            if(!proof.ok)result={status:'failed',error:this.recorder.failPersistence(context)};
+            else if(proof.data) {
+              const saved=proof.data,output=tool.outputSchema.safeParse(executed.data);
+              if(saved.parentRunId!==context.runId||saved.originToolCallId!==record.id||saved.childRunId===context.runId||saved.childOutcome!=='completed'
+                ||!Number.isSafeInteger(saved.childRunId)||saved.childRunId<1||!Number.isSafeInteger(saved.storageVersion)||saved.storageVersion<1
+                ||!output.success||!isDeepStrictEqual(output.data,executed.data)||createHash('sha256').update(canonicalRequest(executed.data)).digest('hex')!==saved.originalReplyHash)
+                result={status:'failed',error:this.recorder.failPersistence(context)};
+              else result={status:'succeeded',data:executed.data};
+            }
+          }
         }
         }
       }

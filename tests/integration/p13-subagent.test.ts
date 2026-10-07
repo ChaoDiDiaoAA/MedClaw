@@ -33,6 +33,131 @@ import { performance } from 'node:perf_hooks';
 import type { AgentSession } from '@earendil-works/pi-coding-agent';
 import { RuntimeService } from '../../packages/core/src/runtime/runtime-service';
 import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
+import { agentRuntimeFixture } from '../fixtures/agent-runtime';
+
+for (const audit of [false,true])for (const delegate of [false,true]) test('p13 original product Agent registration '+(audit?'with P12 audit ':'')+(delegate?'delegates through the plugin and returns committed child result':'starts no child without a real tool call'),async()=>{
+  const f=await agentRuntimeFixture(index=>index===1&&delegate
+    ?{role:'assistant',tool_calls:[{index:0,id:'parent-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}
+    :index===2&&delegate?{role:'assistant',tool_calls:[{index:0,id:'child-business',type:'function',function:{name:'read_data_scope',arguments:'{}'}}]}
+    :{role:'assistant',content:index===3?'ENGINEERING_CHILD_ORIGINAL':'ENGINEERING_PARENT_RESULT'},audit);
+  try {
+    const toolViews:{all:string[];active:string[]}[]=[];
+    const open=Reflect.get(f.agent,'openManagedChild').bind(f.agent);
+    Reflect.set(f.agent,'openManagedChild',async(...args:unknown[])=>{const session:AgentSession=await open(...args);toolViews.push({all:session.getAllTools().map(tool=>tool.name),active:session.getActiveToolNames()});return session;});
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING verify with independent context'),{instanceId:'host',operationRef:'p13-original'});
+    expect(result.ok).toBe(true);if(!result.ok||!result.data.runId)throw new Error('No Run');
+    await f.settle();expect(f.errors).toEqual([]);
+    const names=(f.requests[0]!.tools as {function:{name:string}}[]).map(tool=>tool.function.name);
+    expect(names).toContain('Agent');
+    expect(f.repos.read({runId:result.data.runId})).toMatchObject({kind:'one',run:{status:'completed'}});
+    const children=f.db.query<{id:number;session_id:number;child_result_json:string;cleanup_json:string},[]>("SELECT id,session_id,child_result_json,cleanup_json FROM runs WHERE kind='child'").all();
+    expect(children).toHaveLength(delegate?1:0);
+    expect(f.requests).toHaveLength(delegate?4:1);
+    if(!delegate){expect(f.db.query("SELECT id FROM sessions WHERE kind='child'").all()).toEqual([]);expect(toolViews).toEqual([]);return;}
+    const child=children[0]!,saved=JSON.parse(child.child_result_json);
+    expect(saved).toMatchObject({outcome:'completed',text:'ENGINEERING_CHILD_ORIGINAL',parentRunId:result.data.runId,childRunId:child.id,childSessionId:child.session_id});
+    expect(JSON.parse(child.cleanup_json)).toMatchObject({stopConfirmed:true,requiredPersistenceComplete:true,resourcesReleased:true});
+    const childNames=(f.requests[1]!.tools as {function:{name:string}}[]).map(tool=>tool.function.name);
+    expect(childNames).toContain('read_data_scope');expect(childNames).toContain('read');
+    expect(toolViews[0]!.all.sort()).toEqual([...childNames].sort());expect(toolViews[0]!.active.sort()).toEqual([...childNames].sort());
+    for(const forbidden of ['Agent','extension_runtime_status','edit','write','bash','powershell'])expect(childNames).not.toContain(forbidden);
+    const origin=f.db.query<{status:string;sdk_returned:number;result_json:string},[number,string]>("SELECT status,json_extract(delivery_json,'$.sdkReturned') AS sdk_returned,result_json FROM tool_calls WHERE run_id=? AND native_tool_call_id=?").get(result.data.runId,'parent-Agent')!;
+    expect(origin).toMatchObject({status:'succeeded',sdk_returned:1});expect(JSON.parse(origin.result_json)).toEqual(saved.originalReply);
+    expect(JSON.stringify(f.requests[3]!.messages)).toContain('ENGINEERING_CHILD_ORIGINAL');
+    expect(f.db.query('SELECT run_id,session_id FROM tool_calls WHERE native_tool_call_id=?').get('child-business')).toEqual({run_id:child.id,session_id:child.session_id});
+    expect(f.db.query('SELECT id FROM answers WHERE run_id=?').all(child.id)).toEqual([]);
+    expect(f.db.query('SELECT id FROM session_inputs WHERE session_id=?').all(child.session_id)).toEqual([]);
+  }finally{await f.close();}
+},20000);
+
+test('p13 two original delegations create distinct child identities only after prior stop save and release',async()=>{
+  let firstReleased=false;
+  const f=await agentRuntimeFixture(index=>{
+    if(index===3){
+      const first=f.db.query<{status:string;child_result_json:string;cleanup_json:string},[]>("SELECT status,child_result_json,cleanup_json FROM runs WHERE kind='child'").get()!;
+      expect(first.status).toBe('completed');expect(first.child_result_json).not.toBeNull();
+      expect(JSON.parse(first.cleanup_json)).toMatchObject({stopConfirmed:true,requiredPersistenceComplete:true,resourcesReleased:true});firstReleased=true;
+    }
+    return index===1||index===3?{role:'assistant',tool_calls:[{index:0,id:'delegate-'+index,type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:
+      {role:'assistant',content:'ENGINEERING result '+index};
+  },true);
+  try {
+    const submitted=await f.app.runs.submitAgent(f.request('ENGINEERING two foreground verifications'),{instanceId:'host',operationRef:'p13-twice'});
+    expect(submitted.ok).toBe(true);await f.settle();expect(f.errors).toEqual([]);expect(firstReleased).toBe(true);expect(f.requests).toHaveLength(5);
+    const rows=f.db.query<{id:number;session_id:number;origin_tool_call_id:number;config_json:string},[]>("SELECT id,session_id,origin_tool_call_id,config_json FROM runs WHERE kind='child' ORDER BY id").all();
+    expect(rows).toHaveLength(2);
+    expect(rows[0]!.id).not.toBe(rows[1]!.id);expect(rows[0]!.session_id).not.toBe(rows[1]!.session_id);expect(rows[0]!.origin_tool_call_id).not.toBe(rows[1]!.origin_tool_call_id);
+    for(const key of ['pluginAgentId','nativeSessionId'])expect(JSON.parse(rows[0]!.config_json).subagent[key]).not.toBe(JSON.parse(rows[1]!.config_json).subagent[key]);
+  }finally{await f.close();}
+},20000);
+
+test('p13 cancellation after committed child preserves Agent execution success without another child loop',async()=>{
+  let entered!:()=>void,resume!:()=>void;
+  const released=new Promise<void>(resolve=>{entered=resolve;}),gate=new Promise<void>(resolve=>{resume=resolve;});
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'cancel-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING committed before cancel'});
+  try {
+    const release=Reflect.get(f.agent,'releaseManagedChild').bind(f.agent);
+    Reflect.set(f.agent,'releaseManagedChild',async(...args:unknown[])=>{await release(...args);entered();await gate;});
+    const accepted=await f.app.runs.submitAgent(f.request('ENGINEERING postcommit cancellation'),{instanceId:'host',operationRef:'p13-cancel-after-child'});
+    if(!accepted.ok||!accepted.data.runId)throw new Error('No Run');
+    await released;const cancelling=f.app.runs.cancel(accepted.data.runId);resume();await cancelling;await f.settle();
+    expect(f.requests).toHaveLength(2);
+    expect(f.db.query("SELECT status,json_extract(child_result_json,'$.outcome') AS outcome FROM runs WHERE kind='child'").get()).toEqual({status:'completed',outcome:'completed'});
+    expect(f.db.query("SELECT status,error_json FROM tool_calls WHERE tool_name='Agent'").get()).toEqual({status:'succeeded',error_json:null});
+  }finally{resume();await f.close();}
+},20000);
+
+test('p13 SDK delivery failure retains committed child and original Agent execution result',async()=>{
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'delivery-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING delivery '+index});
+  try {
+    const prepare=Reflect.get(f.agent,'prepare').bind(f.agent);
+    Reflect.set(f.agent,'prepare',async(...args:unknown[])=>{
+      await prepare(...args);const session=(args[0] as {session:AgentSession}).session,after=session.agent.afterToolCall;
+      session.agent.afterToolCall=async(context,signal)=>context.toolCall.name==='Agent'?{content:[{type:'image',data:'ENGINEERING invalid image'} as never],isError:true}:after?.(context,signal);
+    });
+    const submitted=await f.app.runs.submitAgent(f.request('ENGINEERING delivery failure'),{instanceId:'host',operationRef:'p13-delivery-failure'});
+    expect(submitted.ok).toBe(true);await f.settle();
+    expect(f.requests).toHaveLength(3);
+    expect(f.db.query("SELECT status,json_extract(child_result_json,'$.outcome') AS outcome FROM runs WHERE kind='child'").get()).toEqual({status:'completed',outcome:'completed'});
+    const call=f.db.query<{status:string;delivery_json:string},[]>("SELECT status,delivery_json FROM tool_calls WHERE tool_name='Agent'").get()!;
+    expect(call.status).toBe('succeeded');expect(JSON.parse(call.delivery_json)).toMatchObject({sdkReturned:true,error:{code:'tool_delivery_failed'},message:{isError:true},control:{failureClass:'tool_delivery_failed'}});
+    expect(JSON.stringify(f.requests[2]!.messages)).toContain('tool_delivery_failed');
+    expect(f.db.query("SELECT id FROM runs WHERE kind='child'").all()).toHaveLength(1);
+  }finally{await f.close();}
+},20000);
+
+test('p13 single allowed child turn can finish without a queued limit reminder or extra execution',async()=>{
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'one-turn-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING final '+index});
+  try {
+    const configuration=normalizeRuntimeConfiguration({requestPolicy:f.app.config.requestPolicy});configuration.runBudget.maxModelCalls=3;
+    f.app.config.runtimeConfiguration=configuration;
+    f.app.config.agentPolicy={...DEFAULT_AGENT_POLICY,maxModelCalls:3};
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING one child turn'),{instanceId:'host',operationRef:'p13-one-turn'});
+    expect(result.ok).toBe(true);await f.settle();expect(f.requests).toHaveLength(3);
+    expect(f.db.query("SELECT status,json_extract(child_result_json,'$.outcome') AS outcome FROM runs WHERE kind='child'").get()).toEqual({status:'completed',outcome:'completed'});
+    expect(f.db.query("SELECT status FROM tool_calls WHERE tool_name='Agent'").get()).toEqual({status:'succeeded'});
+  }finally{await f.close();}
+},20000);
+
+test('p13 real child business Query and history retain child ownership without changing parent QueryContext',async()=>{
+  const f=await agentRuntimeFixture(index=>{
+    const tool=index===1?'Agent':index===2?'read_data_scope':index===3?'query_current_devices':null;
+    const args=tool==='Agent'?p13AgentInput:tool==='query_current_devices'?{batchIds:[1],time:{start:'2026-10-04',endExclusive:'2026-10-05'},snapshotMode:'exact_date'}:{};
+    return tool?{role:'assistant',tool_calls:[{index:0,id:'owned-'+index,type:'function',function:{name:tool,arguments:JSON.stringify(args)}}]}:{role:'assistant',content:'ENGINEERING only saved facts '+index};
+  });
+  try {
+    seedWorkspaceQueries(f.db,f.repos);const workspace=f.repos.readWorkspace();
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING read-only query'),{instanceId:'host',operationRef:'p13-query-owned'});
+    expect(result.ok).toBe(true);await f.settle();expect(f.errors).toEqual([]);expect(f.requests).toHaveLength(5);
+    const child=f.db.query<{id:number;session_id:number;child_result_json:string},[]>("SELECT id,session_id,child_result_json FROM runs WHERE kind='child'").get()!;
+    const query=f.db.query<{id:number;result_hash:string;run_id:number;session_id:number;input_id:null},[number]>('SELECT id,result_hash,run_id,session_id,input_id FROM queries WHERE run_id=?').get(child.id)!;
+    expect(query).toMatchObject({run_id:child.id,session_id:child.session_id,input_id:null});
+    expect(JSON.parse(child.child_result_json)).toMatchObject({outcome:'completed',queryRefs:[{queryId:query.id,resultHash:query.result_hash}]});
+    expect(f.db.query('SELECT run_id,session_id FROM tool_calls WHERE native_tool_call_id=?').get('owned-3')).toEqual({run_id:child.id,session_id:child.session_id});
+    expect(f.db.query("SELECT id FROM memories WHERE run_id=? AND entry_type='message'").all(child.id).length).toBeGreaterThan(0);
+    expect(f.repos.readWorkspace()).toEqual(workspace);
+  }finally{await f.close();}
+},20000);
 
 test('p13 product child factory binds SQLite identity, explicit SDK and business tools before the first real HTTP request', async () => {
   const root=mkdtempSync(join(tmpdir(),'medclaw-p13-factory-')),db=openDatabase(join(root,'app.sqlite')),history=sqliteHistory(db);
