@@ -13,6 +13,9 @@ import { verifyPriorContextFacts } from './context-store';
 import { ModelCallContextSchema, ContextSnapshotBodySchema, type StartCallContext } from '../../contracts/src/context';
 import { FrozenRunResourcesSchema, ResourceEvidenceSchema, ResourceReadFactSchema, resourceRefKey, type FrozenRunResources, type ResourceEvidence } from '../../contracts/src/resources';
 import { FrozenRunExtensionsSchema, type FrozenRunExtensions } from '../../contracts/src/extensions';
+import { FrozenChildConfigSchema, ChildResultSchema, BoundChildIdentitySchema, childScopeWithin, type BoundChildIdentity, type RegisterChildInput, type FinalChildFact, type ChildResult, type CommittedChildExecutionProof } from '../../contracts/src/subagent';
+import type { ToolExecutionContext } from '../../contracts/src/tool';
+import { readFrozenChild, canReadRelatedQuery } from './child-identity';
 import type { EventWriter, RegisteredEventDraft, RegisteredEventPayload } from '../../contracts/src/event';
 import { RegisteredEventPayloadSchema } from '../../contracts/src/event';
 import { NATIVE_HISTORY_FORMAT, InputContentSchema, type NativeHistoryCommit, type InitialNativeHistory, type PreparedInput, type InputStore, type InputCancelProof, type InputSettlementProof, type ReadInputRequest, type ListInputsRequest } from "../../contracts/src/session";
@@ -31,7 +34,7 @@ import { ReadSessionCheckpointsInputSchema, RestoreSessionCheckpointInputSchema,
   type ReadSessionCheckpointsInput,type RestoreSessionCheckpointInput,type SessionCheckpointReceipt,type SessionCheckpointDetails,type NativeHistorySnapshot } from '../../contracts/src/session';
 import { WorkspaceStateSchema, WorkspaceViewSchema, WorkspaceChangeSchema, RevisionSchema, toWorkspaceContext, type WorkspaceState, type WorkspaceSelection, type WorkspaceView, type WorkspaceChange, type BatchRef, type WorkspaceStore, type WorkspaceInspection, type WorkspaceNotice } from "../../contracts/src/workspace";
 import { businessToolSchemas } from "../../contracts/src/business-tools";
-import { StoredToolConfigurationSchema } from '../../contracts/src/tool-config';
+import { StoredToolConfigurationSchema, normalizeToolConfiguration } from '../../contracts/src/tool-config';
 import { RuntimeConfigurationSchema } from '../../contracts/src/runtime-config';
 import {
   DiagnoseRequestSchema, ModelSelectionSchema, ProviderRequestSchema, RequestPolicySchema, ReferenceDateSchema, TimezoneSchema,
@@ -86,7 +89,8 @@ const savedDeliverySchema = z.object({ contract: z.literal("medclaw.tool-deliver
 });
 const scope = { batchIds: [], deviceIds: null, allowedToolNames: [], allowedResourceRefs: [], artifactIds: [], readOnly: true };
 type RunRow = {
-  input_id: number | null; kind: "provider" | "agent"; session_id: number | null; submission_operation_ref: string | null;
+  input_id: number | null; kind: "provider" | "agent" | "child"; session_id: number | null; submission_operation_ref: string | null;
+  parent_run_id?: number | null; origin_tool_call_id?: number | null; child_result_json?: string | null;
   submission_client_sequence: number | null; submission_request_json: string | null;
   id: number; instance_id: string; status: RunView["status"]; goal: "answer" | "verify";
   input_text: string; output_text: string | null; config_json: string; prior_run_id: number | null;
@@ -121,6 +125,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   private readonly p3: boolean;
   private readonly inputs: SqliteInputStore;
   private readonly p5: boolean;
+  private readonly childRuns:boolean;
   private readonly batchLifecycle:boolean;
   private readonly events: EventWriter | undefined;
   constructor(private readonly db: Database, private readonly beforeCommit?: () => void, events?: EventWriter,
@@ -128,16 +133,17 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     this.events = events ?? (db.query("SELECT name FROM sqlite_schema WHERE name='runtime_events'").get() ? new SqliteEventStore(db, transactions) : undefined);
     this.inputs = new SqliteInputStore(db, this.events);
     this.p5 = db.query("SELECT name FROM sqlite_schema WHERE name='session_inputs'").get() !== null;
+    this.childRuns=!!db.query("SELECT name FROM pragma_table_info('runs') WHERE name='parent_run_id'").get();
     this.p3 = this.db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name='answers'").get() !== null;
     this.batchLifecycle=!!db.query("SELECT name FROM pragma_table_info('batches') WHERE name='status'").get();
   }
 
   private event(row: RunRow, fact: RegisteredEventPayload, at: string, source: RegisteredEventDraft['source'] = 'application', toolCallId: number | null = null): void {
-    if (!this.events || row.kind !== 'agent' || row.session_id === null) return;
+    if (!this.events || !['agent','child'].includes(row.kind) || row.session_id === null) return;
     this.events.appendInTransaction({...fact,runId:row.id,sessionId:row.session_id,source,sourceConnection:null,sourceSequence:null,toolCallId,occurredAt:at,receivedAt:at});
   }
   private runLifecycle(row: RunRow, type: 'run_created'|'run_started', at: string): void {
-    if(row.kind==='agent'&&row.session_id!==null)this.event(row,{type,payload:{contract:'medclaw.event/v1',sessionId:row.session_id,kind:'agent',configVersion:this.config(row).selection.configVersion}},at);
+    if((row.kind==='agent'||row.kind==='child')&&row.session_id!==null)this.event(row,{type,payload:{contract:'medclaw.event/v1',sessionId:row.session_id,kind:row.kind,configVersion:this.config(row).selection.configVersion}},at);
   }
   private runTerminal(row: RunRow, status: 'completed'|'failed'|'cancelled', error: AppError|null, cleanup: unknown, at: string): void {
     const saved = RunCleanupRecordSchema.safeParse(cleanup);
@@ -193,6 +199,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   readRunResources(runId: number): FrozenRunResources | null {
     id(runId); return this.inputRead(() => {
       const row = this.row(runId); if (!row) fail('run_not_found');
+      if (row.kind==='child') {const child=readFrozenChild(this.db,runId);return child.resources?this.checkedResources(child.resources,child.parentSessionId,child.model.configVersion):null;}
       if (row.kind !== 'agent') return null;
       const config = checked(agentConfigSchema, decoded(row.config_json), 'storage_read_failed');
       return config.agent.resources ? this.checkedResources(config.agent.resources, row.session_id!, config.selection.configVersion) : null;
@@ -262,10 +269,12 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const toolRows = this.db.query<{ id: number; native_tool_call_id: string; context_snapshot_id: number | null; call_id: string | null; input_id: number | null; snapshot_json: string | null }, [number, number]>(`SELECT t.id,t.native_tool_call_id,t.context_snapshot_id,c.call_id,s.input_id,s.snapshot_json
         FROM tool_calls t LEFT JOIN model_calls c ON c.id=t.model_call_id LEFT JOIN context_snapshots s ON s.id=t.context_snapshot_id WHERE t.run_id=? AND t.session_id=? ORDER BY t.id`).all(runId, run.session_id!);
       for (const row of toolRows) {
-        const workspace = row.snapshot_json ? checked(ContextSnapshotBodySchema, decoded(row.snapshot_json), 'storage_read_failed').workspaceContext : null;
+        const contextSnapshot = row.snapshot_json ? checked(ContextSnapshotBodySchema, decoded(row.snapshot_json), 'storage_read_failed') : null;
+        const workspace=contextSnapshot?.workspaceContext??null;
         const record = tools.readCall({ runId, sessionId: run.session_id!, nativeToolCallId: row.native_tool_call_id, scope: checked(RunScopeSchema, decoded(run.scope_json)),
           referenceDate: run.reference_date, timezone: run.timezone, signal: new AbortController().signal,
-          ...(row.context_snapshot_id !== null && workspace ? { contextSnapshotId: row.context_snapshot_id, modelCallId: row.call_id!, workspaceContext: workspace, workspaceInputId: row.input_id,
+          ...(run.kind==='child'&&contextSnapshot?.delegationSource?{contextSnapshotId:row.context_snapshot_id!,modelCallId:row.call_id!,workspaceContext:null,workspaceInputId:null,basedOnQueryId:null,delegationSource:contextSnapshot.delegationSource}:
+            row.context_snapshot_id !== null && workspace ? { contextSnapshotId: row.context_snapshot_id, modelCallId: row.call_id!, workspaceContext: workspace, workspaceInputId: row.input_id,
             basedOnQueryId: workspace.queryId, workspaceRevision: workspace.revision } : {}) });
         if (!record?.resourceRead) continue;
         const read = record.resourceRead, snapshot = originFile(runId, read.resourceRef, read.file);
@@ -376,8 +385,12 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     const calls = this.calls(row.id);
     if (callOffset > calls.length) fail("invalid_argument");
     const agent = row.kind === "agent" ? checked(agentConfigSchema, decoded(row.config_json), "storage_read_failed") : null;
+    const child = row.kind === 'child' ? checked(FrozenChildConfigSchema, (decoded(row.config_json) as { subagent: unknown }).subagent, 'storage_read_failed') : null;
+    const childResult = child && row.child_result_json ? checked(ChildResultSchema, decoded(row.child_result_json), 'storage_read_failed') : null;
+    const childDelivery = child ? this.db.query<{ delivery_json: string | null }, [number]>('SELECT delivery_json FROM tool_calls WHERE id=?').get(child.originToolCallId) : null;
+    const delivery = childDelivery?.delivery_json ? checked(savedDeliverySchema, decoded(childDelivery.delivery_json), 'storage_read_failed') : null;
     return checked(RunViewSchema, {
-      id: row.id, kind: row.kind, status: row.status, operationRef: row.kind === "provider" ? this.providerConfig(row).providerRequest.operationRef : rootInput?.operation_ref ?? row.submission_operation_ref,
+      id: row.id, kind: row.kind, status: row.status, operationRef: child ? `internal-child:${child.originToolCallId}` : row.kind === "provider" ? this.providerConfig(row).providerRequest.operationRef : rootInput?.operation_ref ?? row.submission_operation_ref,
       instanceId: row.instance_id, sessionId: row.session_id, inputId: row.input_id, goal: row.goal, inputText: inputPage.text, inputPage,
       model: config.selection, policy: config.policy, priorRunId: row.prior_run_id,
       ...(row.kind === 'provider' ? { runtimeConfiguration: this.providerConfig(row).runtimeConfiguration ?? null } : {}),
@@ -387,7 +400,21 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       answerRef: this.p3 ? this.db.query<{ id: number }, [number]>("SELECT id FROM answers WHERE run_id=?").get(row.id)?.id ?? null : null,
       output,
       calls: row.kind === "provider" ? calls : calls.slice(callOffset, callOffset + callLimit), persistence: "committed",
+      ...(child ? { parentRunId: child.parentRunId, originToolCallId: child.originToolCallId, pluginAgentId: child.pluginAgentId, nativeSessionId: child.nativeSessionId,originSnapshotId:child.originSnapshotId,parentInputId:child.parentInputId,
+        nextCallOffset: callOffset + callLimit < calls.length ? callOffset + callLimit : null,
+        childResult: childResult ? (() => { const { originalReply, ...view } = childResult,preview=safePreview(view.text,32768);return { ...view,truncated:view.truncated||preview.truncated,text:childResult.outcome === 'completed' ? preview.text : AppErrorSchema.safeParse(decoded(row.error_json)).data?.message ?? 'Child execution did not complete.' }; })() : null,
+        delivery: delivery ? { resultRecorded: delivery.resultRecorded, sdkReturned: delivery.sdkReturned,sdkResultIsError:delivery.message?.isError??null,nativeEntryId: delivery.nativeEntryId, nextModelCallId: delivery.nextModelCallId, consumedAt: delivery.consumedAt,consumptionEvidence:delivery.consumptionEvidence??null,error: delivery.error } : null } : {}),
       ...(agent ? { clientSequence: rootInput?.client_sequence ?? row.submission_client_sequence, nativeSessionId: agent.agent.nativeSessionId,
+        ...(this.childRuns?{groupUsage:(()=>{const part=(children:boolean)=>{
+          const where=children?"r.kind='child' AND r.parent_run_id=?":"r.kind='agent' AND r.id=?";
+          const usage=this.db.query<{modelCalls:number;inputTokens:number|null;outputTokens:number|null;cost:number|null},[number]>(`SELECT count(*) modelCalls,
+            CASE WHEN count(*)=0 THEN 0 WHEN count(c.input_tokens)=count(*) THEN sum(c.input_tokens) END inputTokens,
+            CASE WHEN count(*)=0 THEN 0 WHEN count(c.output_tokens)=count(*) THEN sum(c.output_tokens) END outputTokens,
+            CASE WHEN count(*)=0 THEN 0 WHEN count(c.cost)=count(*) THEN sum(c.cost) END cost
+            FROM model_calls c JOIN runs r ON r.id=c.run_id AND r.session_id=c.session_id WHERE ${where}`).get(row.id)!;
+          const tools=this.db.query<{n:number},[number]>(`SELECT count(*) n FROM tool_calls t JOIN runs r ON r.id=t.run_id AND r.session_id=t.session_id WHERE ${where}`).get(row.id)!;
+          return {...usage,toolCalls:tools.n,costCurrency:usage.cost===null?null:'USD'};
+        };return {parent:part(false),children:part(true)};})()}:{}),
         answerNativeLeafId:this.p3 ? this.db.query<{native_leaf_id:string|null},[number]>('SELECT native_leaf_id FROM answers WHERE run_id=?').get(row.id)?.native_leaf_id??null : null,
         nextCallOffset: callOffset + callLimit < calls.length ? callOffset + callLimit : null,
         control: agent.runtimeConfiguration || agent.toolConfiguration || agent.agentPolicy || agent.measurementContext || agent.toolProfileSnapshot ? {
@@ -475,7 +502,11 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         const model = decoded(row.model_json) as {selection:unknown;compaction:unknown}, metadata = checked(CompactionCallMetadataSchema,model.compaction,'storage_read_failed');
         if (metadata.source !== owner.source || metadata.reason !== owner.reason || metadata.baseStorageVersion !== owner.baseStorageVersion || metadata.baseLeafId !== owner.baseLeafId || !isDeepStrictEqual(model.selection,owner.model) || metadata.operationEndedAt) fail('state_conflict');
       }
-      const session = this.readSession(owner.sessionId); if (!session) fail('session_not_found'); this.assertSessionActive(session);
+      const child=owner.source==='auto'&&this.row(owner.runId!)?.kind==='child';
+      if(child) {
+        if(readFrozenChild(this.db,owner.runId!).childSessionId!==owner.sessionId||!this.memory)fail('access_denied');
+        this.memory!.loadInTransaction(owner.sessionId);
+      } else { const session = this.readSession(owner.sessionId); if (!session) fail('session_not_found'); this.assertSessionActive(session); }
       if (owner.source === 'manual') {
         const operation = this.readCompactionOperation({sessionId:owner.sessionId,operationRef:owner.operationRef});
         if (!operation || operation.receipt || operation.cancelRequestedAt || owner.ordinal > operation.frozen.budget.maxModelCalls
@@ -483,7 +514,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       } else {
         if (!existing.length && this.findOperation(owner.operationRef)) fail('state_conflict');
         const run = this.row(owner.runId!);
-        if (!run || run.kind !== 'agent' || run.session_id !== owner.sessionId || !['created','running'].includes(run.status) || run.cancel_requested_at || !isDeepStrictEqual(this.config(run).selection,owner.model)) fail('state_conflict');
+        if (!run || !['agent','child'].includes(run.kind) || run.session_id !== owner.sessionId || !['created','running'].includes(run.status) || run.cancel_requested_at || !isDeepStrictEqual(this.config(run).selection,owner.model)) fail('state_conflict');
       }
       const metadata = checked(CompactionCallMetadataSchema,{contract:'medclaw.compaction/v1',operationRef:owner.operationRef,source:owner.source,reason:owner.reason,ordinal:owner.ordinal,baseStorageVersion:owner.baseStorageVersion,baseLeafId:owner.baseLeafId,
         nativeEntryId:null,savedStorageVersion:null,operationEndedAt:null,operationError:null});
@@ -525,7 +556,8 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if(!entry||entry.type!=='compaction'||entry.firstKeptEntryId!==fact.firstKeptEntryId||entry.tokensBefore!==fact.tokensBefore)fail('session_history_invalid');
       if(!manual) {
         const run=this.row(fact.runId!);
-        if(!run||run.kind!=='agent'||run.session_id!==fact.sessionId||!['created','running'].includes(run.status))fail('state_conflict');
+        if(!run||!['agent','child'].includes(run.kind)||run.session_id!==fact.sessionId||!['created','running'].includes(run.status))fail('state_conflict');
+        if(run.kind==='child')readFrozenChild(this.db,run.id);
       }
       version=this.memory.commitInTransaction(change!).storageVersion;
       if(manual&&(manual.storageVersion!==version||manual.activeLeafId!==change!.activeLeafId))fail('state_conflict');
@@ -652,7 +684,8 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   finishAutoCompaction(operationRef:string,runId:number,error:AppError,endedAt:string):void {
     id(runId);checked(OpaqueIdSchema,operationRef);checked(AppErrorSchema,error);timestamp(endedAt);
     this.inputWrite(()=>{
-      const run=this.row(runId);if(!run||run.kind!=='agent')fail('state_conflict');
+      const run=this.row(runId);if(!run||!['agent','child'].includes(run.kind))fail('state_conflict');
+      if(run.kind==='child')readFrozenChild(this.db,runId);
       const calls=this.compactionCalls(operationRef);
       if(calls.some(call=>call.run_id!==runId||call.session_id!==run.session_id||call.state==='started'))fail('storage_write_failed');
       for(const call of calls) {
@@ -887,10 +920,17 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   readSession(sessionId: number): SessionView | null {
     id(sessionId);
     const row = this.db.query<{ id: number; native_session_id: string; title: string; kind: string; status: string; storage_version: number; current_leaf_id?:string|null; metadata_json:string; metadata_revision?:number; deleted_at?:string|null }, [number]>("SELECT * FROM sessions WHERE id=?").get(sessionId);
-    if (!row) return null;
+    if (!row || row.kind !== 'user') return null;
     const sequence = this.db.query<{ n: number | null }, [number]>(this.p5 ? "SELECT MAX(n) AS n FROM (SELECT submission_client_sequence AS n FROM runs WHERE session_id=?1 UNION ALL SELECT client_sequence AS n FROM session_inputs WHERE session_id=?1)" : "SELECT MAX(submission_client_sequence) AS n FROM runs WHERE session_id=?").get(sessionId)?.n ?? 0;
     return checked(SessionViewSchema, { id: row.id, title: this.sessionTitle(row), metadataRevision:row.metadata_revision??0, deletedAt:row.deleted_at??null, nativeSessionId: row.native_session_id, kind: row.kind, status: row.status,
       inputControl: null, storageVersion: row.storage_version, leafId: row.current_leaf_id??null, nextSubmissionSequence: sequence + 1 }, "storage_read_failed");
+  }
+
+  readChildIdentity(runId: number): BoundChildIdentity | null {
+    id(runId);
+    const row = this.row(runId); if (!row || row.kind !== 'child') return null;
+    const frozen = readFrozenChild(this.db, runId);
+    return checked(BoundChildIdentitySchema, Object.fromEntries(Object.keys(BoundChildIdentitySchema.shape).map(key => [key, frozen[key as keyof typeof frozen]])), 'storage_read_failed');
   }
 
   private sessionTitle(row:{id:number;title:string;metadata_json:string}):string {
@@ -1160,7 +1200,8 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         for (const row of messages) {
           checked(PositiveIdSchema,row.run_id,'storage_read_failed');
           const entry=checked(z.object({type:z.literal('message'),id:OpaqueIdSchema,message:z.object({role:z.string()})}),JSON.parse(row.entry_json),'storage_read_failed');
-          if(row.owner!==sessionId||row.kind!=='agent'||entry.id!==row.native_entry_id) fail('storage_read_failed');
+          if(row.owner!==sessionId||!['agent','child'].includes(row.kind??'')||entry.id!==row.native_entry_id) fail('storage_read_failed');
+          if(row.kind==='child'&&readFrozenChild(this.db,row.run_id).childSessionId!==sessionId)fail('storage_read_failed');
           if(entry.message.role==='user'||entry.message.role==='assistant') links.set(row.native_entry_id,{runId:row.run_id,toolCallRef:null,references:[`run:${row.run_id}`]});
         }
       }
@@ -1174,7 +1215,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       }
       const rows = this.db.query<{ id: number; run_id: number; native_tool_call_id: string; native_entry_id: string; query_id: number | null }, [string, number]>(
         `SELECT t.id,t.run_id,t.native_tool_call_id,json_extract(t.delivery_json,'$.nativeEntryId') AS native_entry_id,q.id AS query_id
-         FROM tool_calls t JOIN runs r ON r.id=t.run_id AND r.session_id=t.session_id AND r.kind='agent'
+         FROM tool_calls t JOIN runs r ON r.id=t.run_id AND r.session_id=t.session_id AND r.kind IN ('agent','child')
          JOIN json_each(?) entry ON entry.value=json_extract(t.delivery_json,'$.nativeEntryId')
          LEFT JOIN queries q ON q.session_id=t.session_id AND q.run_id=t.run_id AND q.call_ref=CAST(t.run_id AS TEXT)||':'||t.native_tool_call_id AND q.source='agent_tool'
          WHERE t.session_id=? AND json_extract(t.delivery_json,'$.sdkReturned')=1`).all(JSON.stringify([...new Set(nativeEntryIds)]), sessionId);
@@ -1248,6 +1289,85 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     });
   }
 
+  registerChild(input: RegisterChildInput): BoundChildIdentity {
+    id(input.parentRunId); id(input.originToolCallId); timestamp(input.createdAt);
+    checked(OpaqueIdSchema,input.pluginAgentId); checked(OpaqueIdSchema,input.nativeSessionId);
+    if(!this.memory)fail('session_history_invalid');
+    return this.transactions.immediate(() => {
+      const parent=this.row(input.parentRunId);
+      if(!parent||parent.kind!=='agent'||parent.session_id===null)fail('access_denied');
+      if(!['created','running'].includes(parent.status)||parent.cancel_requested_at!==null)fail('state_conflict');
+      if(this.db.query('SELECT id FROM runs WHERE origin_tool_call_id=?').get(input.originToolCallId))fail('state_conflict');
+      if(this.db.query("SELECT id FROM runs WHERE parent_run_id=? AND status IN ('created','running')").get(parent.id))fail('runtime_busy');
+      const origin=this.db.query<{native_tool_call_id:string;context_snapshot_id:number;input_id:number|null},[number,number,number]>(`SELECT t.native_tool_call_id,t.context_snapshot_id,s.input_id FROM tool_calls t JOIN context_snapshots s ON s.id=t.context_snapshot_id
+        WHERE t.id=? AND t.run_id=? AND t.session_id=? AND t.tool_name='Agent' AND t.status IN ('requested','running') AND s.run_id=t.run_id AND s.session_id=t.session_id`).get(input.originToolCallId,parent.id,parent.session_id);
+      const childRunId=(this.db.query<{n:number},[]>('SELECT COALESCE(MAX(id),0)+1 n FROM runs').get()!).n;
+      const childSessionId=(this.db.query<{n:number},[]>('SELECT COALESCE(MAX(id),0)+1 n FROM sessions').get()!).n;
+      const frozen=checked(FrozenChildConfigSchema,{...input.frozen,childRunId,childSessionId});
+      if(!origin||frozen.parentRunId!==parent.id||frozen.parentSessionId!==parent.session_id||frozen.instanceId!==parent.instance_id
+        ||frozen.originToolCallId!==input.originToolCallId||frozen.originNativeToolCallId!==origin.native_tool_call_id
+        ||frozen.originSnapshotId!==origin.context_snapshot_id||frozen.parentInputId!==origin.input_id
+        ||frozen.pluginAgentId!==input.pluginAgentId||frozen.nativeSessionId!==input.nativeSessionId
+        ||frozen.promptHash!==createHash('sha256').update(input.prompt).digest('hex')
+        ||!isDeepStrictEqual(frozen.model,this.config(parent).selection)||!isDeepStrictEqual(frozen.policy,this.config(parent).policy)
+        ||!childScopeWithin(frozen.scope,checked(RunScopeSchema,decoded(parent.scope_json),'storage_read_failed')))fail('access_denied');
+      const header=checked(z.object({type:z.literal('session'),version:z.literal(3),id:OpaqueIdSchema,timestamp:TimestampSchema,cwd:z.string()}).passthrough(),input.initialHistory.header,'session_history_invalid');
+      if(header.id!==input.nativeSessionId||!Array.isArray(input.initialHistory.entries)
+        ||input.initialHistory.entries.some(entry=>!entry||typeof entry!=='object'||Reflect.get(entry,'type')==='message'))fail('session_history_invalid');
+      const creation={contract:'medclaw.child-creation/v1',parentRunId:parent.id,originToolCallId:input.originToolCallId,pluginAgentId:input.pluginAgentId};
+      this.db.query(`INSERT INTO sessions(id,native_session_id,kind,creation_operation_ref,creation_request_json,creation_result_json,title,storage_version,native_header_json,history_format_version,created_at,updated_at)
+        VALUES(?,?,'child',?,?,NULL,'Subagent',1,?,?,?,?)`).run(childSessionId,input.nativeSessionId,`internal-child:${input.originToolCallId}`,canonicalRequest(creation),canonicalRequest(header),NATIVE_HISTORY_FORMAT,input.createdAt,input.createdAt);
+      this.db.query(`INSERT INTO runs(id,session_id,kind,parent_run_id,origin_tool_call_id,instance_id,status,goal,input_text,config_json,scope_json,reference_date,timezone,created_at)
+        VALUES(?,?,'child',?,?,?,'created','answer',?,?,?,?,?,?)`).run(childRunId,childSessionId,parent.id,input.originToolCallId,parent.instance_id,input.prompt,
+          canonicalRequest({selection:frozen.model,policy:frozen.policy,subagent:frozen}),canonicalRequest(frozen.scope),parent.reference_date,parent.timezone,input.createdAt);
+      this.memory!.initializeChildInTransaction(childSessionId,childRunId,input.initialHistory);
+      this.runLifecycle(this.row(childRunId)!,'run_created',input.createdAt);
+      this.beforeCommit?.();
+      return this.readChildIdentity(childRunId)!;
+    });
+  }
+
+  findChild(parentRunId:number,originToolCallId:number,expected?:RegisterChildInput):BoundChildIdentity|null {
+    id(parentRunId);id(originToolCallId);
+    return this.inputRead(()=>this.db.transaction(()=>{
+    const row=this.db.query<{id:number},[number,number]>("SELECT id FROM runs WHERE kind='child' AND parent_run_id=? AND origin_tool_call_id=?").get(parentRunId,originToolCallId);
+    if(!row)return null;
+    const identity=this.readChildIdentity(row.id)!;
+    if(expected) {
+      const stored=this.row(row.id)!,frozen=readFrozenChild(this.db,row.id),initial=this.memory?.loadInTransaction(identity.childSessionId);
+      if(canonicalRequest(frozen)!==canonicalRequest({...expected.frozen,childRunId:identity.childRunId,childSessionId:identity.childSessionId})||stored.input_text!==expected.prompt
+        ||!initial||initial.storageVersion!==1||canonicalRequest(initial.header)!==canonicalRequest(expected.initialHistory.header)||canonicalRequest(initial.entries)!==canonicalRequest(expected.initialHistory.entries)||initial.activeLeafId!==expected.initialHistory.activeLeafId)fail('storage_read_failed');
+    }
+    return identity;
+    }).deferred());
+  }
+  readChildHistoryBase(runId:number):{storageVersion:number;leafId:string|null} {
+    id(runId);const frozen=readFrozenChild(this.db,runId);
+    const row=this.db.query<{storage_version:number;current_leaf_id:string|null},[number]>('SELECT storage_version,current_leaf_id FROM sessions WHERE id=?').get(frozen.childSessionId);
+    if(!row)fail('storage_read_failed');return {storageVersion:row.storage_version,leafId:row.current_leaf_id};
+  }
+
+  findCommittedChild(context:ToolExecutionContext):CommittedChildExecutionProof|null {
+    return this.inputRead(()=>this.db.transaction(()=>{
+      const parent=this.row(context.runId);
+      if(!parent||parent.kind!=='agent'||parent.session_id!==context.sessionId||context.delegationSource)fail('access_denied');
+      const origin=this.db.query<{id:number;tool_name:string},[number,number,string]>('SELECT id,tool_name FROM tool_calls WHERE run_id=? AND session_id=? AND native_tool_call_id=?').get(context.runId,context.sessionId,context.nativeToolCallId);
+      if(!origin||origin.tool_name!=='Agent')return null;
+      const row=this.db.query<RunRow,[number,number]>("SELECT * FROM runs WHERE kind='child' AND parent_run_id=? AND origin_tool_call_id=?").get(context.runId,origin.id);
+      if(!row||row.status!=='completed'||!row.child_result_json)return null;
+      const frozen=readFrozenChild(this.db,row.id),result=checked(ChildResultSchema,decoded(row.child_result_json),'storage_read_failed');
+      const cleanup=checked(RunCleanupRecordSchema,decoded(row.cleanup_json),'storage_read_failed');
+      const history=this.memory?.loadInTransaction(frozen.childSessionId);
+      if(!history||cleanup.stopConfirmed!==true||cleanup.requiredPersistenceComplete!==true
+        ||result.childRunId!==row.id||result.parentRunId!==context.runId||result.originToolCallId!==origin.id
+        ||history.storageVersion!==result.storageVersion||history.activeLeafId!==result.finalLeafId||checked(z.object({id:OpaqueIdSchema}),history.header,'storage_read_failed').id!==result.nativeSessionId
+        ||createHash('sha256').update(canonicalRequest(result.originalReply)).digest('hex')!==result.originalReplyHash
+        ||!verifyPriorContextFacts(this.db,row.id).requiredPersistenceComplete)fail('storage_read_failed');
+      return {parentRunId:context.runId,originToolCallId:origin.id,childRunId:row.id,childOutcome:'completed' as const,originalReplyHash:result.originalReplyHash,
+        finalLeafId:result.finalLeafId,storageVersion:result.storageVersion};
+    }).deferred());
+  }
+
   registerProvider(input: RegisterProviderInput): ProviderAccepted {
     const originalRequest = input.method === "model.request" ? checked(ProviderRequestSchema, input.originalRequest) : checked(DiagnoseRequestSchema, input.originalRequest);
     if (!input.operationRef || input.operationRef.length > 512) fail("invalid_argument");
@@ -1286,12 +1406,22 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     if (!callId || callId.length > 512) fail("invalid_argument");
     this.transactions.immediate(() => {
       const row = this.row(runId);
-      if (!row || row.status !== "created" && !(row.kind === "agent" && row.status === "running")) fail("state_conflict");
+      if (!row || row.status !== "created" && !(['agent','child'].includes(row.kind) && row.status === "running")) fail("state_conflict");
       if (row.kind === "provider" && this.calls(runId).length) fail("state_conflict");
       if (kind !== (row.goal === "verify" ? "diagnostic" : "main")) fail("invalid_argument");
-      const requiresContext = row.kind === 'agent' && checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.contextContract === 'medclaw.context/v1';
-      if (requiresContext && !context || context && (row.kind !== 'agent' || kind !== 'main')) fail('state_conflict');
-      if (context && !this.db.query('SELECT id FROM context_snapshots WHERE id=? AND run_id=? AND session_id=? AND input_id=?').get(context.snapshotId,runId,row.session_id,context.inputId)) fail('access_denied');
+      const requiresContext = row.kind==='child' || row.kind === 'agent' && checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.contextContract === 'medclaw.context/v1';
+      if (requiresContext && !context || context && (!['agent','child'].includes(row.kind) || kind !== 'main')) fail('state_conflict');
+      if (context) {
+        const snapshot=this.db.query<{snapshot_json:string},[number,number,number|null,number|null]>('SELECT snapshot_json FROM context_snapshots WHERE id=? AND run_id=? AND session_id=? AND input_id IS ?').get(context.snapshotId,runId,row.session_id,context.inputId);
+        if(!snapshot)fail('access_denied');
+        const body=checked(ContextSnapshotBodySchema,decoded(snapshot.snapshot_json),'storage_read_failed');
+        if(row.kind==='child') {
+          const frozen=readFrozenChild(this.db,runId);
+          if(context.inputId!==null||!isDeepStrictEqual(context.delegationSource,body.delegationSource)
+            ||context.delegationSource.parentRunId!==frozen.parentRunId||context.delegationSource.originToolCallId!==frozen.originToolCallId
+            ||context.delegationSource.parentSnapshotId!==frozen.originSnapshotId||context.delegationSource.promptHash!==frozen.promptHash)fail('access_denied');
+        } else if(context.inputId===null||body.delegationSource)fail('access_denied');
+      }
       if (row.status === "created") {
         const changed = this.db.query("UPDATE runs SET status='running',started_at=? WHERE id=? AND status='created'").run(time, runId);
         if (changed.changes !== 1) fail("state_conflict");
@@ -1326,6 +1456,44 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   finalizeAgent(runId: number, fact: FinalAgentFact): RunView {
     return this.finalize(runId, fact, fact.calls, "agent");
   }
+  childResultReferences(runId:number):Pick<ChildResult,'queryRefs'|'evidenceIds'|'gaps'> {
+    id(runId);const child=readFrozenChild(this.db,runId);
+    const queries=this.db.query<{id:number;result_hash:string},[number,number]>('SELECT id,result_hash FROM queries WHERE run_id=? AND session_id=? ORDER BY id').all(runId,child.childSessionId);
+    const evidence=this.db.query<{id:number},[number,number]>('SELECT e.id FROM query_evidence e JOIN queries q ON q.id=e.query_id WHERE q.run_id=? AND q.session_id=? ORDER BY e.id').all(runId,child.childSessionId);
+    const refs=new Map(queries.map(row=>[row.id,row.result_hash])),evidenceIds=new Set(evidence.map(row=>row.id)),store=new SqliteToolStore(this.db);
+    const reads=this.db.query<{tool_name:string;args_json:string;result_json:string},[number,number]>(`SELECT tool_name,args_json,result_json FROM tool_calls WHERE run_id=? AND session_id=? AND status='succeeded'
+      AND tool_name IN ('read_query','read_query_page','list_query_evidence','read_query_evidence','read_evidence_rows','read_source_metadata')`).all(runId,child.childSessionId);
+    for(const read of reads){
+      const name=read.tool_name as 'read_query'|'read_query_page'|'list_query_evidence'|'read_query_evidence'|'read_evidence_rows'|'read_source_metadata',schemas=businessToolSchemas[name];
+      const args=checked(schemas.input as z.ZodType<Record<string,number>>,decoded(read.args_json),'storage_read_failed');
+      const data=checked(schemas.output as z.ZodType<unknown>,decoded(read.result_json),'storage_read_failed') as {queryId?:number;resultHash?:string;items?:{id?:number;queryId?:number;resultHash?:string}[]};
+      const readEvidence=args.evidenceId?store.readEvidence(args.evidenceId):null,queryId=args.queryId??readEvidence?.queryId,query=queryId?store.readQuery(queryId):null;
+      if(!query||!canReadRelatedQuery(this.db,runId,child.childSessionId,query)||query.batchIds.some(batch=>!child.scope.batchIds.includes(batch))
+        ||child.scope.deviceIds!==null&&(query.scopeDeviceIds===null||query.scopeDeviceIds.some(device=>!child.scope.deviceIds!.includes(device))))fail('storage_read_failed');
+      if(data.queryId!==undefined&&data.queryId!==query.id||data.resultHash!==undefined&&data.resultHash!==query.resultHash
+        ||name==='list_query_evidence'&&data.items?.some(item=>item.queryId!==query.id||item.resultHash!==query.resultHash))fail('storage_read_failed');
+      refs.set(query.id,query.resultHash);
+      for(const evidenceId of readEvidence?[readEvidence.id]:name==='list_query_evidence'?data.items!.map(item=>item.id!):[]){
+        const item=store.readEvidence(evidenceId);
+        if(!item||item.queryId!==query.id||item.resultHash!==query.resultHash||item.batchIds.some(batch=>!child.scope.batchIds.includes(batch)))fail('storage_read_failed');
+        evidenceIds.add(evidenceId);
+      }
+    }
+    const failed=this.db.query<{native_tool_call_id:string},[number,number]>("SELECT native_tool_call_id FROM tool_calls WHERE run_id=? AND session_id=? AND status IN ('failed','cancelled') ORDER BY id").all(runId,child.childSessionId);
+    const receipts=this.db.query<{tool_call_id:string},[number,number]>("SELECT json_extract(entry_json,'$.message.toolCallId') AS tool_call_id FROM memories WHERE run_id=? AND session_id=? AND entry_type='message' AND json_extract(entry_json,'$.message.role')='toolResult' AND json_extract(entry_json,'$.message.isError')=1 ORDER BY sequence").all(runId,child.childSessionId);
+    return {queryRefs:[...refs].sort(([a],[b])=>a-b).map(([queryId,resultHash])=>({queryId,resultHash})),evidenceIds:[...evidenceIds].sort((a,b)=>a-b),
+      gaps:[...new Set([...failed.map(row=>row.native_tool_call_id),...receipts.map(row=>row.tool_call_id)].map(id=>'tool_result_error:'+id))]};
+  }
+  private childFinalEnvelope(runId:number,fact:FinalChildFact):FinalAgentFact & {childResult:ChildResult} {
+    const row=this.row(runId);if(!row||row.kind!=='child')fail('access_denied');
+    return {...fact,stoppedAt:fact.cleanup.executionStarted===false?null:fact.endedAt,
+      cancelRequestedAt:fact.status==='cancelled'?row.cancel_requested_at??fact.endedAt:row.cancel_requested_at};
+  }
+  finalizeChild(runId:number,fact:FinalChildFact) {
+    const result=this.finalize(runId,this.childFinalEnvelope(runId,fact),fact.calls,'child');
+    if(result.kind!=='child')fail('state_conflict');return result;
+  }
+  isChildFinalSaved(runId:number,fact:FinalChildFact):boolean {return this.isFinalSaved(runId,this.childFinalEnvelope(runId,fact));}
   confirmHistorySaved(change:NativeHistoryCommit) {if(!this.memory)fail('storage_read_failed');return this.memory.confirmCommitted(change);}
   private answerReferences(row:RunRow, requireAvailable:boolean):number[] {
     try {
@@ -1335,6 +1503,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         const frozen=this.inputs.content(this.inputs.required(input.id)).workspaceContext;
         if(frozen.queryId!==null)ids.add(frozen.queryId);
       }
+      const explicitReads=new Set<number>();
       const reads=this.db.query<{tool_name:string;args_json:string;result_json:string;delivery_json:string;native_tool_call_id:string},[number,number]>(`SELECT * FROM tool_calls WHERE run_id=? AND session_id=? AND status='succeeded'
         AND tool_name IN ('read_query','read_query_page','list_query_evidence','read_query_evidence')`).all(row.id,row.session_id!);
       for(const read of reads){
@@ -1353,12 +1522,12 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         if(!queryId||data.queryId!==undefined&&data.queryId!==queryId||data.items?.some(item=>item.queryId!==queryId))fail('answer_evidence_invalid');
         const query=store.readQuery(queryId);
         if(!query||data.resultHash!==undefined&&data.resultHash!==query.resultHash||data.items?.some(item=>item.resultHash!==query.resultHash))fail('answer_evidence_invalid');
-        ids.add(queryId);
+        ids.add(queryId);explicitReads.add(queryId);
       }
       for(const id of ids){
         const query=store.readQuery(id),view=sources.query(id,1,1);
         const source=this.db.query<{source:string},[number]>('SELECT source FROM queries WHERE id=?').get(id);
-        if(!query||query.sessionId!==row.session_id||query.batchIds.some(batch=>!scope.batchIds.includes(batch))
+        if(!query||query.sessionId!==row.session_id&&(!explicitReads.has(id)||!canReadRelatedQuery(this.db,row.id,row.session_id!,query))||query.batchIds.some(batch=>!scope.batchIds.includes(batch))
           ||(query.source??'agent_tool')!==source?.source
           ||scope.deviceIds!==null&&(query.scopeDeviceIds===null||query.scopeDeviceIds.some(device=>!scope.deviceIds!.includes(device)))
           ||requireAvailable&&view.query.sourceAvailability!=='available')fail('answer_evidence_invalid');
@@ -1429,7 +1598,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     }
     return next;
   }
-  private finalize(runId: number, fact: FinalProviderFact, finalCalls: import("../../contracts/src/run").FinalCallFact[], kind: "provider" | "agent"): RunView {
+  private finalize(runId: number, fact: FinalProviderFact, finalCalls: import("../../contracts/src/run").FinalCallFact[], kind: "provider" | "agent" | "child"): RunView {
     id(runId); timestamp(fact.endedAt); timestamp(fact.stoppedAt); timestamp(fact.cancelRequestedAt ?? null);
     if (!["completed", "failed", "cancelled"].includes(fact.status)) fail("invalid_argument");
     checked(z.string().nullable(), fact.outputText);
@@ -1439,8 +1608,8 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     return this.transactions.immediate(() => {
       const row = this.row(runId);
       if (!row || row.kind !== kind) fail("state_conflict");
-      const history=kind==='agent'?(fact as FinalAgentFact).history:undefined;
-      const historyRequired=kind==='agent'&&checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.historyContract==='medclaw.history/p9-v1';
+      const history=kind==='agent'||kind==='child'?(fact as FinalAgentFact).history:undefined;
+      const historyRequired=kind==='child'||kind==='agent'&&checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.historyContract==='medclaw.history/p9-v1';
       if(historyRequired&&fact.status==='completed'&&!history)fail('session_history_invalid');
       if(history) {
         if(history.sessionId!==row.session_id||history.runId!==runId)fail('access_denied');
@@ -1459,12 +1628,22 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         for(const compaction of compactions)if(compaction!==pending[0]&&this.confirmCompactionSaved(history,compaction)===null)fail('storage_write_failed');
         if(historyRequired&&fact.status==='completed')this.validateFinalAnswer(row,fact as FinalAgentFact);
       }
+      if(kind==='child') {
+        const result=checked(ChildResultSchema,(fact as FinalAgentFact & {childResult:ChildResult}).childResult);
+        if(Buffer.byteLength(JSON.stringify(result),'utf8')>normalizeToolConfiguration(readFrozenChild(this.db,runId).toolConfiguration).maxResultBytes)fail('tool_result_too_large');
+        const identity=this.readChildIdentity(runId)!,base=this.readChildHistoryBase(runId),refs=this.childResultReferences(runId);
+        if(!history||Object.entries(identity).filter(([key])=>key!=='instanceId'&&key!=='parentSessionId'&&key!=='originNativeToolCallId').some(([key,value])=>result[key as keyof ChildResult]!==value)
+          ||result.outcome!==fact.status||result.text!==fact.outputText||result.storageVersion!==base.storageVersion||result.finalLeafId!==base.leafId||result.committedAt!==fact.endedAt
+          ||result.originalReplyHash!==createHash('sha256').update(canonicalRequest(result.originalReply)).digest('hex')||!isDeepStrictEqual(result.queryRefs,refs.queryRefs)||!isDeepStrictEqual(result.evidenceIds,refs.evidenceIds)
+          ||row.child_result_json!=null&&!isDeepStrictEqual(decoded(row.child_result_json),result))fail('state_conflict');
+      }
       const calls = this.calls(runId);
       if (calls.length !== finalCalls.length || new Set(finalCalls.map(call => call.callId)).size !== finalCalls.length) fail("state_conflict");
       const cancelRequestedAt = fact.cancelRequestedAt ?? row.cancel_requested_at;
       if (fact.cancelRequestedAt && row.cancel_requested_at && fact.cancelRequestedAt !== row.cancel_requested_at) fail("state_conflict");
       if (fact.status === "cancelled" && !cancelRequestedAt || fact.status === "completed" && !calls.length) fail("invalid_argument");
       const terminal = row.status !== "created" && row.status !== "running";
+      if(kind==='child'&&!terminal&&row.cancel_requested_at&&fact.status==='completed')fail('state_conflict');
       if (terminal && (row.status !== fact.status || row.output_text !== null && row.output_text !== fact.outputText
         || row.stopped_at !== null && row.stopped_at !== fact.stoppedAt || !isDeepStrictEqual(decoded(row.error_json), error)
         || row.usage_json !== null && !isDeepStrictEqual(decoded(row.usage_json), usage))) fail("state_conflict");
@@ -1501,9 +1680,9 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       }
       if (cleanup && 'contract' in cleanup && cleanup.requiredPersistenceComplete && (!this.verifyPriorContextFacts(runId).requiredPersistenceComplete||!this.verifyPriorCompactionFacts(runId).requiredPersistenceComplete)) fail('storage_write_failed');
       this.db.query(`UPDATE runs SET status=?,output_text=?,stopped_at=COALESCE(stopped_at,?),ended_at=COALESCE(ended_at,?),cancel_requested_at=?,
-        error_json=?,cleanup_json=?,usage_json=? WHERE id=?`)
+        error_json=?,cleanup_json=?,usage_json=?,child_result_json=COALESCE(child_result_json,?) WHERE id=?`)
         .run(terminal ? row.status : fact.status, row.output_text ?? fact.outputText, fact.stoppedAt, fact.endedAt, cancelRequestedAt,
-          terminal ? row.error_json : json(error), json(cleanup), row.usage_json ?? json(usage), runId);
+          terminal ? row.error_json : json(error), json(cleanup), row.usage_json ?? json(usage),kind==='child'?canonicalRequest((fact as FinalAgentFact & {childResult:ChildResult}).childResult):null, runId);
       if (this.p3 && row.kind === "agent" && fact.status === "completed" && (historyRequired||checked(agentConfigSchema, decoded(row.config_json), "storage_read_failed").agent.stage === "P3")) {
         const frozen = checked(RunScopeSchema, decoded(row.scope_json), "storage_read_failed");
         const queries = this.db.query<{ id: number; session_id: number; batch_ids_json: string; result_json: string }, [number]>(
@@ -1540,7 +1719,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     const expectedCleanup = fact.cleanup && 'contract' in fact.cleanup && savedCleanup.success
       ? { ...fact.cleanup, ...(fact.cleanup.budgetSummary == null && savedCleanup.data.budgetSummary != null ? { budgetSummary: savedCleanup.data.budgetSummary } : {}) }
       : fact.cleanup ?? null;
-    if (!row || row.kind !== ("calls" in fact ? "agent" : "provider") || row.status !== fact.status
+    if (!row || row.kind !== ("childResult" in fact ? "child" : "calls" in fact ? "agent" : "provider") || row.status !== fact.status
       || row.output_text !== fact.outputText || row.stopped_at !== fact.stoppedAt || row.ended_at !== fact.endedAt
       || row.cancel_requested_at !== (fact.cancelRequestedAt ?? null) || !isDeepStrictEqual(decoded(row.error_json), fact.error)
       || !isDeepStrictEqual(decoded(row.usage_json), fact.usage ?? null) || !isDeepStrictEqual(decoded(row.cleanup_json), expectedCleanup)) return false;
@@ -1570,6 +1749,10 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if (!answer || answer.text !== (fact.outputText ?? "")) return false;
     }
     if(this.p5&&row.kind==='agent'&&this.inputs.hasPendingInputsForRun(runId))return false;
+    if('childResult' in fact) {
+      if(!isDeepStrictEqual(decoded(row.child_result_json??null),fact.childResult)||!this.db.query('SELECT id FROM runtime_events WHERE run_id=? AND type=?').get(runId,`run_${fact.status}`)
+        ||this.db.query('SELECT id FROM answers WHERE run_id=?').get(runId))return false;
+    }
     const saved = this.calls(runId), expected = "calls" in fact ? fact.calls : fact.call ? [fact.call] : [];
     return saved.length === expected.length && expected.every(call => {
       const original = saved.find(item => item.callId === call.callId);
@@ -1686,7 +1869,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   verifyPriorHistoryFacts(runId:number) {
     id(runId);return this.inputRead(()=>this.db.transaction(()=>{
       const row=this.row(runId);if(!row)fail('run_not_found');
-      if(row.kind!=='agent'||checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.historyContract!=='medclaw.history/p9-v1')return {requiredPersistenceComplete:true,unconfirmedItems:[] as string[]};
+      if(row.kind!=='child'&&(row.kind!=='agent'||checked(agentConfigSchema,decoded(row.config_json),'storage_read_failed').agent.historyContract!=='medclaw.history/p9-v1'))return {requiredPersistenceComplete:true,unconfirmedItems:[] as string[]};
       try {
         if(!this.memory||row.session_id===null)fail('session_history_invalid');
         const snapshot=this.memory.loadInTransaction(row.session_id),ids=new Set(snapshot.entries.map(value=>(value as {id:string}).id));
@@ -1700,9 +1883,12 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   read(request: z.input<typeof ReadRunRequestSchema>): ReadRunResult {
     const input = checked(ReadRunRequestSchema, request);
     if ("recent" in input) {
-      const rows = this.db.query<RunRow, [number, number | null, number | null, string | null, string | null, number]>(
-        "SELECT * FROM runs WHERE id<? AND (? IS NULL OR session_id=?) AND (? IS NULL OR kind=?) ORDER BY id DESC LIMIT ?",
-      ).all(input.beforeRunId ?? Number.MAX_SAFE_INTEGER, input.sessionId ?? null, input.sessionId ?? null, input.kind ?? null, input.kind ?? null, input.limit + 1);
+      if ('parentRunId' in input && this.row(input.parentRunId)?.kind !== 'agent') fail('access_denied');
+      const rows = 'parentRunId' in input
+        ? this.db.query<RunRow, [number, number, number]>("SELECT * FROM runs WHERE kind='child' AND parent_run_id=? AND id<? ORDER BY id DESC LIMIT ?").all(input.parentRunId, input.beforeRunId ?? Number.MAX_SAFE_INTEGER, input.limit + 1)
+        : this.db.query<RunRow, [number, number | null, number | null, string | null, string | null, number]>(
+          "SELECT * FROM runs WHERE kind IN ('provider','agent') AND id<? AND (? IS NULL OR session_id=?) AND (? IS NULL OR kind=?) ORDER BY id DESC LIMIT ?",
+        ).all(input.beforeRunId ?? Number.MAX_SAFE_INTEGER, input.sessionId ?? null, input.sessionId ?? null, input.kind ?? null, input.kind ?? null, input.limit + 1);
       const page = rows.slice(0, input.limit);
       return { kind: "recent", runs: page.map((row) => {
         const { output, calls, inputPage, cleanup, ...summary } = this.view(row);
@@ -1711,6 +1897,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
           resourcesReleased: cleanup.resourcesReleased, unconfirmedCount: cleanup.unconfirmedItems.length,
           secondaryErrorCount: cleanup.secondaryErrors.length, verifiedAt: cleanup.verifiedAt } : null;
         if (cleanupSummary && cleanup?.budgetSummary !== undefined) Object.assign(cleanupSummary, { budgetSummary: cleanup.budgetSummary });
+        if (summary.kind === 'child') { const { nextCallOffset, childResult, ...childSummary } = summary; return checked(RecentRunViewSchema, { ...childSummary, inputText: safePreview(row.input_text, 2048).text, cleanupSummary }); }
         if ("nextCallOffset" in summary) { const { nextCallOffset, ...agentSummary } = summary; return checked(RecentRunViewSchema, { ...agentSummary, inputText: safePreview(row.input_text, 2048).text, cleanupSummary }); }
         return checked(RecentRunViewSchema, { ...summary, inputText: safePreview(row.input_text, 2048).text, cleanupSummary });
       }),
@@ -1723,7 +1910,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   }
 
   active(): { runId: number; kind: "provider" | "agent"; sessionId: number | null } | null {
-    const row = this.db.query<{ id: number; kind: "provider" | "agent"; session_id: number | null }, []>("SELECT id,kind,session_id FROM runs WHERE status IN ('created','running')").get();
+    const row = this.db.query<{ id: number; kind: "provider" | "agent"; session_id: number | null }, []>("SELECT id,kind,session_id FROM runs WHERE kind IN ('provider','agent') AND status IN ('created','running')").get();
     return row ? { runId: row.id, kind: row.kind, sessionId: row.session_id } : null;
   }
 

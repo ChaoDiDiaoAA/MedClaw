@@ -39,16 +39,20 @@ function schema9() {
       .run(entry.id,entry.parentId,i+1,entry.type,JSON.stringify(entry),memoryAt);
   }).immediate();
   const tables = db.query<{name:string},[]>("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations' ORDER BY name").all().map(row=>row.name);
-  const rows = tables.map(name=>db.query(`SELECT * FROM ${name} ORDER BY id`).all());
+  const rows = tables.map(name=>db.query<Record<string, unknown>, []>(`SELECT * FROM ${name} ORDER BY id`).all());
   return { root,path,db,tables,rows };
 }
 
 test('p10 schema9 migration preserves complete old rows and native/P8 references while admitting only explicit manual ownership', () => {
   const f = schema9(); let db = f.db;
   try {
-    db.close(); db = openDatabase(f.path); expect(SCHEMA_VERSION).toBe(11);
-    for (const [i,name] of f.tables.entries()) expect(db.query(`SELECT * FROM ${name} ORDER BY id`).all()).toEqual(f.rows[i]);
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(11);
+    db.close(); db = openDatabase(f.path); expect(SCHEMA_VERSION).toBe(12);
+    for (const [i,name] of f.tables.entries()) {
+      const rows = db.query<Record<string, unknown>, []>(`SELECT * FROM ${name} ORDER BY id`).all();
+      expect(rows.map((row, n) => Object.fromEntries(Object.keys(f.rows[i]![n]!).map(key => [key, row[key]])))).toEqual(f.rows[i]);
+    }
+    expect(db.query<Record<string, unknown>, []>('SELECT parent_run_id,origin_tool_call_id,child_result_json FROM runs').all().every(row => Object.values(row).every(value => value === null))).toBe(true);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(12);
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]); expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
     expect(db.query('PRAGMA foreign_keys').get()).toEqual({foreign_keys:1});
     const metadata = { compaction: { contract: 'medclaw.compaction/v1', operationRef: 'manual', source: 'manual', reason: 'manual', ordinal: 1 } };

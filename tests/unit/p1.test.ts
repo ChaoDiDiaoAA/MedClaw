@@ -241,6 +241,7 @@ describe("P1 public and private protocol", () => {
       "import.preview", "import.commit", "import.read", "import.cancel", "import.recover", "evidence.readOperation", "evidence.readArtifact",
       "event.read", "event.subscribe", "context.read",
       "resources.list", "resources.select", "resources.read",
+      "extensions.read", "extensions.select", "extensions.command",
     ].sort());
     for (const method of ["credential.read", "credential.modify.begin", "file.resolve", "settings.prepare", "host.shutdown", "diagnostics.export", "executeShell", "__proto__"]) {
       expect(() => parsePublicPayload(method, {})).toThrow();

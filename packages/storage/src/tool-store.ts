@@ -16,6 +16,7 @@ import { InputContentSchema } from '../../contracts/src/session';
 import { WorkspaceContextSchema } from '../../contracts/src/workspace';
 import { ModelCallContextSchema, ContextSnapshotBodySchema } from '../../contracts/src/context';
 import { FrozenRunResourcesSchema, ResourceReadFactSchema, resourceRefKey, type ResourceReadFact } from '../../contracts/src/resources';
+import { readFrozenChild, canReadRelatedQuery } from './child-identity';
 
 const knownErrors = new Set(["invalid_argument", "access_denied", "state_conflict", "operation_not_found", "runtime_interrupted", "storage_read_failed", "storage_write_failed"]);
 function fail(code: string): never { throw new Error(code); }
@@ -114,12 +115,34 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
     const { signal: _signal, ...identity } = context;
     if (!("nativeToolCallId" in identity ? ToolContextIdentitySchema : ToolContextFieldsSchema.omit({ nativeToolCallId: true })).safeParse(identity).success) fail("invalid_argument");
     if ("source" in context && (!["agent_tool", "intent", "user_form"].includes(context.source) || !context.callRef)) fail("invalid_argument");
-    const run = this.db.query<{ input_id?:number|null; config_json:string; workspace_json: string | null; session_id: number; status: string; scope_json: string; reference_date: string; timezone: string }, [number]>(
+    const run = this.db.query<{ kind:string; input_id?:number|null; config_json:string; workspace_json: string | null; session_id: number; status: string; scope_json: string; reference_date: string; timezone: string }, [number]>(
       "SELECT * FROM runs WHERE id=?").get(context.runId);
     if (!run || run.session_id !== context.sessionId || run.reference_date !== context.referenceDate || run.timezone !== context.timezone) fail("access_denied");
     if('inputId' in context && context.inputId !== (run.input_id ?? null)) fail('access_denied');
     const scope = RunScopeSchema.safeParse(decode(run.scope_json));
     if (!scope.success || !isDeepStrictEqual(scope.data, context.scope)) fail("access_denied");
+    if(run.kind==='child') {
+      const frozen=readFrozenChild(this.db,context.runId);
+      // Public historical reads use the exact frozen child owner without inventing a model/tool call.
+      if(!('nativeToolCallId' in context)){
+        if(active||context.source!=='user_form'||context.inputId!==null)fail('access_denied');
+        return;
+      }
+      if(!('nativeToolCallId' in context)||!context.delegationSource||context.workspaceContext!==null||context.workspaceInputId!==null||context.basedOnQueryId!==null||context.workspaceRevision!==undefined
+        ||context.contextSnapshotId==null||!context.modelCallId)fail('access_denied');
+      const owner=this.db.query<{snapshot_json:string;input_id:number|null;model_json:string},[number,string,number,number]>(`SELECT s.snapshot_json,s.input_id,c.model_json FROM context_snapshots s JOIN model_calls c ON c.run_id=s.run_id AND c.session_id=s.session_id
+        WHERE s.id=? AND c.call_id=? AND s.run_id=? AND s.session_id=? AND c.input_id IS NULL`).get(context.contextSnapshotId,context.modelCallId,context.runId,context.sessionId);
+      if(!owner)fail('access_denied');
+      const body=ContextSnapshotBodySchema.safeParse(decode(owner.snapshot_json)),model=decode(owner.model_json) as {context?:unknown},marker=ModelCallContextSchema.safeParse(model.context);
+      if(!body.success||!marker.success)fail('storage_read_failed');
+      if(owner.input_id!==null||marker.data.inputId!==null||marker.data.snapshotId!==context.contextSnapshotId||body.data.workspaceContext!==null
+        ||!isDeepStrictEqual(body.data.delegationSource,context.delegationSource)||!isDeepStrictEqual(marker.data.delegationSource,context.delegationSource)
+        ||context.delegationSource.parentRunId!==frozen.parentRunId||context.delegationSource.originToolCallId!==frozen.originToolCallId
+        ||context.delegationSource.parentSnapshotId!==frozen.originSnapshotId||context.delegationSource.promptHash!==frozen.promptHash)fail('access_denied');
+      if(active&&run.status!=='running')fail('state_conflict');
+      return;
+    }
+    if('delegationSource' in context&&context.delegationSource!==undefined)fail('access_denied');
     const p8 = this.p3 && this.db.query("SELECT id FROM runs WHERE id=? AND json_extract(config_json,'$.agent.contextContract')='medclaw.context/v1'").get(context.runId) !== null;
     if (p8 && 'nativeToolCallId' in context) {
       if (context.contextSnapshotId == null || !context.modelCallId || !context.workspaceContext || context.workspaceInputId == null) fail('state_conflict');
@@ -293,7 +316,8 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
         return;
       }
       this.db.query("UPDATE tool_calls SET delivery_json=? WHERE id=?").run(json({ ...this.delivery(row), contract: "medclaw.tool-delivery/v1", resultRecorded: true, sdkReturned: true, nativeEntryId,
-        deliveredAt: new Date().toISOString(), nextModelCallId: null, consumedAt: null, error: null,
+        deliveredAt: new Date().toISOString(), nextModelCallId: null, consumedAt: null,
+        error:row.tool_name==='Agent'&&row.status==='succeeded'&&message?.isError?safeError('tool_delivery_failed',undefined,{runId:row.run_id,sessionId:row.session_id,toolCallId:row.id}):null,
         ...(message !== undefined ? { message } : {}) }), row.id);
     }), "storage_write_failed");
   }
@@ -306,8 +330,9 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       if (record.resourceRead) { if (!isDeepStrictEqual(record.resourceRead, fact)) fail('state_conflict'); return; }
       if (record.name !== 'read' || record.status !== 'succeeded' || !record.sdkReturned || !record.nativeEntryId || !record.sdkDelivery || record.sdkDelivery.isError) fail('state_conflict');
       const config = this.db.query<{ config_json: string }, [number, number]>('SELECT config_json FROM runs WHERE id=? AND session_id=?').get(context.runId, context.sessionId);
-      const frozen = FrozenRunResourcesSchema.safeParse((config ? decode(config.config_json) as { agent?: { resources?: unknown } } : null)?.agent?.resources);
-      if (!frozen.success || frozen.data.sessionId !== context.sessionId) fail('state_conflict');
+      const child=context.delegationSource?readFrozenChild(this.db,context.runId):null;
+      const frozen = FrozenRunResourcesSchema.safeParse(child?.resources??(config ? decode(config.config_json) as { agent?: { resources?: unknown } } : null)?.agent?.resources);
+      if (!frozen.success || frozen.data.sessionId !== (child?.parentSessionId??context.sessionId)) fail('state_conflict');
       const snapshot = frozen.data.available.find(s => resourceRefKey(s.ref) === resourceRefKey(fact.resourceRef)), file = snapshot?.files.find(f => f.file === fact.file);
       if (!file || file.sha256 !== fact.fileHash || createHash('sha256').update(file.content).digest('hex') !== file.sha256
         || createHash('sha256').update(canonicalRequest(record.sdkDelivery.content)).digest('hex') !== fact.returnedContentHash) fail('state_conflict');
@@ -422,6 +447,13 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   }
   readEvidence(evidenceId: number): Evidence | null {
     return protect(() => { id(evidenceId); const row = this.db.query<EvidenceRow, [number]>("SELECT * FROM query_evidence WHERE id=?").get(evidenceId); return row ? this.evidence(row) : null; }, "storage_read_failed");
+  }
+  readChildQuery(queryId: number, context: ToolExecutionContext): QueryRecord | null {
+    return protect(()=>{
+      id(queryId);this.identity(context,false);
+      const record=this.readQuery(queryId);
+      return record&&canReadRelatedQuery(this.db,context.runId,context.sessionId,record)?record:null;
+    },'storage_read_failed');
   }
   listEvidence(queryId: number): Evidence[] {
     return protect(() => { id(queryId); return this.db.query<EvidenceRow, [number]>("SELECT * FROM query_evidence WHERE query_id=? ORDER BY id").all(queryId).map(row => this.evidence(row)); }, "storage_read_failed");

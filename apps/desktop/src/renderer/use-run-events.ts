@@ -189,7 +189,7 @@ export function useRunEvents(host: HostView, run: RunView | null, enabled: boole
   const cache = useRef(new Map<number, RunEventProjection>()), controller = useRef<RunEventSubscription | null>(null);
   const terminal = useRef(onTerminal); terminal.current = onTerminal;
   const [, render] = useState(0), [visible, setVisible] = useState(() => !document.hidden);
-  const agent = run?.kind === 'agent' ? run : null;
+  const agent = run&&run.kind!=='provider' ? run : null;
   let projection = agent ? cache.current.get(agent.id) : null;
   if (agent && !projection) {
     projection = new RunEventProjection(agent.id, agent.sessionId); cache.current.set(agent.id, projection);

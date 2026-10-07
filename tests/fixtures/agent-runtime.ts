@@ -38,13 +38,14 @@ import { sqliteHistory } from '../fixtures/p9-memory';
 import { restoreNativeManager } from '../../packages/runtime-pi/src/memory-store';
 import type { AnyToolDefinition } from '../../packages/contracts/src/tool';
 
-export async function agentRuntimeFixture(respond?: (index: number, payload: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>, extensions = false) {
+export async function agentRuntimeFixture(respond?: (index: number, payload: Record<string, unknown>) => Promise<Record<string, unknown> | Response> | Record<string, unknown> | Response, extensions = false, usage?: (index:number)=>{prompt_tokens:number;completion_tokens:number;total_tokens:number}) {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p11-runtime-')), author = join(root, 'author'); cpSync(resolve('resources'), author, { recursive: true });
   const db = openDatabase(join(root, 'app.sqlite')), requests: Record<string, unknown>[] = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     requests.push(await request.json() as Record<string, unknown>);
     const delta = await respond?.(requests.length, requests.at(-1)!) ?? { role: 'assistant', content: 'ENGINEERING response; no quality claim.' };
-    return new Response(`data: ${JSON.stringify({ id: 'fixture', model: 'fixture', choices: [{ index: 0, delta, finish_reason: 'tool_calls' in delta ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+    if(delta instanceof Response)return delta;
+    return new Response(`data: ${JSON.stringify({ id: 'fixture', model: 'fixture', choices: [{ index: 0, delta, finish_reason: 'tool_calls' in delta ? 'tool_calls' : 'stop' }],...(usage?{usage:usage(requests.length)}:{}) })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
   } });
   const credentials = new InMemoryCredentialStore(); await credentials.modify('p11-fixture', async () => ({ type: 'api_key', key: 'engineering' }));
   const runtime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
@@ -53,7 +54,7 @@ export async function agentRuntimeFixture(respond?: (index: number, payload: Rec
   const history = sqliteHistory(db), repos = new Repositories(db, undefined, undefined, undefined, history.store), contexts = new SqliteContextStore(db);
   const catalog = new CatalogService(new SqliteCatalogStore(db)), toolStore = new SqliteToolStore(db), queries = new QueryService(catalog, toolStore), evidence = new EvidenceReader(catalog, queries, toolStore);
   const registry = new ToolRegistry(createBusinessTools({ catalog, queries, evidence })), errors: unknown[] = [], recorder = new ToolRecorder(toolStore, (error,context) => {errors.push(error);app.runs.failToolPersistence(context.runId,error);});
-  const configure = (_configuration:unknown, extraDefinitions:readonly AnyToolDefinition[]=[]) => {const combined=new ToolRegistry([...registry.definitions,...extraDefinitions]);return {registry:combined,executor:new ToolExecutor(combined,recorder)};};
+  const configure = (_configuration:unknown, extraDefinitions:readonly AnyToolDefinition[]=[]) => {const combined=new ToolRegistry([...registry.definitions,...extraDefinitions]);return {registry:combined,executor:new ToolExecutor(combined,recorder,{findCommittedChild:context=>repos.findCommittedChild(context)})};};
   const agent = new PiAgentRuntime(runtime, root, history, { registry, recorder, executor: new ToolExecutor(registry, recorder), configure }, new ContextService(contexts, { inspectManagedImport: async () => ({ status: 'valid' as const }) }),join(author,'extensions'));
   const allocated = agent.allocate(); repos.createSession({ expectedWorkspaceRevision: 0 }, 'create-a', allocated.nativeSessionId, new Date().toISOString(), allocated.history); allocated.bind(1);
   const catalogue = ResourceCatalogueSchema.parse(JSON.parse(readFileSync(join(author, 'catalog.json'), 'utf8'))), prompt = catalogue.definitions.find(r => r.kind === 'prompt')!, skill = catalogue.definitions.find(r => r.kind === 'skill')!;

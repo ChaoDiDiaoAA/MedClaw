@@ -18,7 +18,7 @@ import { BUSINESS_RULES, createQuerySchemas, EvidenceViewSchema, PageSchema, Que
 import { TOOL_READ_RULES, RunToolsViewSchema } from './tool';
 import { StoredToolConfigurationSchema, normalizeToolConfiguration } from './tool-config';
 import { RuntimeConfigurationSchema, normalizeRuntimeConfiguration, projectRuntimePolicies } from './runtime-config';
-import { ReadSessionMessagesInputSchema, SessionMessagePageSchema } from "./messages";
+import { ReadSessionMessagesRequestSchema, SessionMessagePageSchema } from "./messages";
 import { ReadContextInputSchema, ContextReadResultSchema } from './context';
 import { ReadSessionCheckpointsInputSchema, RestoreSessionCheckpointInputSchema, SessionCheckpointPageSchema, SessionCheckpointReceiptSchema, RestoreSessionInputSchema } from './session';
 import { CompactSessionInputSchema, ReadCompactionInputSchema, CompactionOperationViewSchema, CancelCompactionResultSchema, CompactionPhaseSchema } from './session';
@@ -28,8 +28,8 @@ import { ExtensionAssemblyProofSchema, ExtensionDescriptorSchema, ExtensionSelec
 
 import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, EventSubscribeResultSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema } from './event';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p12-v1" as const;
-export const DATABASE_SCHEMA_VERSION = 11 as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p13-v1" as const;
+export const DATABASE_SCHEMA_VERSION = 12 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
@@ -154,7 +154,7 @@ export const publicMethodSchemas = {
   "session.readManagementOperation": { input: ReadManagementOperationInputSchema, output: SessionManagementReceiptSchema.nullable() },
   "session.list": { input: ListSessionsRequestSchema, output: SessionPageSchema },
   "session.read": { input: z.strictObject({ sessionId: PositiveIdSchema }), output: SessionDetailSchema.nullable() },
-  "session.messages.read": { input: ReadSessionMessagesInputSchema, output: SessionMessagePageSchema },
+  "session.messages.read": { input: ReadSessionMessagesRequestSchema, output: SessionMessagePageSchema },
   "session.checkpoints.read": { input: ReadSessionCheckpointsInputSchema, output: SessionCheckpointPageSchema },
   "session.restoreCheckpoint": { input: RestoreSessionCheckpointInputSchema, output: SessionCheckpointReceiptSchema },
   "session.restore": { input: RestoreSessionInputSchema, output: SessionDetailSchema },
@@ -177,7 +177,10 @@ export const publicMethodSchemas = {
   'data.delete.recover': {input:DataDeleteReferenceSchema,output:DataDeleteOperationSchema},
   'query.execute': { input: z.strictObject({ params: QueryRequestParamsSchema, expectedRevision: z.number().int().nonnegative() }), output: QueryViewSchema },
   'query.read': { input: PageSchema.extend({ page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional(), queryId: PositiveIdSchema }), output: QueryViewSchema },
-  'query.list': { input: z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.optional() }), output: z.strictObject({ items: z.array(QuerySummarySchema), nextBeforeQueryId: PositiveIdSchema.nullable() }) },
+  'query.list': { input: z.union([
+    z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.optional() }),
+    z.strictObject({ childRunId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.optional() }),
+  ]), output: z.strictObject({ items: z.array(QuerySummarySchema), nextBeforeQueryId: PositiveIdSchema.nullable() }) },
   'evidence.read': { input: PageSchema.extend({ page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional(), queryId: PositiveIdSchema, evidenceId: PositiveIdSchema }), output: EvidenceViewSchema },
   'tool.read': { input: z.strictObject({ runId: PositiveIdSchema, page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional() }), output: RunToolsViewSchema },
   "import.preview": { input: ImportPreviewRequestSchema, output: ImportPreviewSchema },
@@ -214,7 +217,10 @@ export function createPublicMethodSchemas() {
     'data.read': { ...publicMethodSchemas['data.read'], input: query.PageSchema },
     'data.rows': { ...publicMethodSchemas['data.rows'], input: query.PageSchema.extend({ kind: z.enum(['devices', 'changes']), batchId: PositiveIdSchema }) },
     'query.read': { ...publicMethodSchemas['query.read'], input: query.PageSchema.extend({ queryId: PositiveIdSchema }) },
-    'query.list': { ...publicMethodSchemas['query.list'], input: z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.max(presentation.maxPageSize).default(presentation.defaultPageSize) }) },
+    'query.list': { ...publicMethodSchemas['query.list'], input: z.union([
+      z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.max(presentation.maxPageSize).default(presentation.defaultPageSize) }),
+      z.strictObject({ childRunId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.max(presentation.maxPageSize).default(presentation.defaultPageSize) }),
+    ]) },
     'evidence.read': { ...publicMethodSchemas['evidence.read'], input: query.PageSchema.extend({ queryId: PositiveIdSchema, evidenceId: PositiveIdSchema, pageSize: PositiveIdSchema.max(BUSINESS_RULES.maxPageSize).default(BUSINESS_RULES.evidencePageSize) }) },
     'tool.read': { ...publicMethodSchemas['tool.read'], input: z.strictObject({ runId: PositiveIdSchema, page: PositiveIdSchema.default(presentation.defaultPage), pageSize: PositiveIdSchema.max(presentation.maxPageSize).default(presentation.defaultPageSize) }).refine(value => Number.isSafeInteger((value.page - 1) * value.pageSize), 'Page offset must be a safe integer') },
   };

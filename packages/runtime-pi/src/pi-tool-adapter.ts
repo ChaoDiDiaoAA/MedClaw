@@ -20,6 +20,7 @@ import { canonicalRequest } from '../../contracts/src/run';
 import type { FrozenRunResources } from '../../contracts/src/resources';
 import { verifyRunResourceFiles } from './resource-loader';
 import { contextMessageText } from './messages';
+import { NativeAgentReplySchema } from '@medclaw/contracts/subagent';
 
 // Pi 0.87.1 path aliases, used only for attribution; its public tool still performs the actual read.
 async function canonicalReadPath(input: string, cwd: string): Promise<string | null> {
@@ -52,6 +53,7 @@ export function createFrozenToolContextFactory(readContext: ToolContextFactory,
     const context = readContext(nativeToolCallId, signal);
     const frozen = { ...context, scope: structuredClone(context.scope),
       ...(context.workspaceContext === undefined ? {} : { workspaceContext: structuredClone(context.workspaceContext) }),
+      ...(context.delegationSource === undefined ? {} : { delegationSource: structuredClone(context.delegationSource) }),
       ...(context.toolConfiguration === undefined ? {} : { toolConfiguration: structuredClone(context.toolConfiguration) }) };
     cache.set(nativeToolCallId, frozen);
     return frozen;
@@ -99,6 +101,10 @@ function finalBusinessInput(tool: AnyToolDefinition, id: string, original: unkno
   return parsed.success ? parsed.data : final.value;
 }
 function matchesRecordedResult(record: ToolCallRecord, message: ToolResultMessage): boolean {
+  if(record.name==='Agent'&&record.status==='succeeded') {
+    const reply=NativeAgentReplySchema.safeParse(record.data);
+    return reply.success&&!message.isError&&isDeepStrictEqual(reply.data.content,message.content)&&isDeepStrictEqual(reply.data.details,message.details);
+  }
   if (record.name !== message.toolName || message.content.length !== 1 || message.content[0]?.type !== "text") return false;
   let payload: unknown;
   try { payload = JSON.parse(message.content[0].text); } catch { return false; }
@@ -113,6 +119,7 @@ export function createPiToolDefinitions(
   executor: Pick<ToolExecutor, "execute">,
   getContext: ToolContextFactory,
   getControl?: () => RunControl | undefined,
+  options: {preserveNativeResult?:boolean} = {},
 ): PiToolDefinition[] {
   return registry.definitions.map(tool => ({
     name: tool.name,
@@ -123,6 +130,7 @@ export function createPiToolDefinitions(
     async execute(nativeToolCallId, input, signal) {
       const result = await executor.execute(tool.name, input, getContext(nativeToolCallId, signal), getControl?.());
       if (result.status !== "succeeded") throw new Error(JSON.stringify(result));
+      if(options.preserveNativeResult)return nativeResult.parse(NativeAgentReplySchema.parse(result.data));
       return { content: [{ type: "text", text: JSON.stringify(result.data) }], details: result.data };
     },
   }));
@@ -293,9 +301,10 @@ export function createPiRunControlBinding(session: AgentSession, registry: Pick<
     } catch {
       control.updateObservation(id, { postflightStatus: 'failed', hookFailure: { stage: 'afterToolCall', code: 'tool_postprocess_failed' } });
       const record = recorder.read(getContext(id, signal));
+      const code=record?.name==='Agent'&&record.status==='succeeded'?'tool_delivery_failed':'tool_postprocess_failed';
       const queryId = record?.data && typeof record.data === 'object' && 'queryId' in record.data && typeof record.data.queryId === 'number' ? record.data.queryId : null;
-      control.noteFailure(id, { code: 'tool_postprocess_failed', stage: 'after_hook', recordId: record?.id, queryId });
-      checked = { result: { content: [{ type: 'text', text: JSON.stringify(safeError('tool_postprocess_failed')) }], details: {} }, isError: true };
+      control.noteFailure(id, { code, stage: 'after_hook', recordId: record?.id, queryId });
+      checked = { result: { content: [{ type: 'text', text: JSON.stringify(safeError(code)) }], details: {} }, isError: true };
     }
     save(id, signal);
     return { ...checked.result, isError: checked.isError };
@@ -359,15 +368,19 @@ export function createPiNativeTools(
   options: ToolsOptions = {},
   getControl?: () => RunControl | undefined,
   getResources?: () => FrozenRunResources | undefined,
+  allowNames?: readonly string[],
 ): { definitions: PiToolDefinition[]; bind(session: AgentSession): () => void } {
   const getWorkdir = typeof workdir === "string" ? () => workdir : workdir;
   // A session may register tools before its first Run exists. Actual I/O always uses the trusted ctx.cwd below.
   const cwd = typeof workdir === "string" ? workdir : process.cwd();
-  const originals: PiToolDefinition[] = [
-    defineTool(createReadToolDefinition(cwd, options.read)), defineTool(createGrepToolDefinition(cwd, options.grep)), defineTool(createFindToolDefinition(cwd, options.find)),
-    defineTool(createLsToolDefinition(cwd, options.ls)), defineTool(createEditToolDefinition(cwd, options.edit)), defineTool(createWriteToolDefinition(cwd, options.write)),
-    defineTool(createBashToolDefinition(cwd, options.bash)), defineTool(createPowerShellToolDefinition(cwd, options.powershell)),
-  ];
+  const factories: Record<string,()=>PiToolDefinition> = {
+    read:()=>defineTool(createReadToolDefinition(cwd,options.read)), grep:()=>defineTool(createGrepToolDefinition(cwd,options.grep)), find:()=>defineTool(createFindToolDefinition(cwd,options.find)),
+    ls:()=>defineTool(createLsToolDefinition(cwd,options.ls)), edit:()=>defineTool(createEditToolDefinition(cwd,options.edit)), write:()=>defineTool(createWriteToolDefinition(cwd,options.write)),
+    bash:()=>defineTool(createBashToolDefinition(cwd,options.bash)), powershell:()=>defineTool(createPowerShellToolDefinition(cwd,options.powershell)),
+  };
+  const names=allowNames??Object.keys(factories);
+  if(new Set(names).size!==names.length||names.some(name=>!Object.hasOwn(factories,name)))throw safeError('invalid_argument');
+  const originals=names.map(name=>factories[name]!());
   const byName = new Map(originals.map(tool => [tool.name, tool]));
   let session: AgentSession | undefined;
   const identity = (tool: PiToolDefinition): ToolCallIdentity => ({ name: tool.name, version: VERSION,

@@ -7,7 +7,7 @@ import type { NativeSessionBindings, NewSessionInput, NewSessionResult, SelectSe
   ReadManagementOperationInput, SessionManagementReceipt } from "../../../contracts/src/session";
 import type { CommandContext } from "../../../contracts/src/protocol";
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, safeError, serviceResult, type Result } from "../../../contracts/src/error";
-import { ReadSessionMessagesInputSchema, SessionMessagePageSchema, type ReadSessionMessagesInput, type SessionMessagePage } from "../../../contracts/src/messages";
+import { ReadSessionMessagesRequestSchema, SessionMessagePageSchema, type ReadSessionMessagesRequest, type SessionMessagePage } from "../../../contracts/src/messages";
 import { ReadSessionCheckpointsInputSchema, RestoreSessionCheckpointInputSchema, RestoreSessionInputSchema,
   type ReadSessionCheckpointsInput,type RestoreSessionCheckpointInput,type RestoreSessionInput,type SessionCheckpointReceipt } from '../../../contracts/src/session';
 import type { WriteTransactions } from '../../../contracts/src/event';
@@ -152,13 +152,16 @@ export class SessionService {
     if (!existing.ok) return existing;
     return existing.data ? { ok: true, data: existing.data } : this.submitAgent(input, context);
   }
-  readMessages(input: ReadSessionMessagesInput): Promise<Result<SessionMessagePage>> {
+  readMessages(input: ReadSessionMessagesRequest): Promise<Result<SessionMessagePage>> {
     return serviceResult(async () => {
-      const parsed = ReadSessionMessagesInputSchema.safeParse(input);
+      const parsed = ReadSessionMessagesRequestSchema.safeParse(input);
       if (!parsed.success) throw safeError("input_invalid");
-      const session = this.store.readSession(parsed.data.sessionId);
+      const child = 'childRunId' in parsed.data ? this.store.readChildIdentity?.(parsed.data.childRunId) : null;
+      if ('childRunId' in parsed.data && !child) throw safeError('access_denied');
+      const request = 'sessionId' in parsed.data ? parsed.data : { sessionId: child!.childSessionId, leafId: parsed.data.leafId, afterEntryId: parsed.data.afterEntryId, limit: parsed.data.limit };
+      const session = child ? { id: child.childSessionId, nativeSessionId: child.nativeSessionId } : this.store.readSession(request.sessionId);
       if (!session) throw new Error("session_not_found");
-      const native = await this.native.readMessages(parsed.data);
+      const native = await this.native.readMessages(request);
       if (native.sessionId !== session.id || native.nativeSessionId !== session.nativeSessionId || !SessionMessagePageSchema.safeParse(native).success) throw safeError("session_history_invalid");
       const links = this.store.readMessageLinks(session.id, native.items.map(item => item.nativeEntryId));
       const inputLinks = this.store.readMessageInputLinks(session.id, native.items.map(item => item.nativeEntryId));
@@ -179,7 +182,7 @@ export class SessionService {
       const result = SessionMessagePageSchema.safeParse({ ...native, items });
       if (!result.success) throw safeError("session_history_invalid");
       return result.data;
-    }, "storage_read_failed", { sessionId: input.sessionId });
+    }, "storage_read_failed", 'sessionId' in input ? { sessionId: input.sessionId } : { runId: input.childRunId });
   }
   readSubmission(input: ReadSubmissionRequest) { return serviceResult(() => {
     const request = ReadSubmissionRequestSchema.parse(input);

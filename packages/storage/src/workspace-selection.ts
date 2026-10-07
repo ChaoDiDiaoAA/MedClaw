@@ -125,7 +125,7 @@ export function freezeWorkspaceScope(db: Database, workspace: WorkspaceView, too
     const ids = selected.batchRefs.map(batch => batch.id);
     const batches = readWorkspaceBatchReferences(db, ids);
     if (!isDeepStrictEqual(batches.refs, selected.batchRefs) || batches.materialVersion !== selected.materialVersion) fail("access_denied");
-    const names = [...toolNames], supported = new Set([...Object.keys(businessToolSchemas), "read", "grep", "find", "ls", "edit", "write", "bash", "powershell", "extension_runtime_status"]);
+    const names = [...toolNames], supported = new Set([...Object.keys(businessToolSchemas), "read", "grep", "find", "ls", "edit", "write", "bash", "powershell", "extension_runtime_status", "Agent"]);
     if (new Set(names).size !== names.length || names.some(name => !supported.has(name))) fail("invalid_argument");
     for (const deviceId of selected.deviceIds) {
       if (!ids.some(batchId => db.query("SELECT id FROM snapshots WHERE batch_id=? AND device_id=?").get(batchId, deviceId))) fail("access_denied");

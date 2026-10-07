@@ -671,7 +671,8 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   async function closeDetails() { await updateUi({ detailOpen: false }); detailsButton.current?.focus(); }
   const current = workspace?.sessionId && !deletedSessions.current.has(workspace.sessionId) ? workspace.sessionId : null, currentDetail = current ? details[current] ?? null : null, draft = current ? drafts[current] ?? null : null;
   const runEvents = useRunEvents(host, run, page === 'chat' || ui.detailOpen && ui.detailTab === 'runtime', (runId, sessionId) => {
-    void readActive(); void readRun(runId); void readSession(sessionId); void refreshInputs(sessionId);
+    void readActive();void readRun(runId);
+    if(runRef.current?.kind!=='child'||runRef.current.id!==runId){void readSession(sessionId);void refreshInputs(sessionId);}
   });
   const runningSession = sessions.find(s => s.id === active?.sessionId);
   const queueRun = current && currentDetail?.session.inputControl ? selectedRuns.current.get(current) ?? null : null;

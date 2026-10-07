@@ -8,6 +8,7 @@
     "./tool-config": "./src/tool-config.ts",
     "./runtime-config": "./src/runtime-config.ts",
     "./run": "./src/run.ts",
+    "./subagent": "./src/subagent.ts",
     "./context": "./src/context.ts",
     "./resources": "./src/resources.ts",
     "./extensions": "./src/extensions.ts",

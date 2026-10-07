@@ -287,8 +287,12 @@ export class QueryService {
   }
   read(queryId: number, context: QueryContext): QueryRecord {
     this.catalog.assertContext(context); if (this.store.assertReadContext) this.store.assertReadContext(context); else this.store.assertContext(context);
-    const record = this.store.readQuery(PositiveIdSchema.parse(queryId),context.sessionId);
-    if (!record || record.sessionId !== context.sessionId) throw new Error("access_denied");
+    const delegated='nativeToolCallId' in context&&context.delegationSource!==undefined;
+    const id=PositiveIdSchema.parse(queryId);
+    const own=delegated?null:this.store.readQuery(id,context.sessionId);
+    if(own&&own.sessionId!==context.sessionId)throw new Error('access_denied');
+    const record = own ?? ('nativeToolCallId' in context&&context.modelCallId&&context.contextSnapshotId!=null ? this.store.readChildQuery?.(id,context) : null);
+    if (!record) throw new Error("access_denied");
     const batches = this.catalog.batches(record.batchIds, context);
     if (record.id !== queryId || 'kind' in record.params && record.params.kind !== record.kind
       || record.kind === 'current' && record.batchIds.some(id => !record.params.batchIds.includes(id))

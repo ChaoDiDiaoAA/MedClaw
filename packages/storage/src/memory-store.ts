@@ -2,11 +2,12 @@ import type { Database } from 'bun:sqlite';
 import { canonicalRequest } from '../../contracts/src/run';
 import { OpaqueIdSchema, PositiveIdSchema, safeError, serviceResult } from '../../contracts/src/error';
 import { RevisionSchema } from '../../contracts/src/workspace';
-import { NATIVE_HISTORY_FORMAT, type MemoryStore, type NativeHistorySnapshot, type NativeHistoryCommit } from '../../contracts/src/session';
+import { NATIVE_HISTORY_FORMAT, type MemoryStore, type NativeHistorySnapshot, type NativeHistoryCommit, type InitialNativeHistory } from '../../contracts/src/session';
 import type { EventWriter, WriteTransactions } from '../../contracts/src/event';
 import { SqliteWriteTransactions } from './write-transactions';
 import { SqliteEventStore } from './event-store';
 import { RegisteredEventPayloadSchema } from '../../contracts/src/event';
+import { readFrozenChild } from './child-identity';
 
 type SessionRow={id:number;native_session_id:string;kind:string;status:string;native_header_json:string|null;history_format_version:string|null;current_leaf_id:string|null;storage_version:number};
 type EntryRow={session_id:number;native_entry_id:string;parent_entry_id:string|null;sequence:number;entry_type:string;entry_json:string;run_id:number|null};
@@ -28,7 +29,10 @@ export class SqliteMemoryStore implements MemoryStore {
     PositiveIdSchema.parse(sessionId);
     const row=this.db.query<SessionRow,[number]>('SELECT * FROM sessions WHERE id=?').get(sessionId);
     if(!row)throw safeError('input_invalid',undefined,{reason:'session_not_found'});
-    if(row.kind!=='user')throw safeError('access_denied');return row;
+    if(row.kind==='child') {
+      const owner=this.db.query<{id:number},[number]>("SELECT id FROM runs WHERE session_id=? AND kind='child'").get(row.id);
+      if(!owner||readFrozenChild(this.db,owner.id).childSessionId!==row.id)throw safeError('access_denied');
+    } else if(row.kind!=='user')throw safeError('access_denied');return row;
   }
   private rows(sessionId:number):EntryRow[] {return this.db.query<EntryRow,[number]>('SELECT * FROM memories WHERE session_id=? ORDER BY sequence').all(sessionId);}
   private read(session:SessionRow):NativeHistorySnapshot {
@@ -36,7 +40,8 @@ export class SqliteMemoryStore implements MemoryStore {
     const rows=this.rows(session.id),entries=rows.map((row,i)=>{
       const value=decode(row.entry_json) as EntryIdentity;
       if(!value||row.sequence!==i+1||value.id!==row.native_entry_id||value.parentId!==row.parent_entry_id||value.type!==row.entry_type)invalid();
-      if(row.run_id!==null&&!this.db.query("SELECT id FROM runs WHERE id=? AND session_id=? AND kind='agent'").get(row.run_id,session.id))invalid();
+      if(row.run_id!==null&&!this.db.query("SELECT id FROM runs WHERE id=? AND session_id=? AND kind=?").get(row.run_id,session.id,session.kind==='child'?'child':'agent'))invalid();
+      if(session.kind==='child'&&row.run_id===null)invalid();
       return value;
     });
     return this.validate({sessionId:session.id,nativeSessionId:session.native_session_id,header:decode(session.native_header_json),entries,activeLeafId:session.current_leaf_id,storageVersion:session.storage_version});
@@ -60,6 +65,22 @@ export class SqliteMemoryStore implements MemoryStore {
       const result=this.commitInTransaction(change);this.beforeCommit?.();return result;
     }),'storage_write_failed'),'storage_write_failed',{sessionId:change.sessionId,...(change.runId!==null?{runId:change.runId}:{})});
   }
+  /** Initial SDK model/thinking entries belong to the same version-1 child registration. */
+  initializeChildInTransaction(sessionId:number,runId:number,history:InitialNativeHistory):void {
+    this.transactions.assertActive();
+    const session=this.session(sessionId);
+    if(session.kind!=='child'||session.storage_version!==1||session.current_leaf_id!==null||this.rows(sessionId).length
+      ||readFrozenChild(this.db,runId).childSessionId!==sessionId)throw safeError('state_conflict');
+    const initial=this.validate({sessionId,nativeSessionId:session.native_session_id,header:history.header,entries:history.entries,activeLeafId:history.activeLeafId,storageVersion:1});
+    if(canonicalRequest(initial.header)!==canonicalRequest(decode(session.native_header_json!))
+      ||initial.entries.some(value=>!['model_change','thinking_level_change'].includes((value as EntryIdentity).type)))invalid();
+    for(const [index,value] of initial.entries.entries()) {
+      const entry=value as EntryIdentity;
+      this.db.query('INSERT INTO memories(session_id,native_entry_id,parent_entry_id,sequence,entry_type,entry_json,run_id,recorded_at) VALUES(?,?,?,?,?,?,?,?)')
+        .run(sessionId,entry.id,entry.parentId,index+1,entry.type,canonicalRequest(value),runId,new Date().toISOString());
+    }
+    this.db.query('UPDATE sessions SET current_leaf_id=? WHERE id=?').run(initial.activeLeafId,sessionId);
+  }
   commitInTransaction(change:NativeHistoryCommit):{storageVersion:number} {
     this.transactions.assertActive();
     return protect(()=>{
@@ -69,9 +90,11 @@ export class SqliteMemoryStore implements MemoryStore {
       if(session.storage_version!==change.expectedStorageVersion)throw safeError('state_conflict',undefined,{reason:'history_version_mismatch'});
       if(change.runId!==null) {
         PositiveIdSchema.parse(change.runId);
-        if(!this.db.query("SELECT id FROM runs WHERE id=? AND session_id=? AND kind='agent'").get(change.runId,session.id))throw safeError('access_denied');
-      }
+        if(!this.db.query("SELECT id FROM runs WHERE id=? AND session_id=? AND kind=?").get(change.runId,session.id,session.kind==='child'?'child':'agent'))throw safeError('access_denied');
+      } else if(session.kind==='child')throw safeError('access_denied');
       const old=this.read(session), oldById=new Map(old.entries.map(value=>[(value as EntryIdentity).id,value]));
+      if(session.kind==='child'&&this.db.query("SELECT id FROM runs WHERE session_id=? AND kind='child' AND child_result_json IS NOT NULL").get(session.id)
+        &&(change.newEntries.length||change.activeLeafId!==old.activeLeafId))throw safeError('state_conflict');
       if(!Array.isArray(change.newEntries))invalid();
       const incoming=new Map<string,unknown>();
       for(const value of change.newEntries) {

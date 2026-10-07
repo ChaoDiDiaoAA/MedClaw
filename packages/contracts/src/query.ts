@@ -255,6 +255,7 @@ export interface QueryStore {
   assertReadContext?(context: QueryContext): void;
   findQuery(callRef: string): QueryRecord | null;
   readQuery(id: number, sessionId?: number): QueryRecord | null;
+  readChildQuery?(id: number, context: ToolExecutionContext): QueryRecord | null;
   readEvidence(id: number): Evidence | null;
   listEvidence(queryId: number): Evidence[];
   commitQuery(query: Omit<QueryRecord, "id">, evidence: Omit<Evidence, "id" | "queryId">[], context: QueryContext): QueryRecord;

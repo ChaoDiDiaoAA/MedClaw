@@ -5,6 +5,7 @@ import { WorkspaceContextSchema } from './workspace';
 import { ReferenceDateSchema, TimezoneSchema } from './model';
 import { FieldOriginsSchema } from './query';
 import { CallResourceContextSchema, ResourcePayloadObservationSchema, type CallResourceContext } from './resources';
+import { DelegationSourceSchema, type DelegationSource } from './subagent';
 
 export const CONTEXT_CONTRACT = 'medclaw.context/v1' as const;
 export const CONTEXT_READ_BYTES = 3 * 1024 * 1024;
@@ -25,6 +26,7 @@ export const ContextSnapshotBodySchema = z.strictObject({
   resourceVersions: z.record(z.string().min(1).max(256), z.string().min(1).max(256)), nativeRefs: z.array(NativeContextRefSchema).max(1000),
   omitted: z.array(z.strictObject({ kind: ContextRefSchema.shape.kind, id: z.string().min(1).max(256), reason: z.literal('capacity'), omittedRows: PositiveIdSchema })).max(10000),
   projectionLimitBytes: PositiveIdSchema.max(CONTEXT_READ_BYTES / 2),
+  delegationSource: DelegationSourceSchema.optional(),
 }).refine(body => new TextEncoder().encode(body.renderedProjection + body.runtimeFeedback).byteLength <= body.projectionLimitBytes, 'Context projection exceeds byte limit');
 export type ContextSnapshotBody = z.infer<typeof ContextSnapshotBodySchema>;
 export const ContextSnapshotSchema = ContextSnapshotBodySchema.safeExtend({ id: PositiveIdSchema, runId: PositiveIdSchema, sessionId: PositiveIdSchema, inputId: PositiveIdSchema.nullable(), sequence: PositiveIdSchema, createdAt: TimestampSchema, deliveredCallIds: z.array(OpaqueIdSchema).max(1000) }).refine(snapshot => snapshot.workspaceContext === null || snapshot.workspaceContext.sessionId === snapshot.sessionId, 'Snapshot session mismatch');
@@ -34,7 +36,11 @@ export type ContextDeliveryObservation = z.infer<typeof ContextDeliveryObservati
 export const NativeHistoryContextSchema = z.strictObject({ contract: z.literal('medclaw.native-history-context/v1'), leafId: OpaqueIdSchema.nullable(), storageVersion: z.number().int().nonnegative().safe(),
   compactionEntryIds: z.array(OpaqueIdSchema).refine(ids => new Set(ids).size === ids.length, 'Duplicate native compaction entries') });
 export type NativeHistoryContext = z.infer<typeof NativeHistoryContextSchema>;
-export const ModelCallContextSchema = z.strictObject({ contract: z.literal('medclaw.context-call/v1'), snapshotId: PositiveIdSchema, inputId: PositiveIdSchema, observation: ContextDeliveryObservationSchema.nullable(), responseStatus: z.number().int().min(100).max(599).nullable(), payloadVerified: z.boolean().nullable(), nativeHistory: NativeHistoryContextSchema.optional(), resources: CallResourceContextSchema.optional() }).refine(context => context.observation === null || context.payloadVerified === true && context.responseStatus === context.observation.httpStatus, 'Observation requires confirmed payload and response')
+const modelContextFields = { contract: z.literal('medclaw.context-call/v1'), snapshotId: PositiveIdSchema, observation: ContextDeliveryObservationSchema.nullable(), responseStatus: z.number().int().min(100).max(599).nullable(), payloadVerified: z.boolean().nullable(), nativeHistory: NativeHistoryContextSchema.optional(), resources: CallResourceContextSchema.optional() };
+export const ModelCallContextSchema = z.union([
+  z.strictObject({ ...modelContextFields, inputId: PositiveIdSchema, delegationSource: z.never().optional() }),
+  z.strictObject({ ...modelContextFields, inputId: z.null(), delegationSource: DelegationSourceSchema }),
+]).refine(context => context.observation === null || context.payloadVerified === true && context.responseStatus === context.observation.httpStatus, 'Observation requires confirmed payload and response')
   .refine(c => c.observation === null || (c.resources ? c.resources.payload !== null && JSON.stringify(c.resources.payload) === JSON.stringify(c.observation.resources) : !c.observation.resources), 'Resource HTTP observation requires the original payload');
 export type ModelCallContext = z.infer<typeof ModelCallContextSchema>;
 export const ContextDeliverySchema = z.strictObject({ modelCallId: PositiveIdSchema, callId: OpaqueIdSchema, snapshotId: PositiveIdSchema, runId: PositiveIdSchema, sessionId: PositiveIdSchema, deliveredAt: TimestampSchema, observation: ContextDeliveryObservationSchema }).refine(delivery => delivery.deliveredAt === delivery.observation.observedAt, 'Delivery timestamp mismatch');
@@ -49,13 +55,22 @@ export const ContextReadResultSchema = z.discriminatedUnion('kind', [
 export type ContextReadResult = z.infer<typeof ContextReadResultSchema>;
 export const PrepareContextInputSchema = z.strictObject({ runId: PositiveIdSchema, sessionId: PositiveIdSchema, inputId: PositiveIdSchema, nativeEntryId: OpaqueIdSchema, workspaceContext: WorkspaceContextSchema, scope: RunScopeSchema, runtimeFeedback: z.string(), nativeRefs: z.array(NativeContextRefSchema).max(1000), createdAt: TimestampSchema });
 export type PrepareContextInput = z.infer<typeof PrepareContextInputSchema>;
-export type SaveContextSelection = { input: PrepareContextInput; body: ContextSnapshotBody; sourceFingerprint: string };
-export const RegisterContextDeliveryInputSchema = z.strictObject({ runId: PositiveIdSchema, sessionId: PositiveIdSchema, inputId: PositiveIdSchema, callId: OpaqueIdSchema, snapshotId: PositiveIdSchema, observation: ContextDeliveryObservationSchema });
+export const PrepareChildContextInputSchema = z.strictObject({ runId: PositiveIdSchema, sessionId: PositiveIdSchema, inputId: z.null(), delegationSource: DelegationSourceSchema,
+  scope: RunScopeSchema, runtimeFeedback: z.string(), nativeRefs: z.array(NativeContextRefSchema).max(1000), createdAt: TimestampSchema });
+export type PrepareChildContextInput = z.infer<typeof PrepareChildContextInputSchema>;
+export type SaveContextSelection = { input: PrepareContextInput | PrepareChildContextInput; body: ContextSnapshotBody; sourceFingerprint: string };
+const contextDeliveryFields = { runId: PositiveIdSchema, sessionId: PositiveIdSchema, callId: OpaqueIdSchema, snapshotId: PositiveIdSchema, observation: ContextDeliveryObservationSchema };
+export const RegisterContextDeliveryInputSchema = z.union([
+  z.strictObject({ ...contextDeliveryFields, inputId: PositiveIdSchema, delegationSource: z.never().optional() }),
+  z.strictObject({ ...contextDeliveryFields, inputId: z.null(), delegationSource: DelegationSourceSchema }),
+]);
 export type RegisterContextDeliveryInput = z.infer<typeof RegisterContextDeliveryInputSchema>;
-export type StartCallContext = { snapshotId: number; inputId: number; nativeHistory?: NativeHistoryContext; resources?: CallResourceContext };
+export type StartCallContext = { snapshotId: number; nativeHistory?: NativeHistoryContext; resources?: CallResourceContext } &
+  ({ inputId: number; delegationSource?: never } | { inputId: null; delegationSource: DelegationSource });
 export type ModelAdmissionPreview = { revision: number; preparedAt: number; allowTools: boolean; feedback: string };
 export interface ContextStore {
   select(input: PrepareContextInput): SaveContextSelection;
+  selectChild?(input: PrepareChildContextInput): SaveContextSelection;
   save(selection: SaveContextSelection): ContextSnapshot;
   recordDelivery(input: RegisterContextDeliveryInput): ContextDelivery;
   read(input: ReadContextInput): ContextReadResult;

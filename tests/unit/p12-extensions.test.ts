@@ -37,7 +37,7 @@ test('p12 public strict methods preserve original owner and reject old host fram
   expect(PublicHostRequestSchema.safeParse(frame).success).toBe(true);
   expect(PublicHostRequestSchema.safeParse({ ...frame, protocolVersion: 'medclaw.host/p11-v1' }).success).toBe(false);
   expect(isReadOnlyMethod('extensions.command')).toBe(true); expect(isReadOnlyMethod('extensions.select')).toBe(false);
-  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p12-v1'); expect(DATABASE_SCHEMA_VERSION).toBe(11); expect(SDK_VERSION).toBe('0.87.1');
+  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p13-v1'); expect(DATABASE_SCHEMA_VERSION).toBe(12); expect(SDK_VERSION).toBe('0.87.1');
 });
 
 test('p12 extension failures are safe non-retryable errors with the original identity', () => {
@@ -81,7 +81,7 @@ test('p12 run freeze is saved in the input transaction and corrupt original evid
       expect(() => repos.readRunExtensions(accepted.runId!)).toThrow();
     }
     delete config.agent.extensions; db.query('UPDATE runs SET config_json=? WHERE id=?').run(JSON.stringify(config), accepted.runId!);
-    expect(repos.readRunExtensions(accepted.runId!)).toBeNull(); expect(db.query<{version:number},[]>('SELECT max(version) AS version FROM schema_migrations').get()?.version).toBe(11);
+    expect(repos.readRunExtensions(accepted.runId!)).toBeNull(); expect(db.query<{version:number},[]>('SELECT max(version) AS version FROM schema_migrations').get()?.version).toBe(12);
   } finally { db.close(); rmSync(root, {recursive:true,force:true}); }
 });
 

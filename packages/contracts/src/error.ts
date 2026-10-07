@@ -6,7 +6,8 @@ export const OpaqueIdSchema = z.string().min(1).max(256).regex(/^[A-Za-z0-9][A-Z
 export const TimestampSchema = z.string().datetime({ offset: true }).max(64);
 export const ErrorCategorySchema = z.enum(["provider", "runtime", "tool", "session", "storage", "input", "extension", "internal"]);
 export const ErrorReasonSchema = z.enum(["runtime_busy", "workspace_revision_mismatch", "session_not_found", "session_deleted", "session_metadata_revision_mismatch", "message_cursor_invalid", "input_cursor_invalid", "host_interrupted", "checkpoint_invalid", "history_version_mismatch", "session_restore_failed", "compaction_model_failed", "compaction_capacity", "compaction_native_result_invalid",
-  'resource_catalog_invalid', 'resource_missing', 'resource_conflict', 'resource_invalid', 'resource_dependency_missing', 'resource_changed', 'resource_too_large', 'resource_path_invalid', 'resource_snapshot_invalid', 'resource_expansion_failed']);
+  'resource_catalog_invalid', 'resource_missing', 'resource_conflict', 'resource_invalid', 'resource_dependency_missing', 'resource_changed', 'resource_too_large', 'resource_path_invalid', 'resource_snapshot_invalid', 'resource_expansion_failed',
+  'subagent_binding_failed', 'subagent_limit', 'subagent_execution_failed']);
 
 export const EventRangeErrorSchema = z.strictObject({ runId: PositiveIdSchema, firstSequence: PositiveIdSchema.nullable(), lastSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), resumeAfterSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable() }).refine(value => (value.firstSequence === null ? value.lastSequence === 0 : value.firstSequence <= value.lastSequence) && (value.resumeAfterSequence === null || value.resumeAfterSequence <= value.lastSequence));
 export type EventRangeError = z.infer<typeof EventRangeErrorSchema>;
@@ -56,6 +57,7 @@ const errorDefinitions = {
   tool_output_inconsistent: ["tool", "The tool result conflicts with its business contract. Read the original saved facts before using it.", false],
   tool_recovery_limit: ["tool", "The run reached its configured recovery budget. Unresolved failures remain recorded.", false],
   tool_postprocess_failed: ["tool", "Tool postprocessing failed. Committed facts remain available under their original identity.", true],
+  tool_delivery_failed: ["tool", "Committed execution remains available, but original tool result delivery is unconfirmed. Execution will not be retried automatically.", false],
   tool_cancelled: ["tool", "The tool call was cancelled. Committed query facts remain available under their original identity.", false],
   data_coverage_missing: ["tool", "Required dates or predecessor batches are missing from the allowed scope. This does not mean there are zero results.", false],
   query_result_too_large: ["tool", "The query result exceeds the storage limit. Narrow the query scope.", false],

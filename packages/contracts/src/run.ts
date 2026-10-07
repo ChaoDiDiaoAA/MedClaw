@@ -10,6 +10,7 @@ import type { WorkspaceView, WorkspaceContext } from "./workspace";
 import { StoredToolConfigurationSchema, type ToolConfiguration } from './tool-config';
 import { RuntimeConfigurationSchema, type RuntimeConfiguration } from './runtime-config';
 import { ExtensionAssemblyProofSchema } from './extensions';
+import { ChildResultViewSchema } from './subagent';
 
 export const RunStatusSchema = z.enum(["created", "running", "completed", "failed", "cancelled"]);
 export const SdkStopReasonSchema = z.enum(["stop", "length", "toolUse", "error", "aborted", "deferred"]);
@@ -59,7 +60,11 @@ const runFields = {
 };
 export const ProviderRunViewSchema = z.strictObject({ ...runFields, kind: z.literal("provider"), sessionId: z.null(),
   goal: z.enum(["answer", "verify"]), calls: z.array(ModelCallViewSchema).max(1) });
+const GroupUsagePartSchema=z.strictObject({modelCalls:z.number().int().nonnegative().safe(),toolCalls:z.number().int().nonnegative().safe(),
+  inputTokens:nullableToken,outputTokens:nullableToken,cost:nullableAmount,costCurrency:z.literal('USD').nullable()});
+export const RunGroupUsageSchema=z.strictObject({parent:GroupUsagePartSchema,children:GroupUsagePartSchema});
 export const AgentRunViewSchema = z.strictObject({ ...runFields, inputId: PositiveIdSchema.nullable(), kind: z.literal("agent"), sessionId: PositiveIdSchema,
+  groupUsage:RunGroupUsageSchema.optional(),
   answerNativeLeafId: OpaqueIdSchema.nullable().default(null),
   clientSequence: PositiveIdSchema, nativeSessionId: OpaqueIdSchema, goal: z.literal("answer"),
   calls: z.array(ModelCallViewSchema).max(50), nextCallOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
@@ -71,7 +76,17 @@ export const AgentRunViewSchema = z.strictObject({ ...runFields, inputId: Positi
     toolProfileSnapshot: ToolProfileSnapshotSchema.nullable(),
   }).nullable().optional(),
 });
-export const RunViewSchema = z.discriminatedUnion("kind", [ProviderRunViewSchema, AgentRunViewSchema]);
+export const ChildRunViewSchema = z.strictObject({ ...runFields, kind: z.literal('child'), sessionId: PositiveIdSchema,
+  goal: z.literal('answer'), answerRef: z.null(), parentRunId: PositiveIdSchema, originToolCallId: PositiveIdSchema,
+  pluginAgentId: OpaqueIdSchema, nativeSessionId: OpaqueIdSchema, childResult: z.lazy(() => ChildResultViewSchema).nullable(),
+  originSnapshotId:PositiveIdSchema,parentInputId:PositiveIdSchema.nullable(),
+  calls: z.array(ModelCallViewSchema).max(50), nextCallOffset: z.number().int().nonnegative().safe().nullable(),
+  delivery: z.strictObject({ resultRecorded: z.boolean(), sdkReturned: z.boolean(), nativeEntryId: OpaqueIdSchema.nullable(),
+    sdkResultIsError:z.boolean().nullable(),nextModelCallId: OpaqueIdSchema.nullable(), consumedAt: TimestampSchema.nullable(),
+    consumptionEvidence:z.literal('provider_input_verified').nullable(),error: AppErrorSchema.nullable() }).nullable(),
+});
+export type ChildRunView = z.infer<typeof ChildRunViewSchema>;
+export const RunViewSchema = z.discriminatedUnion("kind", [ProviderRunViewSchema, AgentRunViewSchema, ChildRunViewSchema]);
 const outputPaging = { outputOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).default(0), outputLimit: z.number().int().min(1).max(32768).default(16384) };
 const onePaging = { ...outputPaging, inputOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).default(0),
   inputLimit: z.number().int().min(1).max(65536).default(65536), callOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).default(0),
@@ -81,11 +96,13 @@ export const ReadRunRequestSchema = z.union([
   z.strictObject({ operationRef: OpaqueIdSchema, ...onePaging }),
   z.strictObject({ recent: z.literal(true), beforeRunId: PositiveIdSchema.optional(), limit: z.number().int().min(1).max(50).default(20),
     sessionId: PositiveIdSchema.optional(), kind: z.enum(["provider", "agent"]).optional() }),
+  z.strictObject({ recent: z.literal(true), parentRunId: PositiveIdSchema, beforeRunId: PositiveIdSchema.optional(), limit: z.number().int().min(1).max(50).default(20) }),
 ]);
 const recentFields = { inputText: z.string().max(2048), cleanupSummary: RunCleanupSummarySchema.nullable() };
 export const RecentRunViewSchema = z.discriminatedUnion("kind", [
   ProviderRunViewSchema.omit({ output: true, inputPage: true, calls: true, cleanup: true }).extend(recentFields),
   AgentRunViewSchema.omit({ output: true, inputPage: true, calls: true, cleanup: true, nextCallOffset: true }).extend(recentFields),
+  ChildRunViewSchema.omit({ output: true, inputPage: true, calls: true, cleanup: true, nextCallOffset: true, childResult: true }).extend(recentFields),
 ]);
 export const ReadRunResultSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("one"), run: RunViewSchema.nullable() }),
@@ -194,6 +211,8 @@ export type StartRunInput<Resolved> = AgentStartFields & { resolved: Resolved };
 export type RegisterAgentInput = AgentStartFields & { instanceId: string; createdAt: string };
 export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[]; budgetSummary?: BudgetSummary; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit; compactions?: import('./session').CompactionSaveFact[]; extensions?: import('./extensions').ExtensionAssemblyProof };
 export type AgentRuntimePort<Resolved> = {
+  hasPendingSubagentPersistence?: (runId:number)=>boolean;
+  retrySubagentPersistence?: (runId:number)=>Promise<void>;
   validateExtensions?: (sessionId: number, settings: import('./model').PublishedSettings) => Promise<void>;
   freezeExtensions?: (sessionId: number, settings: import('./model').PublishedSettings) => Promise<import('./extensions').FrozenRunExtensions>;
   readExtensionDescriptor?: () => Promise<import('./extensions').ExtensionDescriptor | null>;
@@ -232,7 +251,8 @@ export type AgentRuntimePort<Resolved> = {
     workspaceContext?: WorkspaceContext; scope?: RunScope; referenceDate?: string; timezone?: string; agentPolicy?: AgentPolicy; runtimeConfiguration?: RuntimeConfiguration; toolConfiguration?: ToolConfiguration; measurementContext?: MeasurementContext; toolProfileSnapshot?: ToolProfileSnapshot },
     callbacks: { stream?: (snapshot: StreamSnapshot) => void; startCall: (time: string, context?: StartCallContext) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
       fatal?: (error: AppError) => void; extensionProof?: (proof: import('./extensions').ExtensionAssemblyProof) => void;
-      inputStore?: InputStore; admissionClosed?: () => void; compaction?: import('./session').AutoCompactionCallbacks }) => Promise<AgentExecutionObservation>;
+      inputStore?: InputStore; admissionClosed?: () => void; compaction?: import('./session').AutoCompactionCallbacks;
+      subagents?: import('./subagent').ChildRuntimeCallbacks }) => Promise<AgentExecutionObservation>;
 };
 export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit; compactions?: import('./session').CompactionSaveFact[] };
 export type StoredOperation = ProviderOperation
@@ -257,6 +277,12 @@ export interface ProviderRunStore {
   active(): RunHandle | null;
 }
 export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputStore {
+  registerChild?(input: import('./subagent').RegisterChildInput): import('./subagent').BoundChildIdentity;
+  findChild?(parentRunId: number, originToolCallId: number, expected?: import('./subagent').RegisterChildInput): import('./subagent').BoundChildIdentity | null;
+  readChildHistoryBase?(runId: number): { storageVersion: number; leafId: string | null };
+  childResultReferences?(runId: number): Pick<import('./subagent').ChildResult,'queryRefs'|'evidenceIds'|'gaps'>;
+  finalizeChild?(runId: number, fact: import('./subagent').FinalChildFact): ChildRunView;
+  isChildFinalSaved?(runId: number, fact: import('./subagent').FinalChildFact): boolean;
   readRunExtensions?(runId: number): import('./extensions').FrozenRunExtensions | null;
   readRunResources?(runId: number): import('./resources').FrozenRunResources | null;
   readResourceEvidence?(runId: number, page: number, pageSize: number): { items: import('./resources').ResourceEvidence[]; totalRows: number };

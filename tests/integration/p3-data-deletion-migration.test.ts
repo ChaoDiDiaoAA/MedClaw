@@ -13,7 +13,7 @@ function legacy(){const root=mkdtempSync(join(tmpdir(),'batch-migration-')),path
 
 test('batch deletion migration preserves legacy rows/markers and adds lifecycle/ledger without rewriting history',()=>{
  const f=legacy();let db=f.db;try{const markers=db.query('SELECT * FROM schema_migrations').all(),queries=db.query('SELECT * FROM queries').all(),snapshots=db.query('SELECT * FROM snapshots').all();db.close();db=openDatabase(f.path);
- expect(db.query('SELECT COUNT(*) n FROM schema_migrations').get()).toEqual({n:11});
+ expect(db.query('SELECT COUNT(*) n FROM schema_migrations').get()).toEqual({n:12});
  expect(db.query('SELECT * FROM schema_migrations WHERE version<=6').all()).toEqual(markers);
  expect(db.query('SELECT * FROM queries').all()).toEqual(queries);expect(db.query('SELECT * FROM snapshots').all()).toEqual(snapshots);
  expect(db.query('SELECT status,deleted_at,deletion_operation_ref FROM batches').get()).toEqual({status:'active',deleted_at:null,deletion_operation_ref:null});
@@ -28,10 +28,10 @@ test('batch deletion migration never reuses deleted snapshot/change/device integ
  }finally{db.close();rmSync(f.root,{recursive:true,force:true});}
 });
 test('batch deletion migration failure rolls back all tables and marker before reopening successfully',()=>{
- const f=legacy();try{const old=f.db.query('SELECT * FROM batches').all();f.db.close();let attempted:Database|undefined;try{expect(()=>{attempted=openDatabase(f.path,phase=>{if(phase==='batch_deletion_marker')throw new Error('fixture');});}).toThrow('storage_migration_failed');}finally{attempted?.close();}const raw=new Database(f.path);try{expect(raw.query('SELECT COUNT(*) n FROM schema_migrations').get()).toEqual({n:6});expect(raw.query('SELECT * FROM batches').all()).toEqual(old);}finally{raw.close();}const recovered=openDatabase(f.path);try{expect(recovered.query('SELECT COUNT(*) n FROM schema_migrations').get()).toEqual({n:11});}finally{recovered.close();}}finally{rmSync(f.root,{recursive:true,force:true});}
+ const f=legacy();try{const old=f.db.query('SELECT * FROM batches').all();f.db.close();let attempted:Database|undefined;try{expect(()=>{attempted=openDatabase(f.path,phase=>{if(phase==='batch_deletion_marker')throw new Error('fixture');});}).toThrow('storage_migration_failed');}finally{attempted?.close();}const raw=new Database(f.path);try{expect(raw.query('SELECT COUNT(*) n FROM schema_migrations').get()).toEqual({n:6});expect(raw.query('SELECT * FROM batches').all()).toEqual(old);}finally{raw.close();}const recovered=openDatabase(f.path);try{expect(recovered.query('SELECT COUNT(*) n FROM schema_migrations').get()).toEqual({n:12});}finally{recovered.close();}}finally{rmSync(f.root,{recursive:true,force:true});}
 });
 test('batch deletion public methods are typed, read-only classification is precise and handshake is versioned',()=>{
- expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p12-v1');expect(DATABASE_SCHEMA_VERSION).toBe(11);
+ expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p13-v1');expect(DATABASE_SCHEMA_VERSION).toBe(12);
  for(const method of ['data.delete.preview','data.delete.commit','data.delete.read','data.delete.recover'])expect(Object.hasOwn(publicMethodSchemas,method)).toBe(true);
  expect(isReadOnlyMethod('data.delete.read')).toBe(true);expect(isReadOnlyMethod('data.delete.preview')).toBe(false);expect(isReadOnlyMethod('data.delete.recover')).toBe(false);
 });

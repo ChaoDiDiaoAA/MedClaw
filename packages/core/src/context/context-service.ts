@@ -1,13 +1,17 @@
 import { z } from 'zod';
 import { AppErrorSchema, safeError, serviceResult, type Result } from '../../../contracts/src/error';
-import { ContextProjectionSchema, CONTEXT_MATERIAL_PREFIX, type ContextStore, type PrepareContextInput, type RegisterContextDeliveryInput, type ReadContextInput, type ContextReadResult } from '../../../contracts/src/context';
+import { ContextProjectionSchema, CONTEXT_MATERIAL_PREFIX, type ContextStore, type PrepareContextInput, type PrepareChildContextInput, type SaveContextSelection, type RegisterContextDeliveryInput, type ReadContextInput, type ContextReadResult } from '../../../contracts/src/context';
 import type { ManagedImportInspection } from '../../../contracts/src/workspace';
 
 export class ContextService {
   constructor(private readonly store: ContextStore, private readonly artifacts: {inspectManagedImport(id:number):Promise<ManagedImportInspection>}) {}
-  async prepare(input: PrepareContextInput) {
+  prepare(input: PrepareContextInput) { return this.prepareSelection(input,()=>this.store.select(input)); }
+  prepareChild(input: PrepareChildContextInput) {
+    return this.prepareSelection(input,()=> { if(!this.store.selectChild)throw safeError('state_conflict'); return this.store.selectChild(input); });
+  }
+  private async prepareSelection(input: PrepareContextInput | PrepareChildContextInput, select: () => SaveContextSelection) {
     const result = await serviceResult(async () => {
-      const selection = this.store.select(input);
+      const selection = select();
       const projection = ContextProjectionSchema.parse(JSON.parse(selection.body.renderedProjection.slice(CONTEXT_MATERIAL_PREFIX.length)));
       for (const id of projection.materialScope.artifactIds) {
         const inspection = await this.artifacts.inspectManagedImport(id);

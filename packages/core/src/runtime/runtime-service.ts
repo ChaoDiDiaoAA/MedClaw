@@ -20,6 +20,8 @@ import type { FinalCallFact } from '../../../contracts/src/run';
 import { toWorkspaceContext } from '../../../contracts/src/workspace';
 import type { ResourceService } from '../resources/resource-service';
 import { RESOURCE_LIMITS, resourceRefKey } from '../../../contracts/src/resources';
+import { ChildResultSchema, NativeAgentReplySchema, type BoundChildIdentity, type ChildRuntimeCallbacks, type FinalChildFact, type RegisterChildInput } from '../../../contracts/src/subagent';
+import { createHash } from 'node:crypto';
 
 type Execution = { handle: RunHandle; operationRef: string; abort: AbortController; nativeTerminal: boolean; cause: "user" | "deadline" | "shutdown" | null;
   cancelAt: string | null; stopped: boolean; executionStarted: boolean | null; fact: FinalProviderFact | FinalAgentFact | null;
@@ -30,7 +32,8 @@ type Execution = { handle: RunHandle; operationRef: string; abort: AbortControll
   pendingInputFailures: Map<number, Parameters<RuntimeRunStore['recordInputFailure']>[1]>;
   agentFields?: Omit<StartRunInput<ResolvedProviderSelection>, 'inputId' | 'submission' | 'resolved'>;
   deadlineAt: number | null; deadlineTimer: ReturnType<typeof setTimeout> | null;compactionFailure?:boolean;
-  pendingCompactionCalls?:Map<string,{owner:CompactionCallOwner;fact:FinalCallFact}>;pendingCompactionFailures?:Map<string,{error:AppError;at:string}> };
+  pendingCompactionCalls?:Map<string,{owner:CompactionCallOwner;fact:FinalCallFact}>;pendingCompactionFailures?:Map<string,{runId:number;error:AppError;at:string}>;
+  children?:Map<string,{stop:()=>Promise<void>;stopped:boolean;identity?:BoundChildIdentity;unknown:boolean;pendingFinal?:FinalChildFact;registration?:RegisterChildInput;cancelAt?:string}> };
 type Recovery = { run: RunView; cleanup: RunCleanupRecord; verified: boolean; at: string };
 type ManualExecution={operation:StoredCompactionOperation;abort:AbortController;phase:CompactionPhase;revision:number;nativeIdle:boolean;
   observed:NativeCompactionObservation|null;error:AppError|null;pendingCalls:Map<string,{owner:CompactionCallOwner;fact:FinalCallFact}>;
@@ -59,7 +62,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     private readonly stream?: (snapshot: StreamSnapshot) => void,private readonly transactions?:WriteTransactions,private readonly resources?:ResourceService) {}
   get activeHandle(): RunHandle | null { return this.execution?.handle ?? null; }
   get persistencePending() { return (this.execution?.pendingSave ?? this.recoveries.size > 0)||!!this.manual?.error||this.manualRecoveries.size>0; }
-  get stopPending() { return !!this.execution?.cause && !this.execution.stopped||!!this.manual?.abort.signal.aborted&&!this.manual.nativeIdle; }
+  get stopPending() { return !!this.execution?.cause && (!this.execution.stopped||[...this.execution.children?.values()??[]].some(child=>!child.stopped))||!!this.manual?.abort.signal.aborted&&!this.manual.nativeIdle; }
   /** A pending resolve owns its operation identity before any durable receipt exists. */
   assertOperationAvailable(operationRef: string): void {
     if (this.reservation?.operationRef === operationRef||this.historyMutation?.operationRef===operationRef||this.manual?.operation.operationRef===operationRef) throw safeError('state_conflict', undefined, { operationRef });
@@ -475,15 +478,16 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     const extensions=this.agent?.readExtensionCleanup?.(execution.handle.runId)??(execution.finalCommitted&&savedCleanup&&'extensions' in savedCleanup?savedCleanup.extensions:undefined);
     const selected=execution.handle.kind==='agent'&&this.store.readRunExtensions?.(execution.handle.runId)?.selection.extension;
     const extensionReleaseBasis=selected&&!extensions?execution.extensionReleaseBasis:undefined;
-    const resourcesReleased=execution.stopped&&(!selected||extensions?.resourcesReleased===true||extensionReleaseBasis==='not_loaded');
+    const childrenReleased=!execution.children?.size&&!this.agent?.hasPendingSubagentPersistence?.(execution.handle.runId),stopConfirmed=execution.stopped&&[...execution.children?.values()??[]].every(child=>child.stopped);
+    const resourcesReleased=execution.stopped&&childrenReleased&&(!selected||extensions?.resourcesReleased===true||extensionReleaseBasis==='not_loaded');
     for(const error of extensions?.diagnostics??[])if(error.code==='extension_cleanup_failed'&&!execution.secondaryErrors.some(prior=>isDeepStrictEqual(prior,error)))execution.secondaryErrors.push(error);
     const inputsSettled = execution.rootInputId === null || !!proof && proof.admissionClosed && proof.preflightSettled
       && proof.nativeIdle && proof.nativeQueuesEmpty && !proof.pendingPersistence;
-    return { contract: "medclaw.run-cleanup/v1", executionStarted: execution.executionStarted, stopConfirmed: execution.stopped,
-      requiredPersistenceComplete: complete, inputsSettled, resourcesReleased,
+    return { contract: "medclaw.run-cleanup/v1", executionStarted: execution.executionStarted, stopConfirmed,
+      requiredPersistenceComplete: complete&&childrenReleased, inputsSettled, resourcesReleased,
       ...(extensions?{extensions}:{}),
       ...(extensionReleaseBasis?{extensionReleaseBasis}:{}),
-      unconfirmedItems: [...(execution.stopped ? [] : ['stop']),...(resourcesReleased?[]:['resources']),...(extensions&&!extensions.resourcesReleased?['extension_cleanup']:[]), ...(complete ? [] : ['persistence']), ...(inputsSettled ? [] : ['inputs']), ...(execution.toolGap && !complete ? ['tool_persistence'] : []), ...(this.agent?.hasPendingContextPersistence?.(execution.handle.runId) ? ['context_persistence'] : []),...(this.agent?.hasPendingHistoryPersistence?.(execution.handle.runId)?['history_persistence']:[])], secondaryErrors: execution.secondaryErrors, verifiedAt: complete && execution.stopped && inputsSettled && resourcesReleased ? now() : null,
+      unconfirmedItems: [...(stopConfirmed ? [] : ['stop']),...(childrenReleased?[]:['child_cleanup']),...(resourcesReleased?[]:['resources']),...(extensions&&!extensions.resourcesReleased?['extension_cleanup']:[]), ...(complete&&childrenReleased ? [] : ['persistence']), ...(inputsSettled ? [] : ['inputs']), ...(execution.toolGap && !complete ? ['tool_persistence'] : []), ...(this.agent?.hasPendingContextPersistence?.(execution.handle.runId) ? ['context_persistence'] : []),...(this.agent?.hasPendingHistoryPersistence?.(execution.handle.runId)?['history_persistence']:[])], secondaryErrors: execution.secondaryErrors, verifiedAt: complete && stopConfirmed && inputsSettled && resourcesReleased ? now() : null,
       ...(execution.budgetSummary ? { budgetSummary: structuredClone(execution.budgetSummary) } : {}) };
   }
   private deadline(execution: Execution, timeout: number) {
@@ -546,15 +550,98 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     this.emit(execution.handle.kind === "agent" ? { type: "agent.preview", sessionId: execution.handle.sessionId!, runId: execution.handle.runId,
       noticeSequence: ++execution.sequence, ...snapshot } : { type: "provider.preview", runId: execution.handle.runId, ...snapshot });
   }
-  private async runAgent(execution: Execution, input: StartRunInput<Resolved>) {
-    this.deadline(execution, input.timeoutMs);
-    const deadlineAt = execution.deadlineAt!;
-    let entered = false;
+  private childCallbacks(execution:Execution):ChildRuntimeCallbacks {
+    const owned=(execution.children??=new Map());
+    return {
+      own:(pluginAgentId,stop)=>{
+        this.checkActive(execution);if(this.execution!==execution||execution.handle.kind!=='agent'||owned.size||owned.has(pluginAgentId))throw safeError('state_conflict',undefined,{reason:'subagent_limit'});
+        const slot={stop:async()=>{await stop();slot.stopped=true;},stopped:false,identity:undefined as BoundChildIdentity|undefined,unknown:false,pendingFinal:undefined as FinalChildFact|undefined,registration:undefined as RegisterChildInput|undefined};owned.set(pluginAgentId,slot);
+        return()=>{if(owned.get(pluginAgentId)!==slot)return;if(slot.unknown)throw safeError('storage_read_failed');
+          if(slot.identity){const saved=this.store.read({runId:slot.identity.childRunId});if(saved.kind!=='one'||saved.run?.kind!=='child'||!saved.run.childResult||!saved.run.cleanup?.stopConfirmed||!saved.run.cleanup.requiredPersistenceComplete||!saved.run.cleanup.resourcesReleased)throw safeError('storage_write_failed');}
+          owned.delete(pluginAgentId);};
+      },
+      register:input=>{
+        this.checkActive(execution);const slot=owned.get(input.pluginAgentId);
+        if(!slot||input.parentRunId!==execution.handle.runId||input.frozen.instanceId!==this.instanceId||input.frozen.parentSessionId!==execution.handle.sessionId)throw safeError('access_denied');
+        slot.registration=structuredClone(input);
+        try {const identity=this.store.registerChild!(input);slot.identity=identity;return identity;}
+        catch(error) {
+          try {
+            if(!this.store.findChild)throw safeError('storage_read_failed');
+            const saved=this.store.findChild(input.parentRunId,input.originToolCallId,input);
+            if(saved){if(saved.pluginAgentId!==input.pluginAgentId||saved.nativeSessionId!==input.nativeSessionId)throw safeError('storage_read_failed');slot.identity=saved;return saved;}
+          } catch {slot.unknown=true;}
+          throw safeError('storage_write_failed',error);
+        }
+      },
+      reconcile:pluginAgentId=>{
+        const slot=owned.get(pluginAgentId);if(!slot?.registration||!this.store.findChild)throw safeError('storage_read_failed');
+        if(!slot.unknown)return slot.identity??null;
+        const input=slot.registration,saved=this.store.findChild(input.parentRunId,input.originToolCallId,input);
+        if(saved&&(saved.pluginAgentId!==pluginAgentId||saved.nativeSessionId!==input.nativeSessionId))throw safeError('storage_read_failed');
+        slot.identity=saved??undefined;slot.unknown=false;return saved;
+      },
+      startCall:(runId,time,context)=>{
+        const slot=[...owned.values()].find(slot=>slot.identity?.childRunId===runId);
+        this.checkActive(execution);if(!slot||slot.unknown||slot.stopped)throw safeError('state_conflict');return this.startCall(runId,'main',time,context);
+      },
+      compaction:identity=>{
+        const slot=owned.get(identity.pluginAgentId);if(!slot?.identity||slot.identity.childRunId!==identity.childRunId)throw safeError('access_denied');
+        const root=this.store.read({runId:execution.handle.runId});if(root.kind!=='one'||root.run?.kind!=='agent'||!root.run.model)throw safeError('state_conflict');
+        return this.autoCompaction(execution,identity.childRunId,identity.childSessionId,root.run.model);
+      },
+      stream:snapshot=>{
+        const child=[...owned.values()].find(slot=>slot.identity?.childRunId===snapshot.runId);
+        if(!child?.identity||child.identity.childSessionId!==snapshot.sessionId)return;
+        try{this.stream?.(structuredClone(snapshot));}catch{this.report(safeError('preview_delivery_failed'));}
+      },
+      finish:(identity,observation,reply)=>{
+        const slot=owned.get(identity.pluginAgentId);
+        if(!slot?.identity||!isDeepStrictEqual(slot.identity,identity)||!isDeepStrictEqual(observation.identity,identity)||observation.nativeIdle!==true||!this.store.finalizeChild||!this.store.childResultReferences)throw safeError('state_conflict');
+        slot.stopped=true;
+        if(this.agent?.toolPersistencePending?.(identity.childRunId)||this.agent?.hasPendingContextPersistence?.(identity.childRunId)||this.agent?.hasPendingHistoryPersistence?.(identity.childRunId))throw safeError('storage_write_failed');
+        if(slot.cancelAt)try{this.store.requestCancel(identity.childRunId,slot.cancelAt);}catch(error){throw safeError('storage_write_failed',error);}
+        const originalReply=NativeAgentReplySchema.parse(reply),outcome=observation.outcome;
+        const prior=this.store.read({runId:identity.childRunId});if(prior.kind!=='one'||prior.run?.kind!=='child')throw safeError('storage_read_failed');
+        const cancellationWon=prior.run.childResult===null&&prior.run.cancelRequestedAt!==null;
+        const status=cancellationWon?'cancelled':observation.error===null&&outcome?.callState==='completed'&&['stop','length'].includes(outcome.sdkStopReason)&&outcome.text.trim().length>0?'completed':outcome?.callState==='cancelled'||observation.error?.code==='tool_cancelled'?'cancelled':'failed';
+        const endedAt=slot.pendingFinal?.endedAt??now(),error=status==='completed'?null:observation.error??safeError(status==='cancelled'?'tool_cancelled':'internal_error',undefined,{reason:'subagent_execution_failed'});
+        const base=this.store.readChildHistoryBase!(identity.childRunId);
+        const refs=this.store.childResultReferences(identity.childRunId);
+        const nativeErrors=observation.history.newEntries.flatMap(entry=>{
+          const message=(entry as {type:string;message?:{role:string;isError?:boolean;toolCallId?:string}}).message;
+          return message?.role==='toolResult'&&message.isError&&message.toolCallId?['tool_result_error:'+message.toolCallId]:[];
+        });
+        const childResult=ChildResultSchema.parse({contract:'medclaw.child-result/v1',childRunId:identity.childRunId,childSessionId:identity.childSessionId,parentRunId:identity.parentRunId,
+          originToolCallId:identity.originToolCallId,pluginAgentId:identity.pluginAgentId,nativeSessionId:identity.nativeSessionId,outcome:status,text:outcome?.text??'',
+          ...refs,gaps:[...new Set([...(error?[error.code]:[]),...(outcome?.sdkStopReason==='length'?['sdk_output_length']:[]),...refs.gaps,...nativeErrors])],truncated:outcome?.sdkStopReason==='length',originalReply,originalReplyHash:createHash('sha256').update(canonicalRequest(originalReply)).digest('hex'),
+          finalLeafId:observation.history.activeLeafId,storageVersion:observation.history.expectedStorageVersion+(observation.history.newEntries.length||observation.history.activeLeafId!==base.leafId?1:0),committedAt:endedAt});
+        const candidate:FinalChildFact={status,endedAt,outputText:childResult.text,error,calls:observation.calls,history:observation.history,compactions:observation.compactions,childResult,
+          cleanup:{...observation.cleanup,stopConfirmed:true,requiredPersistenceComplete:true,inputsSettled:true,resourcesReleased:false,unconfirmedItems:['resources'],verifiedAt:null}};
+        if(cancellationWon&&slot.pendingFinal?.status==='completed')slot.pendingFinal=candidate;
+        const fact=slot.pendingFinal??candidate;
+        if(slot.pendingFinal&&(fact.childResult.originalReplyHash!==childResult.originalReplyHash||!isDeepStrictEqual(fact.calls,observation.calls)||!isDeepStrictEqual(fact.history,observation.history)))throw safeError('state_conflict');
+        slot.pendingFinal??=structuredClone(fact);
+        try{this.store.finalizeChild(identity.childRunId,fact);}
+        catch(cause){let saved=false;try{saved=this.store.isChildFinalSaved?.(identity.childRunId,fact)??false;}catch{}
+          if(!saved){const error=safeError('storage_write_failed',cause);this.checkpoint(execution,error,false);execution.abort.abort();throw error;}}
+        return {identity,result:fact.childResult,persistence:'committed'};
+      },
+      released:identity=>{
+        const slot=owned.get(identity.pluginAgentId),saved=this.store.read({runId:identity.childRunId});
+        if(!slot?.identity||!isDeepStrictEqual(slot.identity,identity)||saved.kind!=='one'||saved.run?.kind!=='child'||saved.run.childResult===null
+          ||!saved.run.cleanup?.stopConfirmed||!saved.run.cleanup.requiredPersistenceComplete)throw safeError('storage_write_failed');
+        try{this.store.saveRunCleanup(identity.childRunId,{...saved.run.cleanup,resourcesReleased:true,unconfirmedItems:[],verifiedAt:saved.run.cleanup.verifiedAt??now()});}
+        catch(error){throw safeError('storage_write_failed',error);}slot.stopped=true;
+      },
+    };
+  }
+  private autoCompaction(execution:Execution,runId:number,sessionId:number,model:ResolvedProviderSelection['selection']):AutoCompactionCallbacks {
     const owners=new Map<string,Omit<CompactionCallOwner,'ordinal'>>(),callOwners=new Map<string,CompactionCallOwner>(),revisions=new Map<string,number>();
     const compaction:AutoCompactionCallbacks={
       begin:(reason,time)=>{
-        this.checkActive(execution);const session=this.store.readSession(input.sessionId);if(!session)throw safeError('session_not_found');
-        const operationRef=crypto.randomUUID();owners.set(operationRef,{operationRef,sessionId:input.sessionId,runId:execution.handle.runId,source:'auto',reason,model:input.model,baseStorageVersion:session.storageVersion,baseLeafId:session.leafId});
+        this.checkActive(execution);const session=runId===execution.handle.runId?this.store.readSession(sessionId):this.store.readChildHistoryBase?.(runId);if(!session)throw safeError('session_not_found');
+        const operationRef=crypto.randomUUID();owners.set(operationRef,{operationRef,sessionId:sessionId,runId:runId,source:'auto',reason,model:model,baseStorageVersion:session.storageVersion,baseLeafId:session.leafId});
         return operationRef;
       },
       startCall:(operationRef,time,ordinal)=>{
@@ -567,10 +654,17 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         try{return this.transactions.immediate(()=>this.store.commitCompactionInTransaction(change,fact));}
         catch(error){try{const version=this.store.confirmCompactionSaved?.(change,fact);if(version!=null)return version;}catch{}this.checkpoint(execution,safeError('storage_write_failed'),false);execution.abort.abort();throw error;}
       },
-      failed:(operationRef,error,time,nativeGenerated)=>{if(!nativeGenerated)try{this.store.finishAutoCompaction?.(operationRef,execution.handle.runId,error,time);}catch{(execution.pendingCompactionFailures??=new Map()).set(operationRef,{error,at:time});this.checkpoint(execution,safeError('storage_write_failed'),false);}
+      failed:(operationRef,error,time,nativeGenerated)=>{if(!nativeGenerated)try{this.store.finishAutoCompaction?.(operationRef,runId,error,time);}catch{(execution.pendingCompactionFailures??=new Map()).set(operationRef,{runId,error,at:time});this.checkpoint(execution,safeError('storage_write_failed'),false);}
         if(execution.cause!=='user')this.checkpoint(execution,error,false);execution.abort.abort();},
-      progress:(operationRef,phase)=>{const revision=(revisions.get(operationRef)??0)+1;revisions.set(operationRef,revision);try{this.notice({type:'compaction.progress',sessionId:input.sessionId,operationRef,runId:execution.handle.runId,revision,phase});}catch{}},
+      progress:(operationRef,phase)=>{const revision=(revisions.get(operationRef)??0)+1;revisions.set(operationRef,revision);try{this.notice({type:'compaction.progress',sessionId:sessionId,operationRef,runId:runId,revision,phase});}catch{}},
     };
+    return compaction;
+  }
+  private async runAgent(execution: Execution, input: StartRunInput<Resolved>) {
+    this.deadline(execution, input.timeoutMs);
+    const deadlineAt = execution.deadlineAt!;
+    let entered = false;
+    const compaction=this.autoCompaction(execution,execution.handle.runId,input.sessionId,input.model);
     try {
       const observed = await this.credentials({ purpose: "runtime", operationRef: execution.operationRef, credentialRef: input.model.credentialRef }, () => {
         if (input.inputId !== null) this.store.beginInputDelivery(input.inputId, this.instanceId, now());
@@ -584,6 +678,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         stream: snapshot => { if (snapshot.runId !== execution.handle.runId || snapshot.sessionId !== execution.handle.sessionId) return;
           try { this.stream?.(structuredClone(snapshot)); } catch { try { this.report(safeError('preview_delivery_failed')); } catch {} } },
         inputStore: this.store, admissionClosed: () => { execution.acceptingInputs = false; },compaction,
+        ...(this.store.registerChild?{subagents:this.childCallbacks(execution)}:{}),
         fatal: error => { this.checkpoint(execution, error,!execution.compactionFailure); execution.abort.abort(); },
         extensionProof: proof => {
           if(proof.runId!==execution.handle.runId||proof.sessionId!==execution.handle.sessionId||proof.instanceId!==this.instanceId)throw safeError('state_conflict');
@@ -657,7 +752,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     const fact = execution.fact;
     if (!fact || !execution.stopped) throw new Error("state_conflict");
     if (!execution.finalCommitted && execution.handle.kind === 'agent' && (this.agent?.toolPersistencePending?.(execution.handle.runId)
-      || this.agent?.inputPersistencePending?.(execution.handle.runId) || this.agent?.hasPendingContextPersistence?.(execution.handle.runId) ||this.agent?.hasPendingHistoryPersistence?.(execution.handle.runId)||execution.pendingCompactionCalls?.size||execution.pendingCompactionFailures?.size|| execution.pendingInputFailures.size)) {
+      || this.agent?.inputPersistencePending?.(execution.handle.runId) || this.agent?.hasPendingContextPersistence?.(execution.handle.runId) ||this.agent?.hasPendingHistoryPersistence?.(execution.handle.runId)||this.agent?.hasPendingSubagentPersistence?.(execution.handle.runId)||execution.pendingCompactionCalls?.size||execution.pendingCompactionFailures?.size|| execution.pendingInputFailures.size || execution.children?.size)) {
       fact.cleanup = this.cleanup(execution, false);this.finalSaveFailure(execution);
       return;
     }
@@ -707,8 +802,11 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     if (execution?.handle.runId === runId && !execution.stopped) {
       execution.acceptingInputs = false; execution.stopEpoch++;
       if (!execution.nativeTerminal && !execution.cause && !execution.primaryError) { execution.cause = "user"; execution.cancelAt = now(); }
+      if (execution.cancelAt) {
+        try { this.store.requestCancel(runId, execution.cancelAt); } catch { this.persistenceFailure(execution); }
+        for(const child of execution.children?.values()??[])if(child.identity){child.cancelAt??=execution.cancelAt;try{this.store.requestCancel(child.identity.childRunId,child.cancelAt);}catch{this.persistenceFailure(execution);}}
+      }
       execution.abort.abort();
-      if (execution.cancelAt) { try { this.store.requestCancel(runId, execution.cancelAt); } catch { this.persistenceFailure(execution); } }
     }
     const result = this.store.read({ runId });
     if (result.kind !== "one" || !result.run) throw new Error("run_not_found");
@@ -738,10 +836,10 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       this.saveRecovery(recovery);
       if (this.recoveries.has(runId)) throw new Error("storage_write_failed");
     } else {
+      if(execution?.handle.runId===runId&&execution.cause&&!execution.stopped)throw safeError('stop_unconfirmed',undefined,{runId});
       if (!execution || execution.handle.runId !== runId || !execution.pendingSave || !execution.stopped || !execution.fact) throw new Error("run_save_unavailable");
       if (!execution.finalCommitted && execution.handle.kind === 'agent') {
-        for(const [callId,pending]of execution.pendingCompactionCalls??[]){this.store.finishCompactionCall(pending.owner,pending.fact);execution.pendingCompactionCalls!.delete(callId);}
-        for(const [operationRef,pending]of execution.pendingCompactionFailures??[]){this.store.finishAutoCompaction?.(operationRef,runId,pending.error,pending.at);execution.pendingCompactionFailures!.delete(operationRef);}
+        this.retryCompactionPersistence(execution);
         this.agent?.retryContextPersistence?.(runId); this.agent?.retryToolPersistence?.(runId); this.agent?.retryInputPersistence?.(runId);
         this.agent?.retryHistoryPersistence?.(runId);
         for (const [inputId, fact] of [...execution.pendingInputFailures]) {
@@ -757,7 +855,15 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     }
     const result = this.store.read({ runId }); if (result.kind !== "one" || !result.run) throw new Error("run_not_found"); return result.run;
   }
-  retrySave(runId: number) { return serviceResult(() => this.retrySaveNow(runId), "storage_write_failed", { runId }); }
+  private retryCompactionPersistence(execution:Execution) {
+    for(const [callId,pending]of execution.pendingCompactionCalls??[]){this.store.finishCompactionCall(pending.owner,pending.fact);execution.pendingCompactionCalls!.delete(callId);}
+    for(const [operationRef,pending]of execution.pendingCompactionFailures??[]){this.store.finishAutoCompaction?.(operationRef,pending.runId,pending.error,pending.at);execution.pendingCompactionFailures!.delete(operationRef);}
+  }
+  retrySave(runId: number) { return serviceResult(async () => {
+    const execution=this.execution;
+    if(execution?.handle.runId===runId&&execution.pendingSave&&execution.stopped&&execution.fact){this.retryCompactionPersistence(execution);await this.agent?.retrySubagentPersistence?.(runId);}
+    return this.retrySaveNow(runId);
+  }, "storage_write_failed", { runId }); }
   recoverInterrupted(previousProcessExited: boolean) {
     try {
       const candidates = this.store.recoveryCandidates(this.instanceId), at = now();
