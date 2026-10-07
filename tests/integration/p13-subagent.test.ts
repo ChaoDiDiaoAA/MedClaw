@@ -34,6 +34,7 @@ import type { AgentSession } from '@earendil-works/pi-coding-agent';
 import { RuntimeService } from '../../packages/core/src/runtime/runtime-service';
 import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
 import { agentRuntimeFixture } from '../fixtures/agent-runtime';
+import { canReadRelatedQuery } from '../../packages/storage/src/child-identity';
 
 for (const audit of [false,true])for (const delegate of [false,true]) test('p13 original product Agent registration '+(audit?'with P12 audit ':'')+(delegate?'delegates through the plugin and returns committed child result':'starts no child without a real tool call'),async()=>{
   const f=await agentRuntimeFixture(index=>index===1&&delegate
@@ -155,6 +156,55 @@ test('p13 real child business Query and history retain child ownership without c
     expect(JSON.parse(child.child_result_json)).toMatchObject({outcome:'completed',queryRefs:[{queryId:query.id,resultHash:query.result_hash}]});
     expect(f.db.query('SELECT run_id,session_id FROM tool_calls WHERE native_tool_call_id=?').get('owned-3')).toEqual({run_id:child.id,session_id:child.session_id});
     expect(f.db.query("SELECT id FROM memories WHERE run_id=? AND entry_type='message'").all(child.id).length).toBeGreaterThan(0);
+    expect(f.repos.readWorkspace()).toEqual(workspace);
+  }finally{await f.close();}
+},20000);
+
+for(const mode of ['summary','read','unverified-read'] as const)test('p13 parent discovers committed child Query but Answer requires an explicit consumed read '+mode,async()=>{
+  const explicitRead=mode!=='summary',verified=mode==='read';
+  let childQueryId=0;
+  const f=await agentRuntimeFixture(index=>{
+    const tool=index===1?'Agent':index===2?'read_data_scope':index===3?'query_current_devices':index===5&&explicitRead?'read_query':null;
+    if(index===5)childQueryId=f.db.query<{id:number},[]>("SELECT q.id FROM queries q JOIN runs r ON r.id=q.run_id WHERE r.kind='child'").get()!.id;
+    const args=tool==='Agent'?p13AgentInput:tool==='query_current_devices'?{batchIds:[1],time:{start:'2026-10-04',endExclusive:'2026-10-05'},snapshotMode:'exact_date'}:tool==='read_query'?{queryId:childQueryId}:{};
+    return tool?{role:'assistant',tool_calls:[{index:0,id:index===5&&mode==='unverified-read'?'qref-'+index+'x'.repeat(41):'qref-'+index,type:'function',function:{name:tool,arguments:JSON.stringify(args)}}]}:{role:'assistant',content:'ENGINEERING check child evidence '+index};
+  });
+  try{
+    seedWorkspaceQueries(f.db,f.repos);const workspace=f.repos.readWorkspace();
+    const result=await f.app.runs.submitAgent(f.request('ENGINEERING verify child query references'),{instanceId:'host',operationRef:'p13-query-read-'+mode});
+    if(!result.ok||!result.data.runId)throw new Error('No Run');
+    await f.settle();expect(f.errors).toEqual([]);expect(f.requests).toHaveLength(explicitRead?6:5);
+    expect(JSON.stringify(f.requests[4]!.messages)).toContain('child-result/v1');
+    const snapshot=f.db.query<{snapshot_json:string},[number]>('SELECT snapshot_json FROM context_snapshots WHERE run_id=? ORDER BY sequence DESC LIMIT 1').get(result.data.runId)!;
+    const projection=JSON.parse(JSON.parse(snapshot.snapshot_json).renderedProjection.split('\n').slice(1).join('\n'));
+    const manifest=projection.materials.find((material:{ref:{version:string}})=>material.ref.version==='child-result/v1');
+    expect(manifest).toMatchObject({source:'program_query_fact',value:{queryRefs:[{queryId:childQueryId}]}});
+    const answer=f.db.query<{query_ids_json:string},[number]>('SELECT query_ids_json FROM answers WHERE run_id=?').get(result.data.runId)!;
+    expect(answer).toBeDefined();expect(JSON.parse(answer.query_ids_json).includes(childQueryId)).toBe(verified);
+    if(explicitRead){
+      const read=f.db.query<{status:string;delivery_json:string},[number]>("SELECT status,delivery_json FROM tool_calls WHERE run_id=? AND tool_name='read_query'").get(result.data.runId)!;
+      expect(read.status).toBe('succeeded');expect(JSON.parse(read.delivery_json).sdkReturned).toBe(true);
+      expect(JSON.parse(read.delivery_json).consumptionEvidence==='provider_input_verified').toBe(verified);
+    }
+    const query=f.toolStore.readQuery(childQueryId)!;
+    expect(canReadRelatedQuery(f.db,result.data.runId,1,query)).toBe(true);
+    expect(canReadRelatedQuery(f.db,10,1,query)).toBe(false);
+    expect(canReadRelatedQuery(f.db,result.data.runId,query.sessionId,query)).toBe(false);
+    expect(canReadRelatedQuery(f.db,result.data.runId,1,{...query,resultHash:'a'.repeat(64)})).toBe(false);
+    for(const sql of [
+      "UPDATE tool_calls SET delivery_json=json_set(delivery_json,'$.sdkReturned',json('false')) WHERE tool_name='Agent'",
+      "UPDATE tool_calls SET delivery_json=json_set(delivery_json,'$.message.isError',json('true')) WHERE tool_name='Agent'",
+      "DELETE FROM memories WHERE native_entry_id=(SELECT json_extract(delivery_json,'$.nativeEntryId') FROM tool_calls WHERE tool_name='Agent')",
+      "UPDATE runs SET cleanup_json=json_set(cleanup_json,'$.resourcesReleased',json('false')) WHERE kind='child'",
+    ]){
+      const rollback=new Error('ENGINEERING roll back grant fault');
+      expect(()=>f.db.transaction(()=>{
+        f.db.exec(sql);
+        if(sql.startsWith('DELETE')){let error:unknown;try{canReadRelatedQuery(f.db,result.data.runId!,1,query);}catch(caught){error=caught;}expect(error).toMatchObject({code:'storage_read_failed'});}
+        else expect(canReadRelatedQuery(f.db,result.data.runId!,1,query)).toBe(false);
+        throw rollback;
+      })()).toThrow(rollback);
+    }
     expect(f.repos.readWorkspace()).toEqual(workspace);
   }finally{await f.close();}
 },20000);

@@ -16,7 +16,7 @@ import { SqliteCatalogStore } from './catalog-store';
 import { SqliteToolStore } from './tool-store';
 import { freezeWorkspaceScope, resolveQueryRow, readWorkspaceQuery } from './workspace-selection';
 import { PrepareChildContextInputSchema, type PrepareChildContextInput } from '../../contracts/src/context';
-import { readFrozenChild } from './child-identity';
+import { readFrozenChild, readDeliveredChild } from './child-identity';
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const digest = (value: unknown) => hash(canonicalRequest(value));
@@ -99,6 +99,9 @@ export class SqliteContextStore implements ContextStore {
         const receipt = checked(ToolSdkDeliverySchema, delivery?.message);
         if (!tool || tool.run_id !== input.runId || tool.session_id !== input.sessionId || tool.native_tool_call_id !== ref.nativeToolCallId || tool.context_snapshot_id !== ref.originSnapshotId || delivery?.sdkReturned !== true || delivery.nativeEntryId !== ref.nativeEntryId || digest(receipt.content) !== ref.contentHash) fail('access_denied');
         if (nativeRefs.some(prior => prior.kind === ref.kind && prior.id === ref.id)) fail('state_conflict'); nativeRefs.push(ref);
+        const child=readDeliveredChild(this.db,input.runId,ref.id);
+        if(child)add('tool_result',ref.id,'child-result/v1',{childRunId:child.childRunId,originToolCallId:child.originToolCallId,
+          childResultHash:digest(child),queryRefs:child.queryRefs,evidenceIds:child.evidenceIds,gaps:child.gaps},'program_query_fact');
       }
       for (const ref of nativeRefs) selectedRefs.push({kind:ref.kind === 'input' ? 'input' : 'tool_result',id:String(ref.id),version:ref.kind === 'input' ? 'medclaw.session-input/v1' : 'medclaw.tool-delivery/v1',hash:ref.contentHash,channel:'native_history'});
       const projectionLimitBytes = Math.min(normalizeToolConfiguration(config).maxResultBytes, CONTEXT_READ_BYTES / 2);

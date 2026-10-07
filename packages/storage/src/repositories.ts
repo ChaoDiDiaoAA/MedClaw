@@ -15,7 +15,7 @@ import { FrozenRunResourcesSchema, ResourceEvidenceSchema, ResourceReadFactSchem
 import { FrozenRunExtensionsSchema, type FrozenRunExtensions } from '../../contracts/src/extensions';
 import { FrozenChildConfigSchema, ChildResultSchema, BoundChildIdentitySchema, childScopeWithin, type BoundChildIdentity, type RegisterChildInput, type FinalChildFact, type ChildResult, type CommittedChildExecutionProof } from '../../contracts/src/subagent';
 import type { ToolExecutionContext } from '../../contracts/src/tool';
-import { readFrozenChild } from './child-identity';
+import { readFrozenChild, canReadRelatedQuery } from './child-identity';
 import type { EventWriter, RegisteredEventDraft, RegisteredEventPayload } from '../../contracts/src/event';
 import { RegisteredEventPayloadSchema } from '../../contracts/src/event';
 import { NATIVE_HISTORY_FORMAT, InputContentSchema, type NativeHistoryCommit, type InitialNativeHistory, type PreparedInput, type InputStore, type InputCancelProof, type InputSettlementProof, type ReadInputRequest, type ListInputsRequest } from "../../contracts/src/session";
@@ -1468,6 +1468,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         const frozen=this.inputs.content(this.inputs.required(input.id)).workspaceContext;
         if(frozen.queryId!==null)ids.add(frozen.queryId);
       }
+      const explicitReads=new Set<number>();
       const reads=this.db.query<{tool_name:string;args_json:string;result_json:string;delivery_json:string;native_tool_call_id:string},[number,number]>(`SELECT * FROM tool_calls WHERE run_id=? AND session_id=? AND status='succeeded'
         AND tool_name IN ('read_query','read_query_page','list_query_evidence','read_query_evidence')`).all(row.id,row.session_id!);
       for(const read of reads){
@@ -1486,12 +1487,12 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         if(!queryId||data.queryId!==undefined&&data.queryId!==queryId||data.items?.some(item=>item.queryId!==queryId))fail('answer_evidence_invalid');
         const query=store.readQuery(queryId);
         if(!query||data.resultHash!==undefined&&data.resultHash!==query.resultHash||data.items?.some(item=>item.resultHash!==query.resultHash))fail('answer_evidence_invalid');
-        ids.add(queryId);
+        ids.add(queryId);explicitReads.add(queryId);
       }
       for(const id of ids){
         const query=store.readQuery(id),view=sources.query(id,1,1);
         const source=this.db.query<{source:string},[number]>('SELECT source FROM queries WHERE id=?').get(id);
-        if(!query||query.sessionId!==row.session_id||query.batchIds.some(batch=>!scope.batchIds.includes(batch))
+        if(!query||query.sessionId!==row.session_id&&(!explicitReads.has(id)||!canReadRelatedQuery(this.db,row.id,row.session_id!,query))||query.batchIds.some(batch=>!scope.batchIds.includes(batch))
           ||(query.source??'agent_tool')!==source?.source
           ||scope.deviceIds!==null&&(query.scopeDeviceIds===null||query.scopeDeviceIds.some(device=>!scope.deviceIds!.includes(device)))
           ||requireAvailable&&view.query.sourceAvailability!=='available')fail('answer_evidence_invalid');

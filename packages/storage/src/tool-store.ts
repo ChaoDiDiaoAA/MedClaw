@@ -16,7 +16,7 @@ import { InputContentSchema } from '../../contracts/src/session';
 import { WorkspaceContextSchema } from '../../contracts/src/workspace';
 import { ModelCallContextSchema, ContextSnapshotBodySchema } from '../../contracts/src/context';
 import { FrozenRunResourcesSchema, ResourceReadFactSchema, resourceRefKey, type ResourceReadFact } from '../../contracts/src/resources';
-import { readFrozenChild } from './child-identity';
+import { readFrozenChild, canReadRelatedQuery } from './child-identity';
 
 const knownErrors = new Set(["invalid_argument", "access_denied", "state_conflict", "operation_not_found", "runtime_interrupted", "storage_read_failed", "storage_write_failed"]);
 function fail(code: string): never { throw new Error(code); }
@@ -446,15 +446,8 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   readChildQuery(queryId: number, context: ToolExecutionContext): QueryRecord | null {
     return protect(()=>{
       id(queryId);this.identity(context,false);
-      const frozen=readFrozenChild(this.db,context.runId),record=this.readQuery(queryId);
-      if(!record)return null;
-      if(record.sessionId===context.sessionId)return record.runId===context.runId?record:null;
-      if(record.sessionId!==frozen.parentSessionId)return null;
-      const row=this.db.query<{snapshot_json:string},[number,number,number]>('SELECT snapshot_json FROM context_snapshots WHERE id=? AND run_id=? AND session_id=?').get(frozen.originSnapshotId,frozen.parentRunId,frozen.parentSessionId);
-      if(!row)fail('storage_read_failed');
-      const snapshot=ContextSnapshotBodySchema.parse(decode(row.snapshot_json));
-      const savedHash=createHash('sha256').update(canonicalRequest(record)).digest('hex');
-      return snapshot.selectedRefs.some(ref=>ref.kind==='query'&&ref.channel==='product_projection'&&ref.id===String(record.id)&&ref.version===record.resultHash&&ref.hash===savedHash)?record:null;
+      const record=this.readQuery(queryId);
+      return record&&canReadRelatedQuery(this.db,context.runId,context.sessionId,record)?record:null;
     },'storage_read_failed');
   }
   listEvidence(queryId: number): Evidence[] {
