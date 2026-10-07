@@ -125,6 +125,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   private readonly p3: boolean;
   private readonly inputs: SqliteInputStore;
   private readonly p5: boolean;
+  private readonly childRuns:boolean;
   private readonly batchLifecycle:boolean;
   private readonly events: EventWriter | undefined;
   constructor(private readonly db: Database, private readonly beforeCommit?: () => void, events?: EventWriter,
@@ -132,6 +133,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     this.events = events ?? (db.query("SELECT name FROM sqlite_schema WHERE name='runtime_events'").get() ? new SqliteEventStore(db, transactions) : undefined);
     this.inputs = new SqliteInputStore(db, this.events);
     this.p5 = db.query("SELECT name FROM sqlite_schema WHERE name='session_inputs'").get() !== null;
+    this.childRuns=!!db.query("SELECT name FROM pragma_table_info('runs') WHERE name='parent_run_id'").get();
     this.p3 = this.db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name='answers'").get() !== null;
     this.batchLifecycle=!!db.query("SELECT name FROM pragma_table_info('batches') WHERE name='status'").get();
   }
@@ -398,11 +400,21 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       answerRef: this.p3 ? this.db.query<{ id: number }, [number]>("SELECT id FROM answers WHERE run_id=?").get(row.id)?.id ?? null : null,
       output,
       calls: row.kind === "provider" ? calls : calls.slice(callOffset, callOffset + callLimit), persistence: "committed",
-      ...(child ? { parentRunId: child.parentRunId, originToolCallId: child.originToolCallId, pluginAgentId: child.pluginAgentId, nativeSessionId: child.nativeSessionId,
+      ...(child ? { parentRunId: child.parentRunId, originToolCallId: child.originToolCallId, pluginAgentId: child.pluginAgentId, nativeSessionId: child.nativeSessionId,originSnapshotId:child.originSnapshotId,parentInputId:child.parentInputId,
         nextCallOffset: callOffset + callLimit < calls.length ? callOffset + callLimit : null,
-        childResult: childResult ? (() => { const { originalReply, ...view } = childResult; return { ...view, text: childResult.outcome === 'completed' ? safePreview(view.text, 32768).text : AppErrorSchema.safeParse(decoded(row.error_json)).data?.message ?? 'Child execution did not complete.' }; })() : null,
-        delivery: delivery ? { resultRecorded: delivery.resultRecorded, sdkReturned: delivery.sdkReturned, nativeEntryId: delivery.nativeEntryId, nextModelCallId: delivery.nextModelCallId, consumedAt: delivery.consumedAt, error: delivery.error } : null } : {}),
+        childResult: childResult ? (() => { const { originalReply, ...view } = childResult,preview=safePreview(view.text,32768);return { ...view,truncated:view.truncated||preview.truncated,text:childResult.outcome === 'completed' ? preview.text : AppErrorSchema.safeParse(decoded(row.error_json)).data?.message ?? 'Child execution did not complete.' }; })() : null,
+        delivery: delivery ? { resultRecorded: delivery.resultRecorded, sdkReturned: delivery.sdkReturned,sdkResultIsError:delivery.message?.isError??null,nativeEntryId: delivery.nativeEntryId, nextModelCallId: delivery.nextModelCallId, consumedAt: delivery.consumedAt,consumptionEvidence:delivery.consumptionEvidence??null,error: delivery.error } : null } : {}),
       ...(agent ? { clientSequence: rootInput?.client_sequence ?? row.submission_client_sequence, nativeSessionId: agent.agent.nativeSessionId,
+        ...(this.childRuns?{groupUsage:(()=>{const part=(children:boolean)=>{
+          const where=children?"r.kind='child' AND r.parent_run_id=?":"r.kind='agent' AND r.id=?";
+          const usage=this.db.query<{modelCalls:number;inputTokens:number|null;outputTokens:number|null;cost:number|null},[number]>(`SELECT count(*) modelCalls,
+            CASE WHEN count(*)=0 THEN 0 WHEN count(c.input_tokens)=count(*) THEN sum(c.input_tokens) END inputTokens,
+            CASE WHEN count(*)=0 THEN 0 WHEN count(c.output_tokens)=count(*) THEN sum(c.output_tokens) END outputTokens,
+            CASE WHEN count(*)=0 THEN 0 WHEN count(c.cost)=count(*) THEN sum(c.cost) END cost
+            FROM model_calls c JOIN runs r ON r.id=c.run_id AND r.session_id=c.session_id WHERE ${where}`).get(row.id)!;
+          const tools=this.db.query<{n:number},[number]>(`SELECT count(*) n FROM tool_calls t JOIN runs r ON r.id=t.run_id AND r.session_id=t.session_id WHERE ${where}`).get(row.id)!;
+          return {...usage,toolCalls:tools.n,costCurrency:usage.cost===null?null:'USD'};
+        };return {parent:part(false),children:part(true)};})()}:{}),
         answerNativeLeafId:this.p3 ? this.db.query<{native_leaf_id:string|null},[number]>('SELECT native_leaf_id FROM answers WHERE run_id=?').get(row.id)?.native_leaf_id??null : null,
         nextCallOffset: callOffset + callLimit < calls.length ? callOffset + callLimit : null,
         control: agent.runtimeConfiguration || agent.toolConfiguration || agent.agentPolicy || agent.measurementContext || agent.toolProfileSnapshot ? {
@@ -1885,6 +1897,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
           resourcesReleased: cleanup.resourcesReleased, unconfirmedCount: cleanup.unconfirmedItems.length,
           secondaryErrorCount: cleanup.secondaryErrors.length, verifiedAt: cleanup.verifiedAt } : null;
         if (cleanupSummary && cleanup?.budgetSummary !== undefined) Object.assign(cleanupSummary, { budgetSummary: cleanup.budgetSummary });
+        if (summary.kind === 'child') { const { nextCallOffset, childResult, ...childSummary } = summary; return checked(RecentRunViewSchema, { ...childSummary, inputText: safePreview(row.input_text, 2048).text, cleanupSummary }); }
         if ("nextCallOffset" in summary) { const { nextCallOffset, ...agentSummary } = summary; return checked(RecentRunViewSchema, { ...agentSummary, inputText: safePreview(row.input_text, 2048).text, cleanupSummary }); }
         return checked(RecentRunViewSchema, { ...summary, inputText: safePreview(row.input_text, 2048).text, cleanupSummary });
       }),

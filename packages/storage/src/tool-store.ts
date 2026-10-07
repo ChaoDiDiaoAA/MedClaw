@@ -123,6 +123,11 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
     if (!scope.success || !isDeepStrictEqual(scope.data, context.scope)) fail("access_denied");
     if(run.kind==='child') {
       const frozen=readFrozenChild(this.db,context.runId);
+      // Public historical reads use the exact frozen child owner without inventing a model/tool call.
+      if(!('nativeToolCallId' in context)){
+        if(active||context.source!=='user_form'||context.inputId!==null)fail('access_denied');
+        return;
+      }
       if(!('nativeToolCallId' in context)||!context.delegationSource||context.workspaceContext!==null||context.workspaceInputId!==null||context.basedOnQueryId!==null||context.workspaceRevision!==undefined
         ||context.contextSnapshotId==null||!context.modelCallId)fail('access_denied');
       const owner=this.db.query<{snapshot_json:string;input_id:number|null;model_json:string},[number,string,number,number]>(`SELECT s.snapshot_json,s.input_id,c.model_json FROM context_snapshots s JOIN model_calls c ON c.run_id=s.run_id AND c.session_id=s.session_id

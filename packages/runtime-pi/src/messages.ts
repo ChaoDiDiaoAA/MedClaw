@@ -165,7 +165,7 @@ export function projectToolCall(record: ToolCallRecord): ToolCallView {
   const control = record.control == null ? record.control : { ...ToolControlObservationSchema.parse(record.control), environmentKey: null, workloadBucket: null };
   return ToolCallViewSchema.parse({
     id: record.id, runId: record.runId, sessionId: record.sessionId, nativeToolCallId: record.nativeToolCallId,
-    name: native || business ? record.name : "Unknown tool", version: record.version, executionMode: record.executionMode, status: record.status,
+    name: native || business || record.name==='Agent' ? record.name : "Unknown tool", version: record.version, executionMode: record.executionMode, status: record.status,
     error: record.error === null ? null : safeError(record.error.code, undefined, { runId: record.runId, sessionId: record.sessionId, toolCallId: record.id }),
     sdkReturned: record.sdkReturned, nativeEntryId: record.nativeEntryId,
     contextSnapshotId: record.contextSnapshotId ?? null,

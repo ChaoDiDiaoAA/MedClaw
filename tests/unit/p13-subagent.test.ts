@@ -12,6 +12,14 @@ import { normalizeRuntimeConfiguration } from '../../packages/contracts/src/runt
 import { performance } from 'node:perf_hooks';
 import { createHash } from 'node:crypto';
 import { matchProviderContext } from '../../packages/runtime-pi/src/messages';
+import {RunEventProjection} from '../../apps/desktop/src/renderer/use-run-events';
+import type {EventPage,MessageStreamSnapshot,StoredRunEvent} from '../../packages/contracts/src/event';
+
+test('p13 subagent contracts can be imported first in a fresh process', () => {
+  const probe=Bun.spawnSync([process.execPath,'--eval',"import {ChildResultSchema,FrozenChildConfigSchema} from './packages/contracts/src/subagent.ts'; if (!ChildResultSchema || !FrozenChildConfigSchema) throw new Error('missing public schema'); console.log('ready')"],{cwd:join(import.meta.dir,'../..')});
+  expect(probe.exitCode).toBe(0);
+  expect(probe.stdout.toString().trim()).toBe('ready');
+});
 
 test('p13 delegated payload proof requires the actual prompt alongside projection and trusted feedback', () => {
   const prompt='ENGINEERING delegated prompt',source={parentRunId:1,originToolCallId:2,parentSnapshotId:3,parentInputId:4,
@@ -75,6 +83,9 @@ test('p13 public child reads bind the child owner and reject mixed user or paren
   expect(history.safeParse({ childRunId: 9, sessionId: 1 }).success).toBe(false);
   expect(history.safeParse({ sessionId: 1 }).success).toBe(true);
   expect(history.safeParse({ childRunId: 0 }).success).toBe(false);
+  const queries=publicMethodSchemas['query.list'].input;
+  expect(queries.safeParse({childRunId:9}).success).toBe(true);
+  expect(queries.safeParse({childRunId:9,sessionId:1}).success).toBe(false);
   const runs = publicMethodSchemas['run.read'].input;
   expect(runs.safeParse({ recent: true, parentRunId: 3 }).success).toBe(true);
   expect(runs.safeParse({ recent: true, parentRunId: 3, sessionId: 1 }).success).toBe(false);
@@ -82,6 +93,21 @@ test('p13 public child reads bind the child owner and reject mixed user or paren
   const frame = { protocolVersion: HOST_PROTOCOL_VERSION, kind: 'request', requestId: 'read_child', instanceId: 'host', operationRef: 'read', method: 'run.read', payload: { recent: true, parentRunId: 3 } };
   expect(PublicHostRequestSchema.safeParse(frame).success).toBe(true);
   expect(PublicHostRequestSchema.safeParse({ ...frame, protocolVersion: 'medclaw.host/p12-v1' }).success).toBe(false);
+});
+
+test('p13 child event sequence, snapshot revision and late cleanup metadata stay independent from the parent',()=>{
+  const child=new RunEventProjection(2,3),parent=new RunEventProjection(1,1),time='2026-10-07T00:00:00Z';
+  const created:StoredRunEvent={eventId:20,sequence:1,runId:2,sessionId:3,type:'run_created',payload:{contract:'medclaw.event/v1',sessionId:3,kind:'child',configVersion:'1'},source:'application',sourceConnection:null,sourceSequence:null,toolCallId:null,occurredAt:time,receivedAt:time};
+  const page:EventPage={runId:2,events:[created],nextSequence:1,hasMore:false,range:{firstSequence:1,lastSequence:1}};
+  expect(parent.applyPage(page)).toBe(false);expect(child.applyPage({...page,events:[{...created,sequence:2}],nextSequence:2})).toBe(false);expect(child.state.cursor).toBe(0);
+  expect(child.applyPage(page)).toBe(true);expect(child.applyPage(page)).toBe(true);expect(child.state.events).toHaveLength(1);
+  const stream:MessageStreamSnapshot={type:'message.snapshot',runId:2,sessionId:3,streamConnection:'child-connection',messageId:'same-id',ordinal:1,revision:2,phase:'streaming',modelCallId:'child-call',nativeEntryId:null,blocks:[{contentIndex:0,text:'ORIGINAL'}],totalChars:8,truncated:false};
+  child.applySnapshot(stream);child.applySnapshot({...stream,revision:1,blocks:[{contentIndex:0,text:'OLD'}]});child.applySnapshot({...stream,streamConnection:'parent-connection',revision:10});parent.applySnapshot(stream);
+  expect(child.state.cursor).toBe(1);expect(parent.state.snapshots).toHaveLength(0);
+  const ended:StoredRunEvent={...created,eventId:21,sequence:2,type:'run_completed',payload:{contract:'medclaw.event/v1',stopConfirmed:true,answerId:null,errorCode:null}};
+  expect(child.applyPage({...page,events:[ended],nextSequence:2})).toBe(true);child.replaceAuthoritative('saved');
+  child.applySnapshot({...stream,revision:3,phase:'ended',nativeEntryId:'saved-child-entry',blocks:[{contentIndex:0,text:'LATE MUTATION'}]});child.applySnapshot({...stream,revision:4,messageId:'late-new'});
+  expect(child.state.terminal).toBe(true);expect(child.state.snapshots).toHaveLength(1);expect(child.state.snapshots[0]).toMatchObject({revision:3,phase:'ended',nativeEntryId:'saved-child-entry',blocks:[{text:'ORIGINAL'}]});expect(child.state.nativeEntries).toHaveProperty('message:child-connection/same-id','native:saved-child-entry');
 });
 
 test('p13 committed execution delivery failure stays safe and cannot trigger automatic execution retry', () => {

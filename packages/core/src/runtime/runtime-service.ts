@@ -32,7 +32,7 @@ type Execution = { handle: RunHandle; operationRef: string; abort: AbortControll
   pendingInputFailures: Map<number, Parameters<RuntimeRunStore['recordInputFailure']>[1]>;
   agentFields?: Omit<StartRunInput<ResolvedProviderSelection>, 'inputId' | 'submission' | 'resolved'>;
   deadlineAt: number | null; deadlineTimer: ReturnType<typeof setTimeout> | null;compactionFailure?:boolean;
-  pendingCompactionCalls?:Map<string,{owner:CompactionCallOwner;fact:FinalCallFact}>;pendingCompactionFailures?:Map<string,{error:AppError;at:string}>;
+  pendingCompactionCalls?:Map<string,{owner:CompactionCallOwner;fact:FinalCallFact}>;pendingCompactionFailures?:Map<string,{runId:number;error:AppError;at:string}>;
   children?:Map<string,{stop:()=>Promise<void>;stopped:boolean;identity?:BoundChildIdentity;unknown:boolean;pendingFinal?:FinalChildFact;registration?:RegisterChildInput;cancelAt?:string}> };
 type Recovery = { run: RunView; cleanup: RunCleanupRecord; verified: boolean; at: string };
 type ManualExecution={operation:StoredCompactionOperation;abort:AbortController;phase:CompactionPhase;revision:number;nativeIdle:boolean;
@@ -604,7 +604,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const originalReply=NativeAgentReplySchema.parse(reply),outcome=observation.outcome;
         const prior=this.store.read({runId:identity.childRunId});if(prior.kind!=='one'||prior.run?.kind!=='child')throw safeError('storage_read_failed');
         const cancellationWon=prior.run.childResult===null&&prior.run.cancelRequestedAt!==null;
-        const status=cancellationWon?'cancelled':observation.error===null&&outcome?.callState==='completed'&&['stop','length'].includes(outcome.sdkStopReason)?'completed':outcome?.callState==='cancelled'||observation.error?.code==='tool_cancelled'?'cancelled':'failed';
+        const status=cancellationWon?'cancelled':observation.error===null&&outcome?.callState==='completed'&&['stop','length'].includes(outcome.sdkStopReason)&&outcome.text.trim().length>0?'completed':outcome?.callState==='cancelled'||observation.error?.code==='tool_cancelled'?'cancelled':'failed';
         const endedAt=slot.pendingFinal?.endedAt??now(),error=status==='completed'?null:observation.error??safeError(status==='cancelled'?'tool_cancelled':'internal_error',undefined,{reason:'subagent_execution_failed'});
         const base=this.store.readChildHistoryBase!(identity.childRunId);
         const refs=this.store.childResultReferences(identity.childRunId);
@@ -614,7 +614,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         });
         const childResult=ChildResultSchema.parse({contract:'medclaw.child-result/v1',childRunId:identity.childRunId,childSessionId:identity.childSessionId,parentRunId:identity.parentRunId,
           originToolCallId:identity.originToolCallId,pluginAgentId:identity.pluginAgentId,nativeSessionId:identity.nativeSessionId,outcome:status,text:outcome?.text??'',
-          ...refs,gaps:[...new Set([...(error?[error.code]:[]),...refs.gaps,...nativeErrors])],truncated:false,originalReply,originalReplyHash:createHash('sha256').update(canonicalRequest(originalReply)).digest('hex'),
+          ...refs,gaps:[...new Set([...(error?[error.code]:[]),...(outcome?.sdkStopReason==='length'?['sdk_output_length']:[]),...refs.gaps,...nativeErrors])],truncated:outcome?.sdkStopReason==='length',originalReply,originalReplyHash:createHash('sha256').update(canonicalRequest(originalReply)).digest('hex'),
           finalLeafId:observation.history.activeLeafId,storageVersion:observation.history.expectedStorageVersion+(observation.history.newEntries.length||observation.history.activeLeafId!==base.leafId?1:0),committedAt:endedAt});
         const candidate:FinalChildFact={status,endedAt,outputText:childResult.text,error,calls:observation.calls,history:observation.history,compactions:observation.compactions,childResult,
           cleanup:{...observation.cleanup,stopConfirmed:true,requiredPersistenceComplete:true,inputsSettled:true,resourcesReleased:false,unconfirmedItems:['resources'],verifiedAt:null}};
@@ -654,7 +654,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         try{return this.transactions.immediate(()=>this.store.commitCompactionInTransaction(change,fact));}
         catch(error){try{const version=this.store.confirmCompactionSaved?.(change,fact);if(version!=null)return version;}catch{}this.checkpoint(execution,safeError('storage_write_failed'),false);execution.abort.abort();throw error;}
       },
-      failed:(operationRef,error,time,nativeGenerated)=>{if(!nativeGenerated)try{this.store.finishAutoCompaction?.(operationRef,runId,error,time);}catch{(execution.pendingCompactionFailures??=new Map()).set(operationRef,{error,at:time});this.checkpoint(execution,safeError('storage_write_failed'),false);}
+      failed:(operationRef,error,time,nativeGenerated)=>{if(!nativeGenerated)try{this.store.finishAutoCompaction?.(operationRef,runId,error,time);}catch{(execution.pendingCompactionFailures??=new Map()).set(operationRef,{runId,error,at:time});this.checkpoint(execution,safeError('storage_write_failed'),false);}
         if(execution.cause!=='user')this.checkpoint(execution,error,false);execution.abort.abort();},
       progress:(operationRef,phase)=>{const revision=(revisions.get(operationRef)??0)+1;revisions.set(operationRef,revision);try{this.notice({type:'compaction.progress',sessionId:sessionId,operationRef,runId:runId,revision,phase});}catch{}},
     };
@@ -839,8 +839,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       if(execution?.handle.runId===runId&&execution.cause&&!execution.stopped)throw safeError('stop_unconfirmed',undefined,{runId});
       if (!execution || execution.handle.runId !== runId || !execution.pendingSave || !execution.stopped || !execution.fact) throw new Error("run_save_unavailable");
       if (!execution.finalCommitted && execution.handle.kind === 'agent') {
-        for(const [callId,pending]of execution.pendingCompactionCalls??[]){this.store.finishCompactionCall(pending.owner,pending.fact);execution.pendingCompactionCalls!.delete(callId);}
-        for(const [operationRef,pending]of execution.pendingCompactionFailures??[]){this.store.finishAutoCompaction?.(operationRef,runId,pending.error,pending.at);execution.pendingCompactionFailures!.delete(operationRef);}
+        this.retryCompactionPersistence(execution);
         this.agent?.retryContextPersistence?.(runId); this.agent?.retryToolPersistence?.(runId); this.agent?.retryInputPersistence?.(runId);
         this.agent?.retryHistoryPersistence?.(runId);
         for (const [inputId, fact] of [...execution.pendingInputFailures]) {
@@ -856,9 +855,13 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     }
     const result = this.store.read({ runId }); if (result.kind !== "one" || !result.run) throw new Error("run_not_found"); return result.run;
   }
+  private retryCompactionPersistence(execution:Execution) {
+    for(const [callId,pending]of execution.pendingCompactionCalls??[]){this.store.finishCompactionCall(pending.owner,pending.fact);execution.pendingCompactionCalls!.delete(callId);}
+    for(const [operationRef,pending]of execution.pendingCompactionFailures??[]){this.store.finishAutoCompaction?.(operationRef,pending.runId,pending.error,pending.at);execution.pendingCompactionFailures!.delete(operationRef);}
+  }
   retrySave(runId: number) { return serviceResult(async () => {
     const execution=this.execution;
-    if(execution?.handle.runId===runId&&execution.pendingSave&&execution.stopped&&execution.fact)await this.agent?.retrySubagentPersistence?.(runId);
+    if(execution?.handle.runId===runId&&execution.pendingSave&&execution.stopped&&execution.fact){this.retryCompactionPersistence(execution);await this.agent?.retrySubagentPersistence?.(runId);}
     return this.retrySaveNow(runId);
   }, "storage_write_failed", { runId }); }
   recoverInterrupted(previousProcessExited: boolean) {

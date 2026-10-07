@@ -310,11 +310,12 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
       const control=parent.control.createChild(identity.childRunId,scope,signal),toolContexts=new Map<string,ToolExecutionContext>();
       const {extensions:_extensions,workspaceContext:_workspace,inputPlan:_plan,nativeReceiptLimitBytes:_receipt,...frozenInput}=parent.input;
       const input:ExecutionInput={...frozenInput,runId:identity.childRunId,sessionId:identity.childSessionId,inputId:null,text:request.prompt,scope,signal};
+      const childCompaction=callbacks.compaction?.(identity);
       const abort=()=>{void session.abort().catch(error=>{child.error??=safeError('stop_unconfirmed',error);});};
       const execution:NonNullable<Binding['execution']>={input,control,toolContexts,toolCalls:new Set(),toolOrigins:new Map(),observers:[],facts:[],lastOutcome:null,unsupported:false,registrationFailed:false,currentModelCallId:null,abort,
         tools:{registry:business,executor:configured.executor},resourcePaths:paths,delegation:{parentRunId:origin.runId,originToolCallId:record.id,parentSnapshotId:origin.contextSnapshotId,parentInputId:origin.workspaceInputId??null,promptHash:createHash('sha256').update(request.prompt).digest('hex')},
         callbacks:{startCall:(time,context)=>callbacks.startCall(identity.childRunId,time,context),preview:()=>{},nativeTerminal:()=>{},inputStore:parent.callbacks.inputStore,stream:snapshot=>callbacks.stream?.(snapshot),
-          fatal:error=>{child.error??=error;abort();if(error.code==='storage_write_failed')parent.callbacks.fatal?.(error);},...(callbacks.compaction?{compaction:callbacks.compaction(identity)}:{})}};
+          fatal:error=>{child.error??=error;abort();if(error.code==='storage_write_failed')parent.callbacks.fatal?.(error);},...(childCompaction?{compaction:{...childCompaction,failed:(operationRef,error,time,nativeGenerated)=>{child.error??=error;childCompaction.failed(operationRef,error,time,nativeGenerated);}}}:{})}};
       binding.execution=execution;this.sessions.set(identity.childSessionId,binding);this.controls.set(identity.childRunId,control);this.toolContexts.set(identity.childRunId,toolContexts);
       this.bindModelStream(binding,session,loader,workdir);
       const prompt=session.prompt.bind(session);session.prompt=(text,options)=>prompt(text,{...options,expandPromptTemplates:false});

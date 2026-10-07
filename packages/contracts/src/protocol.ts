@@ -177,7 +177,10 @@ export const publicMethodSchemas = {
   'data.delete.recover': {input:DataDeleteReferenceSchema,output:DataDeleteOperationSchema},
   'query.execute': { input: z.strictObject({ params: QueryRequestParamsSchema, expectedRevision: z.number().int().nonnegative() }), output: QueryViewSchema },
   'query.read': { input: PageSchema.extend({ page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional(), queryId: PositiveIdSchema }), output: QueryViewSchema },
-  'query.list': { input: z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.optional() }), output: z.strictObject({ items: z.array(QuerySummarySchema), nextBeforeQueryId: PositiveIdSchema.nullable() }) },
+  'query.list': { input: z.union([
+    z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.optional() }),
+    z.strictObject({ childRunId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.optional() }),
+  ]), output: z.strictObject({ items: z.array(QuerySummarySchema), nextBeforeQueryId: PositiveIdSchema.nullable() }) },
   'evidence.read': { input: PageSchema.extend({ page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional(), queryId: PositiveIdSchema, evidenceId: PositiveIdSchema }), output: EvidenceViewSchema },
   'tool.read': { input: z.strictObject({ runId: PositiveIdSchema, page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional() }), output: RunToolsViewSchema },
   "import.preview": { input: ImportPreviewRequestSchema, output: ImportPreviewSchema },
@@ -214,7 +217,10 @@ export function createPublicMethodSchemas() {
     'data.read': { ...publicMethodSchemas['data.read'], input: query.PageSchema },
     'data.rows': { ...publicMethodSchemas['data.rows'], input: query.PageSchema.extend({ kind: z.enum(['devices', 'changes']), batchId: PositiveIdSchema }) },
     'query.read': { ...publicMethodSchemas['query.read'], input: query.PageSchema.extend({ queryId: PositiveIdSchema }) },
-    'query.list': { ...publicMethodSchemas['query.list'], input: z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.max(presentation.maxPageSize).default(presentation.defaultPageSize) }) },
+    'query.list': { ...publicMethodSchemas['query.list'], input: z.union([
+      z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.max(presentation.maxPageSize).default(presentation.defaultPageSize) }),
+      z.strictObject({ childRunId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.max(presentation.maxPageSize).default(presentation.defaultPageSize) }),
+    ]) },
     'evidence.read': { ...publicMethodSchemas['evidence.read'], input: query.PageSchema.extend({ queryId: PositiveIdSchema, evidenceId: PositiveIdSchema, pageSize: PositiveIdSchema.max(BUSINESS_RULES.maxPageSize).default(BUSINESS_RULES.evidencePageSize) }) },
     'tool.read': { ...publicMethodSchemas['tool.read'], input: z.strictObject({ runId: PositiveIdSchema, page: PositiveIdSchema.default(presentation.defaultPage), pageSize: PositiveIdSchema.max(presentation.maxPageSize).default(presentation.defaultPageSize) }).refine(value => Number.isSafeInteger((value.page - 1) * value.pageSize), 'Page offset must be a safe integer') },
   };

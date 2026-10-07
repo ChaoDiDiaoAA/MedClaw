@@ -31,14 +31,18 @@ export function createRunSubagent(input:{runId:number;sessionId:number;getSessio
   }});
   const persist=async()=>{
     if(!id||!reply)throw safeError('state_conflict');
-    if(!released)await managed.control.waitForSettled(id);
+    const record=!released?await managed.control.waitForSettled(id):null;
     const settled=observation??await input.settle(id);
     if(!settled){
       await managed.control.release(id);released=true;origin=undefined;id=undefined;
       throw openError??safeError('internal_error',undefined,{reason:'subagent_binding_failed'});
     }
     observation??=settled;
-    const committed=input.finish(observation,reply);
+    if(record&&record.status!=='completed'&&observation.error===null)observation={...observation,error:['aborted','stopped'].includes(record.status)?safeError('tool_cancelled'):safeError('internal_error',undefined,{reason:'subagent_execution_failed'})};
+    let committed:CommittedChildResult;
+    try{committed=input.finish(observation,reply);}
+    catch(error){const known=AppErrorSchema.safeParse(error);if(known.success&&!observation.cleanup.secondaryErrors.some(item=>item.code===known.data.code))observation.cleanup.secondaryErrors.push(known.data);
+      throw safeError('storage_write_failed',error);}
     input.acknowledge(observation,committed.result.storageVersion);
     if(!released){await managed.control.release(id);released=true;}
     await input.release(id);

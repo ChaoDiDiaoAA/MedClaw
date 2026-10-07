@@ -19,6 +19,7 @@ import { PiAgentRuntime } from "../../../packages/runtime-pi/src/agent-runtime.t
 import { projectToolCall } from "../../../packages/runtime-pi/src/messages.ts";
 import { SqliteCatalogStore } from '../../../packages/storage/src/catalog-store.ts';
 import { SqliteToolStore } from '../../../packages/storage/src/tool-store.ts';
+import { readFrozenChild } from '../../../packages/storage/src/child-identity.ts';
 import { SqliteImportStore } from '../../../packages/storage/src/import-store.ts';
 import { SqliteDataDeletionStore } from '../../../packages/storage/src/data-deletion-store.ts';
 import { DataDeletionService } from '../../../packages/core/src/data/data-deletion-service.ts';
@@ -239,14 +240,16 @@ function evidenceSummary(record: Evidence) {
 function readContext(runId: number, requireSelectedSession = true): QueryExecutionContext {
   const row = database!.query<{ kind: string; session_id: number | null; input_id: number | null; scope_json: string; reference_date: string; timezone: string; config_json: string }, [number]>(
     'SELECT kind,session_id,input_id,scope_json,reference_date,timezone,config_json FROM runs WHERE id=?').get(runId);
-  if (!row || row.kind !== 'agent' || row.session_id === null || requireSelectedSession && repositories.readWorkspace().sessionId !== row.session_id) throw new Error('access_denied');
+  if (!row || !['agent','child'].includes(row.kind) || row.session_id === null) throw new Error('access_denied');
+  const child=row.kind==='child'?readFrozenChild(database!,runId):null;
+  if(requireSelectedSession&&repositories.readWorkspace().sessionId!==(child?.parentSessionId??row.session_id))throw new Error('access_denied');
   return { runId, inputId: row.input_id, sessionId: row.session_id, source: 'user_form', callRef: `read:${runId}`,
     scope: RunScopeSchema.parse(JSON.parse(row.scope_json)), referenceDate: row.reference_date, timezone: row.timezone,
     signal: new AbortController().signal };
 }
 function frozenConfiguration(runId: number) {
   const row = database!.query<{ config_json: string }, [number]>('SELECT config_json FROM runs WHERE id=?').get(runId);
-  const value = row ? JSON.parse(row.config_json).toolConfiguration : undefined;
+  const saved=row?JSON.parse(row.config_json):null,value=saved?.subagent?.toolConfiguration??saved?.toolConfiguration;
   return value === undefined ? undefined : StoredToolConfigurationSchema.parse(value);
 }
 function queryView(queryId: number, page: number, pageSize: number) {
@@ -370,10 +373,11 @@ async function dispatch(request: HostRequest): Promise<unknown> {
       return queryView(queryId, page, pageSize);
     }
     case 'query.list': {
-      const { sessionId, beforeQueryId, limit } = createPublicMethodSchemas()['query.list'].input.parse(request.payload);
-      if (repositories.readWorkspace().sessionId !== sessionId) throw new Error('access_denied');
+      const input = createPublicMethodSchemas()['query.list'].input.parse(request.payload),{beforeQueryId,limit}=input;
+      const child='childRunId' in input?readFrozenChild(database!,input.childRunId):null,sessionId='sessionId' in input?input.sessionId:child!.childSessionId;
+      if(!child&&repositories.readWorkspace().sessionId!==sessionId)throw new Error('access_denied');
       const rows = database!.query<{ id: number }, [number, number, number]>('SELECT id FROM queries WHERE session_id=? AND id<? ORDER BY id DESC LIMIT ?').all(sessionId, beforeQueryId ?? Number.MAX_SAFE_INTEGER, limit + 1);
-      return { items: rows.slice(0, limit).map(row => { const saved = toolStore.readQuery(row.id)!; const context=readContext(saved.runId);return new HistorySourceStore(database!).availability(context.scope.batchIds).sourceAvailability==='deleted'?new HistorySourceStore(database!).query(saved.id,1,1).query:summary(queries.read(row.id, context)); }), nextBeforeQueryId: rows.length > limit ? rows[limit - 1]!.id : null };
+      return { items: rows.slice(0, limit).map(row => { const saved = toolStore.readQuery(row.id)!;if(child&&saved.runId!==child.childRunId)throw new Error('access_denied');const context=readContext(saved.runId,!child);return new HistorySourceStore(database!).availability(context.scope.batchIds).sourceAvailability==='deleted'?new HistorySourceStore(database!).query(saved.id,1,1).query:summary(queries.read(row.id, context)); }), nextBeforeQueryId: rows.length > limit ? rows[limit - 1]!.id : null };
     }
     case 'evidence.read': {
       const payload = createPublicMethodSchemas()['evidence.read'].input.parse(request.payload);
@@ -394,8 +398,10 @@ async function dispatch(request: HostRequest): Promise<unknown> {
         if(snapshot && snapshot.kind !== 'snapshot') throw new Error('storage_read_failed');
         const origin=snapshot?.kind === 'snapshot' ? snapshot.snapshot : null;
         const call=origin ? database!.query<{call_id:string},[number]>('SELECT call_id FROM model_calls WHERE id=?').get(row.model_call_id!) : null;
-        if(origin && (!call || !origin.workspaceContext || origin.inputId === null)) throw new Error('storage_read_failed');
-        const record = toolStore.readCall({ ...context, nativeToolCallId: row.native_tool_call_id,...(origin ? {contextSnapshotId:origin.id,modelCallId:call!.call_id,workspaceContext:origin.workspaceContext,workspaceInputId:origin.inputId,basedOnQueryId:origin.workspaceContext!.queryId,workspaceRevision:origin.workspaceContext!.revision} : {}) })!;
+        if(origin&&(!call||!origin.delegationSource&&(!origin.workspaceContext||origin.inputId===null)))throw new Error('storage_read_failed');
+        const record = toolStore.readCall({ ...context, nativeToolCallId: row.native_tool_call_id,...(origin ? {contextSnapshotId:origin.id,modelCallId:call!.call_id,...(origin.delegationSource
+          ?{delegationSource:origin.delegationSource,workspaceContext:null,workspaceInputId:null,basedOnQueryId:null}
+          :{workspaceContext:origin.workspaceContext,workspaceInputId:origin.inputId,basedOnQueryId:origin.workspaceContext!.queryId,workspaceRevision:origin.workspaceContext!.revision})} : {}) })!;
         return projectToolCall(record);
       });
       return { runId, scope: context.scope, items, totalRows, page, pageSize };

@@ -9,7 +9,7 @@ import { Repositories } from '../../packages/storage/src/repositories';
 import { SqliteContextStore } from '../../packages/storage/src/context-store';
 import { SqliteToolStore } from '../../packages/storage/src/tool-store';
 import { FrozenChildConfigSchema } from '../../packages/contracts/src/subagent';
-import { normalizeRuntimeConfiguration, DEFAULT_AGENT_POLICY } from '../../packages/contracts/src/runtime-config';
+import { normalizeRuntimeConfiguration, DEFAULT_AGENT_POLICY,projectRuntimePolicies } from '../../packages/contracts/src/runtime-config';
 import { normalizeToolConfiguration } from '../../packages/contracts/src/tool-config';
 import { memoryNativeFixture, sqliteHistory } from '../fixtures/p9-memory';
 import { join } from 'node:path';
@@ -38,6 +38,21 @@ import { canReadRelatedQuery } from '../../packages/storage/src/child-identity';
 import { SessionService } from '../../packages/core/src/session/session-service';
 import { SubmitInputSchema } from '../../packages/contracts/src/session';
 import { canonicalRequest } from '../../packages/contracts/src/run';
+import {encodeHostFrame,HOST_PROTOCOL_VERSION,MAX_FRAME_BYTES} from '../../packages/contracts/src/protocol';
+import {Application} from '../../packages/core/src/application';
+import {safeError} from '../../packages/contracts/src/error';
+
+test('p13 child recent pages omit full results and a maximum 50-item page fits the Host frame',async()=>{
+  const text='中'.repeat(32768),f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'large-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:index===2?text:'ENGINEERING parent answer'});
+  try{
+    const accepted=await f.app.runs.submitAgent(f.request('ENGINEERING large child result'),{instanceId:'host',operationRef:'p13-large-child-page'});expect(accepted.ok).toBe(true);await f.settle();
+    const recent=f.repos.read({recent:true,parentRunId:1,limit:50});if(recent.kind!=='recent'||recent.runs[0]?.kind!=='child')throw new Error('No child summary');
+    expect(recent.runs[0]).not.toHaveProperty('childResult');expect(f.repos.read({runId:recent.runs[0].id})).toMatchObject({kind:'one',run:{childResult:{text}}});
+    const page={...recent,runs:Array.from({length:50},(_,index)=>({...recent.runs[0]!,id:index+2,inputText:'中'.repeat(2048)}))};
+    const frame=encodeHostFrame({protocolVersion:HOST_PROTOCOL_VERSION,kind:'reply',instanceId:'host',requestId:'maximum-child-page',result:{ok:true,data:page}});
+    expect(new TextEncoder().encode(frame).byteLength).toBeLessThan(MAX_FRAME_BYTES);expect(f.requests).toHaveLength(3);
+  }finally{await f.close();}
+},20000);
 
 for (const audit of [false,true])for (const delegate of [false,true]) test('p13 original product Agent registration '+(audit?'with P12 audit ':'')+(delegate?'delegates through the plugin and returns committed child result':'starts no child without a real tool call'),async()=>{
   const f=await agentRuntimeFixture(index=>index===1&&delegate
@@ -93,6 +108,20 @@ test('p13 two original delegations create distinct child identities only after p
     expect(rows[0]!.id).not.toBe(rows[1]!.id);expect(rows[0]!.session_id).not.toBe(rows[1]!.session_id);expect(rows[0]!.origin_tool_call_id).not.toBe(rows[1]!.origin_tool_call_id);
     for(const key of ['pluginAgentId','nativeSessionId'])expect(JSON.parse(rows[0]!.config_json).subagent[key]).not.toBe(JSON.parse(rows[1]!.config_json).subagent[key]);
   }finally{await f.close();}
+},20000);
+
+test('p13 repeated real child SDK tool-end and equal parent child native IDs retain one call per owner',async()=>{
+  const f=await agentRuntimeFixture(index=>index===1||index===2?{role:'assistant',tool_calls:[{index:0,id:'same-native-call',type:'function',function:{name:index===1?'Agent':'read_data_scope',arguments:JSON.stringify(index===1?p13AgentInput:{})}}]}:{role:'assistant',content:'ENGINEERING original result'});
+  const open=Reflect.get(f.agent,'openManagedChild').bind(f.agent);let duplicate=false,unsubscribe:()=>void=()=>{};
+  Reflect.set(f.agent,'openManagedChild',async(...args:unknown[])=>{const session:AgentSession=await open(...args);unsubscribe=session.subscribe(event=>{if(event.type==='tool_execution_end'&&!duplicate){duplicate=true;Reflect.get(session,'_emit').call(session,event);}});return session;});
+  try{
+    expect(await f.app.runs.submitAgent(f.request('ENGINEERING duplicate event'),{instanceId:'host',operationRef:'p13-duplicate-native'})).toMatchObject({ok:true});await f.settle();expect(duplicate).toBe(true);expect(f.errors).toEqual([]);expect(f.requests).toHaveLength(4);
+    const child=f.db.query<{id:number;session_id:number},[]>("SELECT id,session_id FROM runs WHERE kind='child'").get()!;
+    expect(f.db.query('SELECT run_id,session_id,status FROM tool_calls WHERE native_tool_call_id=? ORDER BY id').all('same-native-call')).toEqual([{run_id:1,session_id:1,status:'succeeded'},{run_id:child.id,session_id:child.session_id,status:'succeeded'}]);
+    for(const runId of [1,child.id])expect(f.db.query("SELECT id FROM runtime_events WHERE run_id=? AND type='tool_finished'").all(runId)).toHaveLength(1);
+    expect(f.repos.read({runId:1})).toMatchObject({kind:'one',run:{cleanup:{resourcesReleased:true},groupUsage:{parent:{modelCalls:2,toolCalls:1},children:{modelCalls:2,toolCalls:1}}}});
+    expect(Reflect.get(f.agent,'sessions').has(child.session_id)).toBe(false);
+  }finally{unsubscribe();await f.close();}
 },20000);
 
 test('p13 cancellation after committed child preserves Agent execution success without another child loop',async()=>{
@@ -159,6 +188,11 @@ test('p13 real child business Query and history retain child ownership without c
     expect(JSON.parse(child.child_result_json)).toMatchObject({outcome:'completed',queryRefs:[{queryId:query.id,resultHash:query.result_hash}]});
     expect(f.db.query('SELECT run_id,session_id FROM tool_calls WHERE native_tool_call_id=?').get('owned-3')).toEqual({run_id:child.id,session_id:child.session_id});
     expect(f.db.query("SELECT id FROM memories WHERE run_id=? AND entry_type='message'").all(child.id).length).toBeGreaterThan(0);
+    const publicContext={runId:child.id,sessionId:child.session_id,inputId:null,source:'user_form' as const,callRef:'read-child',scope:JSON.parse(f.db.query<{scope_json:string},[number]>('SELECT scope_json FROM runs WHERE id=?').get(child.id)!.scope_json),referenceDate:f.request('read').referenceDate,timezone:'Asia/Shanghai',signal:new AbortController().signal};
+    const publicQueries=new QueryService(new CatalogService(new SqliteCatalogStore(f.db)),f.toolStore);
+    expect(publicQueries.read(query.id,publicContext)).toMatchObject({id:query.id,runId:child.id});
+    expect(()=>f.toolStore.assertContext(publicContext)).toThrow('access_denied');
+    expect(()=>publicQueries.read(query.id,{...publicContext,inputId:1})).toThrow('access_denied');
     expect(f.repos.readWorkspace()).toEqual(workspace);
   }finally{await f.close();}
 },20000);
@@ -230,6 +264,9 @@ test('p13 browsing B and rejected B Send or Steer keep the real child on origina
     await childRequest;
     const child=f.db.query<{id:number;session_id:number;config_json:string},[]>("SELECT id,session_id,config_json FROM runs WHERE kind='child'").get()!,frozen=JSON.parse(child.config_json).subagent;
     expect(await sessions.select({sessionId:B,expectedWorkspaceRevision:f.repos.readWorkspace().revision})).toMatchObject({ok:true});
+    const changed=normalizeRuntimeConfiguration(f.app.config);changed.runBudget.maxModelCalls=2;
+    const settings=PublishedSettingsSchema.parse({...f.app.config,configVersion:'2',runtimeConfiguration:changed,...projectRuntimePolicies(changed)});
+    expect(await f.app.prepareConfig('p13-B-settings',settings)).toMatchObject({prepared:true});f.app.commitConfig('p13-B-settings','2');
     for(const mode of ['send','steer'] as const)expect(await sessions.submit(SubmitInputSchema.parse({...f.request('ENGINEERING B '+mode),sessionId:B,clientSequence:1,mode,...(mode==='steer'?{targetRunId:result.data.runId}:{})}),{instanceId:'host',operationRef:'p13-B-'+mode})).toMatchObject({ok:false});
     expect((await sessions.list({}))).toMatchObject({ok:true,data:{sessions:expect.arrayContaining([expect.objectContaining({id:1}),expect.objectContaining({id:B})])}});
     expect(f.repos.listSessions({}).sessions.map(session=>session.id)).not.toContain(child.session_id);
@@ -242,6 +279,81 @@ test('p13 browsing B and rejected B Send or Steer keep the real child on origina
     }
     expect(f.db.query('SELECT id FROM session_inputs WHERE session_id=?').all(B)).toEqual([]);
   }finally{resume();await f.close();}
+},20000);
+
+test('p13 real child automatic compaction saves its own native summary and counts the actual request once',async()=>{
+  const prompt={...p13AgentInput,prompt:'ENGINEERING child context '.repeat(100)};
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'compact-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(prompt)}}]}:
+    index===2?{role:'assistant',tool_calls:[{index:0,id:'compact-read',type:'function',function:{name:'read_data_scope',arguments:'{}'}}]}:
+    {role:'assistant',content:index===3?'ENGINEERING child reply '.repeat(100):index===4?'ENGINEERING child summary':'ENGINEERING parent answer'},false,
+    index=>({prompt_tokens:index===3?32600:10,completion_tokens:2,total_tokens:index===3?32602:12}));
+  const describe=f.agent.describe.bind(f.agent);f.agent.describe=resolved=>({...describe(resolved),compaction:{contract:'medclaw.compaction/v1',enabled:true,reserveTokens:256,keepRecentTokens:128}});
+  try{
+    const accepted=await f.app.runs.submitAgent(f.request('ENGINEERING child compaction'),{instanceId:'host',operationRef:'p13-actual-compaction'});expect(accepted.ok).toBe(true);await f.settle();expect(f.errors).toEqual([]);
+    const child=f.db.query<{id:number;session_id:number;status:string;child_result_json:string},[]>("SELECT id,session_id,status,child_result_json FROM runs WHERE kind='child'").get()!;
+    expect(child.status).toBe('completed');expect(f.requests).toHaveLength(5);expect(JSON.stringify(f.requests[3])).not.toContain('MedClaw trusted runtime feedback');
+    expect(f.db.query('SELECT entry_type FROM memories WHERE session_id=? AND entry_type=?').all(child.session_id,'compaction')).toEqual([{entry_type:'compaction'}]);
+    expect(f.db.query("SELECT run_id,session_id,input_id,kind,state FROM model_calls WHERE kind='compaction'").all()).toEqual([{run_id:child.id,session_id:child.session_id,input_id:null,kind:'compaction',state:'completed'}]);
+    const compact=f.db.query<{version:number;entry:string},[]>("SELECT json_extract(model_json,'$.compaction.savedStorageVersion') version,json_extract(model_json,'$.compaction.nativeEntryId') entry FROM model_calls WHERE kind='compaction'").get()!;expect(compact.version).toBeGreaterThan(0);expect(f.db.query('SELECT native_entry_id FROM memories WHERE session_id=? AND entry_type=?').get(child.session_id,'compaction')).toEqual({native_entry_id:compact.entry});
+    expect(f.repos.read({runId:1})).toMatchObject({kind:'one',run:{groupUsage:{parent:{modelCalls:2,inputTokens:20,outputTokens:4},children:{modelCalls:3,inputTokens:32620,outputTokens:6}}}});
+    expect(f.db.query("SELECT run_id,session_id FROM runtime_events WHERE type='compaction_completed'").all()).toEqual([{run_id:child.id,session_id:child.session_id}]);expect(f.db.query('SELECT id FROM answers WHERE run_id=?').all(child.id)).toEqual([]);
+  }finally{await f.close();}
+},30000);
+
+test('p13 child failed compaction retries its original owner marker before final save without another model request',async()=>{
+  const prompt={...p13AgentInput,prompt:'ENGINEERING child context '.repeat(100)};
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'failed-compact-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(prompt)}}]}:
+    index===2?{role:'assistant',tool_calls:[{index:0,id:'failed-compact-read',type:'function',function:{name:'read_data_scope',arguments:'{}'}}]}:
+    index===4?Response.json({error:{message:'ENGINEERING summary provider failure'}},{status:500}):{role:'assistant',content:'ENGINEERING child reply '.repeat(100)},false,
+    index=>({prompt_tokens:index===3?32600:10,completion_tokens:2,total_tokens:index===3?32602:12}));
+  const describe=f.agent.describe.bind(f.agent);f.agent.describe=resolved=>({...describe(resolved),compaction:{contract:'medclaw.compaction/v1',enabled:true,reserveTokens:256,keepRecentTokens:128}});
+  const finish=f.repos.finishAutoCompaction.bind(f.repos);let writes=0;
+  f.repos.finishAutoCompaction=(...args)=>{if(++writes===1)throw new Error('ENGINEERING once storage failure');return finish(...args);};
+  try{
+    const accepted=await f.app.runs.submitAgent(f.request('ENGINEERING child failed compaction'),{instanceId:'host',operationRef:'p13-failed-compaction'});if(!accepted.ok||!accepted.data.runId)throw new Error('No Run');
+    await Reflect.get(f.app.runs,'execution').task;expect(f.app.runs.busy).toBe(true);expect(f.requests).toHaveLength(4);
+    expect(await f.app.runs.retrySave(accepted.data.runId)).toMatchObject({ok:true,data:{status:'failed',cleanup:{requiredPersistenceComplete:true,resourcesReleased:true}}});
+    expect(f.app.runs.busy).toBe(false);expect(writes).toBe(2);expect(f.requests).toHaveLength(4);
+    const child=f.db.query<{id:number;status:string;child_result_json:string},[]>("SELECT id,status,child_result_json FROM runs WHERE kind='child'").get()!;
+    expect(child.child_result_json).not.toBeNull();expect(['failed','cancelled']).toContain(child.status);
+    expect(f.db.query("SELECT run_id,json_extract(model_json,'$.compaction.operationEndedAt') ended,json_extract(model_json,'$.compaction.operationError.code') code FROM model_calls WHERE kind='compaction'").get()).toMatchObject({run_id:child.id,ended:expect.any(String),code:expect.any(String)});
+  }finally{f.repos.finishAutoCompaction=finish;if(f.app.runs.activeHandle)await f.app.runs.retrySave(f.app.runs.activeHandle.runId);await f.close();}
+},30000);
+
+test('p13 original plugin failure after the actual child prompt cannot turn a completed SDK call into child success',async()=>{
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'plugin-error-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING SDK terminal output'});
+  const open=Reflect.get(f.agent,'openManagedChild').bind(f.agent);
+  Reflect.set(f.agent,'openManagedChild',async(...args:unknown[])=>{const session:AgentSession=await open(...args),prompt=session.prompt.bind(session);session.prompt=async(...input)=>{await prompt(...input);throw new Error('ENGINEERING plugin post-prompt failure');};return session;});
+  try{
+    const accepted=await f.app.runs.submitAgent(f.request('ENGINEERING original plugin failure'),{instanceId:'host',operationRef:'p13-plugin-failure'});expect(accepted.ok).toBe(true);await f.settle();
+    const child=f.db.query<{id:number;status:string;child_result_json:string},[]>("SELECT id,status,child_result_json FROM runs WHERE kind='child'").get()!;
+    expect(child.status).toBe('failed');expect(JSON.parse(child.child_result_json)).toMatchObject({outcome:'failed',gaps:expect.arrayContaining(['internal_error'])});
+    expect(f.db.query("SELECT state FROM model_calls WHERE run_id=? AND kind='main'").get(child.id)).toEqual({state:'completed'});
+    expect(f.db.query("SELECT status FROM tool_calls WHERE native_tool_call_id='plugin-error-Agent'").get()).toEqual({status:'failed'});expect(f.requests).toHaveLength(3);
+  }finally{await f.close();}
+},20000);
+
+for(const reason of ['stop','length'] as const)test('p13 actual '+reason+' without a nonblank child result saves failure without adopting previous output',async()=>{
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'empty-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:
+    index===2?new Response(`data: ${JSON.stringify({id:'empty-child',model:'fixture',choices:[{index:0,delta:{role:'assistant',content:' '},finish_reason:reason}]})}\n\ndata: [DONE]\n\n`,{headers:{'content-type':'text/event-stream'}}):{role:'assistant',content:'ENGINEERING parent result'});
+  try{
+    const accepted=await f.app.runs.submitAgent(f.request('ENGINEERING empty child result'),{instanceId:'host',operationRef:'p13-empty-'+reason});expect(accepted.ok).toBe(true);await f.settle();
+    const child=f.db.query<{id:number;status:string;child_result_json:string},[]>("SELECT id,status,child_result_json FROM runs WHERE kind='child'").get()!;
+    expect(child.status).toBe('failed');expect(JSON.parse(child.child_result_json)).toMatchObject({outcome:'failed',gaps:expect.arrayContaining(['internal_error'])});
+    expect(f.db.query("SELECT json_extract(model_json,'$.sdkStopReason') reason FROM model_calls WHERE run_id=? AND kind='main'").get(child.id)).toEqual({reason});
+    expect(f.requests).toHaveLength(3);
+  }finally{await f.close();}
+},20000);
+
+test('p13 actual length with child text preserves the useful result and its truncation evidence',async()=>{
+  const text='ENGINEERING partial child result';
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'length-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:
+    index===2?new Response(`data: ${JSON.stringify({id:'length-child',model:'fixture',choices:[{index:0,delta:{role:'assistant',content:text},finish_reason:'length'}]})}\n\ndata: [DONE]\n\n`,{headers:{'content-type':'text/event-stream'}}):{role:'assistant',content:'ENGINEERING parent result'});
+  try{
+    const accepted=await f.app.runs.submitAgent(f.request('ENGINEERING truncated child result'),{instanceId:'host',operationRef:'p13-length-result'});expect(accepted.ok).toBe(true);await f.settle();
+    const child=f.db.query<{status:string;child_result_json:string},[]>("SELECT status,child_result_json FROM runs WHERE kind='child'").get()!;
+    expect(child.status).toBe('completed');expect(JSON.parse(child.child_result_json)).toMatchObject({outcome:'completed',text,truncated:true,gaps:expect.arrayContaining(['sdk_output_length'])});expect(f.requests).toHaveLength(3);
+  }finally{await f.close();}
 },20000);
 
 test('p13 child history verification rejects damaged saved prefixes rather than treating child as pre-history',async()=>{
@@ -418,6 +530,21 @@ test('p13 parent manager teardown failure holds root after the child is already 
     expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:true,data:{cleanup:{resourcesReleased:true}}});
     expect(f.app.runs.busy).toBe(false);expect(f.requests).toHaveLength(3);
   }finally{reject=false;if(f.app.runs.activeHandle)await f.app.runs.retrySave(f.app.runs.activeHandle.runId);Reflect.set(f.agent,'prepare',prepare);await f.close();}
+},20000);
+
+test('p13 cold recovery retains an observed child final whose precommit read failed after the parent tool settled',async()=>{
+  const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'cold-read-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:'ENGINEERING child final before read failure'});
+  let settled=false,failures=0;const settle=Reflect.get(f.agent,'settleManagedChild').bind(f.agent),read=f.repos.read.bind(f.repos);
+  Reflect.set(f.agent,'settleManagedChild',async(...args:unknown[])=>{const result=await settle(...args);settled=!!result;return result;});
+  f.repos.read=input=>{if(settled&&'runId' in input&&input.runId===2&&failures++===0)throw safeError('storage_read_failed');return read(input);};
+  try{
+    const accepted=await f.app.runs.submitAgent(f.request('ENGINEERING retain lost child final'),{instanceId:'host',operationRef:'p13-cold-precommit-read'});if(!accepted.ok||!accepted.data.runId)throw new Error('No Run');
+    await Reflect.get(f.app.runs,'execution').task;expect(settled).toBe(true);expect(f.requests).toHaveLength(2);
+    const cold=new Application('cold',f.app.config,f.runtime,f.repos,async(_context,action)=>action(),()=>{throw new Error('No recovery model call');},()=>{});
+    cold.runs.recoverInterrupted(true);expect(cold.persistencePending).toBe(true);expect(cold.busy).toBe(true);
+    expect(await cold.runs.retrySave(accepted.data.runId)).toMatchObject({ok:false,error:{code:'run_save_unavailable'}});
+    expect(f.db.query("SELECT child_result_json FROM runs WHERE kind='child'").get()).toEqual({child_result_json:null});expect(f.requests).toHaveLength(2);
+  }finally{f.repos.read=read;await expect(f.close()).rejects.toThrow('storage_write_failed');}
 },20000);
 
 for(const boundary of ['final','release'] as const)test('p13 child '+boundary+' save gap holds the root and retries only original persistence',async()=>{
@@ -686,7 +813,8 @@ test('p13 child DDL binds an original parent Agent call, freezes identity and is
     const recent = f.repos.read({ recent: true });
     expect(recent.kind === 'recent' && recent.runs.map(r => r.id)).toEqual([f.input.runId]);
     const children = f.repos.read({ recent: true, parentRunId: f.input.runId });
-    expect(children.kind === 'recent' && children.runs).toMatchObject([{ id: childRunId, kind: 'child', parentRunId: f.input.runId, childResult: null, inputId: null, answerRef: null }]);
+    expect(children.kind === 'recent' && children.runs).toMatchObject([{ id: childRunId, kind: 'child', parentRunId: f.input.runId, inputId: null, answerRef: null }]);
+    if(children.kind==='recent')expect(children.runs[0]).not.toHaveProperty('childResult');
     expect(() => f.repos.selectSession({ sessionId: childSessionId, expectedWorkspaceRevision: f.repos.readWorkspace().revision }, contextAt)).toThrow('session_not_found');
     expect(() => insert({ childRunId: childRunId + 1 })).toThrow();
     for (const sql of ["UPDATE runs SET parent_run_id=999", "UPDATE runs SET origin_tool_call_id=999", "UPDATE runs SET instance_id='changed'", "UPDATE runs SET config_json=json_set(config_json,'$.subagent.pluginAgentId','changed')", "UPDATE runs SET status='completed'"]) expect(() => db.query(sql + ' WHERE id=?').run(childRunId)).toThrow();

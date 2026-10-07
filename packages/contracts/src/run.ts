@@ -60,7 +60,11 @@ const runFields = {
 };
 export const ProviderRunViewSchema = z.strictObject({ ...runFields, kind: z.literal("provider"), sessionId: z.null(),
   goal: z.enum(["answer", "verify"]), calls: z.array(ModelCallViewSchema).max(1) });
+const GroupUsagePartSchema=z.strictObject({modelCalls:z.number().int().nonnegative().safe(),toolCalls:z.number().int().nonnegative().safe(),
+  inputTokens:nullableToken,outputTokens:nullableToken,cost:nullableAmount,costCurrency:z.literal('USD').nullable()});
+export const RunGroupUsageSchema=z.strictObject({parent:GroupUsagePartSchema,children:GroupUsagePartSchema});
 export const AgentRunViewSchema = z.strictObject({ ...runFields, inputId: PositiveIdSchema.nullable(), kind: z.literal("agent"), sessionId: PositiveIdSchema,
+  groupUsage:RunGroupUsageSchema.optional(),
   answerNativeLeafId: OpaqueIdSchema.nullable().default(null),
   clientSequence: PositiveIdSchema, nativeSessionId: OpaqueIdSchema, goal: z.literal("answer"),
   calls: z.array(ModelCallViewSchema).max(50), nextCallOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
@@ -74,10 +78,12 @@ export const AgentRunViewSchema = z.strictObject({ ...runFields, inputId: Positi
 });
 export const ChildRunViewSchema = z.strictObject({ ...runFields, kind: z.literal('child'), sessionId: PositiveIdSchema,
   goal: z.literal('answer'), answerRef: z.null(), parentRunId: PositiveIdSchema, originToolCallId: PositiveIdSchema,
-  pluginAgentId: OpaqueIdSchema, nativeSessionId: OpaqueIdSchema, childResult: ChildResultViewSchema.nullable(),
+  pluginAgentId: OpaqueIdSchema, nativeSessionId: OpaqueIdSchema, childResult: z.lazy(() => ChildResultViewSchema).nullable(),
+  originSnapshotId:PositiveIdSchema,parentInputId:PositiveIdSchema.nullable(),
   calls: z.array(ModelCallViewSchema).max(50), nextCallOffset: z.number().int().nonnegative().safe().nullable(),
   delivery: z.strictObject({ resultRecorded: z.boolean(), sdkReturned: z.boolean(), nativeEntryId: OpaqueIdSchema.nullable(),
-    nextModelCallId: OpaqueIdSchema.nullable(), consumedAt: TimestampSchema.nullable(), error: AppErrorSchema.nullable() }).nullable(),
+    sdkResultIsError:z.boolean().nullable(),nextModelCallId: OpaqueIdSchema.nullable(), consumedAt: TimestampSchema.nullable(),
+    consumptionEvidence:z.literal('provider_input_verified').nullable(),error: AppErrorSchema.nullable() }).nullable(),
 });
 export type ChildRunView = z.infer<typeof ChildRunViewSchema>;
 export const RunViewSchema = z.discriminatedUnion("kind", [ProviderRunViewSchema, AgentRunViewSchema, ChildRunViewSchema]);
@@ -96,7 +102,7 @@ const recentFields = { inputText: z.string().max(2048), cleanupSummary: RunClean
 export const RecentRunViewSchema = z.discriminatedUnion("kind", [
   ProviderRunViewSchema.omit({ output: true, inputPage: true, calls: true, cleanup: true }).extend(recentFields),
   AgentRunViewSchema.omit({ output: true, inputPage: true, calls: true, cleanup: true, nextCallOffset: true }).extend(recentFields),
-  ChildRunViewSchema.omit({ output: true, inputPage: true, calls: true, cleanup: true, nextCallOffset: true }).extend(recentFields),
+  ChildRunViewSchema.omit({ output: true, inputPage: true, calls: true, cleanup: true, nextCallOffset: true, childResult: true }).extend(recentFields),
 ]);
 export const ReadRunResultSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("one"), run: RunViewSchema.nullable() }),

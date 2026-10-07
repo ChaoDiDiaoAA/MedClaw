@@ -29,7 +29,7 @@ async function fixture(barrier?:'child-before'|'child-after'|'child-save-gap'|'c
     if(barrier==='child-http-hold'&&step===2)return new Response(new ReadableStream({start(controller){controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({id:'ENGINEERING',model:'fixture',choices:[{index:0,delta:{role:'assistant',content:'ENGINEERING child streaming'},finish_reason:null}]})}\n\n`));}}),{headers:{'content-type':'text/event-stream'}});
     const name=step===1?'Agent':step===2?'read_data_scope':null;
     const delta=name?{role:'assistant',tool_calls:[{index:0,id:'p13-host-'+step,type:'function',function:{name,arguments:JSON.stringify(step===1?p13AgentInput:{})}}]}:{role:'assistant',content:step===3?'ENGINEERING CHILD HOST RESULT':'ENGINEERING PARENT HOST RESULT'};
-    return new Response(`data: ${JSON.stringify({id:'ENGINEERING',model:'fixture',choices:[{index:0,delta,finish_reason:name?'tool_calls':'stop'}]})}\n\ndata: [DONE]\n\n`,{headers:{'content-type':'text/event-stream'}});
+    return new Response(`data: ${JSON.stringify({id:'ENGINEERING',model:'fixture',choices:[{index:0,delta,finish_reason:name?'tool_calls':'stop'}],usage:{prompt_tokens:step*10,completion_tokens:step,total_tokens:step*11}})}\n\ndata: [DONE]\n\n`,{headers:{'content-type':'text/event-stream'}});
   }});
   const host=new HostController({dataRoot:root,hostEntry:barrier&&barrier!=='child-http-hold'?entry:resolve('apps/host/src/main.ts'),bunExecutable:process.execPath,
     onCredentialRequest:async frame=>frame.method==='credential.list'?{ok:true,data:[{providerId:'p13-fixture',type:'api_key'}]}:frame.method==='credential.read'?{ok:true,data:frame.payload.providerId==='p13-fixture'?{type:'api_key',key:'ENGINEERING'}:null}:{ok:false,error:safeError('access_denied')}});
@@ -69,6 +69,11 @@ test('p13 actual Host releases its writer and manager before a new instance rere
     const session=await f.create('p13-host-session'),accepted=await f.send(session.session.id,'p13-host-send');await f.idle();expect(f.requests).toHaveLength(4);
     const children=ReadRunResultSchema.parse(unwrap(await f.host.request('run.read',{recent:true,parentRunId:accepted.runId!})));if(children.kind!=='recent'||children.runs[0]?.kind!=='child')throw new Error('No child');
     const id=children.runs[0].id,history=unwrap(await f.host.request('session.messages.read',{childRunId:id})),facts=f.sql('SELECT * FROM memories ORDER BY id');
+    expect(await f.host.request('tool.read',{runId:id})).toMatchObject({ok:true,data:{runId:id,scope:{readOnly:true},items:[{name:'read_data_scope',runId:id,sessionId:children.runs[0].sessionId,status:'succeeded'}]}});
+    expect(await f.host.request('query.list',{childRunId:id})).toMatchObject({ok:true,data:{items:[]}});
+    expect(await f.host.request('query.list',{sessionId:children.runs[0].sessionId})).toMatchObject({ok:false});
+    expect(await f.host.request('run.read',{runId:accepted.runId!})).toMatchObject({ok:true,data:{run:{groupUsage:{parent:{modelCalls:2,toolCalls:1,inputTokens:50,outputTokens:5,cost:null},children:{modelCalls:2,toolCalls:1,inputTokens:50,outputTokens:5,cost:null}}}}});
+    expect(await f.host.request('run.read',{runId:id})).toMatchObject({ok:true,data:{run:{delivery:{sdkReturned:true,sdkResultIsError:false,consumptionEvidence:'provider_input_verified'},originSnapshotId:1,parentInputId:accepted.inputId}}});
     const old=f.host.read().instanceId!;expect(await f.host.restart(old)).toMatchObject({state:'ready',schemaVersion:12});await f.idle();
     expect(f.host.read().instanceId).not.toBe(old);expect(unwrap(await f.host.request('session.messages.read',{childRunId:id}))).toEqual(history);expect(f.sql('SELECT * FROM memories ORDER BY id')).toEqual(facts);
     expect(f.requests).toHaveLength(4);expect(f.sql("SELECT id FROM sessions WHERE kind='child'")).toHaveLength(1);

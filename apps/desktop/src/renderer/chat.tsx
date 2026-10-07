@@ -15,9 +15,9 @@ import type { DirectoryReadStatus } from './models-page';
 
 // Each public page stays bounded; the displayed collection is independent of that DTO.
 type MessageAvailability = { available: boolean; hasPage: boolean; hasHistory: boolean; hasMore: boolean; unavailable: boolean; runCovered: boolean };
-export function NativeMessages(props: { host: HostView; sessionId: number | null; nativeSessionId?: string | null; visible: boolean;
+export function NativeMessages(props: { host: HostView; sessionId: number | null; childRunId?:number;nativeSessionId?: string | null; visible: boolean;
   context: string; revision?: string | null; testId: string; requiredRunId?: number | null; excludeRunId?: number | null; onChanged?: () => void; onAvailability?: (value: MessageAvailability) => void; onCreate?: () => void }) {
-  const key = JSON.stringify([props.host.instanceId, props.host.state, props.sessionId, props.nativeSessionId, props.visible, props.context, props.revision]);
+  const key = JSON.stringify([props.host.instanceId, props.host.state, props.sessionId,props.childRunId,props.nativeSessionId, props.visible, props.context, props.revision]);
   const target = useRef({ key, epoch: 0 }), generation = useRef(0), mounted = useRef(true);
   if (target.current.key !== key) { target.current = { key, epoch: target.current.epoch + 1 }; generation.current++; }
   type View = { key: string; sessionId: number | null; pages: SessionMessagePage[]; loading: boolean; error: string | null };
@@ -44,7 +44,7 @@ export function NativeMessages(props: { host: HostView; sessionId: number | null
     referenceOrder.current++; setReference(null);
     write({ ...old, loading: true, error: null });
     try {
-      const result = await window.medclaw.request('session.messages.read', { sessionId: scope.sessionId, leafId, afterEntryId, limit: 50 });
+      const result = await window.medclaw.request('session.messages.read', { ...(props.childRunId?{childRunId:props.childRunId}:{sessionId:scope.sessionId}),leafId, afterEntryId, limit: 50 });
       if (!owns()) return;
       if (!result.ok) {
         const unavailable = ['resource_unavailable', 'session_history_unavailable', 'session_history_invalid'].includes(result.error.code) && !old.pages.length;
@@ -111,7 +111,7 @@ export function NativeMessages(props: { host: HostView; sessionId: number | null
     {current.error && <p className="error-text" role="alert">{current.error}{current.pages.length ? ' Showing the last read leaf.' : ''}</p>}
     {current.error && props.onCreate && <button onClick={props.onCreate}>Create new session</button>}
     {last && !items.length && !current.error && <p className="muted">{last.hasMore ? 'More native entries are available; this page has no visible messages.' : 'No native messages in this session.'}</p>}
-    {items.map(message => <article key={message.nativeEntryId} data-native-entry-id={message.nativeEntryId} data-run-id={message.runId ?? undefined} className="native-message"><strong>{message.displayRole.replaceAll('_', ' ')}</strong>
+    {items.map(message => <article key={message.nativeEntryId} data-native-entry-id={message.nativeEntryId} data-run-id={message.runId ?? undefined} className="native-message"><strong>{props.childRunId&&message.displayRole==='user'?'Parent delegation':message.displayRole.replaceAll('_', ' ')}</strong>
       <div className="answer-text">{message.text ?? 'Structured native entry; body omitted.'}</div>
       <p className="tiny muted">Native entry <code>{message.nativeEntryId}</code>{message.runId ? ' · Original Run ' + message.runId : ''}{message.toolCallRef ? ' · Tool call ' + message.toolCallRef : ''}</p>
       {message.textInfo.truncated && <p className="tiny muted">Native message display truncated · {message.text?.length ?? 0} / {message.textInfo.totalChars} characters</p>}
@@ -313,7 +313,7 @@ export function Chat(props: { compactionProgress?:{sessionId:number;runId:number
   const models = props.directory?.models.filter(model => configuredProviders.has(model.provider) && model.input.includes("text") && model.maxTokens !== null) ?? [];
   const selectedModel = models.find(model => model.provider === choice?.provider && model.id === choice?.modelId);
   const choiceValue = selectedModel ? JSON.stringify([selectedModel.provider, selectedModel.id]) : "";
-  const candidateRun = props.run?.kind === "agent" && props.run.sessionId !== props.session?.session.id ? null : props.run;
+  const candidateRun = props.run?.kind === 'child' || props.run?.kind === "agent" && props.run.sessionId !== props.session?.session.id ? null : props.run;
   // A complete, verified current path proves that a saved Run belongs elsewhere.
   // Keep that Run available in details without appending its discarded branch to chat.
   const offBranch = candidateRun?.kind === 'agent' && ['completed', 'failed', 'cancelled'].includes(candidateRun.status)
