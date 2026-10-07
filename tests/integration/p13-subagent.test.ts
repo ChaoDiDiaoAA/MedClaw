@@ -18,6 +18,8 @@ import { seedWorkspaceQueries } from '../fixtures/p7-workspace';
 import { QueryService } from '../../packages/core/src/data/query-service';
 import { CatalogService } from '../../packages/core/src/data/catalog-service';
 import { SqliteCatalogStore } from '../../packages/storage/src/catalog-store';
+import { createPiNativeTools } from '../../packages/runtime-pi/src/pi-tool-adapter';
+import { ToolRecorder } from '../../packages/core/src/tools/recorder';
 
 function frozenFixture(f: ReturnType<typeof acceptContextInput>, origin: { id: number; nativeToolCallId: string }, snapshotId: number,
   native: ReturnType<typeof memoryNativeFixture>, childRunId: number, childSessionId: number, pluginAgentId = 'plugin-child') {
@@ -220,6 +222,10 @@ test('p13 child DDL binds an original parent Agent call, freezes identity and is
     expect(() => tools.assertContext({ ...childContext, scope: { ...childContext.scope, batchIds: [999] } })).toThrow('access_denied');
     expect(() => tools.assertContext({ ...childContext, delegationSource: { ...delegationSource, originToolCallId: nextOrigin.id } })).toThrow('access_denied');
     expect(() => tools.assertContext({ ...childContext, workspaceContext: f.input.workspaceContext })).toThrow();
+    const nativeDefinitions=createPiNativeTools(root,new ToolRecorder(tools),()=>childContext,{},undefined,undefined,['read']);
+    expect(nativeDefinitions.definitions.map(tool=>tool.name)).toEqual(['read']);
+    expect(() => createPiNativeTools(root,new ToolRecorder(tools),()=>childContext,{},undefined,undefined,['read','read'])).toThrow();
+    expect(() => createPiNativeTools(root,new ToolRecorder(tools),()=>childContext,{},undefined,undefined,['Agent'])).toThrow();
     expect(childRepos.verifyPriorContextFacts(identity.childRunId)).toMatchObject({ requiredPersistenceComplete: false, unconfirmedItems: expect.arrayContaining(['context_observation_unknown']) });
     const compactionOwner = { source: 'auto' as const, reason: 'threshold' as const, runId: identity.childRunId, sessionId: identity.childSessionId,
       operationRef: 'child-compaction', ordinal: 1, model: frozen.model, baseStorageVersion: 2, baseLeafId: promptEntry.id };

@@ -10,6 +10,19 @@ import { ChildResultSchema, ChildResultViewSchema, BoundChildIdentitySchema } fr
 import { RunControl } from '../../packages/core/src/runtime/run-control';
 import { normalizeRuntimeConfiguration } from '../../packages/contracts/src/runtime-config';
 import { performance } from 'node:perf_hooks';
+import { createHash } from 'node:crypto';
+import { matchProviderContext } from '../../packages/runtime-pi/src/messages';
+
+test('p13 delegated payload proof requires the actual prompt alongside projection and trusted feedback', () => {
+  const prompt='ENGINEERING delegated prompt',source={parentRunId:1,originToolCallId:2,parentSnapshotId:3,parentInputId:4,
+    promptHash:createHash('sha256').update(prompt).digest('hex'),nativeEntryId:'child-input'};
+  const snapshot={renderedProjection:'ENGINEERING projection',runtimeFeedback:'ENGINEERING feedback',delegationSource:source};
+  const messages=[{role:'system',content:snapshot.runtimeFeedback},{role:'user',content:snapshot.renderedProjection}];
+  expect(matchProviderContext('openai-completions',{messages},snapshot)).toBe(false);
+  expect(matchProviderContext('openai-completions',{messages:[...messages,{role:'user',content:prompt}]},snapshot)).toBe(true);
+  expect(matchProviderContext('openai-completions',{messages:[...messages,{role:'user',content:'changed prompt'}]},snapshot)).toBe(false);
+  expect(matchProviderContext('openai-completions',{messages:[...messages,{role:'user',content:prompt},{role:'user',content:prompt}]},snapshot)).toBe(false);
+});
 
 test('p13 child control shares root limits, reserves a parent call and isolates native attempt identities', () => {
   const scope = { batchIds: [1], deviceIds: [2], allowedToolNames: ['read'], allowedResourceRefs: [], artifactIds: [], readOnly: true };

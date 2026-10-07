@@ -360,15 +360,19 @@ export function createPiNativeTools(
   options: ToolsOptions = {},
   getControl?: () => RunControl | undefined,
   getResources?: () => FrozenRunResources | undefined,
+  allowNames?: readonly string[],
 ): { definitions: PiToolDefinition[]; bind(session: AgentSession): () => void } {
   const getWorkdir = typeof workdir === "string" ? () => workdir : workdir;
   // A session may register tools before its first Run exists. Actual I/O always uses the trusted ctx.cwd below.
   const cwd = typeof workdir === "string" ? workdir : process.cwd();
-  const originals: PiToolDefinition[] = [
-    defineTool(createReadToolDefinition(cwd, options.read)), defineTool(createGrepToolDefinition(cwd, options.grep)), defineTool(createFindToolDefinition(cwd, options.find)),
-    defineTool(createLsToolDefinition(cwd, options.ls)), defineTool(createEditToolDefinition(cwd, options.edit)), defineTool(createWriteToolDefinition(cwd, options.write)),
-    defineTool(createBashToolDefinition(cwd, options.bash)), defineTool(createPowerShellToolDefinition(cwd, options.powershell)),
-  ];
+  const factories: Record<string,()=>PiToolDefinition> = {
+    read:()=>defineTool(createReadToolDefinition(cwd,options.read)), grep:()=>defineTool(createGrepToolDefinition(cwd,options.grep)), find:()=>defineTool(createFindToolDefinition(cwd,options.find)),
+    ls:()=>defineTool(createLsToolDefinition(cwd,options.ls)), edit:()=>defineTool(createEditToolDefinition(cwd,options.edit)), write:()=>defineTool(createWriteToolDefinition(cwd,options.write)),
+    bash:()=>defineTool(createBashToolDefinition(cwd,options.bash)), powershell:()=>defineTool(createPowerShellToolDefinition(cwd,options.powershell)),
+  };
+  const names=allowNames??Object.keys(factories);
+  if(new Set(names).size!==names.length||names.some(name=>!Object.hasOwn(factories,name)))throw safeError('invalid_argument');
+  const originals=names.map(name=>factories[name]!());
   const byName = new Map(originals.map(tool => [tool.name, tool]));
   let session: AgentSession | undefined;
   const identity = (tool: PiToolDefinition): ToolCallIdentity => ({ name: tool.name, version: VERSION,

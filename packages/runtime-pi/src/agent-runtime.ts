@@ -298,185 +298,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
             return () => { stopBusiness(); stopNative(); stopControl(); };
           };
         }
-        const original = session.agent.streamFunction;
-        binding.originalStream=original;
-        session.agent.streamFunction = async (model, context, options) => {
-          if(binding.compaction?.isSummarizing)return binding.compaction.streamSummary(model,context,options);
-          const execution = binding.execution;
-          if (!execution) throw new Error("state_conflict");
-          const { input, callbacks } = execution;
-          input.signal.throwIfAborted(); options?.signal?.throwIfAborted();
-          extension?.assertLive();
-          if (execution.unsupported) throw new Error("agent_response_unsupported");
-          const fail = (error: unknown) => { const known = AppErrorSchema.safeParse(error); callbacks.fatal?.(known.success ? known.data : safeError(error instanceof Error ? error.message : 'internal_error')); execution.abort(); };
-          let snapshot: ContextSnapshot | undefined, admission:ReturnType<RunControl['admitModelCall']>,messages:typeof context.messages;
-          const candidates: { context: ToolExecutionContext; receipt: ToolSdkDelivery; nativeRef?: NativeContextRef }[] = [];
-          const resourceExpected: ExpectedResource[] = [];
-          let resourceContext: CallResourceContext | undefined;
-          try {
-            if (input.resources) await verifyRunResourceFiles(join(this.dataRoot, 'runtime', String(input.runId), 'work', 'scratch'), input.resources);
-            binding.compaction?.beforeMainRequest();
-            binding.memory!.flushBeforeRequest();
-            if (this.hasPendingContextPersistence(input.runId)) throw safeError('storage_write_failed');
-            if (this.toolPersistencePending(input.runId)) throw safeError('storage_write_failed');
-            if (input.resources) {
-              if (!callbacks.inputStore?.readResourceOrigins) throw safeError('state_conflict');
-              const branch = binding.manager.getBranch(), compactionIndex = branch.findLastIndex(e => e.type === 'compaction'), compaction = branch[compactionIndex];
-              const firstKept = compaction?.type === 'compaction' ? compaction.firstKeptEntryId === null ? compactionIndex + 1 : branch.findIndex(e => e.id === compaction.firstKeptEntryId) : 0;
-              if (firstKept < 0) throw safeError('session_history_invalid');
-              const kept = branch.slice(firstKept);
-              const entries = kept.filter(e => e.type === 'message' && (e.message.role === 'user' || e.message.role === 'toolResult'));
-              const facts = [];
-              for (let start = 0; start < entries.length; start += 1000)
-                facts.push(...callbacks.inputStore.readResourceOrigins(input.sessionId, entries.slice(start,start+1000).map(e => e.id)));
-              let after = -1, userIndex = 0, toolIndex = 0;
-              // ponytail: ordered branch scans are quadratic; index native entry keys if measured long-history cost dominates.
-              for (const message of context.messages) {
-                if (message.role !== 'user' && message.role !== 'toolResult') continue;
-                const text = contextMessageText(message.content), ordinal = message.role === 'user' ? userIndex++ : toolIndex++;
-                const index = entries.findIndex((e, i) => i > after && e.type === 'message' && e.message.role === message.role
-                  && e.message.timestamp === message.timestamp && canonicalRequest(e.message.content) === canonicalRequest(message.content)
-                  && (message.role !== 'toolResult' || e.message.role === 'toolResult' && e.message.toolCallId === message.toolCallId));
-                if (index < 0) continue;
-                after = index; const entry = entries[index]!;
-                for (const f of facts.filter(f => f.nativeEntryId === entry.id)) {
-                  if (text === null || f.contentHash !== createHash('sha256').update(f.kind === 'native_read' ? canonicalRequest(message.content) : text).digest('hex')) throw safeError('storage_read_failed');
-                  resourceExpected.push({text,...(message.role === 'user' ? {userIndex:ordinal} : {toolIndex:ordinal}),
-                    fact:{resourceRef:f.resourceRef,originRunId:f.originRunId,file:f.file,inputId:f.inputId,nativeEntryId:f.nativeEntryId,toolCallId:f.toolCallId,
-                      contentHash:f.contentHash,coverage:f.coverage,kind:f.kind === 'native_read' ? 'native_read' : f.resourceRef.kind === 'prompt' ? 'prompt_expansion' : 'skill_expansion'}});
-                }
-              }
-              for (const skill of resourceLoader.getSkills().skills.filter(s => !s.disableModelInvocation)) {
-                const text = /  <skill>[\s\S]*?  <\/skill>/.exec(formatSkillsForPrompt([skill]))?.[0];
-                const ref = input.resources.available.find(s => s.ref.kind === 'skill' && skill.filePath === join(workdir(), 'resources', 'skills', s.ref.id, s.ref.version, 'SKILL.md'))?.ref;
-                if (!text || !ref || !session.systemPrompt.includes(text) || !context.messages.some(m => m.role === 'system' && getSystemMessageText(m).includes(text))) throw safeError('resource_unavailable', undefined, {reason:'resource_snapshot_invalid'});
-                resourceExpected.push({text,fact:{resourceRef:ref,originRunId:input.runId,file:null,inputId:null,nativeEntryId:null,toolCallId:null,
-                  contentHash:createHash('sha256').update(text).digest('hex'),coverage:'index',kind:'skill_index'}});
-              }
-              if (resourceExpected.length > 1000) throw safeError('resource_unavailable', undefined, {reason:'resource_too_large'});
-              resourceContext = CallResourceContextSchema.parse({expected:resourceExpected.map(e => e.fact),payload:null});
-            }
-            if (this.contexts && !(CONTEXT_HTTP_APIS as readonly string[]).includes(model.api)) throw safeError('context_delivery_unsupported');
-            if (this.tools && input.scope && input.referenceDate && input.timezone
-              && binding.manager.getSessionId() === binding.nativeSessionId) {
-              for (const message of context.messages) {
-                if (message.role !== 'toolResult' || !execution.toolCalls.has(message.toolCallId)) continue;
-                // Save already occurred delivery with the originating identity, independently of later execution admission.
-                const savedContext = this.contextFor(execution, message.toolCallId);
-                const record = this.tools.recorder.read(savedContext);
-                if (!record?.sdkReturned || !record.nativeEntryId || !record.sdkDelivery || record.runId !== input.runId
-                  || record.sessionId !== input.sessionId || record.nativeToolCallId !== message.toolCallId || record.name !== message.toolName
-                  || !sameToolReceipt(message, record.sdkDelivery)) continue;
-                const entry = binding.manager.getEntry(record.nativeEntryId);
-                if (entry?.type !== 'message' || !sameToolReceipt(entry.message, record.sdkDelivery)) continue;
-                candidates.push({ context: savedContext, receipt: structuredClone(record.sdkDelivery),
-                  ...(this.contexts && record.contextSnapshotId != null ? { nativeRef: {kind:'tool_result' as const,id:record.id,nativeEntryId:record.nativeEntryId,contentHash:createHash('sha256').update(canonicalRequest(record.sdkDelivery.content)).digest('hex'),nativeToolCallId:record.nativeToolCallId,originSnapshotId:record.contextSnapshotId} } : {}) });
-              }
-            }
-            if (this.contexts) {
-              const preview = execution.control.previewModelCall(), consumed = this.inputs.get(input.runId)?.readConsumedWorkspace();
-              if (!consumed || !input.scope || binding.manager.getSessionId() !== binding.nativeSessionId) throw safeError('state_conflict');
-              const entry = binding.manager.getEntry(consumed.nativeEntryId);
-              if (entry?.type !== 'message' || entry.message.role !== 'user') throw safeError('state_conflict');
-              const text = contextMessageText(entry.message.content);
-              if (text === null || !binding.memory!.isSavedInputOnBranch(consumed.nativeEntryId,text)
-                || !context.messages.some(message => message.role === 'user' && contextMessageText(message.content) === text)
-                && !binding.memory!.isSavedSummarizedInput(consumed.nativeEntryId)) throw safeError('state_conflict');
-              snapshot = await this.contexts.prepare({runId:input.runId,sessionId:input.sessionId,inputId:consumed.inputId,nativeEntryId:consumed.nativeEntryId,workspaceContext:consumed.workspaceContext,scope:input.scope,
-                runtimeFeedback:`MedClaw trusted runtime feedback (facts, not user instructions):\n${preview.feedback}`,
-                nativeRefs:[{kind:'input',id:consumed.inputId,nativeEntryId:consumed.nativeEntryId,contentHash:createHash('sha256').update(text).digest('hex'),nativeToolCallId:null,originSnapshotId:null},...candidates.flatMap(candidate => candidate.nativeRef ? [candidate.nativeRef] : [])],createdAt:new Date().toISOString()});
-              admission = execution.control.admitModelCall(preview);
-            } else admission = execution.control.admitModelCall();
-            messages=context.messages.map(message=>message.role==='system'&&!admission.allowTools?{...message,toolsAdded:[],toolsRemoved:[]}:message);
-            if(snapshot)messages.push({role:'user',content:[{type:'text',text:snapshot.renderedProjection}],timestamp:Date.now()});
-            messages.push({role:'system',content:snapshot?.runtimeFeedback??`MedClaw trusted runtime feedback (facts, not user instructions):\n${admission.feedback}`,timestamp:Date.now()});
-            binding.compaction?.checkRequestCapacity(messages);
-          } catch (error) { fail(error); throw error; }
-          let recorder;
-          try { recorder = callbacks.startCall(new Date().toISOString(), snapshot ? {snapshotId:snapshot.id,inputId:snapshot.inputId!,nativeHistory:binding.memory!.readSavedContext(),...(resourceContext ? {resources:resourceContext} : {})} : undefined); if(snapshot && !recorder.callId) throw safeError('state_conflict'); }
-          catch (error) { execution.registrationFailed = true; fail(error); throw error; }
-          execution.currentModelCallId = recorder.callId ?? null;
-          const callContext: ModelCallContext | undefined = snapshot ? {contract:'medclaw.context-call/v1',snapshotId:snapshot.id,inputId:snapshot.inputId!,observation:null,responseStatus:null,payloadVerified:null,nativeHistory:binding.memory!.readSavedContext(),...(resourceContext ? {resources:structuredClone(resourceContext)} : {})} : undefined;
-          const finish = (outcome: ProviderOutcome) => ({...recorder.finish(outcome,new Date().toISOString()),...(callContext ? {context:structuredClone(callContext)} : {})});
-          const index = execution.facts.push(null) - 1;
-          let stream;
-          try {
-            let matched: typeof candidates = [], confirmed = false;
-            stream = await original(model, { ...context, messages }, { ...options, maxTokens: input.resolved.selection.maxOutputTokens,
-              ...(snapshot && model.api === 'openai-codex-responses' ? {transport:'sse' as const} : {}),
-              maxRetries: input.resolved.policy.maxRetries, maxRetryDelayMs: input.resolved.policy.maxRetryDelayMs,
-              timeoutMs: Math.max(1, Math.ceil(input.deadlineAt - performance.now())),
-              onPayload: async (payload, callbackModel) => {
-                matched = [];
-                const replacement = await options?.onPayload?.(payload, callbackModel);
-                const effective = replacement === undefined ? payload : replacement;
-                if (snapshot && callContext) {
-                  callContext.payloadVerified = matchProviderContext(model.api,effective,snapshot);
-                  if (!callContext.payloadVerified) { const error = safeError('context_payload_mismatch'); fail(error); throw error; }
-                  if (callContext.resources) {
-                    try {callContext.resources.payload = matchProviderResources(effective, model.api, resourceExpected);}
-                    catch(error) {fail(error);throw error;}
-                  }
-                }
-                const receipts = recorder.callId ? matchProviderToolReceipts(model.api, effective, candidates.map(candidate => candidate.receipt)) : [];
-                matched = candidates.filter(candidate => receipts.includes(candidate.receipt));
-                return replacement;
-              },
-              onResponse: async (response, callbackModel) => {
-                let saveFailed = false, firstSaveError: unknown;
-                if (callContext && !confirmed) callContext.responseStatus = response.status;
-                const firstSuccess = !confirmed && response.status >= 200 && response.status < 300;
-                const observedCandidates = firstSuccess ? [...matched] : [];
-                let receipt: RegisterContextDeliveryInput | undefined;
-                if (firstSuccess) {
-                  confirmed = true;
-                  if (snapshot && callContext && recorder.callId) {
-                    receipt = {runId:input.runId,sessionId:input.sessionId,inputId:snapshot.inputId!,callId:recorder.callId,snapshotId:snapshot.id,
-                      observation:{contract:'medclaw.context-observation/v1',api:model.api as typeof CONTEXT_HTTP_APIS[number],transport:model.api === 'bedrock-converse-stream' ? 'aws-event-stream' : 'sse',observedAt:new Date().toISOString(),httpStatus:response.status,projectionHash:snapshot.projectionHash,feedbackHash:snapshot.feedbackHash,
-                        verifiedNativeRefs:observedCandidates.flatMap(candidate => candidate.nativeRef ? [{kind:candidate.nativeRef.kind,id:candidate.nativeRef.id,contentHash:candidate.nativeRef.contentHash}] : []),
-                        ...(callContext.resources?.payload ? {resources:structuredClone(callContext.resources.payload)} : {})}};
-                  }
-                }
-                let callbackError: unknown;
-                try { await options?.onResponse?.(response, callbackModel); } catch (error) { callbackError = error; }
-                finally {
-                  if (receipt && callContext) {
-                    try { this.contexts!.recordDelivery(receipt); callContext.observation = receipt.observation; }
-                    catch (error) { const pending = this.contextReceipts.get(input.runId) ?? new Map<string,RegisterContextDeliveryInput>(); pending.set(receipt.callId,structuredClone(receipt)); this.contextReceipts.set(input.runId,pending); saveFailed = true; firstSaveError = error; }
-                  }
-                  for (const candidate of snapshot || callbackError === undefined ? observedCandidates : []) {
-                    try { this.tools!.recorder.recordConsumption(candidate.context, recorder.callId!, 'provider_input_verified'); }
-                    catch (error) { if (!saveFailed) { saveFailed = true; firstSaveError = error; } }
-                  }
-                }
-                // Preserve every exact fact from this response before the first failure stops SDK continuation.
-                if (saveFailed) { callbacks.fatal?.(safeError('storage_write_failed')); if (callbackError !== undefined) callbacks.fatal?.(safeError('provider_request_failed')); execution.abort(); throw firstSaveError; }
-                if (callbackError !== undefined) throw callbackError;
-              } });
-          } catch {
-            const outcome = unobservedFailure("provider_request_failed"); execution.lastOutcome = outcome;
-            execution.facts[index] = finish(outcome);
-            throw new Error("provider_request_failed");
-          }
-          // Observe result() without consuming a second iterator; Pi owns the stream.
-          const observed = stream.result().then(message => {
-            const outcome = outcomeOf(message, input.resolved.pricingKnown);
-            execution.lastOutcome = outcome;
-            execution.facts[index] = finish(outcome);
-            for (const part of message.content) if (part.type === "toolCall") {
-              if (snapshot && recorder.callId) {
-                if (execution.toolOrigins.has(part.id)) { fail(safeError('state_conflict')); throw safeError('state_conflict'); }
-                execution.toolOrigins.set(part.id,{callId:recorder.callId,snapshot});
-              }
-              execution.toolCalls.add(part.id);
-            }
-            if (message.stopReason === "deferred" || !this.tools && (message.stopReason === "toolUse" || message.content.some(part => part.type === "toolCall"))) {
-              execution.unsupported = true; binding.available = false; execution.abort();
-            }
-          });
-          execution.observers.push(observed);
-          return stream;
-        };
+        this.bindModelStream(binding, session, resourceLoader, workdir, extension);
         if(applyModel) {
           this.checkPreparation(binding);await session.setModel(model!, { persist: false });this.checkPreparation(binding);session.setThinkingLevel("off", { persist: false });
         }
@@ -492,6 +314,188 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
       this.checkPreparation(binding);
       binding.session.setThinkingLevel("off", { persist: false });
     }
+  }
+
+  private bindModelStream(binding: Binding, session: AgentSession, resourceLoader: DefaultResourceLoader, workdir: () => string, extension?: RunExtension): void {
+    const original = session.agent.streamFunction;
+    binding.originalStream=original;
+    session.agent.streamFunction = async (model, context, options) => {
+      if(binding.compaction?.isSummarizing)return binding.compaction.streamSummary(model,context,options);
+      const execution = binding.execution;
+      if (!execution) throw new Error("state_conflict");
+      const { input, callbacks } = execution;
+      input.signal.throwIfAborted(); options?.signal?.throwIfAborted();
+      extension?.assertLive();
+      if (execution.unsupported) throw new Error("agent_response_unsupported");
+      const fail = (error: unknown) => { const known = AppErrorSchema.safeParse(error); callbacks.fatal?.(known.success ? known.data : safeError(error instanceof Error ? error.message : 'internal_error')); execution.abort(); };
+      let snapshot: ContextSnapshot | undefined, admission:ReturnType<RunControl['admitModelCall']>,messages:typeof context.messages;
+      const candidates: { context: ToolExecutionContext; receipt: ToolSdkDelivery; nativeRef?: NativeContextRef }[] = [];
+      const resourceExpected: ExpectedResource[] = [];
+      let resourceContext: CallResourceContext | undefined;
+      try {
+        if (input.resources) await verifyRunResourceFiles(join(this.dataRoot, 'runtime', String(input.runId), 'work', 'scratch'), input.resources);
+        binding.compaction?.beforeMainRequest();
+        binding.memory!.flushBeforeRequest();
+        if (this.hasPendingContextPersistence(input.runId)) throw safeError('storage_write_failed');
+        if (this.toolPersistencePending(input.runId)) throw safeError('storage_write_failed');
+        if (input.resources) {
+          if (!callbacks.inputStore?.readResourceOrigins) throw safeError('state_conflict');
+          const branch = binding.manager.getBranch(), compactionIndex = branch.findLastIndex(e => e.type === 'compaction'), compaction = branch[compactionIndex];
+          const firstKept = compaction?.type === 'compaction' ? compaction.firstKeptEntryId === null ? compactionIndex + 1 : branch.findIndex(e => e.id === compaction.firstKeptEntryId) : 0;
+          if (firstKept < 0) throw safeError('session_history_invalid');
+          const kept = branch.slice(firstKept);
+          const entries = kept.filter(e => e.type === 'message' && (e.message.role === 'user' || e.message.role === 'toolResult'));
+          const facts = [];
+          for (let start = 0; start < entries.length; start += 1000)
+            facts.push(...callbacks.inputStore.readResourceOrigins(input.sessionId, entries.slice(start,start+1000).map(e => e.id)));
+          let after = -1, userIndex = 0, toolIndex = 0;
+          // ponytail: ordered branch scans are quadratic; index native entry keys if measured long-history cost dominates.
+          for (const message of context.messages) {
+            if (message.role !== 'user' && message.role !== 'toolResult') continue;
+            const text = contextMessageText(message.content), ordinal = message.role === 'user' ? userIndex++ : toolIndex++;
+            const index = entries.findIndex((e, i) => i > after && e.type === 'message' && e.message.role === message.role
+              && e.message.timestamp === message.timestamp && canonicalRequest(e.message.content) === canonicalRequest(message.content)
+              && (message.role !== 'toolResult' || e.message.role === 'toolResult' && e.message.toolCallId === message.toolCallId));
+            if (index < 0) continue;
+            after = index; const entry = entries[index]!;
+            for (const f of facts.filter(f => f.nativeEntryId === entry.id)) {
+              if (text === null || f.contentHash !== createHash('sha256').update(f.kind === 'native_read' ? canonicalRequest(message.content) : text).digest('hex')) throw safeError('storage_read_failed');
+              resourceExpected.push({text,...(message.role === 'user' ? {userIndex:ordinal} : {toolIndex:ordinal}),
+                fact:{resourceRef:f.resourceRef,originRunId:f.originRunId,file:f.file,inputId:f.inputId,nativeEntryId:f.nativeEntryId,toolCallId:f.toolCallId,
+                  contentHash:f.contentHash,coverage:f.coverage,kind:f.kind === 'native_read' ? 'native_read' : f.resourceRef.kind === 'prompt' ? 'prompt_expansion' : 'skill_expansion'}});
+            }
+          }
+          for (const skill of resourceLoader.getSkills().skills.filter(s => !s.disableModelInvocation)) {
+            const text = /  <skill>[\s\S]*?  <\/skill>/.exec(formatSkillsForPrompt([skill]))?.[0];
+            const ref = input.resources.available.find(s => s.ref.kind === 'skill' && skill.filePath === join(workdir(), 'resources', 'skills', s.ref.id, s.ref.version, 'SKILL.md'))?.ref;
+            if (!text || !ref || !session.systemPrompt.includes(text) || !context.messages.some(m => m.role === 'system' && getSystemMessageText(m).includes(text))) throw safeError('resource_unavailable', undefined, {reason:'resource_snapshot_invalid'});
+            resourceExpected.push({text,fact:{resourceRef:ref,originRunId:input.runId,file:null,inputId:null,nativeEntryId:null,toolCallId:null,
+              contentHash:createHash('sha256').update(text).digest('hex'),coverage:'index',kind:'skill_index'}});
+          }
+          if (resourceExpected.length > 1000) throw safeError('resource_unavailable', undefined, {reason:'resource_too_large'});
+          resourceContext = CallResourceContextSchema.parse({expected:resourceExpected.map(e => e.fact),payload:null});
+        }
+        if (this.contexts && !(CONTEXT_HTTP_APIS as readonly string[]).includes(model.api)) throw safeError('context_delivery_unsupported');
+        if (this.tools && input.scope && input.referenceDate && input.timezone
+          && binding.manager.getSessionId() === binding.nativeSessionId) {
+          for (const message of context.messages) {
+            if (message.role !== 'toolResult' || !execution.toolCalls.has(message.toolCallId)) continue;
+            // Save already occurred delivery with the originating identity, independently of later execution admission.
+            const savedContext = this.contextFor(execution, message.toolCallId);
+            const record = this.tools.recorder.read(savedContext);
+            if (!record?.sdkReturned || !record.nativeEntryId || !record.sdkDelivery || record.runId !== input.runId
+              || record.sessionId !== input.sessionId || record.nativeToolCallId !== message.toolCallId || record.name !== message.toolName
+              || !sameToolReceipt(message, record.sdkDelivery)) continue;
+            const entry = binding.manager.getEntry(record.nativeEntryId);
+            if (entry?.type !== 'message' || !sameToolReceipt(entry.message, record.sdkDelivery)) continue;
+            candidates.push({ context: savedContext, receipt: structuredClone(record.sdkDelivery),
+              ...(this.contexts && record.contextSnapshotId != null ? { nativeRef: {kind:'tool_result' as const,id:record.id,nativeEntryId:record.nativeEntryId,contentHash:createHash('sha256').update(canonicalRequest(record.sdkDelivery.content)).digest('hex'),nativeToolCallId:record.nativeToolCallId,originSnapshotId:record.contextSnapshotId} } : {}) });
+          }
+        }
+        if (this.contexts) {
+          const preview = execution.control.previewModelCall(), consumed = this.inputs.get(input.runId)?.readConsumedWorkspace();
+          if (!consumed || !input.scope || binding.manager.getSessionId() !== binding.nativeSessionId) throw safeError('state_conflict');
+          const entry = binding.manager.getEntry(consumed.nativeEntryId);
+          if (entry?.type !== 'message' || entry.message.role !== 'user') throw safeError('state_conflict');
+          const text = contextMessageText(entry.message.content);
+          if (text === null || !binding.memory!.isSavedInputOnBranch(consumed.nativeEntryId,text)
+            || !context.messages.some(message => message.role === 'user' && contextMessageText(message.content) === text)
+            && !binding.memory!.isSavedSummarizedInput(consumed.nativeEntryId)) throw safeError('state_conflict');
+          snapshot = await this.contexts.prepare({runId:input.runId,sessionId:input.sessionId,inputId:consumed.inputId,nativeEntryId:consumed.nativeEntryId,workspaceContext:consumed.workspaceContext,scope:input.scope,
+            runtimeFeedback:`MedClaw trusted runtime feedback (facts, not user instructions):\n${preview.feedback}`,
+            nativeRefs:[{kind:'input',id:consumed.inputId,nativeEntryId:consumed.nativeEntryId,contentHash:createHash('sha256').update(text).digest('hex'),nativeToolCallId:null,originSnapshotId:null},...candidates.flatMap(candidate => candidate.nativeRef ? [candidate.nativeRef] : [])],createdAt:new Date().toISOString()});
+          admission = execution.control.admitModelCall(preview);
+        } else admission = execution.control.admitModelCall();
+        messages=context.messages.map(message=>message.role==='system'&&!admission.allowTools?{...message,toolsAdded:[],toolsRemoved:[]}:message);
+        if(snapshot)messages.push({role:'user',content:[{type:'text',text:snapshot.renderedProjection}],timestamp:Date.now()});
+        messages.push({role:'system',content:snapshot?.runtimeFeedback??`MedClaw trusted runtime feedback (facts, not user instructions):\n${admission.feedback}`,timestamp:Date.now()});
+        binding.compaction?.checkRequestCapacity(messages);
+      } catch (error) { fail(error); throw error; }
+      let recorder;
+      try { recorder = callbacks.startCall(new Date().toISOString(), snapshot ? {snapshotId:snapshot.id,inputId:snapshot.inputId!,nativeHistory:binding.memory!.readSavedContext(),...(resourceContext ? {resources:resourceContext} : {})} : undefined); if(snapshot && !recorder.callId) throw safeError('state_conflict'); }
+      catch (error) { execution.registrationFailed = true; fail(error); throw error; }
+      execution.currentModelCallId = recorder.callId ?? null;
+      const callContext: ModelCallContext | undefined = snapshot ? {contract:'medclaw.context-call/v1',snapshotId:snapshot.id,inputId:snapshot.inputId!,observation:null,responseStatus:null,payloadVerified:null,nativeHistory:binding.memory!.readSavedContext(),...(resourceContext ? {resources:structuredClone(resourceContext)} : {})} : undefined;
+      const finish = (outcome: ProviderOutcome) => ({...recorder.finish(outcome,new Date().toISOString()),...(callContext ? {context:structuredClone(callContext)} : {})});
+      const index = execution.facts.push(null) - 1;
+      let stream;
+      try {
+        let matched: typeof candidates = [], confirmed = false;
+        stream = await original(model, { ...context, messages }, { ...options, maxTokens: input.resolved.selection.maxOutputTokens,
+          ...(snapshot && model.api === 'openai-codex-responses' ? {transport:'sse' as const} : {}),
+          maxRetries: input.resolved.policy.maxRetries, maxRetryDelayMs: input.resolved.policy.maxRetryDelayMs,
+          timeoutMs: Math.max(1, Math.ceil(input.deadlineAt - performance.now())),
+          onPayload: async (payload, callbackModel) => {
+            matched = [];
+            const replacement = await options?.onPayload?.(payload, callbackModel);
+            const effective = replacement === undefined ? payload : replacement;
+            if (snapshot && callContext) {
+              callContext.payloadVerified = matchProviderContext(model.api,effective,snapshot);
+              if (!callContext.payloadVerified) { const error = safeError('context_payload_mismatch'); fail(error); throw error; }
+              if (callContext.resources) {
+                try {callContext.resources.payload = matchProviderResources(effective, model.api, resourceExpected);}
+                catch(error) {fail(error);throw error;}
+              }
+            }
+            const receipts = recorder.callId ? matchProviderToolReceipts(model.api, effective, candidates.map(candidate => candidate.receipt)) : [];
+            matched = candidates.filter(candidate => receipts.includes(candidate.receipt));
+            return replacement;
+          },
+          onResponse: async (response, callbackModel) => {
+            let saveFailed = false, firstSaveError: unknown;
+            if (callContext && !confirmed) callContext.responseStatus = response.status;
+            const firstSuccess = !confirmed && response.status >= 200 && response.status < 300;
+            const observedCandidates = firstSuccess ? [...matched] : [];
+            let receipt: RegisterContextDeliveryInput | undefined;
+            if (firstSuccess) {
+              confirmed = true;
+              if (snapshot && callContext && recorder.callId) {
+                receipt = {runId:input.runId,sessionId:input.sessionId,inputId:snapshot.inputId!,callId:recorder.callId,snapshotId:snapshot.id,
+                  observation:{contract:'medclaw.context-observation/v1',api:model.api as typeof CONTEXT_HTTP_APIS[number],transport:model.api === 'bedrock-converse-stream' ? 'aws-event-stream' : 'sse',observedAt:new Date().toISOString(),httpStatus:response.status,projectionHash:snapshot.projectionHash,feedbackHash:snapshot.feedbackHash,
+                    verifiedNativeRefs:observedCandidates.flatMap(candidate => candidate.nativeRef ? [{kind:candidate.nativeRef.kind,id:candidate.nativeRef.id,contentHash:candidate.nativeRef.contentHash}] : []),
+                    ...(callContext.resources?.payload ? {resources:structuredClone(callContext.resources.payload)} : {})}};
+              }
+            }
+            let callbackError: unknown;
+            try { await options?.onResponse?.(response, callbackModel); } catch (error) { callbackError = error; }
+            finally {
+              if (receipt && callContext) {
+                try { this.contexts!.recordDelivery(receipt); callContext.observation = receipt.observation; }
+                catch (error) { const pending = this.contextReceipts.get(input.runId) ?? new Map<string,RegisterContextDeliveryInput>(); pending.set(receipt.callId,structuredClone(receipt)); this.contextReceipts.set(input.runId,pending); saveFailed = true; firstSaveError = error; }
+              }
+              for (const candidate of snapshot || callbackError === undefined ? observedCandidates : []) {
+                try { this.tools!.recorder.recordConsumption(candidate.context, recorder.callId!, 'provider_input_verified'); }
+                catch (error) { if (!saveFailed) { saveFailed = true; firstSaveError = error; } }
+              }
+            }
+            // Preserve every exact fact from this response before the first failure stops SDK continuation.
+            if (saveFailed) { callbacks.fatal?.(safeError('storage_write_failed')); if (callbackError !== undefined) callbacks.fatal?.(safeError('provider_request_failed')); execution.abort(); throw firstSaveError; }
+            if (callbackError !== undefined) throw callbackError;
+          } });
+      } catch {
+        const outcome = unobservedFailure("provider_request_failed"); execution.lastOutcome = outcome;
+        execution.facts[index] = finish(outcome);
+        throw new Error("provider_request_failed");
+      }
+      // Observe result() without consuming a second iterator; Pi owns the stream.
+      const observed = stream.result().then(message => {
+        const outcome = outcomeOf(message, input.resolved.pricingKnown);
+        execution.lastOutcome = outcome;
+        execution.facts[index] = finish(outcome);
+        for (const part of message.content) if (part.type === "toolCall") {
+          if (snapshot && recorder.callId) {
+            if (execution.toolOrigins.has(part.id)) { fail(safeError('state_conflict')); throw safeError('state_conflict'); }
+            execution.toolOrigins.set(part.id,{callId:recorder.callId,snapshot});
+          }
+          execution.toolCalls.add(part.id);
+        }
+        if (message.stopReason === "deferred" || !this.tools && (message.stopReason === "toolUse" || message.content.some(part => part.type === "toolCall"))) {
+          execution.unsupported = true; binding.available = false; execution.abort();
+        }
+      });
+      execution.observers.push(observed);
+      return stream;
+    };
   }
 
   async compact(input:CompactionExecutionInput<ResolvedModel>,callbacks:CompactionCallbacks):Promise<NativeCompactionObservation> {

@@ -98,7 +98,7 @@ export function contextMessageText(content: unknown): string | null {
   return texts.every(text => text !== null && text.isWellFormed()) ? texts.join('\n') : null;
 }
 
-export function matchProviderContext(api: string, payload: unknown, snapshot: Pick<ContextSnapshot, 'renderedProjection' | 'runtimeFeedback'>): boolean {
+export function matchProviderContext(api: string, payload: unknown, snapshot: Pick<ContextSnapshot, 'renderedProjection' | 'runtimeFeedback'> & Partial<Pick<ContextSnapshot,'delegationSource'>>): boolean {
   const body = object(payload); if (!body) return false;
   let messages: unknown, systems: unknown[] = [];
   switch (api) {
@@ -121,7 +121,8 @@ export function matchProviderContext(api: string, payload: unknown, snapshot: Pi
   const feedback = snapshot.runtimeFeedback;
   // Pi folds later system content with double-newline boundaries for Anthropic/Bedrock.
   const matchesFeedback = (text: string) => text === feedback || text.startsWith(`${feedback}\n\n`) || text.endsWith(`\n\n${feedback}`) || text.includes(`\n\n${feedback}\n\n`);
-  return users.filter(text => text === snapshot.renderedProjection).length === 1 && trusted.filter(matchesFeedback).length === 1;
+  const delegationMatches=!snapshot.delegationSource||users.filter(text=>createHash('sha256').update(text).digest('hex')===snapshot.delegationSource!.promptHash).length===1;
+  return delegationMatches && users.filter(text => text === snapshot.renderedProjection).length === 1 && trusted.filter(matchesFeedback).length === 1;
 }
 
 /** Compare receipt identity and content, excluding metadata that is absent from the wire. */
