@@ -41,3 +41,9 @@ test('P3 directory limits reject oversized inventories before copying payload by
   const file = join(oversized, 'large.csv'); writeFileSync(file, ''); truncateSync(file, PACKAGE_LIMITS.bytes + 1);
   await expect(listPackageFiles(oversized)).rejects.toThrow('import_invalid');
 });
+
+test('P3 inventory accepts a 1 GiB input within the enlarged package capacity', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'medclaw-p3-artifacts-')); roots.push(root);
+  const file = join(root, 'large.csv'); writeFileSync(file, ''); truncateSync(file, 1024 * 1024 * 1024);
+  expect(await listPackageFiles(root)).toEqual(['large.csv']);
+});

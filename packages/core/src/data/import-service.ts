@@ -118,6 +118,7 @@ export async function checkSnapshotPackage(root: string, mappingVersion = 'medcl
   const businessFiles = names.filter(file => /^zhejiang_\d{4}-\d{2}-\d{2}\.csv$/.test(file));
   if (!businessFiles.length || businessFiles.length !== manifest.data.businessFiles || files.filter(file => businessFiles.includes(file.path)).reduce((sum, file) => sum + file.bytes, 0) !== manifest.data.businessBytes) invalid('manifest.json', null, 'businessFiles');
   const allowed = new Set([...required, 'manifest.json', ...businessFiles, ...businessFiles.map(file => file.replace(/\.csv$/, '.metadata.json'))]);
+  if (names.includes('README.md')) allowed.add('README.md');
   if (names.some(file => !allowed.has(file)) || [...allowed].some(file => !names.includes(file))) invalid('manifest.json', null, 'files');
   const lockSchema = z.object({ schema: z.literal('medclaw.source-lock/v1'), sources: z.array(z.object({ source: z.string().min(1), path: z.string().min(1), sha256: z.string().regex(/^[a-f0-9]{64}$/) }).passthrough()).min(1) }).passthrough();
   const lock = lockSchema.safeParse(jsonFile(root, 'source-lock.json'));

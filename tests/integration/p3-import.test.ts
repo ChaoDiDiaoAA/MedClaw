@@ -82,6 +82,21 @@ test('P3 rejects unauthorized token, damaged package and stale source or managed
     expect(broken.ok && broken.data.canCommit).toBe(false); expect(broken.ok && broken.data.issues[0]?.file).toBe('使用说明.md');
   } finally { f.db.close(); }
 });
+
+test('P3 imports optional README only as a manifest-bound package file', async () => {
+  const f = fixture(); try {
+    writeFileSync(join(f.source, 'README.md'), '# Complete verification dataset\n');
+    refreshManifest(f.source, 2, 2);
+    const preview = await f.preview();
+    expect(preview.ok && preview.data.canCommit).toBe(true);
+    if (!preview.ok) throw new Error('preview');
+    writeFileSync(join(f.source, 'README.md'), '# Changed after preview\n');
+    const stale = await f.service.commit({ operationRef: 'import-1', previewHash: preview.data.previewHash, fileToken: 'allowed' });
+    expect(stale).toMatchObject({ ok: false, error: { code: 'import_preview_stale' } });
+    expect(f.store.revision()).toBe(0);
+    expect(f.db.query('SELECT count(*) n FROM snapshots').get()).toEqual({ n: 0 });
+  } finally { f.db.close(); }
+});
 test('P3 day failure rolls back the whole package and cancellation never commits', async () => {
   const f = fixture(); try {
     const preview = await f.preview(); if (!preview.ok) throw new Error('preview');

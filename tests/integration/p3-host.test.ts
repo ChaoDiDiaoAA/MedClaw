@@ -33,7 +33,7 @@ async function until(check: () => Promise<boolean>, timeout = 15000) {
 }
 function singleDayPackage(root: string) {
   mkdirSync(root);
-  const input = resolve('data/agent-input');
+  const input = resolve('data/archive/agent-input-20261008-original');
   for (const name of ['entity-lineage.csv', 'source-lock.json', 'adjustment-lineage.csv', 'validation-report.json', 'selection-report.json', '使用说明.md', 'zhejiang_2026-01-01.csv', 'zhejiang_2026-01-01.metadata.json']) copyFileSync(join(input, name), join(root, name));
   const files = readdirSync(root).sort().map(path => { const bytes = readFileSync(join(root, path)); return { path, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') }; });
   writeFileSync(join(root, 'manifest.json'), JSON.stringify({ status: 'complete', files, businessFiles: 1, businessRows: 813, businessBytes: files.find(file => file.path === 'zhejiang_2026-01-01.csv')!.bytes, totalPayloadBytes: files.reduce((sum, file) => sum + file.bytes, 0) }));
