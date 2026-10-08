@@ -18,7 +18,7 @@ const managedManifest = z.strictObject({ schema: z.literal('medclaw.artifact/imp
   mappingVersion:z.string().min(1),calculationVersion:z.string().min(1),sourceLockHash:z.string().min(1),
   sourceBundleId:z.string().min(1),materialVersion:z.string().min(1),verifiedAt:z.string().datetime() });
 
-export const PACKAGE_LIMITS = { files: 300, bytes: 512 * 1024 * 1024, rows: 200000 } as const;
+export const PACKAGE_LIMITS = { files: 300, bytes: 2 * 1024 * 1024 * 1024, rows: 1000000 } as const;
 export function permittedRelativePath(path: string): boolean {
   return !!path && !isAbsolute(path) && !path.includes('\\') && !path.includes(':') && !path.split('/').some(part => !part || part === '.' || part === '..');
 }
