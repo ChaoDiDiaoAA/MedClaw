@@ -133,6 +133,7 @@ export class SessionService {
       const { leafId,storageVersion, ...history } = preview, active = this.active();
       const runtime=session.storageVersion===0 ? {availability:'blocked' as const,error:safeError('session_history_invalid')} : this.native.readAvailability(sessionId);
       return SessionDetailSchema.parse({ session: { ...session, leafId,storageVersion, inputControl: this.inputControl(sessionId) }, history,runtime,
+        currentQueryContext:this.store.readQueryContext?.(sessionId)??null,
         compactionOperation:this.runtime?.readLatestCompaction?.(sessionId)??null,
         runningRunId: active?.kind === "agent" && active.sessionId === sessionId ? active.runId : null });
     }, "storage_read_failed", { sessionId });

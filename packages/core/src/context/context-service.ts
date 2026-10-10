@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { AppErrorSchema, safeError, serviceResult, type Result } from '../../../contracts/src/error';
 import { ContextProjectionSchema, CONTEXT_MATERIAL_PREFIX, type ContextStore, type PrepareContextInput, type PrepareChildContextInput, type SaveContextSelection, type RegisterContextDeliveryInput, type ReadContextInput, type ContextReadResult } from '../../../contracts/src/context';
 import type { ManagedImportInspection } from '../../../contracts/src/workspace';
+import type { PrepareIntentContextInput } from '../../../contracts/src/context';
 
 export class ContextService {
   constructor(private readonly store: ContextStore, private readonly artifacts: {inspectManagedImport(id:number):Promise<ManagedImportInspection>}) {}
@@ -9,11 +10,15 @@ export class ContextService {
   prepareChild(input: PrepareChildContextInput) {
     return this.prepareSelection(input,()=> { if(!this.store.selectChild)throw safeError('state_conflict'); return this.store.selectChild(input); });
   }
-  private async prepareSelection(input: PrepareContextInput | PrepareChildContextInput, select: () => SaveContextSelection) {
+  prepareIntent(input: PrepareIntentContextInput) {
+    return this.prepareSelection(input,()=> { if(!this.store.selectIntent)throw safeError('state_conflict'); return this.store.selectIntent(input); });
+  }
+  private async prepareSelection(input: PrepareContextInput | PrepareChildContextInput | PrepareIntentContextInput, select: () => SaveContextSelection) {
     const result = await serviceResult(async () => {
       const selection = select();
-      const projection = ContextProjectionSchema.parse(JSON.parse(selection.body.renderedProjection.slice(CONTEXT_MATERIAL_PREFIX.length)));
-      for (const id of projection.materialScope.artifactIds) {
+      const artifactIds = 'projection' in selection.input ? selection.input.scope.artifactIds
+        : ContextProjectionSchema.parse(JSON.parse(selection.body.renderedProjection.slice(CONTEXT_MATERIAL_PREFIX.length))).materialScope.artifactIds;
+      for (const id of artifactIds) {
         const inspection = await this.artifacts.inspectManagedImport(id);
         if (inspection.status === 'invalid') throw safeError('access_denied');
         if (inspection.status === 'unavailable') throw safeError(inspection.reason === 'storage_unavailable' ? 'storage_read_failed' : 'artifact_not_ready');

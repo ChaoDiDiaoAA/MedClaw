@@ -252,6 +252,7 @@ export interface CatalogStore {
 export interface QueryStore {
   withQueryTransaction?<T>(action: () => T): T;
   assertContext(context: QueryContext): void;
+  assertQueryAdmission(params: QueryRecord['params'], context: QueryContext): void;
   assertReadContext?(context: QueryContext): void;
   findQuery(callRef: string): QueryRecord | null;
   readQuery(id: number, sessionId?: number): QueryRecord | null;

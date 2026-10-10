@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from 'zod';
-import { BUSINESS_RULES, createQuerySchemas, QueryInterpretationSchema, QueryPageSchema, type Batch, type CatalogSummary, type ChangesQueryInput, type CurrentQueryInput, type Evidence, type QueryContext, type QueryExecutionContext, type QueryParams, type QueryParamsInput, type QueryRecord, type QueryStore, type Snapshot } from "../../../contracts/src/query";
+import { BUSINESS_RULES, createQuerySchemas, QueryInterpretationSchema, QueryPageSchema, type Batch, type CatalogSummary, type ChangesQueryInput, type CurrentQueryInput, type Evidence, type QueryContext, type QueryParams, type QueryParamsInput, type QueryRecord, type QueryStore, type Snapshot } from "../../../contracts/src/query";
 import { AppErrorSchema, PositiveIdSchema, safeError, type Result } from "../../../contracts/src/error";
 import { canonicalRequest } from "../../../contracts/src/run";
 import type { ToolExecutionContext } from "../../../contracts/src/tool";
@@ -112,15 +112,16 @@ export class QueryService {
       deviceIds: params.deviceIds ?? undefined, region: params.region ?? undefined, manufacturer: params.manufacturer ?? undefined,
       category: params.category ?? undefined, distributor: params.distributor ?? undefined, status: params.status ?? undefined };
   }
-  async execute(input: QueryParamsInput, context: QueryExecutionContext): Promise<Result<QueryRecord>> {
+  async execute(input: QueryParamsInput, context: QueryContext): Promise<Result<QueryRecord>> {
     try {
       return this.transaction(() => {
       const params = createQuerySchemas().QueryParamsSchema.parse(input);
+      this.store.assertQueryAdmission(params, context);
       const filters = this.listingFilters(params);
       this.assertFilters(filters, context);
       const prior = this.replay(params.kind, params, context);
       if (prior) return { ok: true, data: prior };
-      if (context.basedOnQueryId != null) this.read(context.basedOnQueryId, context);
+      if ('basedOnQueryId' in context && context.basedOnQueryId != null) this.read(context.basedOnQueryId, context);
       let result: Calculation;
       if (params.kind === 'current') result = this.calculateCurrent(createQuerySchemas().CurrentQuerySchema.parse({ ...filters, snapshotMode: params.snapshotMode }), context);
       else if (params.kind === 'changes') result = this.calculateChanges(createQuerySchemas().ChangesQuerySchema.parse({ ...filters, changeKind: params.changeKind ?? undefined,
@@ -135,7 +136,7 @@ export class QueryService {
         { runId: context.runId, sessionId: context.sessionId }) };
     }
   }
-  private calculateSummary(params: QueryParams, context: QueryExecutionContext): Calculation {
+  private calculateSummary(params: QueryParams, context: QueryContext): Calculation {
     const all = this.catalog.batches(params.batchIds, context).filter(batch => params.region === null || batch.region === params.region);
     const batches = params.population === 'snapshot' && params.kind === 'aggregate'
       ? this.catalog.selectBatches(params.batchIds, params.time ?? undefined, params.snapshotMode!, context, params.region ?? undefined)
@@ -187,7 +188,7 @@ export class QueryService {
     if (params.topN !== null) rows = rows.slice(0, params.topN);
     return { batchIds: batchIds.length ? batchIds : params.batchIds, rows, snapshotIds: summarized.snapshotIds, eventIds: summarized.eventIds, warnings };
   }
-  private memorySummary(params: QueryParams, batchIds: number[], context: QueryExecutionContext): CatalogSummary {
+  private memorySummary(params: QueryParams, batchIds: number[], context: QueryContext): CatalogSummary {
     const filters = this.listingFilters(params);
     let source: Pick<Calculation, 'rows' | 'snapshotIds' | 'eventIds'>;
     if (params.population === 'snapshot') {

@@ -3,7 +3,7 @@ import * as contracts from '../../packages/contracts/src/session';
 import { HOST_PROTOCOL_VERSION, DATABASE_SCHEMA_VERSION, isReadOnlyMethod, publicMethodSchemas, HostHelloSchema, HostReadySchema, HostRequestSchema, HostReplySchema } from '../../packages/contracts/src/protocol';
 import { safeError } from '../../packages/contracts/src/error';
 import { SessionMessageViewSchema } from '../../packages/contracts/src/messages';
-import { ModelCallViewSchema, safePreview } from '../../packages/contracts/src/run';
+import { PiModelCallViewSchema, safePreview } from '../../packages/contracts/src/run';
 import { discoverTests, runStage } from '../run';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -44,7 +44,7 @@ test('P5 safe UTF16 preview and UTF8 page budget', () => {
  expect(contracts.SessionInputPageSchema.safeParse({ sessionId: 1, items: Array.from({ length: 100 }, (_, index) => ({ ...item, id: index + 1, clientSequence: index + 1 })), nextClientSequence: null, hasMore: false }).success).toBe(false);
 });
 test('P5 protocol constants and explicit read classification', () => {
- expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p13-v1'); expect(DATABASE_SCHEMA_VERSION).toBe(12);
+ expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p14-v1'); expect(DATABASE_SCHEMA_VERSION).toBe(13);
  for (const method of ['session.readInput', 'session.listInputs']) expect(isReadOnlyMethod(method)).toBe(true);
  expect(isReadOnlyMethod('session.cancelInput')).toBe(false);
  expect(publicMethodSchemas['session.cancelInput']).toBeDefined();
@@ -91,8 +91,8 @@ test('P5 public errors keep fixed safe text and direct message input identities'
 
 // Public call projections must carry the root Input, including legacy null.
 test('P5 model call exposes positive root input identity with legacy null', () => {
- expect(ModelCallViewSchema.shape.inputId).toBeDefined();
- expect(ModelCallViewSchema.shape.inputId.safeParse(1).success).toBe(true);
- expect(ModelCallViewSchema.shape.inputId.safeParse(null).success).toBe(true);
- expect(ModelCallViewSchema.shape.inputId.safeParse(0).success).toBe(false);
+ expect(PiModelCallViewSchema.shape.inputId).toBeDefined();
+ expect(PiModelCallViewSchema.shape.inputId.safeParse(1).success).toBe(true);
+ expect(PiModelCallViewSchema.shape.inputId.safeParse(null).success).toBe(true);
+ expect(PiModelCallViewSchema.shape.inputId.safeParse(0).success).toBe(false);
 });

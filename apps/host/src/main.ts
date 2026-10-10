@@ -47,6 +47,11 @@ import { SqliteWriteTransactions } from '../../../packages/storage/src/write-tra
 import { SqliteEventStore } from '../../../packages/storage/src/event-store.ts';
 import { EventService } from '../../../packages/core/src/events/event-service.ts';
 import { ContextService } from '../../../packages/core/src/context/context-service.ts';
+import { IntentService } from '../../../packages/core/src/intent/intent-service.ts';
+import { IntentValidator } from '../../../packages/core/src/intent/validate.ts';
+import { CLASSIFY_PROMPT } from '../../../packages/core/src/intent/prompts/classify.ts';
+import { VERIFY_PROMPT } from '../../../packages/core/src/intent/prompts/verify.ts';
+import { OllamaIntentClient } from '@medclaw/intent-ollama';
 import { SqliteContextStore } from '../../../packages/storage/src/context-store.ts';
 
 const errorLog = new ErrorLog("host"), runtimeLog = new RuntimeLog("host"), promptTrace = new PromptTrace();
@@ -206,7 +211,7 @@ async function initialize(raw: unknown) {
     return { registry, executor };
   };
   artifacts = new ArtifactStore(database, join(config.paths.dataRoot, 'artifacts'));
-  contexts = new ContextService(new SqliteContextStore(database, events, transactions),artifacts);
+  contexts = new ContextService(new SqliteContextStore(database, events, transactions,id=>repositories.readQueryContext(id)),artifacts);
   agent = new PiAgentRuntime(runtime, config.paths.dataRoot, {store:memory,commitSync:change=>{
     try{return transactions.immediate(()=>memory.commitInTransaction(change));}
     catch(error){try{const proof=memory.confirmCommitted(change);if(proof)return proof;}catch{/* Read failure keeps the original write unconfirmed. */}throw error;}
@@ -217,7 +222,8 @@ async function initialize(raw: unknown) {
     (context, action) => credentialStore.withContext(context, action),
     Object.assign((...args:Parameters<ModelCallStarter>) => new ModelCallRecorder(repositories, ...args),
       {forCompaction:(owner:CompactionCallOwner,time:string)=>ModelCallRecorder.forCompaction(repositories!,owner,time)}),
-    notice, error => errorLog.add(error), agent, events,transactions, createResourceSource(resolve(import.meta.dir, '../../../resources')));
+    notice, error => errorLog.add(error), agent, events,transactions, createResourceSource(resolve(import.meta.dir, '../../../resources')),
+    {service:new IntentService(repositories,contexts,new OllamaIntentClient({classify:CLASSIFY_PROMPT,verify:VERIFY_PROMPT}),new IntentValidator(catalogService),events,transactions),queries});
   application.runs.recoverInterrupted(true); // The writer lock proves that the previous owning process exited.
   sessions = new SessionService(config.instanceId, repositories, agent, (input, context) => application!.runs.submitAgent(input, context),
     () => application!.runs.activeHandle, sessionId => application!.runs.readInputControl(sessionId),
@@ -303,6 +309,8 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case "session.readManagementOperation": return unwrap(await sessions!.readManagementOperation(request.payload));
     case "session.list": return unwrap(await sessions!.list(request.payload));
     case "session.read": return unwrap(await sessions!.read(request.payload.sessionId));
+    case 'intent.read': return repositories.readIntent(request.payload);
+    case 'model.intent.inspect': return app.inspectIntentModel(request.payload);
     case "session.submit": return unwrap(await sessions!.submit(request.payload, request));
     case "session.messages.read": return unwrap(await sessions!.readMessages(request.payload));
     case 'session.checkpoints.read': return unwrap(await sessions!.readCheckpoints(request.payload));

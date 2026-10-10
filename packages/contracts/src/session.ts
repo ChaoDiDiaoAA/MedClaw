@@ -4,6 +4,7 @@ import { ModelChoiceSchema, ModelSelectionSchema, ReferenceDateSchema, TimezoneS
 import { RevisionSchema, WorkspaceViewSchema, WorkspaceContextSchema } from "./workspace";
 import type { WorkspaceView, WorkspaceChange, WorkspaceContext } from "./workspace";
 import { RunScopeSchema,ModelCallViewSchema } from "./run";
+import { QueryContextRecordSchema, FrozenIntentAdmissionSchema } from './intent';
 import type { AppError, Result } from "./error";
 import type { StoredOperation, RunHandle, RegisterAgentInput } from "./run";
 import type { ReadSessionMessagesInput, SessionMessagePage } from "./messages";
@@ -45,6 +46,7 @@ export const SessionRuntimeViewSchema = z.strictObject({ availability: z.enum(['
   .refine(value => value.availability === 'blocked' ? value.error !== null : value.error === null, 'Blocked instances require a safe error');
 export type SessionRuntimeView = z.infer<typeof SessionRuntimeViewSchema>;
 export const SessionDetailSchema = z.strictObject({
+  currentQueryContext: z.lazy(() => QueryContextRecordSchema).nullable().optional(),
   compactionOperation:z.lazy(()=>CompactionOperationViewSchema).nullable().optional(),
   session: SessionViewSchema, runningRunId: PositiveIdSchema.nullable(),
   runtime:SessionRuntimeViewSchema,
@@ -54,7 +56,7 @@ export const SessionDetailSchema = z.strictObject({
 export const InputModeSchema = z.enum(["send", "steer", "follow_up"]);
 export const ReadSessionCheckpointsInputSchema = z.strictObject({ sessionId: PositiveIdSchema, afterAnswerId: PositiveIdSchema.nullable().default(null), limit: PositiveIdSchema.max(100).default(50) });
 export const SessionCheckpointSchema = z.strictObject({ answerId: PositiveIdSchema, runId: PositiveIdSchema, nativeLeafId: OpaqueIdSchema, committedAt: TimestampSchema,
-  questionSummary: z.string().max(512), answerSummary: z.string().max(512), conditionSummary: z.null(), isCurrentBranch: z.boolean() });
+  questionSummary: z.string().max(512), answerSummary: z.string().max(512), conditionSummary: z.string().max(1024).nullable(), isCurrentBranch: z.boolean() });
 export const SessionCheckpointPageSchema = z.strictObject({ sessionId: PositiveIdSchema, storageVersion: RevisionSchema, items: z.array(SessionCheckpointSchema).max(100), nextAnswerId: PositiveIdSchema.nullable(), hasMore: z.boolean() })
   .refine(page => page.hasMore ? page.items.length > 0 && page.nextAnswerId === page.items.at(-1)!.answerId : page.nextAnswerId === null, 'Checkpoint cursor must identify the last returned eligible answer');
 export const RestoreSessionCheckpointInputSchema = z.strictObject({ sessionId: PositiveIdSchema, targetLeafId: OpaqueIdSchema, expectedStorageVersion: RevisionSchema, expectedWorkspaceRevision: RevisionSchema });
@@ -156,7 +158,10 @@ const submissionFields = {
   expectedQueryId: PositiveIdSchema.nullable(), model: ModelChoiceSchema, referenceDate: ReferenceDateSchema, timezone: TimezoneSchema,
 };
 export const SubmitInputSchema = z.discriminatedUnion("mode", [
-  z.strictObject({ ...submissionFields, mode: z.literal("send") }),
+  z.strictObject({ ...submissionFields, mode: z.literal("send"), routing: z.discriminatedUnion('mode', [
+    z.strictObject({ mode: z.literal('intent'), originRunId: PositiveIdSchema.nullable() }),
+    z.strictObject({ mode: z.literal('explicit_agent_fallback'), originRunId: PositiveIdSchema }),
+  ]).optional() }),
   z.strictObject({ ...submissionFields, mode: z.literal("steer"), targetRunId: PositiveIdSchema }),
   z.strictObject({ ...submissionFields, mode: z.literal("follow_up"), targetRunId: PositiveIdSchema }),
 ]);
@@ -192,10 +197,13 @@ export const SessionInputPageSchema = z.strictObject({ sessionId: PositiveIdSche
 export const InputContentSchema = z.strictObject({ contract: z.literal("medclaw.session-input/v1"), originalSubmitInput: SubmitInputSchema,
   text: z.string(), workspaceContext: WorkspaceContextSchema, scope: RunScopeSchema, model: ModelSelectionSchema, referenceDate: ReferenceDateSchema, timezone: TimezoneSchema,
   deliveryAttempt: z.strictObject({ instanceId: OpaqueIdSchema, startedAt: TimestampSchema }).nullable(),
+  intentAdmission: z.lazy(() => FrozenIntentAdmissionSchema).optional(),
   resourceInputPlan: ResourceInputPlanSchema.optional(), nativeInput: NativeInputReceiptSchema.optional() })
   .refine(c => !c.resourceInputPlan || c.text === c.originalSubmitInput.text && c.text.isWellFormed()
     && new TextEncoder().encode(JSON.stringify(c)).byteLength <= (c.nativeInput ? RESOURCE_LIMITS.inputSavedBytes : RESOURCE_LIMITS.inputAcceptBytes), 'P11 input identity or capacity mismatch')
-  .refine(c => !c.nativeInput || !!c.resourceInputPlan, 'Native receipt requires original resource input plan');
+  .refine(c => !c.nativeInput || !!c.resourceInputPlan, 'Native receipt requires original resource input plan')
+  .refine(c => c.intentAdmission === undefined || c.originalSubmitInput.mode === 'send' && c.originalSubmitInput.routing?.mode === 'intent'
+    && c.intentAdmission.selection.configVersion === c.model.configVersion, 'Intent admission must match the original intent submission');
 export type InputContent = z.infer<typeof InputContentSchema>;
 export type InputMode = z.infer<typeof InputModeSchema>;
 export type InputStatus = z.infer<typeof InputStatusSchema>;
@@ -278,6 +286,7 @@ export interface SessionStore extends Pick<InputStore, "readInput" | "listInputs
   readCheckpointOperation(operationRef:string):{request:RestoreSessionCheckpointInput;receipt:SessionCheckpointReceipt}|null;
   assertHistoryMutationAllowed(sessionId:number):void;
   readSession(sessionId: number): SessionView | null;
+  readQueryContext?: (sessionId:number) => import('./intent').QueryContextRecord|null;
   listSessions(input: { beforeSessionId?: number; limit?: number }): SessionPage;
   readWorkspace(): WorkspaceView;
   updateWorkspace(change: WorkspaceChange, expectedRevision: number, time: string): WorkspaceView;

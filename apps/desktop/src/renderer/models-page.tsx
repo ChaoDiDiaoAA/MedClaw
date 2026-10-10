@@ -1,8 +1,91 @@
 import { useEffect, useRef, useState } from "react";
 import { errorMessage } from "../../../../packages/contracts/src/error";
-import { CustomProviderDefinitionSchema, type AuthAttemptView, type AuthNotifyView, type AuthPromptView, type AuthStatusView, type CustomModelDefinition, type CustomProviderDefinition, type HostView, type ModelDirectoryView, type ProviderAccepted } from "../../../../packages/contracts/src/model";
+import { CustomProviderDefinitionSchema, DEFAULT_INTENT_MODEL, IntentModelConfigurationSchema, type IntentModelConfiguration, type AuthAttemptView, type AuthNotifyView, type AuthPromptView, type AuthStatusView, type CustomModelDefinition, type CustomProviderDefinition, type HostView, type ModelDirectoryView, type ProviderAccepted } from "../../../../packages/contracts/src/model";
 import type { ModelChoice } from "../../../../packages/contracts/src/model";
 import type { ActiveRunView, RuntimeControlView } from "../../../../packages/contracts/src/run";
+import type { IntentModelInspection } from '../../../../packages/contracts/src/intent';
+
+function IntentModelSettings({ host, configVersion, onChanged }: { host: HostView; configVersion?: string; onChanged: () => Promise<void> }) {
+  const [draft, setDraft] = useState<IntentModelConfiguration>({ ...DEFAULT_INTENT_MODEL });
+  const [version, setVersion] = useState<string | null>(null), [busy, setBusy] = useState(false);
+  const [verified, setVerified] = useState<{ instanceId: string | null; baseUrl: string; inspection: IntentModelInspection } | null>(null);
+  const [error, setError] = useState<string | null>(null), [message, setMessage] = useState<string | null>(null);
+  const generation = useRef(0);
+  useEffect(() => {
+    const ticket = ++generation.current;
+    setVersion(null); setError(null);
+    setVerified(old => old?.instanceId === host.instanceId ? old : null);
+    if (host.state !== 'ready') return;
+    setBusy(true);
+    void (async () => {
+      try {
+        const result = await window.medclaw.request('model.config.read', {});
+        if (ticket !== generation.current) return;
+        if (!result.ok) { setError(errorMessage(result.error)); return; }
+        const value = result.data.intentModel ?? { ...DEFAULT_INTENT_MODEL };
+        setDraft(value); setVersion(result.data.configVersion);
+        setVerified(old => old?.baseUrl === value.baseUrl && old.inspection.actualDigest === value.modelDigest ? old : null);
+      } catch { if (ticket === generation.current) setError('The intent configuration could not be read. Reload the published directory.'); }
+      finally { if (ticket === generation.current) setBusy(false); }
+    })();
+    return () => { generation.current++; };
+  }, [host.state, host.instanceId, configVersion]);
+  const blocked = host.state !== 'ready' || busy || version === null;
+  const verifiedNow = verified?.instanceId === host.instanceId && verified.baseUrl === draft.baseUrl && verified.inspection.available && verified.inspection.actualDigest === draft.modelDigest;
+  async function inspect() {
+    const ticket = generation.current; setBusy(true); setError(null); setMessage(null); setVerified(null);
+    try {
+      const result = await window.medclaw.request('model.intent.inspect', { baseUrl: draft.baseUrl, modelTag: draft.modelTag });
+      if (ticket !== generation.current) return;
+      if (!result.ok) { setError(errorMessage(result.error)); return; }
+      setVerified({ instanceId: host.instanceId, baseUrl: draft.baseUrl, inspection: result.data });
+      if (!result.data.available || !result.data.actualDigest) { setError(result.data.error ? errorMessage(result.data.error) : 'The local intent model is unavailable.'); return; }
+      setDraft(old => ({ ...old, modelDigest: result.data.actualDigest })); setMessage('Local model identity verified.');
+    } catch { if (ticket === generation.current) setError('The local intent model could not be verified.'); }
+    finally { if (ticket === generation.current) setBusy(false); }
+  }
+  async function apply() {
+    if (blocked) return;
+    const parsed = IntentModelConfigurationSchema.safeParse(draft);
+    if (!parsed.success) { setError('Check the local URL, timeout and verification record. Enabled routing requires a verified model identity.'); return; }
+    if (draft.enabled && !verifiedNow) { setError('Verify the local model before enabling or applying intent routing.'); return; }
+    const ticket = generation.current; setBusy(true); setError(null); setMessage(null);
+    try {
+      const result = await window.medclaw.request('model.intent.configure', { expectedConfigVersion: version!, intentModel: parsed.data });
+      if (ticket !== generation.current) return;
+      if (!result.ok) { setError(errorMessage(result.error)); return; }
+      setVersion(result.data.configVersion); setDraft(result.data.intentModel ?? { ...DEFAULT_INTENT_MODEL }); setMessage('Intent configuration applied.');
+      await onChanged();
+    } catch { if (ticket === generation.current) setError('The intent configuration could not be applied. Read the published configuration before trying again.'); }
+    finally { if (ticket === generation.current) setBusy(false); }
+  }
+  const metadata = verified?.inspection.metadata;
+  return <section className="panel" aria-labelledby="intent-model-title">
+    <h2 id="intent-model-title">Intent model</h2>
+    <p className="muted">Use the official local Ollama model for intent recognition. The main Agent model is selected separately.</p>
+    <p>Official source: <a href={draft.sourceUrl}>{draft.sourceUrl}</a></p>
+    <form onSubmit={event => { event.preventDefault(); void apply(); }}>
+      <fieldset disabled={blocked}>
+        <legend>Local model configuration</legend>
+        <div className="form-grid">
+          <label>Ollama URL<input value={draft.baseUrl} onChange={event => { setDraft(old => ({ ...old, baseUrl: event.target.value, modelDigest: null })); setVerified(null); }} /></label>
+          <label>Model tag<input value={draft.modelTag} readOnly /></label>
+          <label>Intent timeout (ms)<input type="number" min={1000} max={60000} step={1} value={draft.timeoutMs} onChange={event => setDraft(old => ({ ...old, timeoutMs: event.target.valueAsNumber }))} /></label>
+          <label>Verification record<input maxLength={256} value={draft.verifiedEvidenceRef ?? ''} onChange={event => setDraft(old => ({ ...old, verifiedEvidenceRef: event.target.value || null }))} placeholder="Official source, identity and protocol evidence reference" /></label>
+        </div>
+        <label className="checkbox-label"><input type="checkbox" checked={draft.enabled} onChange={event => setDraft(old => ({ ...old, enabled: event.target.checked }))} />Enable intent routing</label>
+        <p className="muted">Verification reads local model metadata. It does not generate a response or download a model.</p>
+        <div className="actions"><button type="button" onClick={() => void inspect()}>Verify local model</button><button type="submit" className="primary">Apply configuration</button></div>
+      </fieldset>
+    </form>
+    <p>Selected identity: {draft.modelDigest ? <code>{draft.modelDigest}</code> : 'Not verified'}</p>
+    {verified && <p>Actual identity: <code>{verified.inspection.actualDigest ?? 'Unavailable'}</code> · {verified.inspection.checkedAt}</p>}
+    {metadata && <p className="muted">Ollama {metadata.serviceVersion ?? 'Unknown'} · {metadata.family ?? 'Unknown family'} · {metadata.parameterSize ?? 'Unknown size'} · {metadata.quantization ?? 'Unknown quantization'}</p>}
+    {busy && <p role="status">Reading or applying intent configuration…</p>}
+    {message && <p role="status">{message}</p>}
+    {error && <p role="alert" className="error-text">{error}</p>}
+  </section>;
+}
 
 const blankModel = (): CustomModelDefinition => ({ id: "", name: "", input: ["text"], reasoning: false, contextWindow: 8192, maxTokens: 1024, outputLimitConfirmed: true, pricingKnown: false, cost: null });
 const blankProvider = (): CustomProviderDefinition => ({ providerId: "", name: "", baseUrl: "", api: "", models: [blankModel()] });
@@ -137,6 +220,7 @@ export function ModelsPage(props: { directory: ModelDirectoryView | null; direct
     finally { if (token) { try { await window.medclaw.discardSecret(token); } catch { props.onError("Secret input cleanup unconfirmed. Read the published definition."); } } setBusy(false); }
   }
   return <div className="models-layout">
+    <IntentModelSettings host={props.host} configVersion={directory?.configVersion} onChanged={props.onChanged} />
     <section className="panel directory-panel" aria-labelledby="directory-title">
       <div className="section-heading"><div><span className="eyebrow">Pi model directory</span><h2 id="directory-title">Browse and select models</h2></div></div>
       <p className="muted">Published: {directory?.selection ? `${directory.selection.provider} / ${directory.selection.modelId}` : "No model selected"}</p>

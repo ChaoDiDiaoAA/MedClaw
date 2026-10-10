@@ -2,7 +2,7 @@ import type { Database } from 'bun:sqlite';
 import { z } from 'zod';
 import { createHash } from 'node:crypto';
 import { NativeInputReceiptSchema } from '../../contracts/src/resources';
-import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, safeError } from '../../contracts/src/error';
+import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, safeError, type AppError } from '../../contracts/src/error';
 import { InputContentSchema, SessionInputSchema, ReadInputRequestSchema, ListInputsRequestSchema, SessionInputPageSchema, MAX_INPUT_PAGE_BYTES,
  type InputContent, type SessionInput, type SessionInputPage, type ReadInputRequest, type ListInputsRequest, type InputStore, type InputCancelProof, type InputSettlementProof } from '../../contracts/src/session';
 import { canonicalRequest, safePreview } from '../../contracts/src/run';
@@ -36,12 +36,12 @@ export class SqliteInputStore {
  result(row:InputRow) {this.content(row);return {sessionId:row.session_id,clientSequence:row.client_sequence,inputId:row.id,runId:row.mode==='send'?row.target_run_id:row.run_id};}
  operation(op:string):InputRow|null{return this.db.query<InputRow,[string]>('SELECT * FROM session_inputs WHERE operation_ref=?').get(op);}
  sequence(sessionId:number,seq:number):InputRow|null{return this.db.query<InputRow,[number,number]>('SELECT * FROM session_inputs WHERE session_id=? AND client_sequence=?').get(sessionId,seq);}
- private cas(row:InputRow,status:InputRow['status'],processing:InputRow['processing_status'],at:string,error:string|null,runId=row.run_id,entry=row.native_entry_id,contentJson=row.content_json) {
+ private cas(row:InputRow,status:InputRow['status'],processing:InputRow['processing_status'],at:string,error:string|null,runId=row.run_id,entry=row.native_entry_id,contentJson=row.content_json,phase:'native_consumed'|'product_history_saved'='native_consumed') {
   check(TimestampSchema,at);
   const changed=this.db.query(`UPDATE session_inputs SET status=?,processing_status=?,processed_at=?,updated_at=?,error_json=?,run_id=?,native_entry_id=?,content_json=? WHERE id=? AND status=? AND processing_status=? AND run_id IS ? AND native_entry_id IS ? AND content_json=?`).run(status,processing,processing==='pending'?null:row.processed_at??at,at,error,runId,entry,contentJson,row.id,row.status,row.processing_status,row.run_id,row.native_entry_id,row.content_json);
   if(changed.changes!==1)fail('state_conflict');
   const next=this.required(row.id),payload=this.fields(next);
-  if(status==='consumed'&&row.status!=='consumed')this.event(next,{type:'input_delivered',payload:{...payload,phase:'native_consumed'}},at);
+  if(status==='consumed'&&row.status!=='consumed')this.event(next,{type:'input_delivered',payload:{...payload,phase}},at);
   else if(processing==='completed')this.event(next,{type:'input_processed',payload:{...payload,processingStatus:'completed'}},at);
   else if(processing==='cancelled')this.event(next,{type:'input_cancelled',payload:{...payload,processingStatus:'cancelled'}},at);
   else if(status==='failed'||status==='delivery_unknown'||processing==='failed')this.event(next,{type:'input_failed',payload:{...payload,processingStatus:processing==='failed'?'failed':'pending'}},at);
@@ -74,6 +74,33 @@ export class SqliteInputStore {
   if(receipt)content.nativeInput=receipt;
   check(InputContentSchema,content);
   this.cas(row,'consumed',row.processing_status,fact.at,row.error_json,fact.runId,fact.nativeEntryId,canonicalRequest(content));
+ }
+ settleProductInput(inputId:number,fact:{runId:number;sessionId:number;nativeEntryId:string;at:string}):void {
+  if(!this.db.inTransaction)fail('state_conflict');
+  check(TimestampSchema,fact.at);check(OpaqueIdSchema,fact.nativeEntryId);
+  const row=this.required(inputId),content=this.content(row);
+  const run=this.db.query<{session_id:number;kind:string;input_id:number|null;cancel_requested_at:string|null},[number]>('SELECT session_id,kind,input_id,cancel_requested_at FROM runs WHERE id=?').get(fact.runId);
+  if(!run||run.kind!=='agent'||run.input_id!==inputId||run.session_id!==fact.sessionId||row.session_id!==fact.sessionId||row.target_run_id!==fact.runId
+    ||row.mode!=='send'||row.status!=='queued'||row.processing_status!=='pending'||content.deliveryAttempt!==null||run.cancel_requested_at!==null
+    ||[...this.rowsForRun(fact.runId)].length!==1)fail('state_conflict');
+  const native=this.db.query<{entry_json:string},[number,number,string]>("SELECT entry_json FROM memories WHERE session_id=? AND run_id=? AND native_entry_id=? AND entry_type='message'").get(fact.sessionId,fact.runId,fact.nativeEntryId);
+  const message=native?(readJson(native.entry_json) as {message?:{role?:string;content?:unknown}}).message:null;
+  if(message?.role!=='user'||canonicalRequest(message.content)!==canonicalRequest([{type:'text',text:content.text}])
+    ||this.db.query('SELECT id FROM session_inputs WHERE session_id=? AND native_entry_id=? AND id<>?').get(fact.sessionId,fact.nativeEntryId,inputId))fail('session_history_invalid');
+  if(content.resourceInputPlan)content.nativeInput=check(NativeInputReceiptSchema,{text:content.text,sha256:createHash('sha256').update(content.text).digest('hex')});
+  check(InputContentSchema,content);
+  this.db.query('UPDATE session_inputs SET delivered_at=? WHERE id=? AND delivered_at IS NULL').run(fact.at,inputId);
+  this.cas(this.required(inputId),'consumed','pending',fact.at,null,fact.runId,fact.nativeEntryId,canonicalRequest(content),'product_history_saved');
+  this.cas(this.required(inputId),'consumed','completed',fact.at,null);
+ }
+ settleProgramFailure(inputId:number,fact:{runId:number;sessionId:number;status:'failed'|'cancelled';at:string;error:AppError|null}):void {
+  check(PositiveIdSchema,fact.runId);check(PositiveIdSchema,fact.sessionId);check(TimestampSchema,fact.at);
+  const row=this.required(inputId),content=this.content(row),error=fact.error===null?null:canonicalRequest(check(AppErrorSchema,fact.error));
+  if(!content.intentAdmission||row.mode!=='send'||row.session_id!==fact.sessionId||row.target_run_id!==fact.runId
+    ||row.run_id!==null||row.native_entry_id!==null||content.deliveryAttempt!==null||content.nativeInput!==undefined)fail('state_conflict');
+  if(row.status===fact.status&&row.processing_status===fact.status&&row.error_json===error&&row.processed_at===fact.at)return;
+  if(row.status!=='queued'||row.processing_status!=='pending')fail('state_conflict');
+  this.cas(row,fact.status,fact.status,fact.at,error);
  }
  recordInputFailure(inputId:number,fact:Parameters<InputStore['recordInputFailure']>[1]):void {
   check(AppErrorSchema,fact.error);check(TimestampSchema,fact.at);const row=this.required(inputId);this.content(row);

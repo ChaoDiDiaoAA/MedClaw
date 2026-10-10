@@ -15,6 +15,7 @@ import { useInputQueue } from "./input-queue";
 import { ModelsPage, type DirectoryReadStatus } from "./models-page";
 import { SettingsPage } from "./settings-page";
 import { RunDetails } from "./run-details";
+import type { IntentAction } from './intent-panel';
 import { ResourcePanel } from './resource-panel';
 import { ExtensionsPage } from './extensions-page';
 import { DataWorkspace } from "./data-workspace";
@@ -52,8 +53,10 @@ export function App() {
 }
 function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   const [page, setPage] = useState<ViewPage>("chat"), [ui, setUi] = useState(initialUi), [uiVersion, setUiVersion] = useState("0");
+  const uiConfigVersion = useRef('0'), uiReadOrder = useRef(0), uiUpdates = useRef(Promise.resolve(true));
   const [host, setHost] = useState(initialHost), [directory, setDirectory] = useState<ModelDirectoryView | null>(null), [directoryCurrent, setDirectoryCurrent] = useState(false);
   const [directoryStatus, setDirectoryStatus] = useState<DirectoryReadStatus>({ state: 'unread', error: null });
+  const intentDefaults = useRef<{ instanceId: string | null; enabled: boolean } | null>(null);
   const [error, setError] = useState<string | null>(null), [active, setActive] = useState<ActiveRunView | null>(null), [control, setControl] = useState<RuntimeControlView | null>(null);
   const [run, setRun] = useState<RunView | null>(null), [preview, setPreview] = useState<{ text: string; truncated: boolean } | null>(null);
   const [compactionProgress,setCompactionProgress]=useState<Extract<DesktopNotice,{type:'compaction.progress'}>|null>(null),compactionRevisions=useRef(new Map<string,number>());
@@ -107,16 +110,18 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     return next;
   }, []);
 
+  const intentDefault = () => intentDefaults.current?.instanceId === hostRef.current.instanceId ? intentDefaults.current.enabled : null;
   const editDraft = useCallback((sessionId: number, patch: Partial<SessionDraft>) => {
     const pending = pendingDraftTime.current.get(sessionId), prior = draftsRef.current[sessionId];
+    if (patch.text !== undefined && patch.text !== prior?.text) patch = { ...patch, intentRunId: undefined };
     for (const field of ['referenceDate', 'timezone'] as const) if (patch[field] !== undefined && patch[field] !== prior?.[field]) pending?.delete(field);
     if (pending?.size === 0) pendingDraftTime.current.delete(sessionId);
-    setDrafts(old => { const next = { ...old, [sessionId]: { ...(old[sessionId] ?? newSessionDraft(null, catalogRef.current)), ...patch } }; draftsRef.current = next; return next; });
+    setDrafts(old => { const next = { ...old, [sessionId]: { ...(old[sessionId] ?? newSessionDraft(null, catalogRef.current, intentDefault())), ...patch } }; draftsRef.current = next; return next; });
   }, []);
   const defaultModel = () => directoryRef.current?.selection ? { provider: directoryRef.current.selection.provider, modelId: directoryRef.current.selection.modelId, expectedConfigVersion: directoryRef.current.configVersion } : null;
   const ensureDraft = useCallback((sessionId: number, model?: ModelChoice | null) => {
     if (!draftsRef.current[sessionId]) {
-      const draft = newSessionDraft(model ?? defaultModel(), catalogRef.current);
+      const draft = newSessionDraft(model ?? defaultModel(), catalogRef.current, intentDefault());
       // Unknown imported facts cannot be treated as an empty catalog. Only the
       // first confirmed catalog may initialize fields the user has not edited.
       if (!catalogRef.current) { draft.referenceDate = ''; draft.timezone = ''; }
@@ -125,10 +130,12 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     }
   }, [editDraft]);
   const readUi = useCallback(async () => {
+    const order = ++uiReadOrder.current;
     try {
       const result = await window.medclaw.request("settings.ui.read", {});
-      if (result.ok) { setUi(result.data.ui); setUiVersion(result.data.configVersion); } else setError(errorMessage(result.error));
-    } catch { failBridge(); }
+      if (order !== uiReadOrder.current || !mounted.current || bridgeFailed.current) return;
+      if (result.ok) { uiConfigVersion.current = result.data.configVersion; setUi(result.data.ui); setUiVersion(result.data.configVersion); } else setError(errorMessage(result.error));
+    } catch { if (order === uiReadOrder.current) failBridge(); }
   }, [failBridge]);
   const readDirectory = useCallback(async () => {
     if (hostRef.current.state !== 'ready') return;
@@ -136,15 +143,18 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     const owns = () => mounted.current && instance === hostRef.current.instanceId && hostRef.current.state === 'ready' && order === directoryRead.current;
     setDirectoryCurrent(false); setDirectoryStatus({ state: 'loading', error: null });
     try {
-      const result = await window.medclaw.request("model.read", {});
+      const [result, config] = await Promise.all([window.medclaw.request("model.read", {}), window.medclaw.request('model.config.read', {})]);
       if (!owns()) return;
-      if (result.ok) {
+      if (result.ok && config.ok && result.data.configVersion === config.data.configVersion) {
+      intentDefaults.current = { instanceId: instance, enabled: config.data.intentModel?.enabled === true };
+      const defaultRouting: SessionDraft['routing'] = intentDefaults.current.enabled ? { mode: 'intent', originRunId: null } : null;
       directoryRef.current = result.data; setDirectory(result.data); setDirectoryCurrent(true); setDirectoryStatus({ state: 'ready', error: null });
       setDrafts(old => { const next = Object.fromEntries(Object.entries(old).map(([id, draft]) => {
         const model = draft.model ?? result.data.selection;
-        return [id, { ...draft, model: model ? { provider: model.provider, modelId: model.modelId, expectedConfigVersion: result.data.configVersion } : null }];
+        const routing = draft.routing === undefined ? draft.pending ? draft.pending.input.mode === 'send' ? draft.pending.input.routing ?? null : null : defaultRouting : draft.routing;
+        return [id, { ...draft, routing, model: model ? { provider: model.provider, modelId: model.modelId, expectedConfigVersion: result.data.configVersion } : null }];
       })); draftsRef.current = next; return next; });
-      } else { const message = errorMessage(result.error); setDirectoryStatus({ state: 'error', error: message }); setError(message); }
+      } else { const message = !result.ok ? errorMessage(result.error) : !config.ok ? errorMessage(config.error) : 'The model configuration changed. Reload the published directory.'; setDirectoryStatus({ state: 'error', error: message }); setError(message); }
     } catch { if (owns()) { const message = 'The model directory could not be read. Reload the published directory.'; setDirectoryStatus({ state: 'error', error: message }); setError(message); } }
   }, []);
   const readActive = useCallback(async () => {
@@ -182,7 +192,13 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       const prior = selectedRuns.current.get(value.sessionId);
       if (!prior || value.id >= prior.id) selectedRuns.current.set(value.sessionId, value);
     }
-    if (released(value)) { settled.current.add(runId); previews.current.delete(runId); }
+    if (released(value)) {
+      settled.current.add(runId); previews.current.delete(runId);
+      if (value.kind === 'agent' && value.status === 'completed') {
+        const draft = draftsRef.current[value.sessionId];
+        if (draft?.intentRunId === value.id && draft.text === value.inputText) editDraft(value.sessionId, { text: '', intentRunId: undefined });
+      }
+    }
     if (inspectedRun.current === value.id || value.kind === "provider" && runRef.current?.id === runId || inspectedRun.current === null && value.kind === "agent" && workspaceRef.current?.sessionId === value.sessionId
       && selectedRuns.current.get(value.sessionId)?.id === value.id) {
       runRef.current = value; setRun(value);
@@ -590,11 +606,50 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     }
     if (workspaceRef.current?.sessionId === value.sessionId) inspectedRun.current = null;
     const draft = draftsRef.current[value.sessionId];
-    if (healthy && draft) { const next = acceptSubmissionDraft(draft, pending); if (next !== draft) editDraft(value.sessionId, next); }
+    if (healthy && draft) { const next = acceptSubmissionDraft(draft, pending, value.runId); if (next !== draft) editDraft(value.sessionId, next); }
     await Promise.all([...(value.inputId !== null && value.runId !== null ? [readRun(value.runId)] : []), readSession(value.sessionId), readActive()]);
   }
-  async function sendSession(retry = false) {
-    const sessionId = workspaceRef.current?.sessionId, draft = sessionId ? draftsRef.current[sessionId] : null, instance = hostRef.current.instanceId;
+  function canStartIntentAction(source:RunView) {
+    const sessionId=workspaceRef.current?.sessionId,draft=sessionId?draftsRef.current[sessionId]:null;
+    const pending=draft?.pending,knownFailure=!pending||draft?.confirmedFailure===true&&source.kind==='agent'&&['failed','cancelled'].includes(source.status)
+      &&pending.input.mode==='send'&&pending.operationRef===source.operationRef&&pending.input.sessionId===source.sessionId&&pending.input.clientSequence===source.clientSequence;
+    return source.kind==='agent'&&source.sessionId===sessionId&&source.id===runRef.current?.id&&source.inputId!==null&&released(source)
+      &&hostRef.current.state==='ready'&&!!hostRef.current.instanceId&&detailsRef.current[source.sessionId]?.session.status==='active'
+      &&controlRef.current?.acceptingNewRuns===true&&!!draft?.model&&knownFailure&&!sendBusy.current&&!workspaceMutation.current&&!selectBusy.current&&confirmedWorkspace.current&&directoryCurrent;
+  }
+  async function startIntentAction(source:RunView,mode:IntentAction) {
+    if(source.kind!=='agent'||!canStartIntentAction(source))return;
+    const sessionId=source.sessionId,instance=hostRef.current.instanceId,workspace=workspaceRef.current!,draft=draftsRef.current[sessionId]!;
+    const unchanged=()=>mounted.current&&hostRef.current.state==='ready'&&hostRef.current.instanceId===instance&&workspaceRef.current?.sessionId===sessionId
+      &&workspaceRef.current.revision===workspace.revision&&!workspaceMutation.current&&!selectBusy.current&&runRef.current?.id===source.id
+      &&draftsRef.current[sessionId]===draft&&detailsRef.current[sessionId]?.session.status==='active';
+    sendBusy.current=sessionId;setSending(sessionId);setError(null);
+    try{
+      const chunks:string[]=[];let offset=0,total:number|null=null;
+      while(true){
+        const result:Result<PublicReturn<'run.read'>>=await window.medclaw.request('run.read',{runId:source.id,inputOffset:offset,inputLimit:65536});
+        if(!unchanged())return;
+        if(!result.ok)throw new Error(errorMessage(result.error));
+        const original:RunView|null=result.data.kind==='one'?result.data.run:null;
+        if(original?.kind!=='agent'||original.id!==source.id||original.sessionId!==sessionId||original.inputId!==source.inputId
+          ||original.operationRef!==source.operationRef||original.instanceId!==source.instanceId||original.referenceDate!==source.referenceDate||original.timezone!==source.timezone||!released(original))throw new Error('The original task is unconfirmed. Refresh the original Run.');
+        const part=original.inputPage;total??=part.totalChars;
+        if(part.offset!==offset||part.totalChars!==total||offset+part.text.length>total
+          ||(part.nextOffset===null?offset+part.text.length!==total:part.nextOffset!==offset+part.text.length||part.nextOffset<=offset||part.nextOffset>=total))throw new Error('The original task is incomplete. Refresh the original Run.');
+        chunks.push(part.text);if(part.nextOffset===null)break;offset=part.nextOffset;
+      }
+      const text=chunks.join('');
+      if(draft.pending&&(draft.pending.input.text!==text||draft.pending.input.referenceDate!==source.referenceDate||draft.pending.input.timezone!==source.timezone))throw new Error('The retained submission does not match the original task. Read its original submission.');
+      if(draft.text!==''&&draft.text!==text){setError('Keep or clear the current draft before retrying the original task.');return;}
+      if(!unchanged())return;
+      const next:SessionDraft={...draft,text,referenceDate:source.referenceDate,timezone:source.timezone,mode:'send',routing:{mode,originRunId:source.id},intentRunId:undefined,pending:null,confirmedFailure:false,resendConfirmed:false};
+      editDraft(sessionId,next);sendBusy.current=null;
+      await sendSession(false,next);
+    }catch(error){if(unchanged())setError(error instanceof Error?error.message:'The original task could not be read. Refresh the original Run.');}
+    finally{sendBusy.current=null;setSending(null);}
+  }
+  async function sendSession(retry = false,preparedDraft?:SessionDraft) {
+    const sessionId = workspaceRef.current?.sessionId, draft = preparedDraft??(sessionId ? draftsRef.current[sessionId] : null), instance = hostRef.current.instanceId;
     if (!sessionId || !draft || !instance || deletedSessions.current.has(sessionId) || detailsRef.current[sessionId]?.session.status !== 'active' || hostRef.current.state !== 'ready' || sendBusy.current || workspaceMutation.current || !confirmedWorkspace.current) return;
     const originalControl = detailsRef.current[sessionId]?.session.inputControl, root = selectedRuns.current.get(sessionId);
     const mode = originalControl ? draft.mode ?? 'send' : 'send';
@@ -606,7 +661,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       expectedRevision: workspaceRef.current!.revision, expectedBatchIds: workspaceRef.current!.batchRefs.map(batch => batch.id), expectedQueryId: workspaceRef.current!.queryId,
       model: mode === 'send' ? draft.model! : { provider: root!.model.provider, modelId: root!.model.modelId, expectedConfigVersion: root!.model.configVersion },
       referenceDate: mode === 'send' ? draft.referenceDate : root!.referenceDate, timezone: mode === 'send' ? draft.timezone : root!.timezone };
-    const pending = retry ? draft.pending : { operationRef: crypto.randomUUID(), input: mode === 'send' ? { ...fields, mode } : { ...fields, mode, targetRunId: originalControl!.runId } satisfies SubmitInput };
+    const pending = retry ? draft.pending : { operationRef: crypto.randomUUID(), input: mode === 'send' ? { ...fields, mode, ...(draft.routing ? { routing: draft.routing } : {}) } : { ...fields, mode, targetRunId: originalControl!.runId } satisfies SubmitInput };
     if (!pending) return;
     editDraft(sessionId, { pending, mode: pending.input.mode, resendConfirmed: false, confirmedFailure: false }); sendBusy.current = sessionId; setSending(sessionId); setError(null);
     try {
@@ -640,9 +695,19 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     editDraft(target.sessionId, next); setError(null);
   }
   async function updateUi(patch: Partial<DesktopDisplayPreferences>) {
-    const result = await window.medclaw.request("settings.ui.update", { expectedConfigVersion: uiVersion, patch });
-    if (result.ok) { setUi(result.data.ui); setUiVersion(result.data.configVersion); if (hostRef.current.state === "ready") void readDirectory(); return true; }
-    setError(errorMessage(result.error)); void readUi(); return false;
+    const update = uiUpdates.current.then(async () => {
+      if (!mounted.current || bridgeFailed.current) return false;
+      ++uiReadOrder.current;
+      try {
+        const result = await window.medclaw.request("settings.ui.update", { expectedConfigVersion: uiConfigVersion.current, patch });
+        if (!mounted.current || bridgeFailed.current) return false;
+        ++uiReadOrder.current;
+        if (result.ok) { uiConfigVersion.current = result.data.configVersion; setUi(result.data.ui); setUiVersion(result.data.configVersion); if (hostRef.current.state === "ready") void readDirectory(); return true; }
+        setError(errorMessage(result.error)); await readUi(); return false;
+      } catch { failBridge(); return false; }
+    });
+    uiUpdates.current = update;
+    return update;
   }
   async function acceptedProvider(value: ProviderAccepted) {
     inspectedRun.current = null;
@@ -708,6 +773,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       {page==='extensions'&&<section className="page-content"><ExtensionsPage host={host} sessionId={workspaceConfirmed&&!selecting?current:null} runId={run?.kind==='agent'&&run.sessionId===current?run.id:null} activeRunId={active?.runId??null} stopping={!!active?.stopPending||!!active?.persistencePending} onStop={()=>void stop()} onDetails={()=>void updateUi({detailOpen:true})} onPublished={()=>void readDirectory()} /></section>}
     </main>
     {ui.detailOpen && <RunDetails inputs={inputQueue.snapshots[run?.kind === "agent" ? run.sessionId : current ?? 0] ?? null} onRefreshInputs={() => { const id=run?.kind === "agent" ? run.sessionId : current; if(id)void refreshInputs(id,true); }} onMoreInputs={() => { const id=run?.kind === "agent" ? run.sessionId : current; if(id)void readInputPage(id,"more"); }} cancellingInputs={cancellingInputs} onCancelInput={original => void cancelInput(original)} run={run} host={host} viewSessionId={current} tab={ui.detailTab} active={active} control={control} events={runEvents.state} onResumeGap={runEvents.resumeGap} onTab={tab => void updateUi({ detailTab: tab })} onClose={() => void closeDetails()} onError={setError}
+      onIntentAction={(source,mode)=>void startIntentAction(source,mode)} intentActionsDisabled={!run||!canStartIntentAction(run)}
       onQuery={(queryId, sessionId) => { setRequestedQuery({ queryId, ownerSessionId: sessionId }); setPage("queries"); }}
       onRun={value => { inspectedRun.current = value.id; runRef.current = value; setRun(value); setPreview(null); }} onRetrySaved={() => { void readActive(); if (activeRef.current?.sessionId) { void readSession(activeRef.current.sessionId); void refreshInputs(activeRef.current.sessionId); } }} />}
   </div>;

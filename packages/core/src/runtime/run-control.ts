@@ -75,6 +75,11 @@ export class RunControl {
   }
   get configuration(): ToolConfiguration { return structuredClone(this.configurationSnapshot); }
   get runtimeConfiguration(): RuntimeConfiguration { return structuredClone(this.runtimeSnapshot); }
+  assertRun(input: Pick<Options, 'runId' | 'scope' | 'signal' | 'deadlineAt'>): void {
+    if(input.runId!==this.options.runId||input.signal!==this.options.signal||input.deadlineAt!==this.options.deadlineAt
+      ||canonicalRequest(input.scope)!==canonicalRequest(this.options.scope))throw new Error('state_conflict');
+    this.checkActive();
+  }
   createChild(runId: number, scope: RunScope, signal: AbortSignal): RunControl {
     this.checkActive();
     if(this.isChild||!Number.isSafeInteger(runId)||runId<=0||runId===this.options.runId||!childScopeWithin(scope,this.options.scope))throw new Error('access_denied');

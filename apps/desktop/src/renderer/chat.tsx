@@ -12,6 +12,7 @@ import type { PublicReturn } from "../../../../packages/contracts/src/protocol";
 import { type InputQueueSnapshot } from "./input-queue";
 import { finalDisplaySource, resolveReadingAnchor, shouldRecordScroll, type ReadingAnchor, type RunEventProjectionState } from './use-run-events';
 import type { DirectoryReadStatus } from './models-page';
+import { QueryConditions } from './intent-panel';
 
 // Each public page stays bounded; the displayed collection is independent of that DTO.
 type MessageAvailability = { available: boolean; hasPage: boolean; hasHistory: boolean; hasMore: boolean; unavailable: boolean; runCovered: boolean };
@@ -336,7 +337,7 @@ export function Chat(props: { compactionProgress?:{sessionId:number;runId:number
     : currentAvailability?.available === false ? currentAvailability.unavailable ? 'Native message history is unavailable. Refresh messages or create a new session.' : 'Native message history read failed. Refresh messages before sending.'
     : !draft?.referenceDate ? "Enter a reference date in Message time context" : !draft.timezone.trim() ? "Enter a time zone in Message time context" : null;
   const sendReason = !props.directoryCurrent ? "Reload the model directory in Models" : !choice ? "Select a session model" : !model || !model.input.includes("text") ? "The session model is unavailable. Select another model."
-    : !model.maxTokens ? "Confirm the model output limit" : provider?.auth.state !== "available" ? "Authenticate the provider first" : !props.control ? "Run availability is unconfirmed"
+    : !model.maxTokens ? "Confirm the model output limit" : draft?.routing?.mode !== 'intent' && provider?.auth.state !== "available" ? "Authenticate the provider first" : !props.control ? "Run availability is unconfirmed"
     : !props.control.acceptingNewRuns ? (props.control.blockReasons[0] ? errorMessage(props.control.blockReasons[0]) : "Wait for the original run to stop and be saved") : null;
   const reason = commonReason ?? (mode === 'send' ? sendReason : queueReason);
   const showActions = !!inputControl && props.active?.kind === 'agent' && props.active.sessionId === props.sessionId && props.active.runId === inputControl.runId;
@@ -440,6 +441,7 @@ export function Chat(props: { compactionProgress?:{sessionId:number;runId:number
             {props.preview?.truncated && <p className="muted">The live preview was truncated. Read the full saved output in Run details.</p>}
             {showRunBody && run.output.nextOffset !== null && !props.preview && <p className="muted">Showing {run.output.text.length} / {run.output.totalChars} characters. Read the full output in Run details.</p>}
             {run.error && <p role="alert" className="error-text">{errorMessage(run.error)}</p>}</article></>}
+        <QueryConditions sessionId={props.sessionId} context={props.session?.currentQueryContext}/>
         <SessionCheckpoints host={props.host} session={props.session} workspace={props.workspace} visible={props.visible} blocked={props.selecting||props.sending||!props.workspaceConfirmed||!!props.draft?.pending||props.control?.acceptingNewRuns!==true||props.host.state!=='ready'} onResumeCheckpoint={props.onResumeCheckpoint} onRestoreSession={props.onRestoreSession} onHistoryVerified={props.onHistoryVerified}/>
         <SessionCompaction host={props.host} session={props.session} model={choice??null} visible={props.visible} control={props.control} blockedReason={props.selecting||props.sending||!props.workspaceConfirmed||props.draft?.pending?'Verify the current session and original input first.':!props.session?'Create or select a session.':props.session.runtime.availability==='blocked'?'Restore the session before compacting.':sendReason} onHistoryVerified={props.onHistoryVerified} onRestoreSession={props.onRestoreSession}/>
         {props.compactionProgress?.sessionId===props.sessionId&&props.compactionProgress.runId===props.active?.runId&&<p role="status" aria-live="polite">Automatic context compaction · {props.compactionProgress.phase}</p>}
@@ -460,6 +462,7 @@ export function Chat(props: { compactionProgress?:{sessionId:number;runId:number
         {!selectedModel && <span className="tiny" data-testid="session-model">{choice ? "The selected model is unavailable. Select a configured model." : "No session model selected"}</span>}
       </div><button className="quiet" onClick={props.onModels}>Manage models</button></div>
       {props.active && <p className="tiny muted">Model changes apply to the next message. The current run uses its frozen configuration.</p>}
+      <label>Message routing<select aria-label="Message routing" value={draft?.routing?.mode === 'intent' ? 'intent' : 'main_agent'} disabled={!draft || !!draft.pending || props.sending || mode !== 'send' || !props.directoryCurrent} onChange={event => props.onDraft({ routing: event.target.value === 'intent' ? { mode: 'intent', originRunId: null } : null })}><option value="intent">Intent routing</option><option value="main_agent">Main Agent</option></select></label>
       {mode !== 'send' && queueRun && <p className="tiny muted">Queueing for original Run {queueRun.id} · {queueRun.model.provider} / {queueRun.model.modelId} · {queueRun.referenceDate} · {queueRun.timezone}</p>}
       <label className="sr-only" htmlFor="message-text">Message text</label><textarea id="message-text" ref={input} value={draft?.text ?? ""} disabled={!draft} placeholder="Type a message…" onChange={event => props.onDraft({ text: event.target.value })} onKeyDown={event => {
         if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); if (!reason && !props.sending && draft?.text.trim()) props.onSend(); }

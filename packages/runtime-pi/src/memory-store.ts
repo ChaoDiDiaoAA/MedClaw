@@ -6,6 +6,7 @@ import { canonicalRequest } from '../../contracts/src/run';
 import type { NativeHistorySnapshot, NativeHistoryCommit } from '../../contracts/src/session';
 import type { NativeHistoryContext } from '../../contracts/src/context';
 import type { ReadSessionMessagesInput, SessionMessagePage } from '../../contracts/src/messages';
+import type { ProductTurnInput, ProductTurnDiscardProof } from '../../contracts/src/intent';
 import { projectSessionMessages } from './messages';
 export { NATIVE_HISTORY_FORMAT } from '../../contracts/src/session';
 export type PiHistorySnapshot = Omit<NativeHistorySnapshot,'header'|'entries'> & {header:SessionHeader;entries:SessionEntry[]};
@@ -126,6 +127,8 @@ export class PiMemoryAdapter {
   private reported=false;
   private lastAcknowledgement:{identity:string;storageVersion:number}|null=null;
   private compaction:string|null=null;
+  private product:{runId:number;mode:ProductTurnInput['mode'];base:PiHistorySnapshot;frozen?:PiHistoryCommit;cancelled?:boolean}|null=null;
+  get productRunId():number|null{return this.product?.runId??null;}
   get compactionOperationRef():string|null{return this.compaction;}
   constructor(private readonly manager:SessionManager,private readonly options:MemoryOptions) {
     this.saved=validateNativeHistory(options.snapshot);this.observed=this.snapshot();
@@ -167,7 +170,7 @@ export class PiMemoryAdapter {
     if(current.entries.length<from||nativeHistoryJSON(current.header)!==nativeHistoryJSON(this.observed.header)
       ||nativeHistoryJSON(current.entries.slice(0,from))!==nativeHistoryJSON(this.observed.entries))invalid();
     this.observed=current;
-    if(this.pending||this.compaction)return;
+    if(this.pending||this.compaction||this.product)return;
     for(let i=from;i<current.entries.length;i++) {
       const entry=current.entries[i]!;
       if(this.heldFrom!==null&&entry.type==='message'&&['user','toolResult','assistant'].includes(entry.message.role)) {
@@ -189,12 +192,12 @@ export class PiMemoryAdapter {
     catch(error){this.pending??=change;this.failure(error);throw error;}
   }
   flushBeforeRequest():void {
-    if(this.pending||this.compaction)throw safeError('storage_write_failed');
+    if(this.pending||this.compaction||this.product)throw safeError('storage_write_failed');
     this.persist(this.observed.entries,this.observed.activeLeafId);this.heldFrom=null;
   }
   beginCompaction(operationRef:string):void {
     OpaqueIdSchema.parse(operationRef);
-    if(this.pending||this.final)throw safeError('storage_write_failed');
+    if(this.pending||this.final||this.product)throw safeError('storage_write_failed');
     if(this.compaction&&this.compaction!==operationRef)throw safeError('state_conflict');
     this.compaction=operationRef;
   }
@@ -228,22 +231,63 @@ export class PiMemoryAdapter {
     const compaction=branch[latest]!;
     return compaction.type==='compaction'&&input<branch.findIndex(entry=>entry.id===compaction.firstKeptEntryId);
   }
+  beginProductTurn(input:Pick<ProductTurnInput,'runId'|'sessionId'|'baseLeafId'|'baseStorageVersion'|'mode'>):void {
+    PositiveIdSchema.parse(input.runId);PositiveIdSchema.parse(input.sessionId);RevisionSchema.parse(input.baseStorageVersion);
+    if(this.disposed||this.pending||this.final||this.compaction||this.product)throw safeError('state_conflict');
+    if(input.runId!==this.options.getRunId()||input.sessionId!==this.saved.sessionId
+      ||input.baseLeafId!==this.saved.activeLeafId||input.baseStorageVersion!==this.saved.storageVersion)throw safeError('state_conflict');
+    if(input.mode==='program') {
+      if(this.heldFrom!==null||this.saved.activeLeafId!==this.observed.activeLeafId
+        ||nativeHistoryJSON(this.saved.entries)!==nativeHistoryJSON(this.observed.entries))throw safeError('storage_write_failed');
+    } else if(input.mode==='agent_task') {
+      const held=this.heldFrom===null?undefined:this.observed.entries[this.heldFrom];
+      if(!held||!isCandidate(held)||!this.manager.getBranch().some(entry=>entry.id===held.id))throw safeError('session_history_invalid');
+    } else throw safeError('invalid_argument');
+    this.product={runId:input.runId,mode:input.mode,base:structuredClone(this.saved)};
+  }
+  discardProductTurn(proof:ProductTurnDiscardProof):void {
+    const product=this.product;
+    if(!product||product.mode!=='program'||proof.runId!==product.runId||proof.sessionId!==this.saved.sessionId
+      ||proof.requestSettled!==true||proof.routeSettled!==true||proof.requiredFactsSaved!==true||this.pending||this.compaction
+      ||this.options.getRunId()!==product.runId||nativeHistoryJSON(this.saved)!==nativeHistoryJSON(product.base)
+      ||nativeHistoryJSON(validateNativeHistory(proof.committedSnapshot))!==nativeHistoryJSON(product.base))throw safeError('storage_write_failed');
+    for(const [method,{wrapped}]of this.wrappers)if(this.manager[method]!==wrapped)throw safeError('state_conflict');
+    this.product=null;this.final=null;this.heldFrom=null;this.dispose();
+  }
+  cancelAgentProductTurn(proof:ProductTurnDiscardProof):PiHistoryCommit {
+    const product=this.product;
+    if(!product||product.mode!=='agent_task'||proof.runId!==product.runId||proof.sessionId!==this.saved.sessionId
+      ||proof.requestSettled!==true||proof.routeSettled!==true||proof.requiredFactsSaved!==true||this.pending||this.compaction
+      ||this.options.getRunId()!==product.runId||nativeHistoryJSON(this.saved)!==nativeHistoryJSON(product.base)
+      ||nativeHistoryJSON(validateNativeHistory(proof.committedSnapshot))!==nativeHistoryJSON(product.base))throw safeError('storage_write_failed');
+    if(product.cancelled)return this.freezeFinal(proof.runId);
+    const held=this.heldFrom===null?undefined:this.observed.entries[this.heldFrom];
+    if(!held||!isCandidate(held)||!this.manager.getBranch().some(entry=>entry.id===held.id))throw safeError('session_history_invalid');
+    // Preserve real SDK history; move only the active leaf before uncommitted product customs.
+    this.final=null;delete product.frozen;this.manager.branch(held.id);product.cancelled=true;
+    return this.freezeFinal(proof.runId);
+  }
   freezeFinal(runId:number):PiHistoryCommit {
     PositiveIdSchema.parse(runId);
     if(this.final&&this.final.runId!==runId)throw safeError('state_conflict');
     if(this.options.getRunId()!==null&&this.options.getRunId()!==runId)throw safeError('state_conflict');
     this.final??={runId,snapshot:structuredClone(this.observed)};
-    return this.change(this.final.snapshot.entries,this.final.snapshot.activeLeafId,runId);
+    const change=this.change(this.final.snapshot.entries,this.final.snapshot.activeLeafId,runId);
+    if(this.product){this.product.frozen??=change;return structuredClone(this.product.frozen);}
+    return change;
   }
   releaseFinal(runId:number):void {
     if(!this.final&&this.releasedRunId===runId)return;
     if(!this.final||this.final.runId!==runId)throw safeError('state_conflict');
     if(this.pending||this.saved.activeLeafId!==this.final.snapshot.activeLeafId||nativeHistoryJSON(this.saved.entries)!==nativeHistoryJSON(this.final.snapshot.entries))throw safeError('storage_write_failed');
-    this.final=null;this.releasedRunId=runId;
+    this.final=null;this.product=null;this.releasedRunId=runId;
   }
-  acknowledgeSaved(change:PiHistoryCommit,storageVersion:number):void {
+  acknowledgeSaved(change:NativeHistoryCommit,storageVersion:number):void {
     const identity=nativeHistoryJSON(change);
     if(this.lastAcknowledgement?.identity===identity&&this.lastAcknowledgement.storageVersion===storageVersion)return;
+    if(this.product&&(!this.final||change.runId!==this.product.runId
+      ||change.activeLeafId!==this.final.snapshot.activeLeafId
+      ||nativeHistoryJSON([...this.saved.entries,...change.newEntries])!==nativeHistoryJSON(this.final.snapshot.entries)))invalid();
     if(change.sessionId!==this.saved.sessionId||change.expectedStorageVersion!==this.saved.storageVersion||nativeHistoryJSON(change.header)!==nativeHistoryJSON(this.saved.header))invalid();
     const next=validateNativeHistory({...this.saved,entries:[...this.saved.entries,...change.newEntries],activeLeafId:change.activeLeafId,storageVersion});
     if(storageVersion!==this.saved.storageVersion+(change.newEntries.length||change.activeLeafId!==this.saved.activeLeafId?1:0)
@@ -260,14 +304,14 @@ export class PiMemoryAdapter {
   }
   dispose():void {
     if(this.disposed)return;
-    if(this.pending||this.heldFrom!==null||this.final||this.compaction)throw safeError('storage_write_failed');
+    if(this.pending||this.heldFrom!==null||this.final||this.compaction||this.product)throw safeError('storage_write_failed');
     for(const [method,{wrapped}]of this.wrappers)if(this.manager[method]!==wrapped)throw safeError('state_conflict');
     for(const [method,{original}]of this.wrappers)Reflect.set(this.manager,method,original);
     this.disposed=true;
   }
   discardUncommittedForRestore(proof:import('../../contracts/src/session').RestoreDiscardProof):void {
     if(proof.sessionId!==this.saved.sessionId||proof.operationRef!==this.compaction||proof.nativeIdle!==true||proof.nativeQueuesEmpty!==true||proof.observersSettled!==true||proof.requiredCallFactsSaved!==true
-      ||this.pending||this.final||this.options.getRunId()!==null||nativeHistoryJSON(validateNativeHistory(proof.persistentSnapshot))!==nativeHistoryJSON(this.saved))throw safeError('storage_write_failed');
+      ||this.pending||this.final||this.product||this.options.getRunId()!==null||nativeHistoryJSON(validateNativeHistory(proof.persistentSnapshot))!==nativeHistoryJSON(this.saved))throw safeError('storage_write_failed');
     this.compaction=null;this.heldFrom=null;this.dispose();
   }
 }

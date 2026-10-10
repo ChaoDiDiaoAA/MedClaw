@@ -1,10 +1,12 @@
 import { isDeepStrictEqual } from "node:util";
 import type { Command, RuntimeNotice } from "../../contracts/src/protocol.ts";
 import type { AuthAttemptView, DiagnoseRequest, ModelChoice, ProviderAccepted, ProviderRequest, PublishedSettings, CredentialScope, ModelRuntimePort, ResolvedProviderSelection } from "../../contracts/src/model.ts";
-import { PublishedSettingsSchema, AuthPromptViewSchema, AuthNotifyViewSchema } from "../../contracts/src/model.ts";
+import { PublishedSettingsSchema, AuthPromptViewSchema, AuthNotifyViewSchema, DEFAULT_INTENT_MODEL, IntentModelConfigurationSchema, type IntentModelConfiguration } from "../../contracts/src/model.ts";
+import type { IntentModelInspection } from '../../contracts/src/intent';
 import type { AgentRuntimePort, ModelCallStarter, RuntimeRunStore } from "../../contracts/src/run.ts";
 import type { NativeSessionBindings } from "../../contracts/src/session";
-import { RuntimeService } from "./runtime/runtime-service";
+import { RuntimeService, type IntentRoutingDependencies } from "./runtime/runtime-service";
+import type { RunControl } from './runtime/run-control';
 import { AppErrorSchema, safeError, type AppError } from "../../contracts/src/error.ts";
 import type { EventService } from './events/event-service.ts';
 import type { WriteTransactions } from '../../contracts/src/event';
@@ -23,10 +25,12 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
   private prepared: { token: string; candidate: PublishedSettings; old: PublishedSettings; changedRuntime: boolean } | null = null;
   private lastCommit: { token: string; version: string } | null = null;
   private closing = false;
-  constructor(readonly instanceId: string, private settings: PublishedSettings, readonly runtime: ModelRuntimePort<Resolved>, readonly repositories: RuntimeRunStore, private readonly scope: CredentialScope, startCall: ModelCallStarter, private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void = () => {}, private readonly agent?: AgentRuntimePort<Resolved> & NativeSessionBindings, events?: Pick<EventService, 'notifyStream'>,transactions?:WriteTransactions, resourceSource?:ResourceSource) {
+  private readonly intentAbort = new AbortController();
+  private readonly intentInspections = new Set<Promise<IntentModelInspection>>();
+  constructor(readonly instanceId: string, private settings: PublishedSettings, readonly runtime: ModelRuntimePort<Resolved>, readonly repositories: RuntimeRunStore, private readonly scope: CredentialScope, startCall: ModelCallStarter, private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void = () => {}, private readonly agent?: AgentRuntimePort<Resolved,RunControl> & NativeSessionBindings, events?: Pick<EventService, 'notifyStream'>,transactions?:WriteTransactions, resourceSource?:ResourceSource, private readonly intents?:IntentRoutingDependencies) {
     this.resources = resourceSource ? new ResourceService(() => this.settings, repositories, resourceSource, () => agent?.toolNames ?? []) : null;
     this.runs = new RuntimeService(instanceId, () => this.settings, runtime, repositories, scope, startCall, notice, report, agent,
-      () => this.closing || this.prepared !== null || this.refreshes.size > 0 || [...this.logins.values()].some(login => !login.view.endedAt), snapshot => events?.notifyStream(snapshot),transactions,this.resources ?? undefined);
+      () => this.closing || this.prepared !== null || this.refreshes.size > 0 || [...this.logins.values()].some(login => !login.view.endedAt), snapshot => events?.notifyStream(snapshot),transactions,this.resources ?? undefined,intents);
   }
   get config() { return this.settings; }
   get busy() { return this.runs.busy; }
@@ -84,11 +88,19 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
     finally { clearTimeout(timer); this.refreshes.delete(operationRef); }
   }
   cancelOperation(operationRef: string) { const pending = this.refreshes.get(operationRef); pending?.abort(); return { cancelRequested: !!pending, settled: !pending }; }
+  async inspectIntentModel(input:Pick<IntentModelConfiguration,'baseUrl'|'modelTag'>) {
+    if(this.closing)throw safeError('runtime_busy');
+    if(!this.intents)throw safeError('intent_model_unavailable');
+    const pending=this.intents.service.inspectModel(IntentModelConfigurationSchema.parse({...DEFAULT_INTENT_MODEL,...input}),this.intentAbort.signal);
+    this.intentInspections.add(pending);try{return await pending;}finally{this.intentInspections.delete(pending);}
+  }
   async prepareConfig(token: string, input: PublishedSettings) {
     this.runs.assertNoHistoryMutation();
     if (this.prepared && this.prepared.token === token && isDeepStrictEqual(this.prepared.candidate, input)) return { prepared: true as const, selection: (await this.directory()).selection };
     if (this.prepared || this.closing) throw new Error("runtime_busy");
     const candidate = PublishedSettingsSchema.parse(input);
+    const changedIntent=!isDeepStrictEqual(candidate.intentModel??null,this.settings.intentModel??null);
+    if(changedIntent&&candidate.configVersion!==this.settings.configVersion&&candidate.previous?.configVersion!==this.settings.configVersion)throw safeError('config_conflict');
     const oldResources = this.settings.resources?.bySession ?? {}, newResources = candidate.resources?.bySession ?? {};
     const changedResourceSessions = [...new Set([...Object.keys(oldResources), ...Object.keys(newResources)])].filter(id => !isDeepStrictEqual(oldResources[id], newResources[id]));
     const oldExtensions=this.settings.extensions?.bySession??{},newExtensions=candidate.extensions?.bySession??{};
@@ -101,6 +113,11 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
     const old = this.settings;
     this.prepared = { token, candidate, old, changedRuntime };
     try {
+      if(candidate.intentModel?.enabled&&(changedIntent||candidate.rollbackFromVersion!==null)){
+        const inspection=await this.inspectIntentModel(candidate.intentModel);
+        if(!inspection.available)throw inspection.error??safeError('intent_model_unavailable');
+        if(inspection.actualDigest!==candidate.intentModel.modelDigest)throw safeError('intent_model_identity_mismatch');
+      }
       if(changedExtensionSessions.length&&!this.agent?.validateExtensions)throw safeError('extension_unavailable');
       for(const id of changedExtensionSessions){this.extensionSession(Number(id));await this.agent!.validateExtensions!(Number(id),candidate);}
       if (changedResourceSessions.length && !this.resources) throw new Error('resource_unavailable');
@@ -111,6 +128,7 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
       // Main validates auth inside this gate after any candidate credential is durably saved.
       const resolveSelection = () => this.runtime.resolve({ ...selected!, expectedConfigVersion: candidate.configVersion }, candidate.configVersion, candidate.credentialRefs[selected!.provider] ?? null, candidate.requestPolicy, candidate.rollbackFromVersion !== null);
       const selection = selected ? (await (candidate.rollbackFromVersion === null ? resolveSelection() : this.credentialScope(selected.provider, token, candidate.credentialRefs[selected.provider] ?? null, resolveSelection, "rollback"))).selection : null;
+      if(this.closing||this.prepared?.token!==token)throw safeError('config_conflict');
       return { prepared: true as const, selection };
     } catch (error) { if (changedRuntime) await this.runtime.installCustom(old.customProviders.map(p => p.definition)); this.prepared = null; throw error; }
   }
@@ -178,8 +196,10 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
   async shutdown() {
     this.runs.assertShutdownAvailable();
     this.closing = true;
+    this.intentAbort.abort();
     this.refreshes.forEach(a => a.abort()); this.logins.forEach(l => l.abort.abort());
     await Promise.all([...this.logins.values()].map(l => l.task));
+    await Promise.allSettled([...this.intentInspections]);
     return this.runs.shutdown();
   }
 }

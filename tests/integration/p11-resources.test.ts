@@ -191,14 +191,16 @@ test('p11 schema10 migration preserves original facts through the current schema
     expect(db.query("SELECT sql FROM sqlite_schema WHERE name='session_inputs_identity_immutable'").get()).toEqual({ sql: trigger });
     for (const n of names) expect(db.query(`SELECT * FROM ${n}`).all()).toEqual(before.get(n)!);
     db.close(); db = openDatabase(path);
-    expect(db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(r => (r as { name: string }).name)).toEqual(names);
+    const p14Tables=['intent_calls','route_decisions','query_contexts'];
+    expect(db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(r => (r as { name: string }).name)).toEqual([...names,...p14Tables].sort());
+    for(const table of p14Tables)expect(db.query(`SELECT * FROM ${table}`).all()).toEqual([]);
     for (const n of names.filter(n => n !== 'schema_migrations')) {
       const rows = db.query<Record<string, unknown>, []>(`SELECT * FROM ${n}`).all();
       expect(rows.map((row, i) => Object.fromEntries(Object.keys(before.get(n)![i]!).map(key => [key, row[key]])))).toEqual(before.get(n)!);
     }
     expect(db.query<Record<string, unknown>, []>('SELECT parent_run_id,origin_tool_call_id,child_result_json FROM runs').all().every(row => Object.values(row).every(value => value === null))).toBe(true);
     expect(db.query('SELECT * FROM schema_migrations ORDER BY version').all().slice(0, 10)).toEqual(before.get('schema_migrations')!);
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(12);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(13);
     expect(new Repositories(db).readInput({ inputId: f.input.inputId })).toMatchObject({ text: 'Why did this decline?', status: 'consumed' });
     expect(new Repositories(db).readRunResources(f.input.runId)).toBeNull();
   } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
@@ -290,6 +292,6 @@ test('p11 run snapshot and input plan commit together and reject invalid owner',
     const accepted = repos.acceptInput(acceptance);
     expect(Reflect.get(repos, 'readRunResources')).toBeFunction();
     expect(repos.readRunResources(accepted.runId!)).toEqual(resources);
-    expect(db.query<{ n: number }, []>('SELECT MAX(version) n FROM schema_migrations').get()!.n).toBe(12);
+    expect(db.query<{ n: number }, []>('SELECT MAX(version) n FROM schema_migrations').get()!.n).toBe(13);
   } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
 });

@@ -26,6 +26,34 @@ export const ReferenceDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refin
 export const TimezoneSchema = z.string().min(1).max(128).refine(value => {
   try { new Intl.DateTimeFormat("en", { timeZone: value }); return true; } catch { return false; }
 }, "Expected an IANA timezone");
+export const INTENT_VERSIONS = Object.freeze({
+  taxonomyVersion: 'medclaw.intent-taxonomy/v1', ruleVersion: 'medclaw.intent-rules/v1',
+  classifyPromptVersion: 'medclaw.intent-classify-prompt/v1', verifyPromptVersion: 'medclaw.intent-verify-prompt/v1',
+  schemaVersion: 'medclaw.intent/v2', policyVersion: 'medclaw.intent-policy/v2',
+} as const);
+
+export const IntentBaseUrlSchema = z.string().regex(/^http:\/\/(?:127\.0\.0\.1|\[::1\])(?::[1-9]\d{0,4})?\/?$/)
+  .refine(value => {
+    try { return !/[\u0000-\u0020\u007f]/.test(value) && new URL(value).port !== '0'; } catch { return false; }
+  }, 'Only numeric HTTP loopback without URL components is allowed');
+export const IntentModelConfigurationSchema = z.strictObject({
+  contract: z.literal('medclaw.intent-model/v2'), enabled: z.boolean(), baseUrl: IntentBaseUrlSchema,
+  modelTag: z.literal('qwen3.5:0.8b'), modelDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/).nullable(),
+  sourceUrl: z.literal('https://ollama.com/library/qwen3.5:0.8b'), verifiedEvidenceRef: nonblank(256).nullable(),
+  timeoutMs: z.number().int().min(1000).max(60000),
+}).refine(value => !value.enabled || value.modelDigest !== null && value.verifiedEvidenceRef !== null, 'Enabling requires verified model identity and protocol evidence');
+export type IntentModelConfiguration = z.infer<typeof IntentModelConfigurationSchema>;
+export const DEFAULT_INTENT_MODEL: Readonly<IntentModelConfiguration> = Object.freeze({
+  contract:'medclaw.intent-model/v2',enabled:false,baseUrl:'http://127.0.0.1:11434',modelTag:'qwen3.5:0.8b',modelDigest:null,
+  sourceUrl:'https://ollama.com/library/qwen3.5:0.8b',verifiedEvidenceRef:null,timeoutMs:15000,
+});
+export const IntentModelSelectionSchema = IntentModelConfigurationSchema.safeExtend({
+  configVersion: ConfigVersionSchema, api: z.literal('ollama-chat'),
+  taxonomyVersion: z.literal(INTENT_VERSIONS.taxonomyVersion), ruleVersion: z.literal(INTENT_VERSIONS.ruleVersion),
+  classifyPromptVersion: z.literal(INTENT_VERSIONS.classifyPromptVersion), verifyPromptVersion: z.literal(INTENT_VERSIONS.verifyPromptVersion),
+  schemaVersion: z.literal(INTENT_VERSIONS.schemaVersion), policyVersion: z.literal(INTENT_VERSIONS.policyVersion),
+});
+export type IntentModelSelection = z.infer<typeof IntentModelSelectionSchema>;
 const positiveLimit = PositiveIdSchema;
 const inputSchema = z.array(z.enum(["text", "image"])).min(1).max(2).refine(values => new Set(values).size === values.length, "Duplicate input capability");
 export const ModelChoiceSchema = z.strictObject({ provider: ProviderIdSchema, modelId: ModelIdSchema, expectedConfigVersion: ConfigVersionSchema });
@@ -198,6 +226,7 @@ export const CustomProviderDefinitionSchema = z.strictObject({
 }).refine(provider => new Set(provider.models.map(model => model.id)).size === provider.models.length, "Duplicate model ID");
 export const SettingsSnapshotObjectSchema = z.strictObject({
   schemaVersion: z.literal(SETTINGS_SCHEMA_VERSION), configVersion: ConfigVersionSchema,
+  intentModel: IntentModelConfigurationSchema.nullable().optional(),
   model: z.strictObject({ provider: ProviderIdSchema, modelId: ModelIdSchema }).nullable(),
   customProviders: z.array(z.strictObject({ definition: CustomProviderDefinitionSchema, credentialRef: CredentialRefSchema.nullable() })).max(10000),
   credentialRefs: z.record(ProviderIdSchema, CredentialRefSchema.nullable()), requestPolicy: RequestPolicySchema.optional(),

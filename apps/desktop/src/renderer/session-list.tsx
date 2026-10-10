@@ -7,9 +7,11 @@ export function sessionDisplayTitle(session: Pick<SessionView, "id" | "title">):
 }
 
 export type SessionDraft = { text: string; referenceDate: string; timezone: string; model: ModelChoice | null; mode?: InputMode;
+  routing?: Extract<SubmitInput, { mode: 'send' }>['routing'] | null;
+  intentRunId?: number;
   resendConfirmed?: boolean; confirmedFailure?: boolean; pending: { operationRef: string; input: SubmitInput } | null };
-export function newSessionDraft(model: ModelChoice | null, dataDefaults?: { batchCount: number; referenceDate: string | null; timezone: string | null } | null): SessionDraft {
-  return { text: "", referenceDate: dataDefaults && dataDefaults.batchCount > 0 ? dataDefaults.referenceDate ?? "" : new Date().toLocaleDateString("sv-SE"), timezone: dataDefaults && dataDefaults.batchCount > 0 ? dataDefaults.timezone ?? "" : (Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"), model, mode: "send", pending: null, resendConfirmed: false };
+export function newSessionDraft(model: ModelChoice | null, dataDefaults?: { batchCount: number; referenceDate: string | null; timezone: string | null } | null, intentEnabled: boolean | null = false): SessionDraft {
+  return { text: "", referenceDate: dataDefaults && dataDefaults.batchCount > 0 ? dataDefaults.referenceDate ?? "" : new Date().toLocaleDateString("sv-SE"), timezone: dataDefaults && dataDefaults.batchCount > 0 ? dataDefaults.timezone ?? "" : (Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"), model, mode: "send", routing: intentEnabled === null ? undefined : intentEnabled ? { mode: 'intent', originRunId: null } : null, pending: null, resendConfirmed: false };
 }
 export function selectSessionModelDraft(draft: SessionDraft | undefined, context: { instanceId: string | null; configVersion: string | undefined; session: SessionView | undefined },
   target: { instanceId: string; sessionId: number }, choice: ModelChoice): SessionDraft | null {
@@ -17,10 +19,13 @@ export function selectSessionModelDraft(draft: SessionDraft | undefined, context
     || context.session.status !== "active" || choice.expectedConfigVersion !== context.configVersion) return null;
   return { ...(draft ?? newSessionDraft(null)), model: { ...choice } };
 }
-export function acceptSubmissionDraft(draft: SessionDraft, original: NonNullable<SessionDraft["pending"]>): SessionDraft {
+export function acceptSubmissionDraft(draft: SessionDraft, original: NonNullable<SessionDraft["pending"]>, runId: number | null = null): SessionDraft {
   if (draft.pending?.operationRef !== original.operationRef || draft.pending.input.sessionId !== original.input.sessionId
     || draft.pending.input.clientSequence !== original.input.clientSequence) return draft;
-  return { ...draft, mode: 'send', pending: null, resendConfirmed: false, confirmedFailure: false, text: draft.text === original.input.text ? "" : draft.text };
+  const intent = original.input.mode === 'send' && original.input.routing?.mode === 'intent';
+  return { ...draft, mode: 'send', pending: null, resendConfirmed: false, confirmedFailure: false,
+    intentRunId: intent && runId !== null && draft.text === original.input.text ? runId : undefined,
+    text: !intent && draft.text === original.input.text ? '' : draft.text };
 }
 export type SessionManagementEditor = { action: 'rename' | 'delete'; target: SessionView; title: string; visible: boolean; busy: boolean; unknown: boolean; error: string | null };
 export function SessionList(props: { sessions: SessionView[]; current: number | null; running: number | null; creating: boolean; canCreate: boolean; canRecoverCreate?: boolean; canSelect?: boolean;

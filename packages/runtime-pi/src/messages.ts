@@ -1,5 +1,5 @@
 import type { SessionManager, SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
-import { MAX_MESSAGE_PAGE_BYTES, MAX_MESSAGE_TEXT_CHARS, ReadSessionMessagesInputSchema, SessionMessagePageSchema,
+import { MAX_MESSAGE_PAGE_BYTES, MAX_MESSAGE_TEXT_CHARS, MAX_MESSAGE_REFERENCES, ReadSessionMessagesInputSchema, SessionMessagePageSchema,
   type ReadSessionMessagesInput, type SessionMessagePage, type SessionMessageView } from "@medclaw/contracts/messages";
 import { OpaqueIdSchema, PositiveIdSchema, safeError } from "../../contracts/src/error";
 import { ToolCallRecordSchema, ToolCallViewSchema, type ToolCallRecord, type ToolCallView } from "../../contracts/src/tool";
@@ -14,6 +14,7 @@ import { ResourcePayloadObservationSchema } from '../../contracts/src/resources'
 import { createHash } from 'node:crypto';
 import { canonicalRequest } from '../../contracts/src/run';
 import { getSystemMessageText } from '@earendil-works/pi-ai';
+import { ProductResultDetailsSchema } from '../../contracts/src/intent';
 
 export type ExpectedResource = {fact:ResourceDeliveryRef;text:string;userIndex?:number;toolIndex?:number};
 
@@ -207,9 +208,18 @@ export function projectMessageText(message: SessionMessageEntry["message"]) {
 }
 
 function projectEntry(entry: SessionEntry, entryRuns: ReadonlyMap<string, number>): SessionMessageView | null {
-  if (entry.type === "custom" || entry.type === "custom_message") return null;
   const base = { nativeEntryId: entry.id, parentEntryId: entry.parentId, entryType: entry.type, inputId: null, runId: null,
     references: [] as string[], toolCallRef: null };
+  if (entry.type === 'custom_message') {
+    if (entry.customType !== 'medclaw-query-result' || !entry.display || typeof entry.content !== 'string' || !entry.content.length) return null;
+    const details = ProductResultDetailsSchema.safeParse(entry.details);
+    if (!details.success) return null;
+    const preview = safePreview(entry.content, MAX_MESSAGE_TEXT_CHARS), { runId, queryIds } = details.data;
+    return { ...base, displayRole: 'program', runId, text: preview.text,
+      references: [`run:${runId}`, ...queryIds.slice(0, MAX_MESSAGE_REFERENCES - 1).map(id => `query:${id}`)],
+      textInfo: { totalChars: entry.content.length, truncated: preview.truncated, redacted: false } };
+  }
+  if (entry.type === 'custom') return null;
   if (entry.type === "message") {
     const message = entry.message;
     if (!message || typeof message !== "object") return unsupported();

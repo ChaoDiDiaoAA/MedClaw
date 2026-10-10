@@ -15,6 +15,9 @@ import { safeError, type AppError } from "../../contracts/src/error";
 import { type AgentExecutionObservation, type AgentRuntimePort, type FinalCallFact, type ProviderOutcome } from "../../contracts/src/run";
 import type { NativeSessionBindings, NativeSessionPreview, InputAdapterPort, InputSettlementProof, MemoryStore, NativeHistoryCommit, NativeHistorySnapshot, SessionRuntimeView } from "../../contracts/src/session";
 import { PiMemoryAdapter, projectSavedMessages, restoreNativeManager, nativeHistoryJSON } from './memory-store';
+import { appendProductTurn } from './product-turn-adapter';
+import { IntentAgentTaskSchema, ProductTurnInputSchema, type ProductTurnInput, type ProductTurnFact, type ProductTurnDiscardProof } from '../../contracts/src/intent';
+import { createQueryIntentStepTool } from '../../core/src/intent/agent-tool';
 import { PiInputAdapter } from './input-adapter';
 import { outcomeOf, type PiModelRuntime, type ResolvedModel } from "./model-runtime";
 import { createPiNativeTools, createPiToolDefinitions, observePiToolDelivery, createPiRunControlBinding, createFrozenToolContextFactory } from "./pi-tool-adapter";
@@ -41,12 +44,12 @@ import { projectRuntimePolicies } from '../../contracts/src/runtime-config';
 import { SUBAGENT_BUILD, createRunSubagent, type ManagedAgentSessionBridge } from './subagent-adapter';
 type RunExtension = Awaited<ReturnType<typeof loadRunExtension>>;
 
-type ExecutionInput = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[0];
+type ExecutionInput = Parameters<AgentRuntimePort<ResolvedModel,RunControl>["execute"]>[0];
 type Callbacks = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[1];
 type RunTools = { registry: ToolRegistry; executor: ToolExecutor };
 type ManagedChild = { binding: Binding; identity?: BoundChildIdentity; error: AppError | null; unsubscribe: (() => void)[];
   stop: () => Promise<void>; unown: () => void; observation?: ChildExecutionObservation; released: boolean };
-type Binding = { manager: SessionManager; nativeSessionId: string; memory?:PiMemoryAdapter; ownerRunId?:number; assembling?:boolean; entryRuns: Map<string, number>; session?: AgentSession; extension?:RunExtension; commandPrompt?:AgentSession['prompt']; toolSignature?: string; lastRunId?: number; bindTools?: () => () => void; available: boolean;
+type Binding = { manager: SessionManager; nativeSessionId: string; memory?:PiMemoryAdapter; ownerRunId?:number; product?:{identity:string;fact?:ProductTurnFact}; assembling?:boolean; entryRuns: Map<string, number>; session?: AgentSession; extension?:RunExtension; commandPrompt?:AgentSession['prompt']; toolSignature?: string; lastRunId?: number; bindTools?: () => () => void; available: boolean;
   manual?:CompactionExecutionInput<ResolvedModel>;compaction?:CompactionAdapter;originalStream?:AgentSession['agent']['streamFunction'];execution?: { input: ExecutionInput; callbacks: Callbacks; toolCalls: Set<string>;
   observers: Promise<void>[]; facts: (FinalCallFact | null)[]; lastOutcome: ProviderOutcome | null; unsupported: boolean;
   registrationFailed: boolean; currentModelCallId: string | null; abort: () => void; control: RunControl; resourcePaths?: Awaited<ReturnType<typeof materializeRunResources>>; tools?: RunTools; toolContexts: Map<string, ToolExecutionContext>; toolOrigins: Map<string, { callId: string; snapshot: ContextSnapshot }>;
@@ -54,7 +57,7 @@ type Binding = { manager: SessionManager; nativeSessionId: string; memory?:PiMem
 const unobservedFailure = (code: string): ProviderOutcome => ({ sdkStopReason: "pending", text: "", responseModel: null, callState: "failed",
   usage: { inputTokens: null, outputTokens: null, cost: null, costCurrency: null, source: null, unavailableReason: "call_not_observed" }, error: safeError(code) });
 
-export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSessionBindings {
+export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel,RunControl>, NativeSessionBindings {
   private readonly eventAdapter = new EventAdapter();
   readSnapshots(runId: number) { return this.eventAdapter.readSnapshots(runId); }
   private readonly sessions = new Map<number, Binding>();
@@ -68,6 +71,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
   private readonly inputStartFailures = new Map<number, { save: () => void; pending: boolean; proof: InputSettlementProof }>();
   private readonly contextReceipts = new Map<number, Map<string, RegisterContextDeliveryInput>>();
   private readonly subagentCleanup = new Map<number,()=>Promise<void>>();
+  private readonly productCancellations=new Set<number>();
   hasPendingSubagentPersistence(runId:number) {return this.subagentCleanup.has(runId);}
   async retrySubagentPersistence(runId:number) {await this.subagentCleanup.get(runId)?.();}
   readonly contextContract?: typeof CONTEXT_CONTRACT;
@@ -192,7 +196,8 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
       candidate={manager,nativeSessionId:snapshot.nativeSessionId,entryRuns:new Map(),available:true,assembling:true};
       this.attachMemory(sessionId,candidate,snapshot);
       const context=manager.buildSessionContext();
-      if(context.messages.length)await this.assemble(candidate,context.model ? this.runtime.native.getModel(context.model.provider,context.model.modelId) : undefined,false);
+      // Program-only history has no native model; defer assembly to avoid writing SDK defaults during restore.
+      if(context.messages.length&&context.model)await this.assemble(candidate,this.runtime.native.getModel(context.model.provider,context.model.modelId),false);
       if(nativeHistoryJSON(manager.getHeader())!==nativeHistoryJSON(snapshot.header)||nativeHistoryJSON(manager.getEntries())!==nativeHistoryJSON(snapshot.entries)||manager.getLeafId()!==snapshot.activeLeafId)throw safeError('session_history_invalid');
       candidate.assembling=false;this.sessions.set(sessionId,candidate);this.blocked.delete(sessionId);
     }catch(native) {
@@ -208,20 +213,88 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel>, NativeSe
       onFailure:error=>{binding.available=false;this.blocked.set(sessionId,error);binding.execution?.callbacks.fatal?.(error);binding.execution?.abort();}});
   }
   private historyBinding(runId:number):Binding {
-    const binding=[...this.sessions.values()].find(binding=>binding.execution?.input.runId===runId||binding.lastRunId===runId);
+    const binding=[...this.sessions.values()].find(binding=>binding.execution?.input.runId===runId||binding.lastRunId===runId||binding.ownerRunId===runId);
     if(!binding?.memory)throw safeError('state_conflict');return binding;
   }
   hasPendingHistoryPersistence(runId:number):boolean {
-    const binding=[...this.sessions.values()].find(binding=>binding.execution?.input.runId===runId||binding.lastRunId===runId);
-    return binding?.memory?.persistencePending(runId)??false;
+    const binding=[...this.sessions.values()].find(binding=>binding.execution?.input.runId===runId||binding.lastRunId===runId||binding.ownerRunId===runId);
+    return this.productCancellations.has(runId)||(binding?.memory?.persistencePending(runId)??false);
   }
   retryHistoryPersistence(runId:number):void {this.historyBinding(runId).memory!.retryPersistence(runId);}
   readFinalHistory(runId:number):NativeHistoryCommit {const binding=this.historyBinding(runId);if(binding.execution||binding.session&&!binding.session.isIdle)throw safeError('stop_unconfirmed');return binding.memory!.freezeFinal(runId);}
   acknowledgeHistorySaved(change:NativeHistoryCommit,storageVersion:number):void {
     if(change.runId===null)throw safeError('state_conflict');const binding=this.historyBinding(change.runId);
-    if(this.sessions.get(change.sessionId)!==binding)throw safeError('access_denied');binding.memory!.acknowledgeSaved(change as Parameters<PiMemoryAdapter['acknowledgeSaved']>[0],storageVersion);
+    if(this.sessions.get(change.sessionId)!==binding)throw safeError('access_denied');binding.memory!.acknowledgeSaved(change,storageVersion);
   }
-  releaseHistoryFacts(runId:number):void {this.historyBinding(runId).memory!.releaseFinal(runId);}
+  releaseHistoryFacts(runId:number):void {
+    const binding=this.historyBinding(runId);binding.memory!.releaseFinal(runId);
+    if(binding.product){delete binding.product;delete binding.ownerRunId;}
+  }
+  async cancelIntentProductTurn(runId:number):Promise<NativeHistoryCommit> {
+    this.productCancellations.add(runId);
+    const binding=this.historyBinding(runId),sessionId=binding.product?.fact?.history.sessionId
+      ??[...this.sessions].find(([,value])=>value===binding)?.[0];
+    if(sessionId===undefined||!binding.product||binding.execution||binding.manual||binding.compaction
+      ||binding.session&&(!binding.session.isIdle||binding.session.agent.hasQueuedMessages())
+      ||this.inputPersistencePending(runId)||this.toolPersistencePending(runId)||this.hasPendingContextPersistence(runId)||this.hasPendingSubagentPersistence(runId))throw safeError('storage_write_failed');
+    const loaded=await this.history.store.load(sessionId);if(!loaded.ok)throw loaded.error;
+    const history=binding.memory!.cancelAgentProductTurn({runId,sessionId,requestSettled:true,routeSettled:true,requiredFactsSaved:true,committedSnapshot:loaded.data});
+    this.productCancellations.delete(runId);return history;
+  }
+  async retryProductPersistence(runId:number):Promise<void> {if(this.productCancellations.has(runId))await this.cancelIntentProductTurn(runId);}
+  async appendProductTurn(raw:ProductTurnInput):Promise<ProductTurnFact> {
+    const parsed=ProductTurnInputSchema.safeParse(raw);if(!parsed.success)throw safeError('invalid_argument');
+    const input=parsed.data,identity=canonicalRequest(input);
+    if(this.loading.has(input.sessionId))throw safeError('runtime_busy');
+    const availability=this.readAvailability(input.sessionId);if(availability.availability==='blocked')throw availability.error;
+    if(!this.sessions.has(input.sessionId)) {
+      if(input.mode!=='program')throw safeError('state_conflict');
+      // Program results load a native manager without selecting, authenticating or assembling a main model.
+      const load=(async()=>{
+        const loaded=await this.history.store.load(input.sessionId);if(!loaded.ok)throw loaded.error;
+        if(this.sessions.has(input.sessionId))throw safeError('state_conflict');
+        const manager=restoreNativeManager(loaded.data,this.dataRoot);
+        const candidate:Binding={manager,nativeSessionId:loaded.data.nativeSessionId,entryRuns:new Map(),available:true};
+        this.attachMemory(input.sessionId,candidate,loaded.data);this.sessions.set(input.sessionId,candidate);
+      })();
+      this.loading.set(input.sessionId,load);
+      try{await load;}finally{if(this.loading.get(input.sessionId)===load)this.loading.delete(input.sessionId);}
+    }
+    const binding=this.sessions.get(input.sessionId)!;
+    if(binding.product) {
+      if(binding.ownerRunId!==input.runId||binding.product.identity!==identity||!binding.product.fact)throw safeError('state_conflict');
+      return structuredClone(binding.product.fact);
+    }
+    if(!binding.memory||binding.ownerRunId!==undefined||binding.execution||binding.manual||binding.compaction
+      ||binding.session&&(!binding.session.isIdle||binding.session.agent.hasQueuedMessages())
+      ||binding.extension&&!binding.extension.proof.resourcesReleased
+      ||input.mode==='agent_task'&&binding.lastRunId!==input.runId)throw safeError('stop_unconfirmed');
+    if(binding.lastRunId!==undefined&&(this.inputPersistencePending(binding.lastRunId)||this.toolPersistencePending(binding.lastRunId)
+      ||this.hasPendingContextPersistence(binding.lastRunId)||this.hasPendingSubagentPersistence(binding.lastRunId)))throw safeError('storage_write_failed');
+    if(input.mode==='program'){binding.session?.dispose();binding.session=undefined;binding.commandPrompt=undefined;}
+    binding.ownerRunId=input.runId;binding.product={identity};
+    try {
+      const fact=appendProductTurn(binding.manager,binding.memory,input);
+      binding.product.fact=structuredClone(fact);binding.lastRunId=input.runId;
+      for(const entry of fact.history.newEntries)binding.entryRuns.set((entry as {id:string}).id,input.runId);
+      return fact;
+    }catch(error){
+      if(binding.memory.productRunId!==input.runId){delete binding.product;delete binding.ownerRunId;}
+      throw error;
+    }
+  }
+  async discardProductTurn(proof:ProductTurnDiscardProof):Promise<void> {
+    const binding=this.historyBinding(proof.runId);
+    if(this.sessions.get(proof.sessionId)!==binding||!binding.product||binding.ownerRunId!==proof.runId||binding.execution||binding.manual||binding.compaction
+      ||binding.session&&(!binding.session.isIdle||binding.session.agent.hasQueuedMessages()))throw safeError('stop_unconfirmed');
+    const loaded=await this.history.store.load(proof.sessionId);if(!loaded.ok)throw loaded.error;
+    if(nativeHistoryJSON(loaded.data)!==nativeHistoryJSON(proof.committedSnapshot))throw safeError('storage_write_failed');
+    const manager=restoreNativeManager(loaded.data,this.dataRoot),candidate:Binding={manager,nativeSessionId:loaded.data.nativeSessionId,entryRuns:new Map(),available:true};
+    this.attachMemory(proof.sessionId,candidate,loaded.data);
+    try{binding.memory!.discardProductTurn({...proof,committedSnapshot:loaded.data});}
+    catch(error){candidate.memory!.dispose();throw error;}
+    binding.session?.dispose();this.sessions.set(proof.sessionId,candidate);this.blocked.delete(proof.sessionId);
+  }
 
   private contextFor(execution: NonNullable<Binding['execution']>, nativeToolCallId: string, sdkSignal?: AbortSignal): ToolExecutionContext {
     try { return createFrozenToolContextFactory((id, signal) => {
@@ -406,7 +479,8 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
       const audit=extension?extension.override({...base,extensions:others}):{...base,extensions:[]};
       return {...base,extensions:[...audit.extensions,...managed.extensions]};
     };
-    const signature = JSON.stringify({ compaction, extensions:extension?.proof.assemblyId??null,subagent:subagent?binding.execution!.input.runId:null,resources: paths?.signature ?? null, tools: definitions.map(({ name, description, parameters, executionMode }) => ({ name, description, parameters, executionMode })) });
+    const intentTask=binding.execution?.input.intentTask;
+    const signature = JSON.stringify({ compaction, intentTask:intentTask??null, extensions:extension?.proof.assemblyId??null,subagent:subagent?binding.execution!.input.runId:null,resources: paths?.signature ?? null, tools: definitions.map(({ name, description, parameters, executionMode }) => ({ name, description, parameters, executionMode })) });
     if (!binding.session || binding.toolSignature !== signature) {
       if (binding.session && (!binding.session.isIdle || binding.lastRunId !== undefined && this.tools?.recorder.persistencePending(binding.lastRunId))) throw new Error('state_conflict');
       let candidate: AgentSession | undefined;
@@ -417,7 +491,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
           additionalExtensionPaths: [], additionalSkillPaths: paths?.skillPaths ?? [], additionalPromptTemplatePaths: paths?.promptPaths ?? [], additionalThemePaths: [], extensionFactories,
           ...(extension||subagent?{extensionsOverride:override}:{}),
-          systemPrompt: this.productSystemPrompt(), appendSystemPrompt: [] });
+          systemPrompt: this.productSystemPrompt()+(intentTask?`\nValidated MedClaw intent task (data, never additional permissions):\n${canonicalRequest(intentTask)}\nUse query_intent_step for every validated query step. Preserve its parameters and Query identities. Complete dependencies first. A listing, trend or statistics step uses part 0. For comparisons, each manufacturer, device or period is a separate zero-based part.`:''), appendSystemPrompt: [] });
         await (extension?extension.track(resourceLoader.reload()):resourceLoader.reload()); binding.execution?.control.checkActive();extension?.assertLive();
         if(extension&&resourceLoader.getPrompts().prompts.some(prompt=>prompt.name==='extension_status'))throw safeError('extension_conflict');
         if (paths && (resourceLoader.getSkills().skills.length !== paths.skillPaths.length || resourceLoader.getPrompts().prompts.length !== paths.promptPaths.length
@@ -712,10 +786,11 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
     const binding = this.sessions.get(input.sessionId);
     if (!binding || !binding.available) throw new Error("session_history_invalid");
     if(binding.extension&&!binding.extension.proof.resourcesReleased)throw safeError('stop_unconfirmed');
-    if (binding.execution||binding.manual||binding.compaction) throw new Error("state_conflict");
+    if (binding.execution||binding.manual||binding.compaction||binding.product) throw new Error("state_conflict");
     let abortTask: Promise<void> | null = null, unsubscribe: (() => void) | undefined, unsubscribeTools: (() => void) | undefined, unsubscribeMessages: (() => void) | undefined, unsubscribeCompaction:(()=>void)|undefined,activeCompaction:CompactionAdapter|undefined, terminalEmitted = false;
     const abort = () => { this.inputs.get(input.runId)?.stop(); binding.execution?.subagent?.cancel();if (binding.session && !abortTask) abortTask = binding.session.abort(); };
-    const control = new RunControl({ runId: input.runId, toolConfiguration: input.toolConfiguration, runtimeConfiguration: input.runtimeConfiguration, policy: input.agentPolicy,
+    input.runControl?.assertRun({runId:input.runId,scope:input.scope!,signal:input.signal,deadlineAt:input.deadlineAt});
+    const control = input.runControl ?? new RunControl({ runId: input.runId, toolConfiguration: input.toolConfiguration, runtimeConfiguration: input.runtimeConfiguration, policy: input.agentPolicy,
       scope: input.scope ?? { batchIds: [], deviceIds: null, allowedToolNames: [], allowedResourceRefs: [], artifactIds: [], readOnly: true },
       signal: input.signal, deadlineAt: input.deadlineAt, totalTimeoutMs: input.resolved.policy.timeoutMs,
       measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot });
@@ -759,6 +834,12 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           finish:(observed,reply)=>callbacks.subagents!.finish(observed.identity,observed,reply),
           acknowledge:(observed,version)=>this.acknowledgeHistorySaved(observed.history,version),release:id=>this.releaseManagedChild(execution,id),fatal:error=>callbacks.fatal?.(error)});
         execution.tools=this.tools.configure(control.configuration,[...(binding.extension?.definitions??[]),...execution.subagent.definitions]);
+      }
+      if(input.intentTask){
+        IntentAgentTaskSchema.parse(input.intentTask);
+        if(!callbacks.queryIntentStep||!callbacks.beforeFinalHistory||!this.tools?.configure||execution.subagent
+          ||!input.scope?.allowedToolNames.includes('query_intent_step')||input.scope.allowedToolNames.includes('Agent'))throw safeError('state_conflict');
+        execution.tools=this.tools.configure(control.configuration,[...(binding.extension?.definitions??[]),createQueryIntentStepTool(callbacks.queryIntentStep)]);
       }
       const preparing=this.prepare(binding,input.resolved);
       if(binding.extension){
@@ -864,6 +945,14 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         }else await close();
       } finally { unsubscribe?.(); unsubscribeTools?.(); unsubscribeMessages?.();unsubscribeCompaction?.(); input.signal.removeEventListener("abort", abort); binding.lastRunId = input.runId; binding.execution = undefined;binding.compaction=undefined; }
     }
-    return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []), budgetSummary: control.summary(), history:binding.memory!.freezeFinal(input.runId),...(activeCompaction?{compactions:activeCompaction.readSaveFacts()}:{}), ...(inputSettlement ? { inputSettlement } : {}),...(this.extensions.has(input.runId)?{extensions:this.readExtensionCleanup(input.runId)!}:{}) };
+    let productTurn:ProductTurnFact|undefined,finalizationError:AppError|undefined;
+    if(input.intentTask&&!input.signal.aborted&&execution.lastOutcome?.callState==='completed'&&!execution.lastOutcome.error){
+      try{productTurn=await callbacks.beforeFinalHistory!();}
+      catch(error){
+        const parsed=AppErrorSchema.safeParse(error);finalizationError=parsed.success?parsed.data:safeError('session_history_invalid');
+        if(binding.product){try{await this.cancelIntentProductTurn(input.runId);}catch{finalizationError=safeError('storage_write_failed');}}
+      }
+    }
+    return { nativeIdle: true, lastOutcome: execution.lastOutcome, calls: execution.facts.flatMap(fact => fact ? [fact] : []), budgetSummary: control.summary(), history:binding.memory!.freezeFinal(input.runId),...(productTurn?{productTurn}:{}),...(finalizationError?{finalizationError}:{}),...(activeCompaction?{compactions:activeCompaction.readSaveFacts()}:{}), ...(inputSettlement ? { inputSettlement } : {}),...(this.extensions.has(input.runId)?{extensions:this.readExtensionCleanup(input.runId)!}:{}) };
   }
 }
