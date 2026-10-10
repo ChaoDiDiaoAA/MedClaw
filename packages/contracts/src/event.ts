@@ -3,6 +3,7 @@ import { PositiveIdSchema, OpaqueIdSchema, TimestampSchema, AppErrorSchema } fro
 import { ConfigVersionSchema } from './model';
 import { ToolCallRecordSchema } from './tool';
 import { InputStatusSchema, InputProcessingStatusSchema } from './session';
+import { IntentDecisionSchema, IntentStageSchema, IntentStatusSchema, RuleEvaluationSchema } from './intent';
 
 export const EVENT_LIMITS = { defaultLimit: 50, maxLimit: 100, payloadBytes: 65536, pageBytes: 3 * 1024 * 1024, maxSubscriptions: 16, maxPendingNotices: 256, maxSnapshots: 32, maxTextChars: 32768 } as const;
 export const EventIntegerSchema = z.number().int().min(Number.MIN_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER);
@@ -23,7 +24,7 @@ export const RegisteredEventPayloadSchema = z.discriminatedUnion('type', [
   variant('run_cancelled', terminal),
   variant('input_accepted', { ...input, runId: z.null(), status: z.literal('queued'), processingStatus: z.literal('pending'), errorCode: z.null() }),
   variant('input_queued', { ...input, runId: z.null(), status: z.literal('queued'), processingStatus: z.literal('pending'), errorCode: z.null() }),
-  variant('input_delivered', { ...input, phase: z.enum(['sdk_received', 'native_consumed']) }),
+  variant('input_delivered', { ...input, phase: z.enum(['sdk_received', 'native_consumed', 'product_history_saved']) }),
   variant('input_processed', { ...input, processingStatus: z.literal('completed') }),
   variant('input_cancelled', { ...input, processingStatus: z.literal('cancelled') }),
   variant('input_failed', { ...input, processingStatus: z.enum(['pending', 'failed']) }),
@@ -33,6 +34,14 @@ export const RegisteredEventPayloadSchema = z.discriminatedUnion('type', [
   variant('query_completed', { queryId: PositiveIdSchema, resultHash: z.string().regex(/^[a-f0-9]{64}$/), batchIds: ids }),
   variant('context_delivered', { snapshotId: PositiveIdSchema, callId: OpaqueIdSchema }),
   variant('history_saved', { storageVersion: PositiveIdSchema, nativeLeafId: OpaqueIdSchema.nullable() }),
+  variant('intent_rule_evaluated', { runId: PositiveIdSchema, inputId: PositiveIdSchema, ruleEvaluation: z.lazy(() => RuleEvaluationSchema) }),
+  variant('intent_started', { stage: z.lazy(() => IntentStageSchema), previousCallId: OpaqueIdSchema.nullable(), runId: PositiveIdSchema, inputId: PositiveIdSchema,
+    intentCallId: OpaqueIdSchema, callId: OpaqueIdSchema, snapshotId: PositiveIdSchema, configVersion: ConfigVersionSchema, modelTag: z.literal('qwen3.5:0.8b') }),
+  variant('intent_finished', { stage: z.lazy(() => IntentStageSchema), runId: PositiveIdSchema, inputId: PositiveIdSchema, intentCallId: OpaqueIdSchema, callId: OpaqueIdSchema,
+    state: z.enum(['completed', 'failed', 'cancelled']), validationState: z.enum(['valid', 'invalid', 'not_run']), errorCode: errorCode.nullable() }),
+  variant('route_decided', { runId: PositiveIdSchema, inputId: PositiveIdSchema, decisionId: PositiveIdSchema, intentCallId: OpaqueIdSchema.nullable(),
+    route: z.lazy(() => IntentDecisionSchema.shape.route), decisionSource: z.lazy(() => IntentDecisionSchema.shape.decisionSource),
+    matchedBy: z.lazy(() => IntentDecisionSchema.shape.matchedBy), status: z.lazy(() => IntentStatusSchema).nullable(), queryParamsHash: z.string().regex(/^[a-f0-9]{64}$/).nullable() }),
   variant('compaction_completed', { operationRef: OpaqueIdSchema, reason: z.enum(['threshold', 'overflow']), nativeEntryId: OpaqueIdSchema, firstKeptEntryId: OpaqueIdSchema,
     storageVersion: PositiveIdSchema, tokensBefore: nonnegative, estimatedTokensAfter: nonnegative.nullable() }),
 ]);
@@ -44,8 +53,20 @@ function validEvent(event: RegisteredEventDraft, ctx: z.RefinementCtx) {
   if ('sessionId' in event.payload && event.payload.sessionId !== event.sessionId) ctx.addIssue({ code: 'custom', message: 'Session identity mismatch' });
   if ('inputId' in event.payload && (event.payload.runId ?? event.payload.targetRunId) !== event.runId) ctx.addIssue({ code: 'custom', message: 'Input run identity mismatch' });
   if (event.type.startsWith('tool_') && 'callId' in event.payload && event.payload.callId !== event.toolCallId) ctx.addIssue({ code: 'custom', message: 'Tool identity mismatch' });
-  if (event.type === 'context_delivered' && (event.toolCallId !== null || event.source !== 'pi' || event.sourceConnection !== null)) ctx.addIssue({ code: 'custom', message: 'Context delivery source mismatch' });
+  if (event.type === 'context_delivered' && (event.toolCallId !== null || !['pi', 'intent'].includes(event.source) || event.sourceConnection !== null)) ctx.addIssue({ code: 'custom', message: 'Context delivery source mismatch' });
   if (event.type === 'compaction_completed' && (event.toolCallId !== null || event.source !== 'pi' || event.sourceConnection !== null || event.sourceSequence !== null)) ctx.addIssue({ code: 'custom', message: 'Compaction source mismatch' });
+  if (event.type === 'intent_started' || event.type === 'intent_finished') {
+    const payload = event.payload;
+    if (event.source !== 'intent' || event.toolCallId !== null || event.sourceConnection !== `intent:${payload.callId}`
+      || payload.intentCallId !== payload.callId || event.sourceSequence !== (event.type === 'intent_started' ? 1 : 2)) ctx.addIssue({ code: 'custom', message: 'Intent call source identity mismatch' });
+    if (event.type === 'intent_started' && ((event.payload.stage === 'classify') !== (event.payload.previousCallId === null)
+      || event.payload.previousCallId === event.payload.callId)) ctx.addIssue({ code: 'custom', message: 'Intent stage origin mismatch' });
+  }
+  if (event.type === 'intent_rule_evaluated' && (event.source !== 'application' || event.toolCallId !== null
+    || event.sourceConnection !== `intent-rule:${event.runId}` || event.sourceSequence !== 1)) ctx.addIssue({ code: 'custom', message: 'Rule source mismatch' });
+  if (event.type === 'route_decided' && (event.source !== 'application' || event.toolCallId !== null
+    || event.sourceConnection !== `route:${event.payload.decisionId}` || event.sourceSequence !== 1)) ctx.addIssue({ code: 'custom', message: 'Route source mismatch' });
+  if (event.type === 'input_delivered' && event.payload.phase === 'product_history_saved' && event.source !== 'application') ctx.addIssue({ code: 'custom', message: 'Product history delivery must be a program fact' });
 }
 const drafts = RegisteredEventPayloadSchema.options.map(option => option.extend(envelope));
 export const RegisteredEventDraftSchema = z.union(drafts).superRefine(validEvent);

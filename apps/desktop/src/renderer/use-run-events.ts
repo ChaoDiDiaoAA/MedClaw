@@ -3,7 +3,7 @@ import type { DesktopBridge } from './App';
 import { errorMessage, type AppError } from '../../../../packages/contracts/src/error';
 import { useEffect, useRef, useState } from 'react';
 import type { HostView } from '../../../../packages/contracts/src/model';
-import type { RunView } from '../../../../packages/contracts/src/run';
+import { canonicalRequest, type RunView } from '../../../../packages/contracts/src/run';
 
 export type ReadingAnchor = { key: string; nativeEntryId: string | null; neighbors: string[] };
 export function resolveReadingAnchor(anchor: ReadingAnchor, available: string[], aliases: Record<string, string>): { key: string | null; contentUpdated: boolean } {
@@ -136,6 +136,17 @@ export class RunEventProjection {
   constructor(runId: number, sessionId: number) { this.state = { runId, sessionId, cursor: 0, events: [], snapshots: [], prefixUnrecorded: false, terminal: false, finalSource: 'temporary', error: null, snapshotsIncomplete: false, phase: 'idle', gap: null, nativeEntries: {} }; }
   applyPage(page: EventPage, explicitResume: number | null = null): boolean {
     if (page.runId !== this.state.runId || page.events.some(event => event.runId !== this.state.runId || event.sessionId !== this.state.sessionId)) return false;
+    const known = new Map(this.state.events.map(event => [event.sequence, event]));
+    const ids = new Set(this.state.events.map(event => event.eventId));
+    for (const event of page.events) {
+      if (event.sequence <= this.state.cursor) {
+        const prior = known.get(event.sequence);
+        if (!prior || canonicalRequest(prior) !== canonicalRequest(event)) return false;
+      } else {
+        if (ids.has(event.eventId)) return false;
+        ids.add(event.eventId);
+      }
+    }
     const fresh = page.events.filter(event => event.sequence > this.state.cursor);
     if (fresh.some((event, index) => event.sequence !== (explicitResume ?? this.state.cursor) + index + 1) || page.nextSequence !== (fresh.at(-1)?.sequence ?? this.state.cursor)) return false;
     if (!this.state.events.length && fresh[0]?.sequence === 1 && fresh[0].type !== 'run_created') this.state.prefixUnrecorded = true;

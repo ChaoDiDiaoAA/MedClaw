@@ -101,6 +101,30 @@ test('snapshot_refresh_reuses_original_open_parameters_without_reentering_initia
   expect(view.state.cursor).toBe(3); expect((view.state.snapshots[0] as MessageStreamSnapshot).blocks[0]?.text).toBe('refreshed');
   await controller.stop();
 });
+
+test('conflicting_event_replay_preserves_cursor_until_read_only_recovery', async () => {
+  const fixture = eventBridge(), view = new RunEventProjection(1, 2); let terminalReads = 0;
+  const controller = new RunEventSubscription(view, 'instance1', fixture.bridge, () => {}, () => { terminalReads++; });
+  await controller.start(); expect(view.state.cursor).toBe(3);
+  const original = fixture.bridge.request, before = structuredClone(view.state.events);
+  const completed: StoredRunEvent = { ...event(4), type: 'run_completed',
+    payload: { contract: 'medclaw.event/v1', answerId: 9, errorCode: null, stopConfirmed: true } };
+  let conflicting = true;
+  fixture.bridge.request = (async (method: string, payload: any) => {
+    if (method !== 'event.read') return original(method as any, payload);
+    fixture.operations.push({ method, payload: structuredClone(payload) });
+    return { ok: true, data: page(conflicting ? [event(1), { ...event(2), eventId: 99 }, event(3), completed] : [completed], 4) };
+  }) as DesktopBridge['request'];
+  await controller.refresh();
+  expect(view.state.cursor).toBe(3); expect(view.state.events).toEqual(before);
+  expect(view.state.phase).toBe('error'); expect(terminalReads).toBe(0);
+  conflicting = false; await controller.refresh();
+  expect(view.state.cursor).toBe(4); expect(view.state.events).toEqual([...before, completed]);
+  expect(view.state.phase).toBe('live'); expect(terminalReads).toBe(1);
+  expect(fixture.operations.filter(operation => operation.method === 'event.read').slice(-2).map(operation => operation.payload.afterSequence)).toEqual([3, 3]);
+  expect(fixture.operations.every(operation => ['event.subscribe', 'event.read'].includes(operation.method))).toBe(true);
+  await controller.stop();
+});
 test('terminal_event_refreshes_authoritative_run_and_control', async () => {
   const fixture = eventBridge(), view = new RunEventProjection(1, 2); let reads = 0;
   const request = fixture.bridge.request;

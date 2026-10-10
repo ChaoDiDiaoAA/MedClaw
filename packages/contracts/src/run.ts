@@ -2,7 +2,7 @@ import type { StreamSnapshot, StreamSnapshotReader } from './event';
 import type { ModelCallContext, StartCallContext } from './context';
 import { z } from "zod";
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } from "./error";
-import { AgentPolicySchema, BudgetSummarySchema, MeasurementContextSchema, ModelSelectionSchema, ReferenceDateSchema, RequestPolicySchema, TimezoneSchema, ToolProfileSnapshotSchema } from "./model";
+import { AgentPolicySchema, BudgetSummarySchema, IntentModelSelectionSchema, MeasurementContextSchema, ModelSelectionSchema, ReferenceDateSchema, RequestPolicySchema, TimezoneSchema, ToolProfileSnapshotSchema } from "./model";
 import type { AppError } from "./error";
 import type { AgentPolicy, BudgetSummary, DiagnoseRequest, MeasurementContext, ModelSelection, ProviderAccepted, ProviderRequest, RequestPolicy, ToolProfileSnapshot } from "./model";
 import type { NewSessionInput, NewSessionResult, SubmitInput, SubmitResult, SessionStore, InputStore, InputAdapterPort, InputSettlementProof, InputControl, RenameSessionInput, DeleteSessionInput, SessionManagementReceipt, NativeHistoryCommit } from "./session";
@@ -22,7 +22,7 @@ export const RunScopeSchema = z.strictObject({
 const nullableAmount = z.number().finite().nonnegative().nullable();
 const nullableToken = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable();
 const safeLabel = z.string().min(1).max(256);
-export const ModelCallViewSchema = z.strictObject({
+export const PiModelCallViewSchema = z.strictObject({
   compaction:z.strictObject({operationRef:OpaqueIdSchema,reason:z.enum(['manual','threshold','overflow']),nativeEntryId:OpaqueIdSchema.nullable(),savedStorageVersion:z.number().int().nonnegative().nullable()}).optional(),
   contextSnapshotId: PositiveIdSchema.nullable().optional(),
   id: PositiveIdSchema, inputId: PositiveIdSchema.nullable().default(null), callId: OpaqueIdSchema, kind: z.enum(["main", "diagnostic", "compaction"]), state: z.enum(["started", "completed", "failed", "cancelled"]),
@@ -32,6 +32,15 @@ export const ModelCallViewSchema = z.strictObject({
   inputTokens: nullableToken, outputTokens: nullableToken, cost: nullableAmount, costCurrency: z.literal("USD").nullable(),
   usageSource: safeLabel.nullable(), unavailableReason: safeLabel.nullable(), error: AppErrorSchema.nullable(),
 });
+export const IntentModelCallViewSchema = PiModelCallViewSchema.omit({
+  kind: true, model: true, inputId: true, attemptCountUnknown: true, sdkStopReason: true,
+  compaction: true, contextSnapshotId: true, cost: true, costCurrency: true, usageSource: true,
+}).extend({
+  kind: z.literal('intent'), model: IntentModelSelectionSchema, inputId: PositiveIdSchema, attemptCountUnknown: z.literal(false),
+  sdkStopReason: z.null(), contextSnapshotId: PositiveIdSchema, cost: z.null(), costCurrency: z.null(),
+  usageSource: z.literal('ollama_reported').nullable(),
+});
+export const ModelCallViewSchema = z.discriminatedUnion('kind', [PiModelCallViewSchema, IntentModelCallViewSchema]);
 const pageSchema = (limit: number) => z.strictObject({
   text: z.string().max(limit), offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   nextOffset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(), totalChars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -135,8 +144,9 @@ export const RuntimeControlViewSchema = z.strictObject({ instanceId: OpaqueIdSch
   acceptingNewRuns: z.boolean(), blockReasons: z.array(AppErrorSchema).max(32), budget: RuntimeBudgetViewSchema.nullable().optional() });
 export const UsageViewSchema = z.strictObject({
   inputTokens: nullableToken, outputTokens: nullableToken, cost: nullableAmount, costCurrency: z.literal("USD").nullable(),
-  source: z.literal("pi_normalized").nullable(), unavailableReason: safeLabel.nullable(),
-});
+  source: z.enum(['pi_normalized', 'ollama_reported', 'mixed']).nullable(), unavailableReason: safeLabel.nullable(),
+}).refine(value => !['ollama_reported', 'mixed'].includes(value.source ?? '') || value.cost === null && value.costCurrency === null,
+  'Ollama and mixed totals have no verified total cost');
 export type RunStatus = z.infer<typeof RunStatusSchema>;
 export type RunHandle = z.infer<typeof RunHandleSchema>;
 export type RuntimeControlView = z.infer<typeof RuntimeControlViewSchema>;
@@ -192,6 +202,7 @@ export interface FinalProviderFact {
   cleanup?: RunCleanupRecord | { oldProcessExited?: boolean; observationGap?: boolean; previousInstanceId?: string; errors?: AppError[] } | null;
 }
 interface AgentStartCommon {
+  intentAdmission?: import('./intent').FrozenIntentAdmission;
   extensions?: import('./extensions').FrozenRunExtensions;
   resources?: import('./resources').FrozenRunResources;
   inputPlan?: import('./resources').ResourceInputPlan;
@@ -209,8 +220,8 @@ interface AgentStartCommon {
 export type AgentStartFields = AgentStartCommon & ({ inputId: null; submission: { operationRef: string; originalSubmitInput: SubmitInput } } | { inputId: number; submission: null });
 export type StartRunInput<Resolved> = AgentStartFields & { resolved: Resolved };
 export type RegisterAgentInput = AgentStartFields & { instanceId: string; createdAt: string };
-export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[]; budgetSummary?: BudgetSummary; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit; compactions?: import('./session').CompactionSaveFact[]; extensions?: import('./extensions').ExtensionAssemblyProof };
-export type AgentRuntimePort<Resolved> = {
+export type AgentExecutionObservation = { nativeIdle: true; lastOutcome: ProviderOutcome | null; calls: FinalCallFact[]; budgetSummary?: BudgetSummary; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit; productTurn?: import('./intent').ProductTurnFact; finalizationError?: AppError; compactions?: import('./session').CompactionSaveFact[]; extensions?: import('./extensions').ExtensionAssemblyProof };
+export type AgentRuntimePort<Resolved, Control = unknown> = {
   hasPendingSubagentPersistence?: (runId:number)=>boolean;
   retrySubagentPersistence?: (runId:number)=>Promise<void>;
   validateExtensions?: (sessionId: number, settings: import('./model').PublishedSettings) => Promise<void>;
@@ -222,6 +233,10 @@ export type AgentRuntimePort<Resolved> = {
   abortCompaction?: (sessionId: number, operationRef: string) => void;
   acknowledgeCompactionSaved?:(sessionId:number,operationRef:string,change:NativeHistoryCommit|null,storageVersion:number)=>void|Promise<void>;
   readonly historyContract?: 'medclaw.history/p9-v1';
+  appendProductTurn?: (input: import('./intent').ProductTurnInput) => Promise<import('./intent').ProductTurnFact>;
+  discardProductTurn?: (proof: import('./intent').ProductTurnDiscardProof) => Promise<void>;
+  cancelIntentProductTurn?: (runId:number) => Promise<NativeHistoryCommit>;
+  retryProductPersistence?: (runId:number) => Promise<void>;
   hasPendingHistoryPersistence?: (runId: number) => boolean;
   retryHistoryPersistence?: (runId: number) => void;
   readFinalHistory?: (runId:number)=>NativeHistoryCommit;
@@ -244,6 +259,8 @@ export type AgentRuntimePort<Resolved> = {
   readBudget?: (runId: number) => RuntimeBudgetView | null;
   describe: (resolved: Resolved) => P2AgentOptions;
   execute: (input: { runId: number; sessionId: number; inputId?: number | null; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number;
+    runControl?: Control;
+    intentTask?: import('./intent').IntentAgentTask;
     instanceId?: string;
     extensions?: import('./extensions').FrozenRunExtensions;
     resources?: import('./resources').FrozenRunResources; inputPlan?: import('./resources').ResourceInputPlan;
@@ -252,9 +269,16 @@ export type AgentRuntimePort<Resolved> = {
     callbacks: { stream?: (snapshot: StreamSnapshot) => void; startCall: (time: string, context?: StartCallContext) => ModelCallRecorderPort; preview: (text: string) => void; nativeTerminal: (outcome: ProviderOutcome) => void;
       fatal?: (error: AppError) => void; extensionProof?: (proof: import('./extensions').ExtensionAssemblyProof) => void;
       inputStore?: InputStore; admissionClosed?: () => void; compaction?: import('./session').AutoCompactionCallbacks;
+      queryIntentStep?: (input: import('./intent').IntentQueryStepInput, context: import('./tool').ToolExecutionContext) => Promise<import('./intent').IntentAgentStepResult>;
+      beforeFinalHistory?: () => Promise<import('./intent').ProductTurnFact>;
       subagents?: import('./subagent').ChildRuntimeCallbacks }) => Promise<AgentExecutionObservation>;
 };
-export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord; inputSettlement?: InputSettlementProof; history?: NativeHistoryCommit; compactions?: import('./session').CompactionSaveFact[] };
+export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord; history?: NativeHistoryCommit; compactions?: import('./session').CompactionSaveFact[] } & (
+  { resultSource?: 'pi'; inputSettlement?: InputSettlementProof; productTurn?: import('./intent').ProductTurnFact; productSettlement?: never }
+  | { resultSource: 'program'; inputSettlement?: never; productSettlement: import('./intent').ProductSettlement } & (
+      { status:'completed'; history: NativeHistoryCommit; productTurn: import('./intent').ProductTurnFact }
+      | { status:'failed'|'cancelled'; outputText:null; history?:never; productTurn?:never })
+);
 export type StoredOperation = ProviderOperation
   | { method: "session.create"; operationRef: string; originalRequest: NewSessionInput; result: NewSessionResult }
   | { method: "session.submit"; operationRef: string; originalRequest: SubmitInput; result: SubmitResult }
@@ -277,6 +301,8 @@ export interface ProviderRunStore {
   active(): RunHandle | null;
 }
 export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputStore {
+  verifyIntentOrigin?: (request: Extract<SubmitInput, {mode:'send'}>) => void;
+  readHistorySnapshot?: (sessionId: number) => import('./session').NativeHistorySnapshot;
   registerChild?(input: import('./subagent').RegisterChildInput): import('./subagent').BoundChildIdentity;
   findChild?(parentRunId: number, originToolCallId: number, expected?: import('./subagent').RegisterChildInput): import('./subagent').BoundChildIdentity | null;
   readChildHistoryBase?(runId: number): { storageVersion: number; leafId: string | null };
@@ -294,9 +320,11 @@ export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputSt
   finishAutoCompaction?(operationRef:string,runId:number,error:AppError,endedAt:string):void;
   confirmHistorySaved?(change:NativeHistoryCommit):{storageVersion:number}|null;
   verifyPriorContextFacts?(runId: number): { requiredPersistenceComplete: boolean; unconfirmedItems: string[] };
+  verifyPriorIntentFacts?(runId: number, previousProcessExited: boolean, time: string): { requiredPersistenceComplete: boolean; unconfirmedItems: string[] };
   verifyPriorHistoryFacts?(runId: number): { requiredPersistenceComplete: boolean; unconfirmedItems: string[] };
   freezeAgentScope(workspace: WorkspaceView, toolNames: readonly string[]): RunScope;
   registerAgent(input: RegisterAgentInput): SubmitResult;
+  startIntentRun?(runId:number,at:string):void;
   finalizeAgent(runId: number, fact: FinalAgentFact): RunView;
   isFinalSaved(runId: number, fact: FinalProviderFact | FinalAgentFact): boolean;
   checkpointFailure(runId: number, error: AppError, cleanup: RunCleanupRecord, time: string): void;

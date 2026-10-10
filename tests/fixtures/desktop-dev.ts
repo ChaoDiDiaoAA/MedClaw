@@ -9,7 +9,7 @@ import { canonicalRequest } from '../../packages/contracts/src/run';
 export const projectRoot = resolve(import.meta.dirname, '../..');
 export const bunExecutable = process.env.MEDCLAW_BUN_EXECUTABLE ?? execFileSync('bun', ['-e', 'process.stdout.write(process.execPath)'], { encoding: 'utf8' }).trim();
 
-export async function launchActualDev(temporary: string, dataRoot: string, importDirectory?: string, beforePageAcquisition?: () => void, controlledHostEntry?: string): Promise<{ page: Page; browser: Browser; child: ChildProcess; close(): Promise<void> }> {
+export async function launchActualDev(temporary: string, dataRoot: string, importDirectory?: string, beforePageAcquisition?: () => void, controlledHostEntry?: string, controlledMainEntry?: string): Promise<{ page: Page; browser: Browser; child: ChildProcess; close(): Promise<void> }> {
   mkdirSync(temporary, { recursive: true });
   const listener = createServer();
   await new Promise<void>(resolve => listener.listen(0, '127.0.0.1', resolve));
@@ -25,6 +25,7 @@ export async function launchActualDev(temporary: string, dataRoot: string, impor
     const Module=require('module'), original=Module._load;let observed=false;
     Module._load=function(name,...rest){const value=original.call(this,name,...rest);
       if(name==='electron'&&value.app&&!observed){observed=true;
+        ${controlledMainEntry ? `require(${JSON.stringify(controlledMainEntry)});` : ''}
         value.app.commandLine.appendSwitch('remote-debugging-port',${JSON.stringify(String(port))});
         value.app.commandLine.appendSwitch('remote-debugging-address','127.0.0.1');
         value.app.on('browser-window-created',(_,window)=>window.hide());

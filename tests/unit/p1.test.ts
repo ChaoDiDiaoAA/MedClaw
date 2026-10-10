@@ -232,6 +232,7 @@ describe("P1 public and private protocol", () => {
       "model.list", "model.read", "model.refresh", "operation.cancel", "model.auth.start", "model.auth.respond",
       "model.auth.cancel", "model.auth.status", "model.custom.read", "model.custom.save", "model.configure", "model.policy.update",
       "model.config.read", "model.config.rollback", "model.request", "model.diagnose", "run.active", "run.read", "run.cancel", "run.retrySave",
+      "intent.read", "model.intent.inspect", "model.intent.configure",
       "session.create", "session.select", "session.list", "session.read", "session.messages.read", "session.submit", "session.readSubmission", "session.readInput", "session.listInputs", "session.cancelInput", "workspace.read", "workspace.restore", "run.control.read",
       "session.rename", "session.delete", "session.readManagementOperation",
       "session.checkpoints.read", "session.restoreCheckpoint", "session.restore",

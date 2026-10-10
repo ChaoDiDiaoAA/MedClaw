@@ -35,17 +35,18 @@ export interface SettingsCoordinator {
   abort(token: string): Promise<unknown>;
   readVersion?(): Promise<string>;
 }
-export type SettingsPatch = Partial<Pick<SettingsSnapshot, "model" | "customProviders" | "credentialRefs" | "requestPolicy" | "agentPolicy" | 'runtimeConfiguration' | 'resources' | 'extensions'>> & {
+export type SettingsPatch = Partial<Pick<SettingsSnapshot, "model" | "customProviders" | "credentialRefs" | "requestPolicy" | "agentPolicy" | 'runtimeConfiguration' | 'resources' | 'extensions' | 'intentModel'>> & {
   toolConfiguration?: StoredToolConfiguration;
   ui?: Partial<DesktopDisplayPreferences>;
 };
 export interface PublishOptions {
-  kind?: "model" | "custom" | "policy" | "ui" | "rollback" | 'resources' | 'extensions';
+  kind?: "model" | "custom" | "policy" | "ui" | "rollback" | 'resources' | 'extensions' | 'intent';
   targetConfigVersion?: string;
   beforeWrite?(candidate: PublishedSettings): Promise<void>;
   onUnpublished?(): Promise<void>;
 }
 const patchSchema = z.strictObject({
+  intentModel: SettingsSnapshotObjectSchema.shape.intentModel,
   model: SettingsSnapshotObjectSchema.shape.model.optional(),
   customProviders: SettingsSnapshotObjectSchema.shape.customProviders.optional(),
   credentialRefs: SettingsSnapshotObjectSchema.shape.credentialRefs.optional(),
@@ -102,6 +103,7 @@ export class MainSettings {
       if (kind === "ui" && (Object.keys(parsed.data).some(key => key !== "ui") || !parsed.data.ui || Object.keys(parsed.data.ui).length === 0)) fail("invalid_argument");
       if (kind === 'resources' && (Object.keys(parsed.data).some(key => key !== 'resources') || !parsed.data.resources)) fail('invalid_argument');
       if (kind === 'extensions' && (Object.keys(parsed.data).some(key => key !== 'extensions') || !parsed.data.extensions)) fail('invalid_argument');
+      if (kind === 'intent' && (Object.keys(parsed.data).length!==1 || !('intentModel' in parsed.data))) fail('invalid_argument');
       let next: SettingsSnapshot;
       let rollbackFromVersion: string | null = null;
       if (kind === "rollback") {

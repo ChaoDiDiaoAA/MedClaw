@@ -55,9 +55,9 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
     requireHost();
     return settings.synchronize();
   };
-  const publish = async (expected: string, patch: Parameters<MainSettings["publish"]>[1], kind: "model" | "custom" | "policy" | "ui" | "rollback" | 'resources' | 'extensions', targetConfigVersion?: string, coordination: Pick<PublishOptions, "beforeWrite" | "onUnpublished"> = {}) => {
+  const publish = async (expected: string, patch: Parameters<MainSettings["publish"]>[1], kind: "model" | "custom" | "policy" | "ui" | "rollback" | 'resources' | 'extensions' | 'intent', targetConfigVersion?: string, coordination: Pick<PublishOptions, "beforeWrite" | "onUnpublished"> = {}) => {
     const result = await settings.publish(expected, patch, { kind, ...(targetConfigVersion ? { targetConfigVersion } : {}), ...coordination,
-      beforeWrite: async candidate => { await coordination.beforeWrite?.(candidate); if (kind !== "ui" && kind !== 'resources' && kind !== 'extensions') await checkSelectionAuth(candidate.model); },
+      beforeWrite: async candidate => { await coordination.beforeWrite?.(candidate); if (kind !== "ui" && kind !== 'resources' && kind !== 'extensions' && kind !== 'intent') await checkSelectionAuth(candidate.model); },
     });
     if (kind !== "ui") options.notify({ type: "config.changed", configVersion: result.configVersion });
     return result;
@@ -103,7 +103,11 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       }
       case "settings.ui.read": { const s = settings.read(); return { configVersion: s.configVersion, ui: s.ui }; }
       case "settings.ui.update": { const p = raw as { expectedConfigVersion: string; patch: PublishedSettings["ui"] }; const s = await publish(p.expectedConfigVersion, { ui: p.patch }, "ui"); if (host.read().state === "ready") await synchronize(); options.notify({ type: "config.changed", configVersion: s.configVersion }); return { configVersion: s.configVersion, ui: s.ui }; }
-      case "model.config.read": { const s = settings.read(); return { configVersion: s.configVersion, previousConfigVersion: s.previous?.configVersion ?? null, rollbackFromVersion: s.rollbackFromVersion, policy: s.requestPolicy, agentPolicy: s.agentPolicy, runtimeConfiguration: s.runtimeConfiguration, toolConfiguration: s.toolConfiguration }; }
+      case "model.config.read": { const s = settings.read(); return { configVersion: s.configVersion, intentModel:s.intentModel??null, previousConfigVersion: s.previous?.configVersion ?? null, rollbackFromVersion: s.rollbackFromVersion, policy: s.requestPolicy, agentPolicy: s.agentPolicy, runtimeConfiguration: s.runtimeConfiguration, toolConfiguration: s.toolConfiguration }; }
+      case 'model.intent.configure': {
+        await synchronize();const p=raw as PublicPayload<'model.intent.configure'>;
+        const s=await publish(p.expectedConfigVersion,{intentModel:p.intentModel},'intent');return {configVersion:s.configVersion,intentModel:s.intentModel??null};
+      }
       case "diagnostics.read": return options.diagnostics((raw as { categories: string[] }).categories);
       case "model.configure": {
         await synchronize(); const p = raw as { provider: string; modelId: string; expectedConfigVersion: string };

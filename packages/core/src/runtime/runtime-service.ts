@@ -22,6 +22,14 @@ import type { ResourceService } from '../resources/resource-service';
 import { RESOURCE_LIMITS, resourceRefKey } from '../../../contracts/src/resources';
 import { ChildResultSchema, NativeAgentReplySchema, type BoundChildIdentity, type ChildRuntimeCallbacks, type FinalChildFact, type RegisterChildInput } from '../../../contracts/src/subagent';
 import { createHash } from 'node:crypto';
+import { RunControl } from './run-control';
+import { IntentModelSelectionSchema, INTENT_VERSIONS } from '../../../contracts/src/model';
+import { IntentAgentTaskSchema, IntentQueryStepInputSchema, type IntentDecision, type IntentInputProjection, type FrozenIntentAdmission, type ProductSettlement } from '../../../contracts/src/intent';
+import { compileIntentStepQueries } from '../intent/route-policy';
+import type { IntentService } from '../intent/intent-service';
+import type { QueryService } from '../data/query-service';
+
+export type IntentRoutingDependencies = { service: IntentService; queries: QueryService };
 
 type Execution = { handle: RunHandle; operationRef: string; abort: AbortController; nativeTerminal: boolean; cause: "user" | "deadline" | "shutdown" | null;
   cancelAt: string | null; stopped: boolean; executionStarted: boolean | null; fact: FinalProviderFact | FinalAgentFact | null;
@@ -29,6 +37,8 @@ type Execution = { handle: RunHandle; operationRef: string; abort: AbortControll
   scope?: RunScope; referenceDate?: string; timezone?: string; toolGap: boolean; budgetSummary?: BudgetSummary;
   rootInputId: number | null; acceptingInputs: boolean; stopEpoch: number; inputSettlement?: InputSettlementProof;
   extensionReleaseBasis?: 'not_loaded';
+  control?: RunControl; intentAdmission?: FrozenIntentAdmission; productSettlement?: ProductSettlement;
+  productStarted?:boolean; intentFailure?:{status:'failed'|'cancelled';error:AppError|null;at:string};
   pendingInputFailures: Map<number, Parameters<RuntimeRunStore['recordInputFailure']>[1]>;
   agentFields?: Omit<StartRunInput<ResolvedProviderSelection>, 'inputId' | 'submission' | 'resolved'>;
   deadlineAt: number | null; deadlineTimer: ReturnType<typeof setTimeout> | null;compactionFailure?:boolean;
@@ -58,8 +68,8 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   constructor(readonly instanceId: string, private readonly settings: () => PublishedSettings, private readonly modelRuntime: ModelRuntimePort<Resolved>,
     private readonly store: RuntimeRunStore, private readonly credentials: CredentialScope, private readonly startCall: ModelCallStarter,
     private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void,
-    private readonly agent: (AgentRuntimePort<Resolved> & NativeSessionBindings) | undefined, private readonly modelControlBusy: () => boolean,
-    private readonly stream?: (snapshot: StreamSnapshot) => void,private readonly transactions?:WriteTransactions,private readonly resources?:ResourceService) {}
+    private readonly agent: (AgentRuntimePort<Resolved,RunControl> & NativeSessionBindings) | undefined, private readonly modelControlBusy: () => boolean,
+    private readonly stream?: (snapshot: StreamSnapshot) => void,private readonly transactions?:WriteTransactions,private readonly resources?:ResourceService,private readonly intents?:IntentRoutingDependencies) {}
   get activeHandle(): RunHandle | null { return this.execution?.handle ?? null; }
   get persistencePending() { return (this.execution?.pendingSave ?? this.recoveries.size > 0)||!!this.manual?.error||this.manualRecoveries.size>0; }
   get stopPending() { return !!this.execution?.cause && (!this.execution.stopped||[...this.execution.children?.values()??[]].some(child=>!child.stopped))||!!this.manual?.abort.signal.aborted&&!this.manual.nativeIdle; }
@@ -156,7 +166,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       for (const gap of gaps) reasons.push(safeError(recoveryCode(this.recoveries.get(gap.id)), undefined, { runId: gap.id }));
       for (const recovery of this.recoveries.values()) if (!gaps.some(gap => gap.id === recovery.run.id)) reasons.push(safeError(recoveryCode(recovery), undefined, { runId: recovery.run.id }));
       if (reasons.length > 32) throw new Error("frame_too_large");
-      const budget = this.execution?.handle.kind === 'agent' ? this.agent?.readBudget?.(this.execution.handle.runId) ?? null : null;
+      const budget = this.execution?.handle.kind === 'agent' ? this.execution.control?.readBudget() ?? this.agent?.readBudget?.(this.execution.handle.runId) ?? null : null;
       return RuntimeControlViewSchema.parse({ instanceId: this.instanceId, activeRootRun: this.activeHandle, acceptingNewRuns: reasons.length === 0, blockReasons: reasons, budget });
     }, "storage_read_failed");
   }
@@ -316,18 +326,27 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       if (request.mode !== 'send') return this.submitQueuedInput(request, context);
       this.reserve(context.operationRef, request, "agent", request.sessionId);
       try {
+        if (request.routing?.originRunId != null) {
+          if (!this.store.verifyIntentOrigin) throw safeError('state_conflict');
+          this.store.verifyIntentOrigin(request);
+        }
         if (!this.agent) throw new Error("session_history_invalid");
         await this.agent.ensureLoaded(request.sessionId);
         const loadedSession=this.store.readSession(request.sessionId);
         if(!loadedSession||loadedSession.status!=='active')throw safeError('state_conflict',undefined,{reason:loadedSession?'session_deleted':'session_not_found'});
         const availability=this.agent.readAvailability(request.sessionId);if(availability.availability!=='ready')throw availability.error??safeError('session_history_invalid');
-        const config = this.settings(), resolved = await this.modelRuntime.resolve(request.model, config.configVersion,
-          config.credentialRefs[request.model.provider] ?? null, config.requestPolicy, true);
+        const intentRouted=request.routing?.mode==='intent',businessRouted=intentRouted||request.routing?.mode==='explicit_agent_fallback';
+        const config = this.settings();
+        if(intentRouted&&(!this.intents||!config.intentModel?.enabled||!this.agent.appendProductTurn||!this.store.readHistorySnapshot||!this.store.startIntentRun))throw safeError('intent_model_unavailable');
+        const resolved = await this.modelRuntime.resolve(request.model, config.configVersion,
+          config.credentialRefs[request.model.provider] ?? null, config.requestPolicy, !intentRouted);
         this.recheck(context.operationRef, config.configVersion);
+        const intentAdmission=intentRouted?this.intents!.service.freeze(IntentModelSelectionSchema.parse({ ...config.intentModel,
+          configVersion:config.configVersion,api:'ollama-chat',...INTENT_VERSIONS }),loadedSession.leafId,loadedSession.storageVersion):undefined;
         const extensions = await this.agent.freezeExtensions?.(request.sessionId,config);
         this.recheck(context.operationRef, config.configVersion);
         const workspace = this.store.readWorkspace(), scope = this.store.freezeAgentScope(workspace,
-          [...(this.agent.toolNames ?? []), ...(extensions?.source?.manifest.tools ?? [])]);
+          [...(this.agent.toolNames ?? []), ...(extensions?.source?.manifest.tools ?? []), ...(intentRouted?['query_intent_step']:[])].filter(name=>!businessRouted||name!=='Agent'));
         const resources = await this.resources?.freeze(request.sessionId, config, scope), inputPlan = resources ? this.resources!.planInput(resources, request) : undefined;
         this.recheck(context.operationRef, config.configVersion);
         if (!isDeepStrictEqual(this.store.readWorkspace(), workspace)) throw safeError('state_conflict', undefined, { reason: 'workspace_revision_mismatch' });
@@ -339,11 +358,11 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         try { profiles = this.agent.captureToolProfiles?.(scope); } catch { /* Missing statistics use the frozen configured timeout. */ }
         const fields = { sessionId: request.sessionId, text: request.text, model: resolved.selection, policy: resolved.policy, goal: "answer" as const,
           workspace: toWorkspaceContext(workspace), scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: resolved.policy.timeoutMs,
-          agentPolicy, runtimeConfiguration, toolConfiguration, ...(profiles ? structuredClone(profiles) : {}),
+          agentPolicy, runtimeConfiguration, toolConfiguration, ...(intentAdmission?{intentAdmission}:{}), ...(profiles ? structuredClone(profiles) : {}),
           ...(resources ? { resources, inputPlan } : {}), ...(extensions?{extensions}:{}), agentOptions: this.agent.describe(resolved), ...(this.agent.contextContract ? {contextContract:this.agent.contextContract} : {}),...(this.agent.historyContract?{historyContract:this.agent.historyContract}:{}) };
         const createdAt = now(), content: InputContent = { contract: 'medclaw.session-input/v1', originalSubmitInput: request, text: request.text,
           workspaceContext: toWorkspaceContext(workspace), scope: structuredClone(scope), model: structuredClone(resolved.selection),
-          referenceDate: request.referenceDate, timezone: request.timezone, deliveryAttempt: null, ...(inputPlan ? { resourceInputPlan: inputPlan } : {}) };
+          referenceDate: request.referenceDate, timezone: request.timezone, deliveryAttempt: null, ...(intentAdmission?{intentAdmission}:{}), ...(inputPlan ? { resourceInputPlan: inputPlan } : {}) };
         const nativeReceiptLimitBytes = receiptBudget(content, this.instanceId, createdAt);
         const accepted = this.store.acceptInput({ operationRef: context.operationRef, originalSubmitInput: request, content, createdAt,
           execution: { mode: 'send', run: { ...fields, instanceId: this.instanceId, createdAt } } });
@@ -351,8 +370,9 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const execution = this.begin({ runId: accepted.runId, kind: 'agent', sessionId: request.sessionId }, context.operationRef);
         execution.rootInputId = accepted.inputId; execution.agentFields = fields;
         execution.scope = structuredClone(scope); execution.referenceDate = request.referenceDate; execution.timezone = request.timezone;
-        execution.acceptingInputs = true; this.reservation = null;
-        execution.task = this.runAgent(execution, { ...fields, nativeReceiptLimitBytes, inputId: accepted.inputId, submission: null, resolved });
+        execution.acceptingInputs = !intentAdmission; execution.intentAdmission=intentAdmission; this.reservation = null;
+        const start={ ...fields, nativeReceiptLimitBytes, inputId: accepted.inputId, submission: null, resolved };
+        execution.task = intentAdmission?this.runIntent(execution,start):this.runAgent(execution,start);
         return accepted;
       } finally { if (this.reservation?.operationRef === context.operationRef) this.reservation = null; }
     }, "storage_write_failed", { operationRef: context.operationRef, sessionId: input.sessionId });
@@ -481,8 +501,9 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     const childrenReleased=!execution.children?.size&&!this.agent?.hasPendingSubagentPersistence?.(execution.handle.runId),stopConfirmed=execution.stopped&&[...execution.children?.values()??[]].every(child=>child.stopped);
     const resourcesReleased=execution.stopped&&childrenReleased&&(!selected||extensions?.resourcesReleased===true||extensionReleaseBasis==='not_loaded');
     for(const error of extensions?.diagnostics??[])if(error.code==='extension_cleanup_failed'&&!execution.secondaryErrors.some(prior=>isDeepStrictEqual(prior,error)))execution.secondaryErrors.push(error);
-    const inputsSettled = execution.rootInputId === null || !!proof && proof.admissionClosed && proof.preflightSettled
-      && proof.nativeIdle && proof.nativeQueuesEmpty && !proof.pendingPersistence;
+    const product=execution.productSettlement;
+    const inputsSettled = execution.rootInputId === null || !!product&&product.admissionClosed&&product.requestSettled&&product.routeSettled&&product.requiredFactsSaved&&product.pendingFactsEmpty
+      || !!proof && proof.admissionClosed && proof.preflightSettled && proof.nativeIdle && proof.nativeQueuesEmpty && !proof.pendingPersistence;
     return { contract: "medclaw.run-cleanup/v1", executionStarted: execution.executionStarted, stopConfirmed,
       requiredPersistenceComplete: complete&&childrenReleased, inputsSettled, resourcesReleased,
       ...(extensions?{extensions}:{}),
@@ -512,8 +533,8 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     execution.abort.abort();
     this.checkpoint(execution, safeError('run_timeout'));
   }
-  private checkActive(execution: Execution) {
-    if (this.execution !== execution || execution.stopped || execution.nativeTerminal) throw safeError('state_conflict');
+  private checkActive(execution: Execution, afterNativeIdle = false) {
+    if (this.execution !== execution || execution.stopped || execution.nativeTerminal && !afterNativeIdle) throw safeError('state_conflict');
     if (execution.deadlineAt !== null && performance.now() >= execution.deadlineAt && !execution.cause) this.expire(execution);
     if (execution.primaryError) throw execution.primaryError;
     if (execution.abort.signal.aborted) throw safeError(execution.cause === 'deadline' ? 'run_timeout' : 'tool_cancelled');
@@ -660,11 +681,108 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     };
     return compaction;
   }
-  private async runAgent(execution: Execution, input: StartRunInput<Resolved>) {
-    this.deadline(execution, input.timeoutMs);
+  private async runIntent(execution: Execution, input: StartRunInput<Resolved>) {
+    this.deadline(execution,input.timeoutMs);
+    const admission=execution.intentAdmission!,epoch=execution.stopEpoch;
+    const control=execution.control=new RunControl({runId:execution.handle.runId,scope:input.scope,signal:execution.abort.signal,
+      deadlineAt:execution.deadlineAt!,policy:input.agentPolicy,runtimeConfiguration:input.runtimeConfiguration,
+      toolConfiguration:input.toolConfiguration,measurementContext:input.measurementContext,toolProfileSnapshot:input.toolProfileSnapshot});
+    const active=()=>{
+      this.checkActive(execution);control.checkActive();
+      const read=this.store.read({runId:execution.handle.runId});
+      if(execution.stopEpoch!==epoch||read.kind!=='one'||!read.run||read.run.sessionId!==input.sessionId
+        ||read.run.cancelRequestedAt!==null||!['created','running'].includes(read.run.status))throw safeError('tool_cancelled');
+    };
+    try {
+      active();
+      this.store.startIntentRun!(execution.handle.runId,now());active();
+      const projection=this.intents!.service.prepareInput(execution.handle.runId);
+      const {decision,decisionId}=await this.intents!.service.recognize(projection,admission.selection,{signal:execution.abort.signal,
+        control,checkActive:active,workspaceContext:toWorkspaceContext(input.workspace),expectedCancelEpoch:epoch,admission});
+      active();
+      if(decision.route==='agent') {
+        const resolved=await this.modelRuntime.resolve({provider:input.model.provider,modelId:input.model.modelId,expectedConfigVersion:input.model.configVersion},
+          input.model.configVersion,input.model.credentialRef,input.policy,true);
+        active();if(!isDeepStrictEqual(resolved.selection,input.model))throw safeError('state_conflict');
+        execution.acceptingInputs=true;
+        await this.runAgent(execution,{...input,resolved},{decision,decisionId,projection});return;
+      }
+      const queryContext:QueryExecutionContext={runId:execution.handle.runId,sessionId:input.sessionId,inputId:input.inputId,source:'intent',
+        callRef:`intent:${execution.handle.runId}:${decisionId}:${decision.adoptedIntents[0]?.id??'none'}`,scope:input.scope,
+        referenceDate:input.referenceDate,timezone:input.timezone,signal:execution.abort.signal,checkActive:active};
+      let query:Awaited<ReturnType<QueryService['execute']>>|null=null;
+      if(decision.route==='simple') {query=await this.intents!.queries.execute(decision.queryParams!,queryContext);if(!query.ok)throw query.error;}
+      active();
+      const record=query?.ok?query.data:null,queryIds=record?[record.id]:[];
+      const text=record?`Query #${record.id} completed with ${record.rows.length} result rows.\n${JSON.stringify({parameters:record.params,interpretation:record.interpretation??null,warnings:record.warnings})}`
+        :decision.route==='reject'?'This request is outside the supported medical device data tasks.'
+        :decision.status==='UNSUPPORTED_DATA'?`The current data or tools cannot support this request. ${decision.issues.map(issue=>issue.message).join(' ')}`
+        :decision.missingSlots.length?`Please provide: ${decision.missingSlots.join(', ')}.`:'Please clarify the task before execution.';
+      execution.productStarted=true;
+      const productTurn=await this.agent!.appendProductTurn!({mode:'program',runId:execution.handle.runId,sessionId:input.sessionId,inputId:input.inputId!,
+        text:input.text,baseLeafId:admission.baseLeafId,baseStorageVersion:admission.baseStorageVersion,occurredAt:now(),decisionId,
+        result:{kind:record?'result':decision.route==='reject'?'out_of_scope':decision.status==='UNSUPPORTED_DATA'?'insufficient_evidence':'clarification',
+          text,queryIds,missingSlots:decision.missingSlots},
+        execution:{contract:'medclaw.intent-execution/v1',decisionId,taskIntents:decision.adoptedIntents,
+          stepResults:record?[{stepId:decision.adoptedIntents[0]!.id,queryRefs:[{queryId:record.id,resultHash:record.resultHash}]}]:[]},
+        adoptedContext:decision.contextIntentId&&decision.adoptedSlots?{contract:'medclaw.query-context-entry/v2',decisionId,
+          sourceRunId:execution.handle.runId,sourceInputId:input.inputId!,taskIntents:decision.adoptedIntents,contextIntentId:decision.contextIntentId,
+          adoptedSlots:decision.adoptedSlots,scopeBatchHashes:projection.scopeBatchHashes,queryIds,
+          pendingClarification:decision.route==='clarify'?{taskText:projection.pendingClarification?.taskText??input.text,missingSlots:decision.missingSlots}:null}:null});
+      active();
+      if(this.intents!.service.hasPendingSave(execution.handle.runId))throw safeError('storage_write_failed');
+      execution.acceptingInputs=false;execution.stopped=true;execution.executionStarted=false;execution.extensionReleaseBasis='not_loaded';
+      execution.budgetSummary=control.summary();
+      execution.productSettlement={contract:'medclaw.product-settlement/v1',basis:'product_history',nativeUserEntryId:productTurn.userEntryId,
+        runId:execution.handle.runId,sessionId:input.sessionId,inputId:input.inputId!,
+        admissionClosed:true,requestSettled:true,routeSettled:true,requiredFactsSaved:true,pendingFactsEmpty:true};
+      execution.fact={status:'completed',resultSource:'program',outputText:text,error:null,calls:[],history:productTurn.history,productTurn,
+        productSettlement:execution.productSettlement,stoppedAt:null,endedAt:now(),cancelRequestedAt:null,cleanup:this.cleanup(execution,true)};
+      this.saveFinal(execution);
+    } catch(error) {
+      const parsed=AppErrorSchema.safeParse(error);
+      const failure=parsed.success?parsed.data:safeError('internal_error');
+      if(execution.cause!=='user')this.checkpoint(execution,failure);
+      execution.intentFailure={status:execution.cause==='user'?'cancelled':'failed',error:execution.cause==='user'?null:execution.primaryError??failure,at:execution.failureAt??now()};
+      await this.finishIntentFailure(execution);
+    } finally {if(execution.stopped)this.clearDeadline(execution);}
+  }
+  private async finishIntentFailure(execution:Execution) {
+    if(this.execution!==execution||!execution.intentFailure)throw safeError('state_conflict');
+    execution.budgetSummary=execution.control!.summary();execution.acceptingInputs=false;
+    execution.stopped=true;execution.executionStarted=false;execution.extensionReleaseBasis='not_loaded';
+    this.clearDeadline(execution);
+    if(this.intents!.service.hasPendingSave(execution.handle.runId)){this.persistenceFailure(execution);return;}
+    try {
+      if(execution.intentFailure.status==='cancelled'&&execution.cancelAt)this.store.requestCancel(execution.handle.runId,execution.cancelAt);
+      if(execution.productStarted){
+        await this.agent!.discardProductTurn!({runId:execution.handle.runId,sessionId:execution.handle.sessionId!,requestSettled:true,routeSettled:true,
+          requiredFactsSaved:true,committedSnapshot:this.store.readHistorySnapshot!(execution.handle.sessionId!)});
+        execution.productStarted=false;
+      }
+      execution.productSettlement={contract:'medclaw.product-settlement/v1',basis:'product_history',nativeUserEntryId:null,
+        runId:execution.handle.runId,sessionId:execution.handle.sessionId!,inputId:execution.rootInputId!,
+        admissionClosed:true,requestSettled:true,routeSettled:true,requiredFactsSaved:true,pendingFactsEmpty:true};
+      const failure=execution.intentFailure;
+      execution.fact={status:failure.status,resultSource:'program',outputText:null,error:failure.error,calls:[],productSettlement:execution.productSettlement,
+        stoppedAt:null,endedAt:failure.at,cancelRequestedAt:execution.cancelAt,cleanup:this.cleanup(execution,true)};
+      this.saveFinal(execution);
+    }catch{this.persistenceFailure(execution);}
+  }
+  private async runAgent(execution: Execution, input: StartRunInput<Resolved>, intent?:{decision:IntentDecision;decisionId:number;projection:IntentInputProjection}) {
+    if(execution.deadlineAt===null)this.deadline(execution, input.timeoutMs);
     const deadlineAt = execution.deadlineAt!;
     let entered = false;
     const compaction=this.autoCompaction(execution,execution.handle.runId,input.sessionId,input.model);
+    const task=intent?IntentAgentTaskSchema.parse({contract:'medclaw.intent-task/v1',decisionId:intent.decisionId,taskIntents:intent.decision.adoptedIntents}):undefined;
+    const stepQueries=new Map<string,Map<number,import('../../../contracts/src/query').QueryRecord>>();
+    const metadataSteps=new Set<string>();
+    const plans=new Map(task?.taskIntents.map(item=>{
+      const saved=this.intents!.service.read({runId:execution.handle.runId});
+      if(saved?.decision?.id!==intent!.decisionId||saved.decision.route!=='agent'||!isDeepStrictEqual(saved.decision.adoptedIntents,task.taskIntents))throw safeError('state_conflict');
+      const devices=saved.calls.find(call=>call.callId===intent!.decision.intentCallId)?.validation?.resolvedDeviceIds.find(value=>value.intentId===item.id)?.deviceIds??[];
+      return [item.id,compileIntentStepQueries(item,intent!.projection,devices)] as const;
+    }));
     try {
       const observed = await this.credentials({ purpose: "runtime", operationRef: execution.operationRef, credentialRef: input.model.credentialRef }, () => {
         if (input.inputId !== null) this.store.beginInputDelivery(input.inputId, this.instanceId, now());
@@ -673,12 +791,45 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         runId: execution.handle.runId, sessionId: input.sessionId, inputId: input.inputId, text: input.text, resolved: input.resolved, agentOptions: input.agentOptions,
         instanceId:this.instanceId,extensions:input.extensions,resources: input.resources, inputPlan: input.inputPlan, nativeReceiptLimitBytes: input.nativeReceiptLimitBytes,
         scope: input.scope, workspaceContext: toWorkspaceContext(input.workspace), referenceDate: input.referenceDate, timezone: input.timezone, signal: execution.abort.signal, deadlineAt,
-        agentPolicy: input.agentPolicy, runtimeConfiguration: input.runtimeConfiguration, toolConfiguration: input.toolConfiguration, measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot }, {
+        agentPolicy: input.agentPolicy, runtimeConfiguration: input.runtimeConfiguration, toolConfiguration: input.toolConfiguration, measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot, ...(execution.control?{runControl:execution.control}:{}), ...(task?{intentTask:task}:{}) }, {
         startCall: (time,context) => this.startCall(execution.handle.runId, "main", time,context), preview: text => this.preview(execution, text),
         stream: snapshot => { if (snapshot.runId !== execution.handle.runId || snapshot.sessionId !== execution.handle.sessionId) return;
           try { this.stream?.(structuredClone(snapshot)); } catch { try { this.report(safeError('preview_delivery_failed')); } catch {} } },
         inputStore: this.store, admissionClosed: () => { execution.acceptingInputs = false; },compaction,
-        ...(this.store.registerChild?{subagents:this.childCallbacks(execution)}:{}),
+        ...(task?{
+          queryIntentStep:async(raw:import('../../../contracts/src/intent').IntentQueryStepInput,context:import('../../../contracts/src/tool').ToolExecutionContext)=>{
+            this.checkActive(execution);
+            const step=IntentQueryStepInputSchema.parse(raw),item=task.taskIntents.find(value=>value.id===step.stepId),params=plans.get(step.stepId)?.[step.part];
+            const origin=context.workspaceInputId==null?null:this.store.readInput({inputId:context.workspaceInputId});
+            if(!item||context.runId!==execution.handle.runId||context.sessionId!==input.sessionId
+              ||origin?.sessionId!==input.sessionId||origin.targetRunId!==execution.handle.runId||origin.runId!==execution.handle.runId
+              ||origin.status!=='consumed'||!origin.nativeEntryId||!isDeepStrictEqual(context.scope,input.scope))throw safeError('access_denied');
+            if(item.dependsOn.some(id=>plans.get(id)!.length?plans.get(id)!.some((_,index)=>!stepQueries.get(id)?.has(index)):!metadataSteps.has(id)))throw safeError('state_conflict');
+            if(item.l2==='FRESHNESS'&&step.part===0){const batches=this.intents!.service.readFreshness(item,context);this.checkActive(execution);metadataSteps.add(item.id);return {batches};}
+            if(!params)throw safeError('access_denied');
+            const result=await this.intents!.queries.execute(params,context);if(!result.ok)throw result.error;
+            this.checkActive(execution);
+            const parts=stepQueries.get(item.id)??new Map();parts.set(step.part,result.data);stepQueries.set(item.id,parts);
+            return {query:result.data};
+          },
+          beforeFinalHistory:async()=>{
+            this.checkActive(execution,true);execution.control!.checkActive();
+            if(this.intents!.service.hasPendingSave(execution.handle.runId))throw safeError('storage_write_failed');
+            for(const item of task.taskIntents){const parts=plans.get(item.id)!;
+              if(!parts.length?!metadataSteps.has(item.id):parts.some((_,index)=>!stepQueries.get(item.id)?.has(index)))throw safeError('answer_evidence_invalid');}
+            const baseline=this.store.readHistorySnapshot!(input.sessionId);
+            const contextQueries=intent!.decision.contextIntentId?[...(stepQueries.get(intent!.decision.contextIntentId)?.values()??[])]:[];
+            const turn=await this.agent!.appendProductTurn!({mode:'agent_task',runId:execution.handle.runId,sessionId:input.sessionId,inputId:input.inputId!,
+              baseLeafId:baseline.activeLeafId,baseStorageVersion:baseline.storageVersion,occurredAt:now(),
+              execution:{contract:'medclaw.intent-execution/v1',decisionId:task.decisionId,taskIntents:task.taskIntents,
+                stepResults:task.taskIntents.map(item=>({stepId:item.id,queryRefs:[...(stepQueries.get(item.id)?.values()??[])].map(query=>({queryId:query.id,resultHash:query.resultHash}))}))},
+              adoptedContext:intent!.decision.contextIntentId&&intent!.decision.adoptedSlots?{contract:'medclaw.query-context-entry/v2',decisionId:task.decisionId,
+                sourceRunId:execution.handle.runId,sourceInputId:input.inputId!,taskIntents:task.taskIntents,contextIntentId:intent!.decision.contextIntentId,
+                adoptedSlots:intent!.decision.adoptedSlots,scopeBatchHashes:intent!.projection.scopeBatchHashes,queryIds:contextQueries.map(query=>query.id),pendingClarification:null}:null});
+            this.checkActive(execution,true);return turn;
+          },
+        }:{}),
+        ...(this.store.registerChild&&!execution.intentAdmission?{subagents:this.childCallbacks(execution)}:{}),
         fatal: error => { this.checkpoint(execution, error,!execution.compactionFailure); execution.abort.abort(); },
         extensionProof: proof => {
           if(proof.runId!==execution.handle.runId||proof.sessionId!==execution.handle.sessionId||proof.instanceId!==this.instanceId)throw safeError('state_conflict');
@@ -687,6 +838,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         nativeTerminal: outcome => { execution.nativeTerminal = true; if (outcome.error && !execution.cause) this.checkpoint(execution, outcome.error,!execution.compactionFailure); },
       }); });
       if (observed.budgetSummary) execution.budgetSummary = structuredClone(observed.budgetSummary);
+      if(observed.finalizationError&&execution.cause!=='user')this.checkpoint(execution,observed.finalizationError);
       execution.acceptingInputs = false;
       execution.inputSettlement = observed.inputSettlement;
       if (execution.rootInputId !== null && (!observed.inputSettlement || observed.inputSettlement.unconfirmedInputIds.length)) {
@@ -698,7 +850,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       execution.fact = { status: this.status(execution, outcome), outputText: outcome?.text ?? null, stoppedAt: execution.executionStarted === false ? null : endedAt, endedAt: execution.failureAt ?? endedAt,
         cancelRequestedAt: execution.cancelAt, error: this.terminalError(execution, outcome), calls: observed.calls,
         usage: outcome?.usageDetails ?? (outcome ? { source: outcome.usage.source, unavailableReason: outcome.usage.unavailableReason } : null), cleanup: this.cleanup(execution, true),
-        ...(observed.inputSettlement ? { inputSettlement: observed.inputSettlement } : {}),...(observed.history?{history:observed.history}:{}),...(observed.compactions?{compactions:observed.compactions}:{}) };
+        ...(observed.inputSettlement ? { inputSettlement: observed.inputSettlement } : {}),...(observed.history?{history:observed.history}:{}),...(observed.productTurn?{productTurn:observed.productTurn}:{}),...(observed.compactions?{compactions:observed.compactions}:{}) };
     } catch {
       if (entered) this.checkpoint(execution, safeError("stop_unconfirmed"));
       else {
@@ -752,7 +904,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     const fact = execution.fact;
     if (!fact || !execution.stopped) throw new Error("state_conflict");
     if (!execution.finalCommitted && execution.handle.kind === 'agent' && (this.agent?.toolPersistencePending?.(execution.handle.runId)
-      || this.agent?.inputPersistencePending?.(execution.handle.runId) || this.agent?.hasPendingContextPersistence?.(execution.handle.runId) ||this.agent?.hasPendingHistoryPersistence?.(execution.handle.runId)||this.agent?.hasPendingSubagentPersistence?.(execution.handle.runId)||execution.pendingCompactionCalls?.size||execution.pendingCompactionFailures?.size|| execution.pendingInputFailures.size || execution.children?.size)) {
+      || this.agent?.inputPersistencePending?.(execution.handle.runId) || this.intents?.service.hasPendingSave(execution.handle.runId) || this.agent?.hasPendingContextPersistence?.(execution.handle.runId) ||this.agent?.hasPendingHistoryPersistence?.(execution.handle.runId)||this.agent?.hasPendingSubagentPersistence?.(execution.handle.runId)||execution.pendingCompactionCalls?.size||execution.pendingCompactionFailures?.size|| execution.pendingInputFailures.size || execution.children?.size)) {
       fact.cleanup = this.cleanup(execution, false);this.finalSaveFailure(execution);
       return;
     }
@@ -790,7 +942,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         this.finalSaveFailure(execution);return;
       }
       this.clearDeadline(execution);
-      execution.pendingSave = false; if (this.execution === execution) this.execution = null;
+      execution.control?.dispose();execution.pendingSave = false; if (this.execution === execution) this.execution = null;
       this.emit(execution.handle.kind === "agent" ? { type: "agent.settled", sessionId: execution.handle.sessionId!, runId: execution.handle.runId,
         noticeSequence: ++execution.sequence, status: fact.status } : { type: "provider.settled", runId: execution.handle.runId });
     } else {
@@ -799,14 +951,32 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   }
   cancelNow(runId: number): CancelRunResult {
     const execution = this.execution;
-    if (execution?.handle.runId === runId && !execution.stopped) {
+    const saved=execution?.handle.runId===runId&&execution.intentAdmission&&!execution.finalCommitted?this.store.read({runId}):null;
+    const pendingIntent=saved?.kind==='one'&&!!saved.run&&['created','running'].includes(saved.run.status);
+    const pendingProduct=pendingIntent&&execution!.stopped&&execution!.fact&&'calls' in execution!.fact&&execution!.fact.resultSource==='program'&&execution!.fact.status==='completed';
+    const pendingAgent=pendingIntent&&execution!.stopped&&execution!.fact&&'calls' in execution!.fact&&execution!.fact.resultSource!=='program'&&execution!.fact.status==='completed';
+    if (execution?.handle.runId === runId && (!execution.stopped||pendingProduct||pendingAgent)) {
       execution.acceptingInputs = false; execution.stopEpoch++;
-      if (!execution.nativeTerminal && !execution.cause && !execution.primaryError) { execution.cause = "user"; execution.cancelAt = now(); }
+      if ((pendingIntent||!execution.nativeTerminal)&&!execution.cause&&!execution.primaryError) { execution.cause = "user"; execution.cancelAt ??= now(); }
       if (execution.cancelAt) {
         try { this.store.requestCancel(runId, execution.cancelAt); } catch { this.persistenceFailure(execution); }
         for(const child of execution.children?.values()??[])if(child.identity){child.cancelAt??=execution.cancelAt;try{this.store.requestCancel(child.identity.childRunId,child.cancelAt);}catch{this.persistenceFailure(execution);}}
       }
       execution.abort.abort();
+      if(pendingProduct){
+        execution.fact=null;execution.productSettlement=undefined;execution.stopped=false;
+        execution.intentFailure={status:'cancelled',error:null,at:now()};
+        execution.task=execution.task.then(async()=>{if(this.execution===execution&&!execution.finalCommitted)await this.finishIntentFailure(execution);});
+      }else if(pendingAgent){
+        const fact=execution.fact as FinalAgentFact;
+        fact.status='cancelled';fact.error=null;fact.cancelRequestedAt=execution.cancelAt;fact.endedAt=now();delete fact.productTurn;
+        execution.stopped=false;
+        execution.task=execution.task.then(async()=>{
+          if(this.execution!==execution||execution.finalCommitted)return;
+          try{fact.history=await this.agent!.cancelIntentProductTurn!(runId);}catch{this.persistenceFailure(execution);}
+          execution.stopped=true;this.saveFinal(execution);
+        });
+      }
     }
     const result = this.store.read({ runId });
     if (result.kind !== "one" || !result.run) throw new Error("run_not_found");
@@ -840,8 +1010,10 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       if (!execution || execution.handle.runId !== runId || !execution.pendingSave || !execution.stopped || !execution.fact) throw new Error("run_save_unavailable");
       if (!execution.finalCommitted && execution.handle.kind === 'agent') {
         this.retryCompactionPersistence(execution);
-        this.agent?.retryContextPersistence?.(runId); this.agent?.retryToolPersistence?.(runId); this.agent?.retryInputPersistence?.(runId);
-        this.agent?.retryHistoryPersistence?.(runId);
+        if(!('calls' in execution.fact&&execution.fact.resultSource==='program')){
+          this.agent?.retryContextPersistence?.(runId); this.agent?.retryToolPersistence?.(runId); this.agent?.retryInputPersistence?.(runId);
+          this.agent?.retryHistoryPersistence?.(runId);
+        }
         for (const [inputId, fact] of [...execution.pendingInputFailures]) {
           const current = this.store.readInput({ inputId });
           // Consumption/removal evidence supersedes a tentative unknown result; never overwrite it.
@@ -861,7 +1033,17 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   }
   retrySave(runId: number) { return serviceResult(async () => {
     const execution=this.execution;
-    if(execution?.handle.runId===runId&&execution.pendingSave&&execution.stopped&&execution.fact){this.retryCompactionPersistence(execution);await this.agent?.retrySubagentPersistence?.(runId);}
+    if(execution?.handle.runId===runId&&execution.stopped&&execution.intentFailure&&!execution.fact){
+      this.intents!.service.flush(runId);await this.finishIntentFailure(execution);
+      if(execution.finalCommitted&&!execution.pendingSave){const read=this.store.read({runId});if(read.kind!=='one'||!read.run)throw safeError('run_not_found');return read.run;}
+    }
+    if(execution?.handle.runId===runId&&execution.pendingSave&&execution.stopped&&execution.fact){
+      this.retryCompactionPersistence(execution);await this.agent?.retrySubagentPersistence?.(runId);
+      if(!('calls' in execution.fact&&execution.fact.resultSource==='program')){
+        this.agent?.retryContextPersistence?.(runId);this.agent?.retryToolPersistence?.(runId);this.agent?.retryInputPersistence?.(runId);this.agent?.retryHistoryPersistence?.(runId);
+        await this.agent?.retryProductPersistence?.(runId);
+      }
+    }
     return this.retrySaveNow(runId);
   }, "storage_write_failed", { runId }); }
   recoverInterrupted(previousProcessExited: boolean) {
@@ -876,6 +1058,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const inputFacts = this.store.verifyPriorInputFacts?.(run.id, previousProcessExited, at)
           ?? { inputsSettled: run.kind !== 'agent' || run.inputId === null, requiredPersistenceComplete: run.kind !== 'agent' || run.inputId === null,
             unconfirmedItems: run.kind === 'agent' && run.inputId !== null ? ['inputs'] : [] };
+        const intentFacts = this.store.verifyPriorIntentFacts?.(run.id,previousProcessExited,at) ?? {requiredPersistenceComplete:true,unconfirmedItems:[]};
         const contextFacts = this.store.verifyPriorContextFacts?.(run.id) ?? {requiredPersistenceComplete:true,unconfirmedItems:[]};
         const historyFacts = this.store.verifyPriorHistoryFacts?.(run.id) ?? {requiredPersistenceComplete:true,unconfirmedItems:[]};
         const compactionFacts=this.store.verifyPriorCompactionFacts?.(run.id,previousProcessExited,at)??{requiredPersistenceComplete:true,unconfirmedItems:[]};
@@ -885,10 +1068,10 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
           ?run.cleanup?.extensionReleaseBasis??(previousProcessExited?'owner_process_exited' as const:undefined):undefined;
         this.recoveries.set(run.id, { run, at, verified: facts.stopConfirmed === true,
           cleanup: { contract: "medclaw.run-cleanup/v1", executionStarted: run.cleanup?.executionStarted ?? null, stopConfirmed: facts.stopConfirmed,
-            requiredPersistenceComplete: facts.requiredPersistenceComplete && inputFacts.requiredPersistenceComplete && contextFacts.requiredPersistenceComplete && historyFacts.requiredPersistenceComplete&&compactionFacts.requiredPersistenceComplete, inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed===true&&(!this.store.readRunExtensions?.(run.id)?.selection.extension||releasedExtension?.resourcesReleased===true||!!extensionReleaseBasis),
+            requiredPersistenceComplete: facts.requiredPersistenceComplete && intentFacts.requiredPersistenceComplete && inputFacts.requiredPersistenceComplete && contextFacts.requiredPersistenceComplete && historyFacts.requiredPersistenceComplete&&compactionFacts.requiredPersistenceComplete, inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed===true&&(!this.store.readRunExtensions?.(run.id)?.selection.extension||releasedExtension?.resourcesReleased===true||!!extensionReleaseBasis),
             ...(releasedExtension?{extensions:releasedExtension}:{}),
             ...(extensionReleaseBasis?{extensionReleaseBasis}:{}),
-            unconfirmedItems: [...new Set([...facts.unconfirmedItems, ...inputFacts.unconfirmedItems,...contextFacts.unconfirmedItems,...historyFacts.unconfirmedItems,...compactionFacts.unconfirmedItems])], secondaryErrors: run.cleanup?.secondaryErrors ?? [], verifiedAt: facts.stopConfirmed === true && inputFacts.inputsSettled && contextFacts.requiredPersistenceComplete && historyFacts.requiredPersistenceComplete&&compactionFacts.requiredPersistenceComplete ? at : run.cleanup?.verifiedAt ?? null,
+            unconfirmedItems: [...new Set([...facts.unconfirmedItems, ...intentFacts.unconfirmedItems, ...inputFacts.unconfirmedItems,...contextFacts.unconfirmedItems,...historyFacts.unconfirmedItems,...compactionFacts.unconfirmedItems])], secondaryErrors: run.cleanup?.secondaryErrors ?? [], verifiedAt: facts.stopConfirmed === true && intentFacts.requiredPersistenceComplete && inputFacts.inputsSettled && contextFacts.requiredPersistenceComplete && historyFacts.requiredPersistenceComplete&&compactionFacts.requiredPersistenceComplete ? at : run.cleanup?.verifiedAt ?? null,
             ...(run.cleanup?.budgetSummary !== undefined ? { budgetSummary: run.cleanup.budgetSummary } : {}) } });
       }
       for(const recovery of this.recoveries.values())if(!recovery.cleanup.resourcesReleased){

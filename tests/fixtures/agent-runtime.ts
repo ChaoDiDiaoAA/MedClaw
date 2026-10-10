@@ -37,8 +37,12 @@ import { parseSkillBlock } from '@earendil-works/pi-coding-agent';
 import { sqliteHistory } from '../fixtures/p9-memory';
 import { restoreNativeManager } from '../../packages/runtime-pi/src/memory-store';
 import type { AnyToolDefinition } from '../../packages/contracts/src/tool';
+import type { IntentModelClient, IntentModelConfiguration } from '../../packages/contracts/src/intent';
+import { IntentService } from '../../packages/core/src/intent/intent-service';
+import { IntentValidator } from '../../packages/core/src/intent/validate';
+import { SqliteEventStore } from '../../packages/storage/src/event-store';
 
-export async function agentRuntimeFixture(respond?: (index: number, payload: Record<string, unknown>) => Promise<Record<string, unknown> | Response> | Record<string, unknown> | Response, extensions = false, usage?: (index:number)=>{prompt_tokens:number;completion_tokens:number;total_tokens:number}) {
+export async function agentRuntimeFixture(respond?: (index: number, payload: Record<string, unknown>) => Promise<Record<string, unknown> | Response> | Record<string, unknown> | Response, extensions = false, usage?: (index:number)=>{prompt_tokens:number;completion_tokens:number;total_tokens:number}, intents?: { client: IntentModelClient; configuration: IntentModelConfiguration }) {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p11-runtime-')), author = join(root, 'author'); cpSync(resolve('resources'), author, { recursive: true });
   const db = openDatabase(join(root, 'app.sqlite')), requests: Record<string, unknown>[] = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
@@ -51,25 +55,27 @@ export async function agentRuntimeFixture(respond?: (index: number, payload: Rec
   const runtime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
   const definition = { providerId: 'p11-fixture', name: 'Engineering', api: 'openai-completions', baseUrl: `http://127.0.0.1:${server.port}/v1`, models: [{ id: 'fixture', name: 'Engineering', input: ['text' as const], reasoning: false, contextWindow: 32768, maxTokens: 1024, outputLimitConfirmed: true as const, pricingKnown: false, cost: null }] };
   await runtime.installCustom([definition]);
-  const history = sqliteHistory(db), repos = new Repositories(db, undefined, undefined, undefined, history.store), contexts = new SqliteContextStore(db);
+  const history = sqliteHistory(db), repos = new Repositories(db, undefined, undefined, undefined, history.store), contexts = new SqliteContextStore(db,undefined,undefined,id=>repos.readQueryContext(id));
   const catalog = new CatalogService(new SqliteCatalogStore(db)), toolStore = new SqliteToolStore(db), queries = new QueryService(catalog, toolStore), evidence = new EvidenceReader(catalog, queries, toolStore);
   const registry = new ToolRegistry(createBusinessTools({ catalog, queries, evidence })), errors: unknown[] = [], recorder = new ToolRecorder(toolStore, (error,context) => {errors.push(error);app.runs.failToolPersistence(context.runId,error);});
   const configure = (_configuration:unknown, extraDefinitions:readonly AnyToolDefinition[]=[]) => {const combined=new ToolRegistry([...registry.definitions,...extraDefinitions]);return {registry:combined,executor:new ToolExecutor(combined,recorder,{findCommittedChild:context=>repos.findCommittedChild(context)})};};
-  const agent = new PiAgentRuntime(runtime, root, history, { registry, recorder, executor: new ToolExecutor(registry, recorder), configure }, new ContextService(contexts, { inspectManagedImport: async () => ({ status: 'valid' as const }) }),join(author,'extensions'));
+  const contextService = new ContextService(contexts, { inspectManagedImport: async () => ({ status: 'valid' as const }) });
+  const agent = new PiAgentRuntime(runtime, root, history, { registry, recorder, executor: new ToolExecutor(registry, recorder), configure }, contextService,join(author,'extensions'));
   const allocated = agent.allocate(); repos.createSession({ expectedWorkspaceRevision: 0 }, 'create-a', allocated.nativeSessionId, new Date().toISOString(), allocated.history); allocated.bind(1);
   const catalogue = ResourceCatalogueSchema.parse(JSON.parse(readFileSync(join(author, 'catalog.json'), 'utf8'))), prompt = catalogue.definitions.find(r => r.kind === 'prompt')!, skill = catalogue.definitions.find(r => r.kind === 'skill')!;
   const ref = ({ kind, id, version, treeHash }: typeof prompt) => ({ kind, id, version, treeHash });
   const descriptor=extensions?await agent.readExtensionDescriptor():null;
   const config = PublishedSettingsSchema.parse({ schemaVersion: 'medclaw.settings/p1-v1', configVersion: '1', model: { provider: 'p11-fixture', modelId: 'fixture' }, customProviders: [{ definition, credentialRef: null }], credentialRefs: {}, previous: null, rollbackFromVersion: null,
+    ...(intents ? { intentModel: intents.configuration } : {}),
     ...(extensions?{extensions:{bySession:{'1':{extension:descriptor!.ref}}}}:{}),
     requestPolicy: { timeoutMs: 15000, maxRetries: 0, maxRetryDelayMs: 2000 }, resources: { bySession: { '1': { prompt: ref(prompt), skills: [ref(skill)] } } } });
   const source = createResourceSource(author);
   const starter=Object.assign((...args:Parameters<ModelCallStarter>)=>new ModelCallRecorder(repos,...args),{forCompaction:(owner:CompactionCallOwner,time:string)=>ModelCallRecorder.forCompaction(repos,owner,time)});
-  const app = new Application('host', config, runtime, repos, async (_context, action) => action(), starter, () => {}, error => errors.push(error), agent, undefined, SqliteWriteTransactions.forDatabase(db), source);
+  const intentService = intents ? new IntentService(repos, contextService, intents.client, new IntentValidator(catalog), new SqliteEventStore(db), SqliteWriteTransactions.forDatabase(db)) : undefined;
+  const app = new Application('host', config, runtime, repos, async (_context, action) => action(), starter, () => {}, error => errors.push(error), agent, undefined, SqliteWriteTransactions.forDatabase(db), source, intentService ? { service: intentService, queries } : undefined);
   const request = (text: string): SubmitInput => SubmitInputSchema.parse({ sessionId: 1, clientSequence: repos.readSession(1)!.nextSubmissionSequence, mode: 'send', text, expectedRevision: repos.readWorkspace().revision, expectedBatchIds: repos.readWorkspace().batchRefs.map(ref=>ref.id), expectedQueryId: repos.readWorkspace().queryId, model: { provider: 'p11-fixture', modelId: 'fixture', expectedConfigVersion: app.config.configVersion }, referenceDate: '2026-10-06', timezone: 'Asia/Shanghai' });
   const settle = async () => { for (let i = 0; i < 2000 && app.runs.busy; i++) await Bun.sleep(2); expect(app.runs.busy).toBe(false); };
   const content = (id: number) => InputContentSchema.parse(JSON.parse(db.query<{ content_json: string }, [number]>('SELECT content_json FROM session_inputs WHERE id=?').get(id)!.content_json));
   return { root, author, db, requests, errors, app, agent, repos, contexts, source, toolStore, recorder, runtime, history, registry, prompt: ref(prompt), skill: ref(skill), request, settle, content,
     close: async () => { try { await app.runs.shutdown(); } finally { server.stop(true); db.close(); rmSync(root, { recursive: true, force: true }); } } };
 }
-

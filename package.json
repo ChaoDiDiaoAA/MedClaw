@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "packageManager": "bun@1.4.0",
-  "workspaces": ["apps/desktop", "apps/host", "packages/contracts", "packages/core", "packages/runtime-pi", "packages/storage", "packages/logging"],
+  "workspaces": ["apps/desktop", "apps/host", "packages/contracts", "packages/core", "packages/runtime-pi", "packages/storage", "packages/logging", "packages/intent-ollama"],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "dev:desktop": "bun apps/desktop/dev.ts",

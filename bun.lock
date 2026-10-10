@@ -30,6 +30,7 @@
       "dependencies": {
         "@medclaw/contracts": "workspace:*",
         "@medclaw/core": "workspace:*",
+        "@medclaw/intent-ollama": "workspace:*",
         "@medclaw/logging": "workspace:*",
         "@medclaw/runtime-pi": "workspace:*",
         "@medclaw/storage": "workspace:*",
@@ -43,6 +44,13 @@
     },
     "packages/core": {
       "name": "@medclaw/core",
+      "dependencies": {
+        "@medclaw/contracts": "workspace:*",
+        "zod": "4.6.5",
+      },
+    },
+    "packages/intent-ollama": {
+      "name": "@medclaw/intent-ollama",
       "dependencies": {
         "@medclaw/contracts": "workspace:*",
         "zod": "4.6.5",
@@ -206,6 +214,8 @@
     "@medclaw/desktop": ["@medclaw/desktop@workspace:apps/desktop"],
 
     "@medclaw/host": ["@medclaw/host@workspace:apps/host"],
+
+    "@medclaw/intent-ollama": ["@medclaw/intent-ollama@workspace:packages/intent-ollama"],
 
     "@medclaw/logging": ["@medclaw/logging@workspace:packages/logging"],
 

@@ -17,6 +17,7 @@ import { WorkspaceContextSchema } from '../../contracts/src/workspace';
 import { ModelCallContextSchema, ContextSnapshotBodySchema } from '../../contracts/src/context';
 import { FrozenRunResourcesSchema, ResourceReadFactSchema, resourceRefKey, type ResourceReadFact } from '../../contracts/src/resources';
 import { readFrozenChild, canReadRelatedQuery } from './child-identity';
+import { IntentItemsSchema } from '../../contracts/src/intent';
 
 const knownErrors = new Set(["invalid_argument", "access_denied", "state_conflict", "operation_not_found", "runtime_interrupted", "storage_read_failed", "storage_write_failed"]);
 function fail(code: string): never { throw new Error(code); }
@@ -169,10 +170,28 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
         if (!workspace.success || !isDeepStrictEqual(workspace.data, context.workspaceContext)) fail('access_denied');
       }
     }
-    if (active && run.status !== "running") fail("state_conflict");
+    if (active && run.status !== "running" && !(run.status === 'created' && 'source' in context && context.source === 'intent')) fail("state_conflict");
   }
 
   assertContext(context: QueryContext): void { protect(() => this.identity(context, true), "storage_read_failed"); }
+  assertQueryAdmission(params: QueryRecord['params'], context: QueryContext): void {
+    if (!('source' in context) || context.source !== 'intent') return;
+    protect(() => {
+      cancelled(context); this.identity(context, true);
+      const run = this.db.query<{ kind: string; cancel_requested_at: string | null; parent_run_id: number | null }, [number]>(
+        'SELECT kind,cancel_requested_at,parent_run_id FROM runs WHERE id=?').get(context.runId);
+      if (!run || run.kind !== 'agent' || run.parent_run_id !== null || context.inputId === null) fail('access_denied');
+      if (run.cancel_requested_at !== null) fail('state_conflict');
+      if (!this.db.query("SELECT name FROM sqlite_schema WHERE name='route_decisions'").get()) fail('access_denied');
+      const decision = this.db.query<{ id: number; route: string; business_status: string | null; adopted_intents_json: string; query_params_json: string | null }, [number, number, number]>(
+        'SELECT id,route,business_status,adopted_intents_json,query_params_json FROM route_decisions WHERE run_id=? AND session_id=? AND input_id=?')
+        .get(context.runId, context.sessionId, context.inputId);
+      if (!decision || decision.route !== 'simple' || decision.business_status !== 'RESOLVED') fail('access_denied');
+      const intents = IntentItemsSchema.safeParse(decode(decision.adopted_intents_json)), adopted = QueryParamsSchema.safeParse(decision.query_params_json === null ? null : decode(decision.query_params_json));
+      if (!intents.success || !adopted.success || intents.data.length !== 1) fail('storage_read_failed');
+      if (context.callRef !== `intent:${context.runId}:${decision.id}:${intents.data[0]!.id}` || json(adopted.data) !== json(params)) fail('access_denied');
+    }, 'storage_read_failed');
+  }
   assertReadContext(context: QueryContext): void { protect(() => this.identity(context, false), "storage_read_failed"); }
 
   private call(row: CallRow): ToolCallRecord {
@@ -461,6 +480,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   commitQuery(input: Omit<QueryRecord, "id">, inputEvidence: Omit<Evidence, "id" | "queryId">[], context: QueryContext): QueryRecord {
     return protect(() => this.transactions.immediate(() => {
       cancelled(context); this.identity(context, true);
+      this.assertQueryAdmission(input.params, context);
       if (input.runId !== context.runId || input.sessionId !== context.sessionId || input.callRef !== ("callRef" in context ? context.callRef : `${context.runId}:${context.nativeToolCallId}`)
         || !input.batchIds.every(batch => context.scope.batchIds.includes(batch))) fail("access_denied");
       const parsed = QueryRecordSchema.omit({ id: true }).safeParse(input);
@@ -541,11 +561,12 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
         json(item.snapshotIds), json(item.eventIds), json(item.sourceRowRefs), item.calculationVersion, item.materialVersion, item.sourceBundleId, item.sourceLockHash, item.resultHash,
         ...(this.p3 ? [json(item.filters ?? params.data), item.provenance ?? "synthetic-derived"] : []));
       if (this.p3) this.db.query("INSERT INTO business_events(operation_ref,type,actor,session_id,run_id,query_id,details_json,occurred_at) VALUES(?,'query_committed',?,?,?,?,?,?)")
-        .run(input.callRef, source === "user_form" ? "user" : "agent", input.sessionId, input.runId, queryId,
+        .run(input.callRef, source === "user_form" ? "user" : source === 'intent' ? 'system' : "agent", input.sessionId, input.runId, queryId,
           json({ queryId, kind: input.kind, resultHash: input.resultHash, source, rowCount: input.rows.length,
             ...('workspaceRevision' in context ? { workspaceRevision: context.workspaceRevision } : {}) }), input.createdAt);
       cancelled(context); this.identity(context, true);
-      this.events?.appendInTransaction({type:'query_completed',payload:{contract:'medclaw.event/v1',queryId,resultHash:input.resultHash,batchIds:input.batchIds},runId:input.runId,sessionId:input.sessionId,source:source==='user_form'?'application':'tool',sourceConnection:null,sourceSequence:null,toolCallId:'nativeToolCallId'in context?this.callRow(context)?.id??null:null,occurredAt:input.createdAt,receivedAt:input.createdAt});
+      this.assertQueryAdmission(input.params, context);
+      this.events?.appendInTransaction({type:'query_completed',payload:{contract:'medclaw.event/v1',queryId,resultHash:input.resultHash,batchIds:input.batchIds},runId:input.runId,sessionId:input.sessionId,source:source==='agent_tool'?'tool':'application',sourceConnection:null,sourceSequence:null,toolCallId:'nativeToolCallId'in context?this.callRow(context)?.id??null:null,occurredAt:input.createdAt,receivedAt:input.createdAt});
       return this.readQuery(queryId)!;
     }), "storage_write_failed");
   }

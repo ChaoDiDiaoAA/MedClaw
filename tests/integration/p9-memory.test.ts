@@ -142,13 +142,14 @@ function preserved(db: Database, f: ReturnType<typeof legacy>) {
 test('p9 migration preserves schema8 active/deleted history, JSON bytes, receipts, inputs, query, answer, context and Workspace', () => {
   const f = legacy(); let db = f.db;
   try {
-    db.close(); db = openDatabase(f.path); expect(SCHEMA_VERSION).toBe(12); preserved(db,f);
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(12);
+    db.close(); db = openDatabase(f.path); expect(SCHEMA_VERSION).toBe(13); preserved(db,f);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(13);
     expect(db.query('SELECT native_header_json,current_leaf_id,history_format_version,storage_version FROM sessions').all()).toEqual(Array(2).fill({native_header_json:null,current_leaf_id:null,history_format_version:null,storage_version:0}));
     expect(db.query('SELECT * FROM memories').all()).toEqual([]);
     expect(db.query('PRAGMA foreign_keys').get()).toEqual({foreign_keys:1}); expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
-    for (const table of ['query_contexts','checkpoints','long_term_memories']) expect(db.query('SELECT name FROM sqlite_schema WHERE name=?').get(table)).toBeNull();
+    for (const table of ['intent_calls','route_decisions','query_contexts']) expect(db.query(`SELECT * FROM ${table}`).all()).toEqual([]);
+    for (const table of ['checkpoints','long_term_memories']) expect(db.query('SELECT name FROM sqlite_schema WHERE name=?').get(table)).toBeNull();
     db.close(); db = openDatabase(f.path); preserved(db,f);
   } finally { db.close(); rmSync(f.root,{recursive:true,force:true}); }
 });
@@ -182,7 +183,7 @@ test('p9 actual SQLite COMMIT lock failure rolls back migration, restores FK and
 test('p9 new schema enforces native identities, parent/leaf ownership, Run and Answer associations', () => {
   const root=mkdtempSync(join(tmpdir(),'medclaw-p9-fk-')), db=openDatabase(join(root,'app.sqlite'));
   try {
-    expect(SCHEMA_VERSION).toBe(12); const native=memoryNativeFixture(); const header=JSON.stringify(native.header);
+    expect(SCHEMA_VERSION).toBe(13); const native=memoryNativeFixture(); const header=JSON.stringify(native.header);
     db.query(`INSERT INTO sessions(id,native_session_id,creation_operation_ref,creation_request_json,creation_result_json,title,created_at,updated_at,native_header_json,history_format_version,storage_version)
       VALUES(1,?,'create-a','{}','{}','ENGINEERING A',?, ?,?,'pi-session/3;pi-sdk/0.87.1',1)`).run(native.header.id,memoryAt,memoryAt,header);
     db.query(`INSERT INTO sessions(id,native_session_id,creation_operation_ref,creation_request_json,creation_result_json,title,created_at,updated_at) VALUES(2,'b','create-b','{}','{}','ENGINEERING B',?,?)`).run(memoryAt,memoryAt);

@@ -27,13 +27,14 @@ import { ExtensionAssemblyProofSchema, ExtensionDescriptorSchema, ExtensionSelec
   ExtensionsReadInputSchema, ExtensionsSelectInputSchema, ExtensionsSelectResultSchema, ExtensionsCommandInputSchema } from './extensions';
 
 import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, EventSubscribeResultSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema } from './event';
+import { IntentBaseUrlSchema, IntentModelConfigurationSchema, IntentModelInspectionSchema, IntentReadResultSchema, ReadIntentInputSchema } from './intent';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p13-v1" as const;
-export const DATABASE_SCHEMA_VERSION = 12 as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p14-v1" as const;
+export const DATABASE_SCHEMA_VERSION = 13 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
-  return method === 'extensions.command' || method === "session.readManagementOperation" || method === "event.subscribe" || method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method.startsWith('evidence.read') || method === 'data.rows' || method === 'tool.read' || method === "run.active" || method === "session.readSubmission" || method === "session.readInput" || method === "session.listInputs";
+  return method === 'model.intent.inspect' || method === 'extensions.command' || method === "session.readManagementOperation" || method === "event.subscribe" || method.endsWith(".read") || method.endsWith(".list") || method.endsWith(".status") || method.startsWith('evidence.read') || method === 'data.rows' || method === 'tool.read' || method === "run.active" || method === "session.readSubmission" || method === "session.readInput" || method === "session.listInputs";
 }
 export const EmptyPayloadSchema = z.strictObject({});
 const accepted = z.strictObject({ accepted: z.literal(true) });
@@ -136,10 +137,14 @@ export const publicMethodSchemas = {
     output: z.strictObject({ configVersion: ConfigVersionSchema, definition: CustomProviderDefinitionSchema, registered: z.boolean() }),
   },
   "model.configure": { input: ModelChoiceSchema, output: configurableSelection },
+  'intent.read': { input: ReadIntentInputSchema, output: IntentReadResultSchema.nullable() },
+  'model.intent.inspect': { input: z.strictObject({ baseUrl: IntentBaseUrlSchema, modelTag: z.literal('qwen3.5:0.8b') }), output: IntentModelInspectionSchema },
+  'model.intent.configure': { input: z.strictObject({ ...expectedVersion, intentModel: IntentModelConfigurationSchema.nullable() }),
+    output: z.strictObject({ configVersion: ConfigVersionSchema, intentModel: IntentModelConfigurationSchema.nullable() }) },
   "model.policy.update": { input: policyUpdateInput, output: z.strictObject(policyResultFields).transform(normalizePolicyResult) },
   "model.config.read": {
     input: EmptyPayloadSchema,
-    output: z.strictObject({ ...policyResultFields, previousConfigVersion: ConfigVersionSchema.nullable(), rollbackFromVersion: ConfigVersionSchema.nullable() }).transform(normalizePolicyResult),
+    output: z.strictObject({ ...policyResultFields, intentModel: IntentModelConfigurationSchema.nullable().optional(), previousConfigVersion: ConfigVersionSchema.nullable(), rollbackFromVersion: ConfigVersionSchema.nullable() }).transform(normalizePolicyResult),
   },
   "model.config.rollback": {
     input: z.strictObject({ ...expectedVersion, targetConfigVersion: ConfigVersionSchema }),
@@ -269,6 +274,9 @@ export type HostPrivateMethod = keyof typeof hostPrivateMethodSchemas;
 const hostFields = { protocolVersion: z.literal(HOST_PROTOCOL_VERSION), kind: z.literal("request"), requestId: OpaqueIdSchema, instanceId: OpaqueIdSchema, operationRef: OpaqueIdSchema };
 const hostRequest = <M extends string, S extends z.ZodType>(method: M, payload: S) => z.strictObject({ ...hostFields, method: z.literal(method), payload });
 export const PublicHostRequestSchema = z.discriminatedUnion("method", [
+  hostRequest('intent.read', publicMethodSchemas['intent.read'].input),
+  hostRequest('model.intent.inspect', publicMethodSchemas['model.intent.inspect'].input),
+  hostRequest('model.intent.configure', publicMethodSchemas['model.intent.configure'].input),
   hostRequest('extensions.read', publicMethodSchemas['extensions.read'].input),
   hostRequest('extensions.select', publicMethodSchemas['extensions.select'].input),
   hostRequest('extensions.command', publicMethodSchemas['extensions.command'].input),

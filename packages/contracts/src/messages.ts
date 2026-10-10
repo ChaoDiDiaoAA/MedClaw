@@ -28,7 +28,7 @@ export const SessionMessageViewSchema = z.strictObject({
   nativeEntryId: OpaqueIdSchema,
   parentEntryId: OpaqueIdSchema.nullable(),
   entryType: z.string().min(1).max(128),
-  displayRole: z.enum(["system", "user", "assistant", "tool_result", "product", "history_marker"]),
+  displayRole: z.enum(["system", "user", "assistant", "tool_result", "product", "history_marker", "program"]),
   text: z.string().max(MAX_MESSAGE_TEXT_CHARS).nullable(),
   references: z.array(ReferenceSchema).max(MAX_MESSAGE_REFERENCES).refine(references => new Set(references).size === references.length, "References must be unique"),
   inputId: PositiveIdSchema.nullable(),

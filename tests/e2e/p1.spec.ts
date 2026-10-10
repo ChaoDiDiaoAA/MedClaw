@@ -314,7 +314,9 @@ test("custom definition updates all models and persisted Unicode output pages re
   const saved = await page.evaluate(() => window.medclaw.request("run.read", { runId: 3 }));
   if (!saved.ok || saved.data.kind !== "one" || !saved.data.run) throw new Error("Expected the newly selected model Run");
   expect(saved.data.run.model.modelId).toBe("fixture-second");
-  expect(saved.data.run.calls[0]!.model.modelId).toBe("fixture-second");
+  const savedCall = saved.data.run.calls[0]!;
+  if (savedCall.kind !== 'main') throw new Error('Expected a main Pi call');
+  expect(savedCall.model.modelId).toBe("fixture-second");
   await chooseSessionModel("UI fixture model updated");
   await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p1-ui-fixture", "fixture"]));
   const unchanged = await page.evaluate(() => window.medclaw.request("run.read", { runId: 1 }));

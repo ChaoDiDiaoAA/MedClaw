@@ -268,7 +268,7 @@ export class CatalogService {
     const values = [...new Set(this.snapshots(input.batchIds, context).map(row => row[input.field]).filter((value): value is string => value !== null && value.length > 0))].sort();
     const page = pageItems(values, input); return { values: page.items, totalRows: page.totalRows, page: page.page, pageSize: page.pageSize };
   }
-  resolveDevice(input: PageInput & { text: string; matchBy: "name" | "source_id" | "submission_id" }, context: ToolExecutionContext) {
+  resolveDevice(input: PageInput & { text: string; matchBy: "name" | "source_id" | "submission_id" }, context: QueryContext) {
     this.assertContext(context);
     input = createBusinessToolSchemas().resolve_device.input.parse(input);
     const text = input.text.toLocaleLowerCase("en-US");

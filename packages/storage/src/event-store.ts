@@ -1,5 +1,7 @@
 import type { Database } from 'bun:sqlite';
 import { isDeepStrictEqual } from 'node:util';
+import { createHash } from 'node:crypto';
+import { canonicalRequest } from '../../contracts/src/run';
 import { RegisteredEventDraftSchema, StoredRunEventSchema, EVENT_LIMITS, type EventStore, type RegisteredEventDraft, type StoredRunEvent, type EventRange } from '../../contracts/src/event';
 import { safeError } from '../../contracts/src/error';
 import { SqliteWriteTransactions } from './write-transactions';
@@ -29,7 +31,34 @@ export class SqliteEventStore implements EventStore {
    if(!this.db.query("SELECT id FROM runtime_events WHERE run_id=? AND session_id=? AND type='history_saved' AND json_extract(payload_json,'$.storageVersion')=?").get(draft.runId,draft.sessionId,payload.storageVersion))fail(code);
   }
   if(draft.type==='context_delivered'&&!this.db.query(`SELECT d.id FROM context_deliveries d JOIN model_calls c ON c.id=d.model_call_id WHERE d.snapshot_id=? AND c.call_id=? AND d.run_id=? AND d.session_id=?`).get(draft.payload.snapshotId,draft.payload.callId,draft.runId,draft.sessionId))fail(code);
-  if('inputId' in p){const row=this.db.query<{run_id:number|null;target_run_id:number|null},[number,number]>('SELECT run_id,target_run_id FROM session_inputs WHERE id=? AND session_id=?').get(p.inputId,draft.sessionId);if(!row||(row.run_id??row.target_run_id)!==draft.runId||p.runId!==null&&row.run_id!==p.runId||p.targetRunId!==null&&row.target_run_id!==p.targetRunId)fail(code);}
+  if('inputId' in p){
+   const row=this.db.query<{run_id:number|null;target_run_id:number|null},[number,number]>('SELECT run_id,target_run_id FROM session_inputs WHERE id=? AND session_id=?').get(p.inputId,draft.sessionId);
+   const intentEvent=['intent_rule_evaluated','intent_started','intent_finished','route_decided'].includes(draft.type);
+   if(!row||(row.run_id??row.target_run_id)!==draft.runId||p.runId!==null&&(intentEvent ? p.runId!==draft.runId||row.target_run_id!==p.runId : row.run_id!==p.runId)
+     ||'targetRunId' in p&&p.targetRunId!==null&&row.target_run_id!==p.targetRunId)fail(code);
+   if(intentEvent&&!this.db.query("SELECT r.id FROM runs r JOIN sessions s ON s.id=r.session_id WHERE r.id=? AND r.session_id=? AND r.input_id=? AND r.kind='agent' AND r.parent_run_id IS NULL AND s.kind='user'").get(draft.runId,draft.sessionId,p.inputId))fail(code);
+  }
+  if(draft.type==='intent_started'||draft.type==='intent_finished'){
+   const payload=draft.payload;
+   const call=this.db.query<{input_id:number;stage:string;snapshot_id:number;model_json:string;previous_call:string|null;state:string;validation_state:string;error_json:string|null;started_at:string;ended_at:string|null},[string,number,number]>(`SELECT i.input_id,i.stage,i.snapshot_id,m.model_json,pm.call_id previous_call,m.state,i.validation_state,m.error_json,m.started_at,m.ended_at
+     FROM intent_calls i JOIN model_calls m ON m.id=i.model_call_id LEFT JOIN intent_calls pi ON pi.id=i.previous_call_id LEFT JOIN model_calls pm ON pm.id=pi.model_call_id
+     WHERE m.call_id=? AND m.kind='intent' AND i.run_id=? AND i.session_id=?`).get(payload.callId,draft.runId,draft.sessionId);
+   if(!call||call.input_id!==payload.inputId||call.stage!==payload.stage)fail(code);
+   if(draft.type==='intent_started'){
+    const model=JSON.parse(call.model_json);
+    if(call.snapshot_id!==draft.payload.snapshotId||call.previous_call!==draft.payload.previousCallId||model.selection.configVersion!==draft.payload.configVersion
+      ||model.selection.modelTag!==draft.payload.modelTag||call.started_at!==draft.occurredAt)fail(code);
+   }else if(call.state!==draft.payload.state||call.validation_state!==draft.payload.validationState||call.ended_at!==draft.occurredAt
+     ||(call.error_json===null?null:JSON.parse(call.error_json).code)!==draft.payload.errorCode)fail(code);
+  }
+  if(draft.type==='route_decided'){
+   const payload=draft.payload;
+   const route=this.db.query<{input_id:number;call_id:string|null;route:string;decision_source:string;matched_by:string|null;business_status:string|null;query_params_json:string|null;created_at:string},[number,number,number]>(`SELECT d.*,m.call_id FROM route_decisions d
+     LEFT JOIN intent_calls i ON i.id=d.intent_call_id LEFT JOIN model_calls m ON m.id=i.model_call_id WHERE d.id=? AND d.run_id=? AND d.session_id=?`).get(payload.decisionId,draft.runId,draft.sessionId);
+   if(!route||route.input_id!==payload.inputId||route.call_id!==payload.intentCallId||route.route!==payload.route||route.decision_source!==payload.decisionSource
+     ||route.matched_by!==payload.matchedBy||route.business_status!==payload.status||route.created_at!==draft.occurredAt
+     ||(route.query_params_json===null?null:createHash('sha256').update(canonicalRequest(JSON.parse(route.query_params_json))).digest('hex'))!==payload.queryParamsHash)fail(code);
+  }
   if('answerId' in p&&p.answerId!==null&&!owned('answers',p.answerId))fail(code);
   if('queryId' in p&&!owned('queries',p.queryId))fail(code);
   if('queryIds' in p&&p.queryIds.some(id=>!owned('queries',id)))fail(code);
