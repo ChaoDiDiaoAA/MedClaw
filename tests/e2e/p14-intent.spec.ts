@@ -140,8 +140,6 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
   let holdIntentStage:'classify'|'verify'|null=null;
   const blockedIntents:{stage:'classify'|'verify';runId:number;release:()=>void}[]=[];
   type MainWire={messages:{role:string;content:unknown}[];tools?:{function:{name:string}}[]};
-  let businessAgent=false;
-  const blockedMain:{wire:MainWire;release:()=>void}[]=[];
   const server=createServer(async(request,response)=>{
     response.setHeader('content-type','application/json');
     if(request.url==='/api/version'){response.end(JSON.stringify({version:'ENGINEERING'}));return;}
@@ -160,11 +158,8 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
       response.end(JSON.stringify({model:'qwen3.5:0.8b',done:true,done_reason:'stop',message:{role:'assistant',content:JSON.stringify(result)},prompt_eval_count:11,eval_count:7}));return;
     }
     const wire=JSON.parse(body) as MainWire;mainRequests.push(wire);response.setHeader('content-type','text/event-stream');
-    const call=blockedMain.length+1;
-    if(businessAgent)await new Promise<void>(release=>blockedMain.push({wire,release}));
-    const delta=businessAgent&&call<=3?{role:'assistant',tool_calls:[{index:0,id:`ENGINEERING-step-${call}`,type:'function',function:{name:'query_intent_step',arguments:JSON.stringify({stepId:call===2?'s1':'s2',part:0})}}]}:
-      {role:'assistant',content:businessAgent?`ENGINEERING business answer ${call}`:'ENGINEERING explicit main answer'};
-    response.end(`data: ${JSON.stringify({id:'ENGINEERING',model:'fixture',choices:[{index:0,delta,finish_reason:'tool_calls' in delta?'tool_calls':'stop'}]})}\n\ndata: [DONE]\n\n`);
+    const delta={role:'assistant',content:'ENGINEERING explicit main answer'};
+    response.end(`data: ${JSON.stringify({id:'ENGINEERING',model:'fixture',choices:[{index:0,delta,finish_reason:'stop'}]})}\n\ndata: [DONE]\n\n`);
   });
   await new Promise<void>(done=>server.listen(0,'127.0.0.1',done));let desktop:Awaited<ReturnType<typeof launchActualDev>>|undefined;
   try{
@@ -197,7 +192,8 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
     await expect.poll(async()=>(await recent())?.status,{timeout:30000}).toBe('completed');
     const first=(await recent())!;const rule=await page.evaluate(runId=>window.medclaw.request('intent.read',{runId}),first.id);
     expect(rule).toMatchObject({ok:true,data:{calls:[],decision:{route:'simple'},execution:{runStatus:'completed'}}});expect(intentRequests).toHaveLength(0);expect(mainRequests).toHaveLength(0);
-    await expect(page.getByTestId('chat-native-messages')).toContainText('Query #1 completed with 1 result rows.');
+    await expect(page.getByTestId('chat-native-messages')).toContainText('Part 0: Query #1');
+    await expect(page.getByTestId('chat-native-messages')).toContainText('Complete result rows: 1.');
     const conditions=page.getByRole('region',{name:'Current query conditions',exact:true});
     await expect(conditions).toContainText('浙江');await expect(conditions).toContainText(`Run ${first.id}`);
     await expect(conditions).toContainText('2026-01-01 ≤ date < 2026-01-02');
@@ -247,14 +243,10 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
     await message.fill('');await intentPanel.getByRole('button',{name:'Retry recognition',exact:true}).click();
     await expect.poll(async()=>{const run=await recent();return run&&run.id!==failed.id&&run.status==='failed';},{timeout:30000}).toBe(true);
     const retried=(await recent())!;expect(intentRequests).toHaveLength(5);expect(mainRequests).toHaveLength(1);await expect(message).toHaveValue(failedText);
-    await expect(intentPanel.getByRole('button',{name:'Analyze with main agent',exact:true})).toBeEnabled();
-    await intentPanel.getByRole('button',{name:'Analyze with main agent',exact:true}).click();
-    await expect.poll(async()=>{const run=await recent();return run&&run.id!==retried.id&&run.status==='completed';},{timeout:30000}).toBe(true);
-    const fallback=(await recent())!,fallbackFacts=await page.evaluate(runId=>window.medclaw.request('intent.read',{runId}),fallback.id);
-    expect(fallbackFacts).toMatchObject({ok:true,data:{calls:[],decision:{decisionSource:'explicit_agent_fallback',intentCallId:null,adoptedIntents:[]},execution:{finalHistorySaved:true}}});
-    const fallbackInput=await page.evaluate(inputId=>window.medclaw.request('session.readInput',{inputId}),fallback.inputId!);
-    expect(fallbackInput).toMatchObject({ok:true,data:{text:failedText}});expect(intentRequests).toHaveLength(5);expect(mainRequests).toHaveLength(2);
-    await expect(intentPanel).toContainText('explicit_agent_fallback');await expect(intentPanel).toContainText('Intent calls: 0');
+    await expect(intentPanel.getByRole('button',{name:'Review query conditions',exact:true})).toBeEnabled();
+    await intentPanel.getByRole('button',{name:'Review query conditions',exact:true}).click();
+    await expect(page.getByRole('alert').filter({hasText:'Review and confirm query conditions'})).toBeVisible();
+    expect((await recent())!.id).toBe(retried.id);expect(intentRequests).toHaveLength(5);expect(mainRequests).toHaveLength(1);
     await page.getByRole('button',{name:'Close run details',exact:true}).click();failIntent=false;
     for(const scenario of [
       {mode:'missing' as const,calls:1,text:'列出浙江新增的器械记录',status:'NEED_PARAMETERS',explanation:'Provide the missing parameters to resolve this task.'},
@@ -265,7 +257,7 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
       outcome=scenario.mode;await page.getByRole('button',{name:'New Session',exact:true}).click();await expect(routing).toHaveValue('intent');
       const prior=(await recent())!.id,count=intentRequests.length;await message.fill(scenario.text);await send.click();
       await expect.poll(async()=>{const run=await recent();return run&&run.id!==prior&&run.status==='completed';},{timeout:30000}).toBe(true);
-      expect(intentRequests).toHaveLength(count+scenario.calls);expect(mainRequests).toHaveLength(2);
+      expect(intentRequests).toHaveLength(count+scenario.calls);expect(mainRequests).toHaveLength(1);
       const currentConditions=page.getByRole('region',{name:'Current query conditions',exact:true});
       if(scenario.mode==='missing'){
         await expect(currentConditions).toHaveCount(1);
@@ -310,7 +302,7 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
     expect(observedPages.every(offset=>offset===0||offset===65536)).toBe(true);
     const tail=await page.evaluate(runId=>window.medclaw.request('run.read',{runId,inputOffset:65536,inputLimit:65536}),longRetry.id);
     expect(tail).toMatchObject({ok:true,data:{kind:'one',run:{inputPage:{text:longTask.slice(65536),totalChars:longTask.length,nextOffset:null}}}});
-    expect(intentRequests).toHaveLength(beforeIntent);expect(mainRequests).toHaveLength(2);
+    expect(intentRequests).toHaveLength(beforeIntent);expect(mainRequests).toHaveLength(1);
     await page.getByRole('button',{name:'Close run details',exact:true}).click();
     await page.getByRole('button',{name:'New Session',exact:true}).click();failIntent=true;
     const unknownText='ENGINEERING lost acceptance reply',unknownPrior=(await recent())!.id;
@@ -320,10 +312,10 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
     const unknownRun=(await recent())!.id;
     await page.getByRole('button',{name:'View run details',exact:true}).click();await page.getByRole('tab',{name:'Conditions',exact:true}).click();
     await expect(intentPanel.getByRole('button',{name:'Retry recognition',exact:true})).toBeDisabled();
-    await expect(intentPanel.getByRole('button',{name:'Analyze with main agent',exact:true})).toBeDisabled();
+    await expect(intentPanel.getByRole('button',{name:'Review query conditions',exact:true})).toBeDisabled();
     await page.getByRole('button',{name:'Read original submission',exact:true}).click();
     await expect(intentPanel.getByRole('button',{name:'Retry recognition',exact:true})).toBeEnabled();
-    expect((await recent())!.id).toBe(unknownRun);expect(intentRequests).toHaveLength(beforeIntent+1);expect(mainRequests).toHaveLength(2);
+    expect((await recent())!.id).toBe(unknownRun);expect(intentRequests).toHaveLength(beforeIntent+1);expect(mainRequests).toHaveLength(1);
     await page.getByRole('button',{name:'Close run details',exact:true}).click();failIntent=false;outcome='resolved';
     await page.getByRole('button',{name:'New Session',exact:true}).click();
     await expect(page.getByRole('button',{name:'New Session',exact:true})).toBeEnabled();
@@ -375,95 +367,31 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
       expect(stopped).toMatchObject({ok:true,data:{decision:null,execution:{runStatus:'cancelled',queryIds:[],answerId:null,requiredPersistenceComplete:true}}});
       if(!stopped.ok||!stopped.data)throw new Error('Missing stopped intent facts');
       expect(stopped.data.calls.map(call=>[call.stage,call.state])).toEqual(stage==='classify'?[['classify','cancelled']]:[['classify','completed'],['verify','cancelled']]);
-      expect(intentRequests).toHaveLength(before+(stage==='classify'?1:2));expect(mainRequests).toHaveLength(2);
+      expect(intentRequests).toHaveLength(before+(stage==='classify'?1:2));expect(mainRequests).toHaveLength(1);
       await expect(message).toHaveValue(`B ${stage} draft remains.`);
       const afterCondition=await page.evaluate(sessionId=>window.medclaw.request('session.read',{sessionId}),a);
       expect(afterCondition).toMatchObject({ok:true,data:{currentQueryContext:originalCondition.data.currentQueryContext}});
       await selectSession(a);await expect(message).toHaveValue(`A ${stage} draft remains.`);
       await expect(page.getByRole('region',{name:'Current query conditions',exact:true})).toContainText(`Run ${originalConditionRun.id}`);
     }
-    review=false;outcome='multi';businessAgent=true;const beforeMulti=intentRequests.length;
+    review=false;outcome='multi';const beforeMulti=intentRequests.length,priorMulti=(await recent())!.id;
     await message.fill('先查询浙江在售器械，再查询退市器械，分别保留结果。');await expect(send).toBeEnabled();await send.click();
-    const waitMain=async(count:number)=>{await expect.poll(()=>blockedMain.length,{timeout:30000}).toBe(count);return blockedMain[count-1]!;};
-    const firstMain=await waitMain(1),multi=(await recent())!;
-    expect(firstMain.wire.tools?.map(tool=>tool.function.name)).toContain('query_intent_step');
-    expect(firstMain.wire.tools?.map(tool=>tool.function.name)).not.toContain('Agent');
-    const accepting=await page.evaluate(sessionId=>window.medclaw.request('session.read',{sessionId}),a);
-    expect(accepting).toMatchObject({ok:true,data:{session:{inputControl:{runId:multi.id,acceptingInputs:true}}}});
-    const queuedTexts=['ENGINEERING steer original multi Run','ENGINEERING follow original multi Run'];
-    for(const [index,label] of ['Steer','Follow Up'].entries()){
-      await message.fill(queuedTexts[index]!);await page.getByRole('button',{name:'Message actions',exact:true}).click();
-      await expect(page.getByRole('menuitem',{name:label,exact:true})).toBeEnabled();await page.getByRole('menuitem',{name:label,exact:true}).click();
-      await expect(page.getByRole('button',{name:label,exact:true})).toBeEnabled();await page.getByRole('button',{name:label,exact:true}).click();
-      await expect(message).toHaveValue('');await expect(send).toBeVisible();
+    await expect.poll(async()=>{const run=await recent();return run&&run.id!==priorMulti&&run.status==='completed';},{timeout:30000}).toBe(true);
+    const multi=(await recent())!,finalMulti=await page.evaluate(runId=>window.medclaw.request('intent.read',{runId}),multi.id);
+    expect(finalMulti).toMatchObject({ok:true,data:{decision:{route:'simple',queryParams:null,contextIntentId:null,executionPlan:{contract:'medclaw.intent-query-plan/v1',steps:[{stepId:'s1',dependsOn:[]},{stepId:'s2',dependsOn:['s1']}]}},
+      execution:{stepResults:[{stepId:'s1',queryRefs:[{queryId:expect.any(Number)}]},{stepId:'s2',queryRefs:[{queryId:expect.any(Number)}]}],finalHistorySaved:true,requiredPersistenceComplete:true}}});
+    if(!finalMulti.ok||!finalMulti.data)throw new Error('Missing program plan facts');
+    expect(finalMulti.data.execution.queryIds).toHaveLength(2);
+    for(const [index,queryId] of finalMulti.data.execution.queryIds.entries()){
+      expect(await page.evaluate(queryId=>window.medclaw.request('query.read',{queryId}),queryId))
+        .toMatchObject({ok:true,data:{query:{runId:multi.id,sessionId:a,params:{status:index?'delisted':'active'}}}});
     }
-    const queued=await page.evaluate(sessionId=>window.medclaw.request('session.listInputs',{sessionId,limit:100}),a);
-    if(!queued.ok)throw new Error(queued.error.code);
-    const queueItems=queued.data.items.filter(input=>queuedTexts.includes(input.text));
-    expect(queueItems.map(input=>({mode:input.mode,targetRunId:input.targetRunId,status:input.status,runId:input.runId}))).toEqual([
-      {mode:'steer',targetRunId:multi.id,status:'queued',runId:null},{mode:'follow_up',targetRunId:multi.id,status:'queued',runId:null},
-    ]);
-    await message.fill('A multi draft remains.');await selectSession(b);await expect(message).toHaveValue('B verify draft remains.');
-    await expect(page.getByRole('button',{name:'Message actions',exact:true})).toHaveCount(0);await expect(send).toBeDisabled();
-    await expect(page.getByTestId('stop-target')).toContainText(`Run ${multi.id}`);await selectSession(a);await expect(message).toHaveValue('A multi draft remains.');
-    firstMain.release();const secondMain=await waitMain(2);
-    expect(JSON.stringify(secondMain.wire.messages)).toContain(queuedTexts[0]);
-    expect(secondMain.wire.messages.filter(item=>item.role==='tool')).toEqual(expect.arrayContaining([expect.objectContaining({content:expect.stringContaining('state_conflict')})]));
-    const rejectedDependency=await page.evaluate(runId=>window.medclaw.request('intent.read',{runId}),multi.id);
-    expect(rejectedDependency).toMatchObject({ok:true,data:{execution:{queryIds:[]}}});
-    secondMain.release();const thirdMain=await waitMain(3);
-    const firstStepTools=await page.evaluate(runId=>window.medclaw.request('tool.read',{runId}),multi.id);
-    if(!firstStepTools.ok)throw new Error(firstStepTools.error.code);
-    expect(firstStepTools.data.items.map(item=>({status:item.status,error:item.error?.code??null}))).toEqual([
-      {status:'failed',error:'state_conflict'},{status:'succeeded',error:null},
-    ]);
-    const firstStep=await page.evaluate(runId=>window.medclaw.request('intent.read',{runId}),multi.id);
-    if(!firstStep.ok||!firstStep.data)throw new Error('Missing first multi step');
-    expect(firstStep.data.execution.queryIds).toHaveLength(1);
-    thirdMain.release();const fourthMain=await waitMain(4);
-    const completedSteps=await page.evaluate(runId=>window.medclaw.request('intent.read',{runId}),multi.id);
-    if(!completedSteps.ok||!completedSteps.data)throw new Error('Missing completed multi steps');
-    expect(completedSteps.data.execution.queryIds).toHaveLength(2);
-    for(const [index,queryId] of completedSteps.data.execution.queryIds.entries()){
-      const query=await page.evaluate(queryId=>window.medclaw.request('query.read',{queryId}),queryId);
-      expect(query).toMatchObject({ok:true,data:{query:{runId:multi.id,sessionId:a,params:{status:index?'delisted':'active'}}}});
-    }
-    fourthMain.release();const followMain=await waitMain(5);expect(JSON.stringify(followMain.wire.messages)).toContain(queuedTexts[1]);followMain.release();
-    await expect.poll(async()=>{const gate=await page.evaluate(()=>window.medclaw.request('run.control.read',{}));return gate.ok&&gate.data.acceptingNewRuns&&gate.data.activeRootRun===null;},{timeout:30000}).toBe(true);
-    expect((await recent())!.id).toBe(multi.id);expect((await recent())!.status).toBe('completed');
-    const finalMulti=await page.evaluate(runId=>window.medclaw.request('intent.read',{runId}),multi.id);
-    expect(finalMulti).toMatchObject({ok:true,data:{decision:{route:'agent',contextIntentId:null,adoptedIntents:[{id:'s1',slots:{status:'active'},dependsOn:[]},{id:'s2',slots:{status:'delisted'},dependsOn:['s1']}]},
-      execution:{queryIds:completedSteps.data.execution.queryIds,stepResults:[{stepId:'s1',queryRefs:[{queryId:completedSteps.data.execution.queryIds[0]}]},{stepId:'s2',queryRefs:[{queryId:completedSteps.data.execution.queryIds[1]}]}],finalHistorySaved:true,requiredPersistenceComplete:true}}});
-    const consumed=await page.evaluate(sessionId=>window.medclaw.request('session.listInputs',{sessionId,limit:100}),a);
-    if(!consumed.ok)throw new Error(consumed.error.code);
-    for(const inputId of [multi.inputId,...queueItems.map(input=>input.id)]){
-      const input=consumed.data.items.find(item=>item.id===inputId);
-      expect(input).toMatchObject({status:'consumed',processingStatus:'completed',runId:multi.id,targetRunId:multi.id,nativeEntryId:expect.any(String)});
-    }
-    expect(intentRequests).toHaveLength(beforeMulti+1);expect(blockedMain).toHaveLength(5);expect(mainRequests).toHaveLength(7);
-    const afterMulti=await page.evaluate(sessionId=>window.medclaw.request('session.read',{sessionId}),a);
-    expect(afterMulti).toMatchObject({ok:true,data:{currentQueryContext:originalCondition.data.currentQueryContext}});
-    await expect(message).toHaveValue('A multi draft remains.');await selectSession(b);await expect(message).toHaveValue('B verify draft remains.');
-    await selectSession(a);await message.fill('查询浙江在售和退市器械，保留各自结果。');await expect(send).toBeEnabled();await send.click();
-    const stoppedMain=await waitMain(6),stoppedAgent=(await recent())!;
-    const cancelledText='ENGINEERING queued follow-up cancelled with original Agent';
-    await message.fill(cancelledText);await page.getByRole('button',{name:'Message actions',exact:true}).click();
-    await page.getByRole('menuitem',{name:'Follow Up',exact:true}).click();await page.getByRole('button',{name:'Follow Up',exact:true}).click();await expect(message).toHaveValue('');
-    const beforeStop=await page.evaluate(sessionId=>window.medclaw.request('session.listInputs',{sessionId,limit:100}),a);
-    if(!beforeStop.ok)throw new Error(beforeStop.error.code);const cancelledInput=beforeStop.data.items.find(input=>input.text===cancelledText)!;
-    expect(cancelledInput).toMatchObject({status:'queued',targetRunId:stoppedAgent.id,runId:null});
-    await message.fill('A stopped Agent draft remains.');await selectSession(b);await expect(message).toHaveValue('B verify draft remains.');
-    await expect(page.getByTestId('stop-target')).toContainText(`Run ${stoppedAgent.id}`);await page.getByRole('button',{name:'Stop generating',exact:true}).click();stoppedMain.release();
-    await expect.poll(async()=>{const gate=await page.evaluate(()=>window.medclaw.request('run.control.read',{}));return gate.ok&&gate.data.acceptingNewRuns&&gate.data.activeRootRun===null;},{timeout:30000}).toBe(true);
-    const stoppedFacts=await page.evaluate(runId=>window.medclaw.request('intent.read',{runId}),stoppedAgent.id);
-    expect(stoppedFacts).toMatchObject({ok:true,data:{decision:{route:'agent'},execution:{runStatus:'cancelled',queryIds:[],answerId:null,requiredPersistenceComplete:true}}});
-    expect(await page.evaluate(inputId=>window.medclaw.request('session.readInput',{inputId}),cancelledInput.id)).toMatchObject({ok:true,data:{status:'cancelled',processingStatus:'cancelled',runId:null,nativeEntryId:null}});
-    expect(intentRequests).toHaveLength(beforeMulti+2);expect(mainRequests).toHaveLength(8);expect(blockedMain).toHaveLength(6);
-    await expect(message).toHaveValue('B verify draft remains.');await selectSession(a);await expect(message).toHaveValue('A stopped Agent draft remains.');
-    expect(await page.evaluate(sessionId=>window.medclaw.request('session.read',{sessionId}),a)).toMatchObject({ok:true,data:{currentQueryContext:originalCondition.data.currentQueryContext}});
+    expect(intentRequests).toHaveLength(beforeMulti+1);expect(mainRequests).toHaveLength(1);
+    await expect(page.getByTestId('chat-native-messages')).toContainText('Step s2');
+    expect(await page.evaluate(sessionId=>window.medclaw.request('session.read',{sessionId}),a))
+      .toMatchObject({ok:true,data:{currentQueryContext:originalCondition.data.currentQueryContext}});
   }finally{
     for(const blocked of blockedIntents)blocked.release();
-    for(const blocked of blockedMain)blocked.release();
     writeFileSync(replayControl,JSON.stringify({sourceId:null,hold:false,loseSubmitText:null}));
     await desktop?.close();server.closeAllConnections();await new Promise<void>(done=>server.close(()=>done()));
     const inside=relative(tmpdir(),root);if((!desktop||existsSync(join(root,'dev-exit-confirmed')))&&inside&&!inside.startsWith('..')&&!inside.includes(':'))rmSync(root,{recursive:true,force:true});

@@ -17,7 +17,7 @@ import { WorkspaceContextSchema } from '../../contracts/src/workspace';
 import { ModelCallContextSchema, ContextSnapshotBodySchema } from '../../contracts/src/context';
 import { FrozenRunResourcesSchema, ResourceReadFactSchema, resourceRefKey, type ResourceReadFact } from '../../contracts/src/resources';
 import { readFrozenChild, canReadRelatedQuery } from './child-identity';
-import { IntentItemsSchema } from '../../contracts/src/intent';
+import { IntentItemsSchema, IntentQueryPlanSchema } from '../../contracts/src/intent';
 
 const knownErrors = new Set(["invalid_argument", "access_denied", "state_conflict", "operation_not_found", "runtime_interrupted", "storage_read_failed", "storage_write_failed"]);
 function fail(code: string): never { throw new Error(code); }
@@ -174,7 +174,27 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   }
 
   assertContext(context: QueryContext): void { protect(() => this.identity(context, true), "storage_read_failed"); }
+  assertFormRoute(runId: number, params: QueryRecord['params']): void {
+    const row=this.db.query<{session_id:number;input_id:number|null;cancel_requested_at:string|null;content_json:string|null;decision_source:string;query_params_json:string|null;route:string;business_status:string|null},[number]>(
+      `SELECT r.session_id,r.input_id,r.cancel_requested_at,i.content_json,d.decision_source,d.query_params_json,d.route,d.business_status
+       FROM runs r JOIN session_inputs i ON i.id=r.input_id AND i.session_id=r.session_id AND i.target_run_id=r.id
+       JOIN route_decisions d ON d.run_id=r.id AND d.input_id=i.id AND d.session_id=r.session_id WHERE r.id=? AND r.kind='agent' AND r.parent_run_id IS NULL`).get(runId);
+    if(!row||row.input_id===null||row.content_json===null||row.cancel_requested_at!==null||row.decision_source!=='user_form'
+      ||row.route!=='simple'||row.business_status!=='RESOLVED')fail('access_denied');
+    const parsed=InputContentSchema.safeParse(decode(row.content_json));if(!parsed.success)fail('storage_read_failed');
+    const request=parsed.data.originalSubmitInput;
+    if(request.mode!=='send'||request.routing?.mode!=='user_form'||parsed.data.intentAdmission
+      ||request.text!=='Query form: '+canonicalRequest(request.routing.params)||row.query_params_json===null
+      ||json(params)!==json(request.routing.params)||json(params)!==json(decode(row.query_params_json)))fail('access_denied');
+  }
   assertQueryAdmission(params: QueryRecord['params'], context: QueryContext): void {
+    if('source' in context&&context.source==='user_form')return protect(()=>{
+      cancelled(context);this.identity(context,true);this.assertFormRoute(context.runId,params);
+      if(context.inputId===null||context.callRef!==`form:${context.runId}:${context.inputId}`)fail('access_denied');
+      const row=this.db.query<{content_json:string},[number]>('SELECT content_json FROM session_inputs WHERE id=?').get(context.inputId);
+      const request=InputContentSchema.parse(decode(row!.content_json)).originalSubmitInput;
+      if((context.basedOnQueryId??null)!==request.expectedQueryId||context.workspaceRevision!==request.expectedRevision)fail('access_denied');
+    },'storage_read_failed');
     if (!('source' in context) || context.source !== 'intent') return;
     protect(() => {
       cancelled(context); this.identity(context, true);
@@ -183,10 +203,15 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       if (!run || run.kind !== 'agent' || run.parent_run_id !== null || context.inputId === null) fail('access_denied');
       if (run.cancel_requested_at !== null) fail('state_conflict');
       if (!this.db.query("SELECT name FROM sqlite_schema WHERE name='route_decisions'").get()) fail('access_denied');
-      const decision = this.db.query<{ id: number; route: string; business_status: string | null; adopted_intents_json: string; query_params_json: string | null }, [number, number, number]>(
-        'SELECT id,route,business_status,adopted_intents_json,query_params_json FROM route_decisions WHERE run_id=? AND session_id=? AND input_id=?')
+      const decision = this.db.query<{ id: number; route: string; business_status: string | null; adopted_intents_json: string; query_params_json: string | null; execution_plan_json:string|null }, [number, number, number]>(
+        'SELECT id,route,business_status,adopted_intents_json,query_params_json,execution_plan_json FROM route_decisions WHERE run_id=? AND session_id=? AND input_id=?')
         .get(context.runId, context.sessionId, context.inputId);
       if (!decision || decision.route !== 'simple' || decision.business_status !== 'RESOLVED') fail('access_denied');
+      if(decision.execution_plan_json!==null){
+        const plan=IntentQueryPlanSchema.parse(decode(decision.execution_plan_json));
+        if(!plan.steps.some(step=>step.queries.some((expected,part)=>context.callRef===`intent:${context.runId}:${decision.id}:${step.stepId}:${part}`&&canonicalRequest(expected)===canonicalRequest(params))))fail('access_denied');
+        return;
+      }
       const intents = IntentItemsSchema.safeParse(decode(decision.adopted_intents_json)), adopted = QueryParamsSchema.safeParse(decision.query_params_json === null ? null : decode(decision.query_params_json));
       if (!intents.success || !adopted.success || intents.data.length !== 1) fail('storage_read_failed');
       if (context.callRef !== `intent:${context.runId}:${decision.id}:${intents.data[0]!.id}` || json(adopted.data) !== json(params)) fail('access_denied');

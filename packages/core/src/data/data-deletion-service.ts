@@ -8,6 +8,7 @@ export class DataDeletionService {
  private closing=false;
  private readonly active=new Map<string,{key:string;promise:Promise<Result<DataDeleteOperation>>}>();
  constructor(private readonly store:SqliteDataDeletionStore,private readonly artifacts:ArtifactStore,private readonly instanceId:string){}
+ get busy(){return this.active.size>0;}
  private execute(operationRef:string,key:string,action:()=>Promise<DataDeleteOperation>){
   const prior=this.active.get(operationRef);if(prior)return prior.key===key?prior.promise:serviceResult<DataDeleteOperation>(()=>{throw new Error('state_conflict');},'storage_write_failed');
   const promise=serviceResult(async()=>{if(this.closing)throw new Error('host_interrupted');return action();},'storage_write_failed',{operationRef});

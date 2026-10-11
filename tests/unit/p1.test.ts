@@ -238,13 +238,14 @@ describe("P1 public and private protocol", () => {
       "session.checkpoints.read", "session.restoreCheckpoint", "session.restore",
       "session.compact", "session.compaction.read", "session.compaction.cancel",
       "settings.ui.read", "settings.ui.update", "diagnostics.read", "host.read", "host.start", "host.stop", "host.restart",
-      "data.delete.preview", "data.delete.commit", "data.delete.read", "data.delete.recover", "workspace.update", "data.read", "data.rows", "query.execute", "query.read", "query.list", "evidence.read", "tool.read",
+      "data.delete.preview", "data.delete.commit", "data.delete.read", "data.delete.recover", "workspace.update", "data.read", "data.rows", "query.read", "query.list", "evidence.read", "tool.read",
       "import.preview", "import.commit", "import.read", "import.cancel", "import.recover", "evidence.readOperation", "evidence.readArtifact",
       "event.read", "event.subscribe", "context.read",
+      'answer.read', 'activity.list', 'export.create', 'export.read', 'export.list', 'export.cancel', 'export.recover',
       "resources.list", "resources.select", "resources.read",
       "extensions.read", "extensions.select", "extensions.command",
     ].sort());
-    for (const method of ["credential.read", "credential.modify.begin", "file.resolve", "settings.prepare", "host.shutdown", "diagnostics.export", "executeShell", "__proto__"]) {
+    for (const method of ["query.execute", "credential.read", "credential.modify.begin", "file.resolve", "settings.prepare", "host.shutdown", "diagnostics.export", "executeShell", "__proto__"]) {
       expect(() => parsePublicPayload(method, {})).toThrow();
     }
     expect(() => parsePublicPayload("run.retrySave", { runId: 1, outputText: "forged", usage: {} })).toThrow();

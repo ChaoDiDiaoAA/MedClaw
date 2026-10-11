@@ -76,6 +76,6 @@ export async function agentRuntimeFixture(respond?: (index: number, payload: Rec
   const request = (text: string): SubmitInput => SubmitInputSchema.parse({ sessionId: 1, clientSequence: repos.readSession(1)!.nextSubmissionSequence, mode: 'send', text, expectedRevision: repos.readWorkspace().revision, expectedBatchIds: repos.readWorkspace().batchRefs.map(ref=>ref.id), expectedQueryId: repos.readWorkspace().queryId, model: { provider: 'p11-fixture', modelId: 'fixture', expectedConfigVersion: app.config.configVersion }, referenceDate: '2026-10-06', timezone: 'Asia/Shanghai' });
   const settle = async () => { for (let i = 0; i < 2000 && app.runs.busy; i++) await Bun.sleep(2); expect(app.runs.busy).toBe(false); };
   const content = (id: number) => InputContentSchema.parse(JSON.parse(db.query<{ content_json: string }, [number]>('SELECT content_json FROM session_inputs WHERE id=?').get(id)!.content_json));
-  return { root, author, db, requests, errors, app, agent, repos, contexts, source, toolStore, recorder, runtime, history, registry, prompt: ref(prompt), skill: ref(skill), request, settle, content,
+  return { root, author, db, requests, errors, app, agent, repos, contexts, source, toolStore, recorder, runtime, history, registry, intentService, queries, prompt: ref(prompt), skill: ref(skill), request, settle, content,
     close: async () => { try { await app.runs.shutdown(); } finally { server.stop(true); db.close(); rmSync(root, { recursive: true, force: true }); } } };
 }

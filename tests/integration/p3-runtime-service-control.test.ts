@@ -171,7 +171,7 @@ test('P3 RuntimeService freezes configured policy and profiles once and projects
   c.toolProfileSnapshot.available = false;
   expect(c.captured()?.agentPolicy?.maxToolCalls).toBe(200);
   expect(c.captured()?.runtimeConfiguration?.runBudget.maxToolCalls).toBe(200);
-  expect(c.service.bindQueryContext('query-form', c.repo.readWorkspace().revision)).not.toHaveProperty('toolConfiguration');
+  expect(c.captured()?.scope).not.toHaveProperty('toolConfiguration');
   expect(c.captured()?.toolProfileSnapshot?.available).toBe(true);
   expect(await c.service.submitAgent(c.request, { instanceId: 'instance', operationRef: 'submit' })).toEqual(accepted);
   expect(c.profilesRead()).toBe(1);
@@ -205,23 +205,19 @@ test('P3 statistics read failure does not block Run admission or fabricate a pro
   c.complete();
 });
 
-test('P3 manual Query context has a trusted synchronous deadline check', async () => {
+test('P3 a new form cannot borrow the active Run or change its frozen input identity', async () => {
   const c = await fixture();
   const accepted = await c.service.submitAgent(c.request, { instanceId: 'instance', operationRef: 'submit' });
   if (!accepted.ok) throw accepted.error;
   const send = requireSend(accepted.data);
   expect(send.inputId).toBeGreaterThan(0);
   await c.waitForStart;
-  const context = c.service.bindQueryContext('query-form', c.repo.readWorkspace().revision);
-  expect(context.checkActive).toBeFunction();
-  expect(context.inputId).toBe(send.inputId);
-  const monotonic = spyOn(performance, 'now').mockReturnValue(c.captured()!.deadlineAt + 1);
-  try {
-    let failure: unknown;
-    try { context.checkActive?.(); } catch (error) { failure = error; }
-    expect(failure).toMatchObject({ code: 'run_timeout' });
-    expect(context.signal.aborted).toBe(true);
-  } finally { monotonic.mockRestore(); c.complete(); }
+  const params=(await import('../../packages/contracts/src/query')).QueryParamsSchema.parse({kind:'current',population:'snapshot',snapshotMode:'exact_date',batchIds:[1]});
+  const form={...c.request,mode:'send' as const,clientSequence:2,text:'Query form: '+(await import('../../packages/contracts/src/run')).canonicalRequest(params),routing:{mode:'user_form' as const,params}};
+  const before=c.repo.listInputs({sessionId:send.sessionId,afterClientSequence:null,limit:100});
+  expect(await c.service.submitAgent(form,{instanceId:'instance',operationRef:'new-form'})).toMatchObject({ok:false,error:{code:'state_conflict',reason:'runtime_busy'}});
+  expect(c.repo.listInputs({sessionId:send.sessionId,afterClientSequence:null,limit:100})).toEqual(before);
+  expect(c.captured()?.inputId).toBe(send.inputId);expect(c.captured()?.text).toBe(c.request.text);c.complete();
 });
 
 test('P3 large total deadlines use bounded timer chunks without an immediate deadline abort', async () => {

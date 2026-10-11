@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { PositiveIdSchema, TimestampSchema, safeError } from '../../contracts/src/error';
 import { IntentModelSelectionSchema } from '../../contracts/src/model';
 import { InputContentSchema } from '../../contracts/src/session';
-import { renderIntentContext, ContextSnapshotBodySchema, ModelCallContextSchema } from '../../contracts/src/context';
+import { renderIntentContext, intentContextSource, ContextSnapshotBodySchema, ModelCallContextSchema } from '../../contracts/src/context';
 import { IntentModelCallViewSchema, RunScopeSchema, canonicalRequest } from '../../contracts/src/run';
 import { RegisteredEventPayloadSchema, type EventWriter, type RegisteredEventPayload } from '../../contracts/src/event';
 import {
@@ -14,7 +14,7 @@ import {
   RouteCommitSchema, QueryContextRecordSchema, type IntentStore, type IntentCallRegistration,
   type IntentCallCompletion, type RouteCommit, type ReadIntentInput, type IntentValidation,
   PrepareIntentInputSchema, FrozenIntentAdmissionSchema, IntentInputProjectionSchema, AdoptedContextFactSchema, IntentExecutionFactSchema,
-  ProductResultDetailsSchema, type PrepareIntentInput, type QueryContextRecord, INTENT_VERSIONS,
+  ProductResultDetailsSchema, QueryContextFactSchema, FormExecutionFactSchema, type PrepareIntentInput, type QueryContextRecord, INTENT_VERSIONS,
 } from '../../contracts/src/intent';
 import { SqliteEventStore } from './event-store';
 import { SqliteWriteTransactions } from './write-transactions';
@@ -45,7 +45,7 @@ type CallRow = { id: number; model_call_id: number; call_id: string; run_id: num
 type RouteRow = { id: number; run_id: number; session_id: number; input_id: number; intent_call_id: number | null;
   call_id: string | null; route: string; decision_source: string; matched_by: string | null; business_status: string | null;
   rule_evaluation_json: string | null; adopted_intents_json: string; context_intent_id: string | null; adopted_slots_json: string | null;
-  query_params_json: string | null; missing_slots_json: string; issues_json: string; schema_version: string; policy_version: string; created_at: string };
+  query_params_json: string | null; execution_plan_json: string | null; missing_slots_json: string; issues_json: string; schema_version: string; policy_version: string; created_at: string };
 const callSelect = 'SELECT i.*,m.call_id,m.model_json,m.state,m.started_at,m.ended_at,m.duration_ms,m.input_tokens,m.output_tokens,m.cost,m.cost_currency,m.usage_source,m.unavailable_reason,m.error_json,m.granularity,m.attempt,m.attempt_count_unknown FROM intent_calls i JOIN model_calls m ON m.id=i.model_call_id';
 const readFactsSchema=z.strictObject(IntentReadResultSchema.shape).omit({execution:true,effectiveContext:true});
 
@@ -56,6 +56,20 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
   }
   private write<T>(action: () => T): T {
     try { return this.transactions.immediate(action); } catch (error) { if (error instanceof Error && error.name === 'SQLiteError') fail('storage_write_failed'); throw error; }
+  }
+  readContextProjection(cached:Record<string,unknown>):QueryContextRecord {
+    const common={sessionId:cached.session_id,nativeLeafId:cached.native_leaf_id,version:cached.version,sourceRunId:cached.source_run_id,
+      sourceInputId:cached.source_input_id,scopeBatchHashes:decoded(cached.scope_batch_hashes_json as string),queryIds:decoded(cached.query_ids_json as string),
+      pendingClarification:decoded(cached.pending_clarification_json as string|null)};
+    if(cached.schema_version==='medclaw.query-form/v1'){
+      const route=this.route(cached.source_run_id as number);
+      if(!route||route.decision_source!=='user_form'||route.input_id!==cached.source_input_id||route.session_id!==cached.session_id
+        ||cached.context_intent_id!=='user_form'||!isDeepStrictEqual(decoded(cached.task_intents_json as string),[]))fail('storage_read_failed');
+      return checked(QueryContextRecordSchema,{...common,contract:'medclaw.query-form-context/v1',decisionId:route.id,params:decoded(cached.adopted_slots_json as string)});
+    }
+    if(cached.schema_version!=='medclaw.intent/v2')fail('storage_read_failed');
+    return checked(QueryContextRecordSchema,{...common,taskIntents:decoded(cached.task_intents_json as string),contextIntentId:cached.context_intent_id,
+      adoptedSlots:decoded(cached.adopted_slots_json as string)});
   }
   private owner(runId: number, sessionId?: number, inputId?: number): RunRow {
     const run = this.db.query<RunRow, [number]>('SELECT * FROM runs WHERE id=?').get(runId);
@@ -98,7 +112,7 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
       const snapshot = this.db.query<{ run_id: number; session_id: number; input_id: number; snapshot_json: string }, [number]>('SELECT * FROM context_snapshots WHERE id=?').get(input.snapshotId);
       if (!snapshot || snapshot.run_id !== run.id || snapshot.session_id !== run.session_id || snapshot.input_id !== run.input_id) fail('access_denied');
       const body = checked(ContextSnapshotBodySchema, decoded(snapshot.snapshot_json));
-      const source = { contract: 'medclaw.intent-context/v1', inputId: run.input_id, baseLeafId: projection.baseLeafId, baseStorageVersion: projection.baseStorageVersion };
+      const source = intentContextSource(input.input);
       if (!isDeepStrictEqual(body.intentSource, source) || body.delegationSource || !isDeepStrictEqual(body.workspaceContext, content.workspaceContext)
         || body.renderedProjection !== renderIntentContext(input.input)
         || hash(body.renderedProjection) !== body.projectionHash || hash(body.runtimeFeedback) !== body.feedbackHash) fail('access_denied');
@@ -206,6 +220,7 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
     return checked(IntentDecisionSchema, { intentCallId: row.call_id, matchedBy: row.matched_by, route: row.route, status: row.business_status,
       adoptedIntents: decoded(row.adopted_intents_json), contextIntentId: row.context_intent_id, adoptedSlots: decoded(row.adopted_slots_json),
       queryParams: decoded(row.query_params_json), missingSlots: decoded(row.missing_slots_json), issues: decoded(row.issues_json),
+      ...(row.execution_plan_json===null?{}:{executionPlan:decoded(row.execution_plan_json)}),
       ruleEvaluation: decoded(row.rule_evaluation_json), decisionSource: row.decision_source, schemaVersion: row.schema_version, policyVersion: row.policy_version });
   }
   commitRoute(raw: RouteCommit): { decisionId: number } {
@@ -231,11 +246,18 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
         const origin=this.owner(request.routing.originRunId,run.session_id);
         if(origin.id>=run.id||!['failed','cancelled','completed'].includes(origin.status)||origin.input_text!==content.text
           ||origin.reference_date!==content.referenceDate||origin.timezone!==content.timezone)fail('state_conflict');
+      } else if (decision.decisionSource === 'user_form') {
+        const accepted=this.db.query<{content_json:string},[number]>('SELECT content_json FROM session_inputs WHERE id=?').get(run.input_id)!;
+        const content=checked(InputContentSchema,decoded(accepted.content_json)),request=content.originalSubmitInput;
+        if(request.mode!=='send'||request.routing?.mode!=='user_form'||content.intentAdmission||content.resourceInputPlan
+          ||content.text!=='Query form: '+canonicalRequest(request.routing.params)||!isDeepStrictEqual(decision.queryParams,request.routing.params)
+          ||!isDeepStrictEqual(request.routing.params.batchIds,content.scope.batchIds)
+          ||this.db.query('SELECT id FROM model_calls WHERE run_id=?').get(run.id))fail('state_conflict');
       }
-      const decisionId = Number(this.db.query(`INSERT INTO route_decisions(run_id,session_id,input_id,intent_call_id,route,decision_source,matched_by,business_status,rule_evaluation_json,adopted_intents_json,context_intent_id,adopted_slots_json,query_params_json,missing_slots_json,issues_json,schema_version,policy_version,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(run.id, run.session_id, run.input_id, adoptedPk, decision.route, decision.decisionSource, decision.matchedBy,
+      const decisionId = Number(this.db.query(`INSERT INTO route_decisions(run_id,session_id,input_id,intent_call_id,route,decision_source,matched_by,business_status,rule_evaluation_json,adopted_intents_json,context_intent_id,adopted_slots_json,query_params_json,missing_slots_json,issues_json,schema_version,policy_version,created_at,execution_plan_json)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(run.id, run.session_id, run.input_id, adoptedPk, decision.route, decision.decisionSource, decision.matchedBy,
           decision.status, json(decision.ruleEvaluation), json(decision.adoptedIntents)!, decision.contextIntentId, json(decision.adoptedSlots), json(decision.queryParams),
-          JSON.stringify(decision.missingSlots), JSON.stringify(decision.issues), decision.schemaVersion, decision.policyVersion, input.createdAt).lastInsertRowid);
+          JSON.stringify(decision.missingSlots), JSON.stringify(decision.issues), decision.schemaVersion, decision.policyVersion, input.createdAt,json(decision.executionPlan??null)).lastInsertRowid);
       this.event(run, { type: 'route_decided', payload: { contract: 'medclaw.event/v1', runId: run.id, inputId: run.input_id, decisionId,
         intentCallId: decision.intentCallId, route: decision.route, decisionSource: decision.decisionSource, matchedBy: decision.matchedBy,
         status: decision.status, queryParamsHash: decision.queryParams === null ? null : hash(canonicalRequest(decision.queryParams)) } }, `route:${decisionId}`, 1, input.createdAt);
@@ -279,7 +301,7 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
     const snapshot=this.db.query<{run_id:number;session_id:number;input_id:number;snapshot_json:string},[number]>('SELECT * FROM context_snapshots WHERE id=?').get(row.snapshot_id);
     if(!snapshot||snapshot.run_id!==run.id||snapshot.session_id!==run.session_id||snapshot.input_id!==run.input_id)fail('storage_read_failed');
     const body=checked(ContextSnapshotBodySchema,decoded(snapshot.snapshot_json));
-    if(body.renderedProjection!==renderIntentContext(registration.input)||hash(body.renderedProjection)!==body.projectionHash)fail('storage_read_failed');
+    if(!isDeepStrictEqual(body.intentSource,intentContextSource(registration.input))||body.renderedProjection!==renderIntentContext(registration.input)||hash(body.renderedProjection)!==body.projectionHash)fail('storage_read_failed');
     return registration.input;
   }
   prepareIntentInput(raw: PrepareIntentInput) {
@@ -345,36 +367,50 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
       }
       let previousQueryContext:QueryContextRecord|null=null;
       if(nearestCondition){
-        const entry=decoded(nearestCondition.entry_json) as {data:unknown},adopted=checked(AdoptedContextFactSchema,entry.data);
+        const entry=decoded(nearestCondition.entry_json) as {data:unknown},adopted=checked(QueryContextFactSchema,entry.data);
         const cached=this.db.query<Record<string,unknown>,[number]>('SELECT * FROM query_contexts WHERE session_id=?').get(run.session_id);
         const branchIds=[...branch.keys()],projectionIndex=branchIds.indexOf(cached?.native_leaf_id as string);
-        if(!cached||cached.schema_version!=='medclaw.intent/v2'||projectionIndex<0||projectionIndex>branchIds.indexOf(nearestCondition.native_entry_id)
+        if(!cached||projectionIndex<0||projectionIndex>branchIds.indexOf(nearestCondition.native_entry_id)
           ||nearestCondition.run_id!==adopted.sourceRunId)fail('storage_read_failed');
-        const context=checked(QueryContextRecordSchema,{sessionId:cached.session_id,nativeLeafId:cached.native_leaf_id,version:cached.version,
-          sourceInputId:cached.source_input_id,sourceRunId:cached.source_run_id,taskIntents:decoded(cached.task_intents_json as string),contextIntentId:cached.context_intent_id,
-          adoptedSlots:decoded(cached.adopted_slots_json as string),scopeBatchHashes:decoded(cached.scope_batch_hashes_json as string),queryIds:decoded(cached.query_ids_json as string),pendingClarification:decoded(cached.pending_clarification_json as string|null)});
-        const {contract:_contract,decisionId,...adoptedFields}=adopted,{sessionId:_sessionId,nativeLeafId:_leaf,version:_version,...contextFields}=context;
+        const context=this.readContextProjection(cached),decisionId=adopted.decisionId;
         const source=this.owner(adopted.sourceRunId,run.session_id,adopted.sourceInputId),route=this.route(source.id);
         const executionRow=nearestCondition.parent_entry_id===null?null:branch.get(nearestCondition.parent_entry_id);
         const nativeExecution=executionRow?decoded(executionRow.entry_json) as {type:string;customType:string;data:unknown}:null;
-        if(!isDeepStrictEqual(adoptedFields,contextFields)||source.status!=='completed'||!route||route.id!==decisionId||executionRow?.run_id!==source.id
-          ||nativeExecution?.type!=='custom'||nativeExecution.customType!=='medclaw-intent-execution')fail('storage_read_failed');
-        const execution=checked(IntentExecutionFactSchema,nativeExecution.data),decision=this.decision(route);
-        if(execution.decisionId!==decisionId||!isDeepStrictEqual(execution.taskIntents,adopted.taskIntents)||!isDeepStrictEqual(decision.adoptedIntents,adopted.taskIntents)
-          ||decision.contextIntentId!==adopted.contextIntentId||!isDeepStrictEqual(decision.adoptedSlots,adopted.adoptedSlots))fail('storage_read_failed');
-        const queries=new SqliteToolStore(this.db),queryRefs=execution.stepResults.flatMap(step=>step.queryRefs);
+        if(source.status!=='completed'||!route||route.id!==decisionId||executionRow?.run_id!==source.id||nativeExecution?.type!=='custom')fail('storage_read_failed');
+        const decision=this.decision(route),queryRefs:{queryId:number;resultHash:string}[]=[];
+        if(adopted.contract==='medclaw.query-form-context/v1'){
+          if(!('contract' in context)||nativeExecution.customType!=='medclaw-query-form-execution'||decision.decisionSource!=='user_form')fail('storage_read_failed');
+          const {sessionId:_sessionId,nativeLeafId:_leaf,version:_version,pendingClarification:_pending,...fact}=context;
+          const execution=checked(FormExecutionFactSchema,nativeExecution.data);
+          if(!isDeepStrictEqual(fact,adopted)||!isDeepStrictEqual(decision.queryParams,adopted.params)||execution.decisionId!==decisionId
+            ||!isDeepStrictEqual(adopted.queryIds,[execution.queryId]))fail('storage_read_failed');
+          queryRefs.push({queryId:execution.queryId,resultHash:execution.resultHash});
+        }else{
+          if('contract' in context||nativeExecution.customType!=='medclaw-intent-execution'||decision.decisionSource==='user_form')fail('storage_read_failed');
+          const {contract:_contract,decisionId:_decision,...adoptedFields}=adopted,{sessionId:_sessionId,nativeLeafId:_leaf,version:_version,...contextFields}=context;
+          const execution=checked(IntentExecutionFactSchema,nativeExecution.data);
+          if(!isDeepStrictEqual(adoptedFields,contextFields)||execution.decisionId!==decisionId||!isDeepStrictEqual(execution.taskIntents,adopted.taskIntents)
+            ||!isDeepStrictEqual(decision.adoptedIntents,adopted.taskIntents)||decision.contextIntentId!==adopted.contextIntentId
+            ||!isDeepStrictEqual(decision.adoptedSlots,adopted.adoptedSlots))fail('storage_read_failed');
+          queryRefs.push(...execution.stepResults.flatMap(step=>step.queryRefs));
+        }
+        const queries=new SqliteToolStore(this.db);
         for(const queryId of adopted.queryIds){const query=queries.readQuery(queryId),ref=queryRefs.find(ref=>ref.queryId===queryId);
-          if(!query||!ref||query.runId!==source.id||query.sessionId!==run.session_id||query.inputId!==source.input_id||query.resultHash!==ref.resultHash)fail('storage_read_failed');}
+          if(!query||!ref||query.runId!==source.id||query.sessionId!==run.session_id||query.inputId!==source.input_id||query.resultHash!==ref.resultHash
+            ||adopted.contract==='medclaw.query-form-context/v1'&&(query.source!=='user_form'||!isDeepStrictEqual(query.params,adopted.params)
+              ||query.callRef!==`form:${source.id}:${source.input_id}`))fail('storage_read_failed');}
         if(isDeepStrictEqual(context.scopeBatchHashes,scopeBatchHashes))previousQueryContext=context;
       }
-      const catalog=new SqliteCatalogStore(this.db),batches=catalog.readBatches(scope.batchIds),rows=catalog.readSnapshots(scope.batchIds,scope.deviceIds);
+      const catalog=new SqliteCatalogStore(this.db),batches=catalog.readBatches(scope.batchIds),rows=catalog.readIntentSnapshots(scope.batchIds,scope.deviceIds);
       const unique=(values:string[])=>[...new Set(values)].sort();
       return checked(IntentInputProjectionSchema,{contract:'medclaw.intent-input/v2',runId:run.id,sessionId:run.session_id,inputId:run.input_id,
         baseLeafId:frozen.baseLeafId,baseStorageVersion:frozen.baseStorageVersion,text:content.text,referenceDate:run.reference_date,timezone:run.timezone,
         scope,scopeBatchHashes,previousQueryContext,pendingClarification:latestBusinessResultSeen?pendingClarification:previousQueryContext?.pendingClarification??null,recentTurns:recentTurns.reverse(),
         selectedEntities:(scope.deviceIds??[]).map(deviceId=>{const row=rows.find(row=>row.deviceId===deviceId);if(!row)fail('access_denied');return {deviceId,label:row.deviceName};}),
         availableData:{regions:unique(batches.map(batch=>batch.region)),dates:unique(batches.map(batch=>batch.snapshotDate)),currencies:unique(rows.map(row=>row.currency)),units:unique(rows.map(row=>row.unit))},
-        enabledL2:input.enabledL2,availableToolNames:scope.allowedToolNames,versions:{configVersion:frozen.selection.configVersion,...INTENT_VERSIONS}});
+        enabledL2:input.enabledL2,availableToolNames:scope.allowedToolNames,versions:{configVersion:frozen.selection.configVersion,
+          taxonomyVersion:frozen.selection.taxonomyVersion,ruleVersion:frozen.selection.ruleVersion,classifyPromptVersion:frozen.selection.classifyPromptVersion,
+          verifyPromptVersion:frozen.selection.verifyPromptVersion,schemaVersion:frozen.selection.schemaVersion,policyVersion:frozen.selection.policyVersion}});
     }).deferred(); }catch(error){if(error instanceof Error&&error.name==='SQLiteError')fail('storage_read_failed');throw error;}
   }
 }

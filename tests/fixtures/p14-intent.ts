@@ -1,4 +1,4 @@
-import { CONTEXT_MATERIAL_PREFIX, renderIntentContext } from '../../packages/contracts/src/context';
+import { CONTEXT_MATERIAL_PREFIX, IntentModelViewSchema, readIntentContext } from '../../packages/contracts/src/context';
 import { IntentStageInputSchema } from '../../packages/contracts/src/intent';
 import { BusinessDataSchema } from '../../packages/contracts/src/query';
 
@@ -67,7 +67,8 @@ export function intentCatalogData() {
 }
 
 export function readIntentStageMessage(content: string) {
-  const input = IntentStageInputSchema.parse(JSON.parse(content.slice(CONTEXT_MATERIAL_PREFIX.length).split('\n', 1)[0]!));
-  if (renderIntentContext(input) !== content) throw new Error('Unexpected intent Context rendering');
-  return input;
+  if (content.startsWith(CONTEXT_MATERIAL_PREFIX + '{"contract":"medclaw.intent-model-view/v1"')) {
+    return IntentModelViewSchema.parse(JSON.parse(content.slice(CONTEXT_MATERIAL_PREFIX.length)));
+  }
+  return readIntentContext(content);
 }

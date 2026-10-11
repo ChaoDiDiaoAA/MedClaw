@@ -9,7 +9,7 @@ import { canonicalRequest, RuntimeControlViewSchema, safePreview, type AgentRunt
 import { SubmitInputSchema, type NativeSessionBindings, type SubmitInput, type SubmitResult, type InputControl, type SessionInput,
   type InputContent, type InputSettlementProof } from "../../../contracts/src/session";
 import { sameSubmission } from '../session/session-service';
-import type { QueryExecutionContext } from '../../../contracts/src/query';
+import { QueryParamsSchema, type QueryExecutionContext, type QueryParams } from '../../../contracts/src/query';
 import type { RunScope } from '../../../contracts/src/run';
 import { normalizeToolConfiguration } from '../../../contracts/src/tool-config';
 import { normalizeRuntimeConfiguration, projectRuntimePolicies } from '../../../contracts/src/runtime-config';
@@ -24,8 +24,9 @@ import { ChildResultSchema, NativeAgentReplySchema, type BoundChildIdentity, typ
 import { createHash } from 'node:crypto';
 import { RunControl } from './run-control';
 import { IntentModelSelectionSchema, INTENT_VERSIONS } from '../../../contracts/src/model';
-import { IntentAgentTaskSchema, IntentQueryStepInputSchema, type IntentDecision, type IntentInputProjection, type FrozenIntentAdmission, type ProductSettlement } from '../../../contracts/src/intent';
+import { IntentAgentTaskSchema, IntentQueryStepInputSchema, type IntentDecision, type IntentInputProjection, type FrozenIntentAdmission, type ProductSettlement, type IntentStepResult } from '../../../contracts/src/intent';
 import { compileIntentStepQueries } from '../intent/route-policy';
+import { renderQueryAnswer } from '../intent/render-query-answer';
 import type { IntentService } from '../intent/intent-service';
 import type { QueryService } from '../data/query-service';
 
@@ -38,6 +39,8 @@ type Execution = { handle: RunHandle; operationRef: string; abort: AbortControll
   rootInputId: number | null; acceptingInputs: boolean; stopEpoch: number; inputSettlement?: InputSettlementProof;
   extensionReleaseBasis?: 'not_loaded';
   control?: RunControl; intentAdmission?: FrozenIntentAdmission; productSettlement?: ProductSettlement;
+  form?: { params: QueryParams; baseLeafId: string | null; baseStorageVersion: number; basedOnQueryId: number | null; workspaceRevision: number };
+  inheritedSnapshotMode?:'exact_date'|'as_of'|null;
   productStarted?:boolean; intentFailure?:{status:'failed'|'cancelled';error:AppError|null;at:string};
   pendingInputFailures: Map<number, Parameters<RuntimeRunStore['recordInputFailure']>[1]>;
   agentFields?: Omit<StartRunInput<ResolvedProviderSelection>, 'inputId' | 'submission' | 'resolved'>;
@@ -123,18 +126,6 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     if (!execution || execution.handle.runId !== runId || execution.stopped) return;
     execution.toolGap = true;
     this.checkpoint(execution, error); execution.abort.abort();
-  }
-  bindQueryContext(operationRef: string, expectedRevision: number): QueryExecutionContext {
-    const execution = this.execution, workspace = this.store.readWorkspace();
-    if (workspace.revision !== expectedRevision) throw new Error('state_conflict');
-    if (!execution || execution.handle.kind !== 'agent' || execution.handle.sessionId !== workspace.sessionId || !execution.scope
-      || !execution.referenceDate || !execution.timezone || execution.primaryError || execution.abort.signal.aborted || execution.stopped || execution.nativeTerminal) throw new Error('state_conflict');
-    if (!isDeepStrictEqual(workspace.batchRefs.map(batch => batch.id), execution.scope.batchIds)
-      || !isDeepStrictEqual(workspace.deviceIds.length ? workspace.deviceIds : null, execution.scope.deviceIds)) throw new Error('state_conflict');
-    return { runId: execution.handle.runId, inputId: execution.rootInputId, sessionId: execution.handle.sessionId!, source: 'user_form',
-      callRef: `${execution.handle.runId}:${operationRef}`, scope: structuredClone(execution.scope), referenceDate: execution.referenceDate,
-      timezone: execution.timezone, signal: execution.abort.signal, basedOnQueryId: workspace.queryId, workspaceRevision: expectedRevision,
-      checkActive: () => this.checkActive(execution) };
   }
   get busy() { return this.closing || this.modelControlBusy() || this.historyMutation!==null || this.manual!==null || this.reservation !== null || this.execution !== null
     || this.recoveryError !== null || this.recoveries.size > 0 ||this.manualRecoveries.size>0|| this.store.active() !== null || this.store.recoveryCandidates(this.instanceId).length > 0; }
@@ -326,28 +317,33 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       if (request.mode !== 'send') return this.submitQueuedInput(request, context);
       this.reserve(context.operationRef, request, "agent", request.sessionId);
       try {
-        if (request.routing?.originRunId != null) {
+        if (request.routing && 'originRunId' in request.routing && request.routing.originRunId != null) {
           if (!this.store.verifyIntentOrigin) throw safeError('state_conflict');
           this.store.verifyIntentOrigin(request);
         }
+        if (request.routing?.mode === 'explicit_agent_fallback') throw safeError('intent_confirmation_required');
         if (!this.agent) throw new Error("session_history_invalid");
         await this.agent.ensureLoaded(request.sessionId);
         const loadedSession=this.store.readSession(request.sessionId);
         if(!loadedSession||loadedSession.status!=='active')throw safeError('state_conflict',undefined,{reason:loadedSession?'session_deleted':'session_not_found'});
         const availability=this.agent.readAvailability(request.sessionId);if(availability.availability!=='ready')throw availability.error??safeError('session_history_invalid');
-        const intentRouted=request.routing?.mode==='intent',businessRouted=intentRouted||request.routing?.mode==='explicit_agent_fallback';
+        const form=request.routing?.mode==='user_form'?request.routing:null;
+        if(form&&(request.text!=='Query form: '+canonicalRequest(form.params)
+          ||!isDeepStrictEqual(form.params.batchIds,request.expectedBatchIds)))throw safeError('invalid_argument');
+        const intentRouted=request.routing?.mode==='intent',businessRouted=intentRouted||!!form;
         const config = this.settings();
         if(intentRouted&&(!this.intents||!config.intentModel?.enabled||!this.agent.appendProductTurn||!this.store.readHistorySnapshot||!this.store.startIntentRun))throw safeError('intent_model_unavailable');
+        if(form&&(!this.intents||!this.agent.appendProductTurn||!this.store.readHistorySnapshot||!this.store.startIntentRun))throw safeError('state_conflict');
         const resolved = await this.modelRuntime.resolve(request.model, config.configVersion,
-          config.credentialRefs[request.model.provider] ?? null, config.requestPolicy, !intentRouted);
+          config.credentialRefs[request.model.provider] ?? null, config.requestPolicy, !intentRouted&&!form);
         this.recheck(context.operationRef, config.configVersion);
         const intentAdmission=intentRouted?this.intents!.service.freeze(IntentModelSelectionSchema.parse({ ...config.intentModel,
           configVersion:config.configVersion,api:'ollama-chat',...INTENT_VERSIONS }),loadedSession.leafId,loadedSession.storageVersion):undefined;
-        const extensions = await this.agent.freezeExtensions?.(request.sessionId,config);
+        const extensions = form?undefined:await this.agent.freezeExtensions?.(request.sessionId,config);
         this.recheck(context.operationRef, config.configVersion);
         const workspace = this.store.readWorkspace(), scope = this.store.freezeAgentScope(workspace,
-          [...(this.agent.toolNames ?? []), ...(extensions?.source?.manifest.tools ?? []), ...(intentRouted?['query_intent_step']:[])].filter(name=>!businessRouted||name!=='Agent'));
-        const resources = await this.resources?.freeze(request.sessionId, config, scope), inputPlan = resources ? this.resources!.planInput(resources, request) : undefined;
+          form?[]:[...(this.agent.toolNames ?? []), ...(extensions?.source?.manifest.tools ?? []), ...(intentRouted?['query_intent_step']:[])].filter(name=>!businessRouted||name!=='Agent'));
+        const resources = form?undefined:await this.resources?.freeze(request.sessionId, config, scope), inputPlan = resources ? this.resources!.planInput(resources, request) : undefined;
         this.recheck(context.operationRef, config.configVersion);
         if (!isDeepStrictEqual(this.store.readWorkspace(), workspace)) throw safeError('state_conflict', undefined, { reason: 'workspace_revision_mismatch' });
         if (resources) scope.allowedResourceRefs = resources.available.map(snapshot => resourceRefKey(snapshot.ref));
@@ -355,7 +351,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const runtimeConfiguration = normalizeRuntimeConfiguration(config);
         const agentPolicy = projectRuntimePolicies(runtimeConfiguration).agentPolicy;
         let profiles: ReturnType<NonNullable<AgentRuntimePort<Resolved>['captureToolProfiles']>> | undefined;
-        try { profiles = this.agent.captureToolProfiles?.(scope); } catch { /* Missing statistics use the frozen configured timeout. */ }
+        try { if(!form)profiles = this.agent.captureToolProfiles?.(scope); } catch { /* Missing statistics use the frozen configured timeout. */ }
         const fields = { sessionId: request.sessionId, text: request.text, model: resolved.selection, policy: resolved.policy, goal: "answer" as const,
           workspace: toWorkspaceContext(workspace), scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: resolved.policy.timeoutMs,
           agentPolicy, runtimeConfiguration, toolConfiguration, ...(intentAdmission?{intentAdmission}:{}), ...(profiles ? structuredClone(profiles) : {}),
@@ -370,9 +366,14 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const execution = this.begin({ runId: accepted.runId, kind: 'agent', sessionId: request.sessionId }, context.operationRef);
         execution.rootInputId = accepted.inputId; execution.agentFields = fields;
         execution.scope = structuredClone(scope); execution.referenceDate = request.referenceDate; execution.timezone = request.timezone;
-        execution.acceptingInputs = !intentAdmission; execution.intentAdmission=intentAdmission; this.reservation = null;
+        execution.acceptingInputs = !intentAdmission&&!form; execution.intentAdmission=intentAdmission;
+        if(form)execution.form={params:form.params,baseLeafId:loadedSession.leafId,baseStorageVersion:loadedSession.storageVersion,
+          basedOnQueryId:request.expectedQueryId,workspaceRevision:request.expectedRevision};
+        this.reservation = null;
         const start={ ...fields, nativeReceiptLimitBytes, inputId: accepted.inputId, submission: null, resolved };
-        execution.task = intentAdmission?this.runIntent(execution,start):this.runAgent(execution,start);
+        // Return the committed acceptance before synchronous intent catalog preparation occupies the Host.
+        execution.task = intentAdmission ? new Promise<void>(resolve => setImmediate(resolve)).then(() => this.runIntent(execution,start))
+          : form ? this.runQueryForm(execution,start) : this.runAgent(execution,start);
         return accepted;
       } finally { if (this.reservation?.operationRef === context.operationRef) this.reservation = null; }
     }, "storage_write_failed", { operationRef: context.operationRef, sessionId: input.sessionId });
@@ -681,6 +682,42 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     };
     return compaction;
   }
+  private async runQueryForm(execution: Execution, input: StartRunInput<Resolved>) {
+    this.deadline(execution,input.timeoutMs);
+    const form=execution.form!,epoch=execution.stopEpoch;
+    const control=execution.control=new RunControl({runId:execution.handle.runId,scope:input.scope,signal:execution.abort.signal,
+      deadlineAt:execution.deadlineAt!,policy:input.agentPolicy,runtimeConfiguration:input.runtimeConfiguration,toolConfiguration:input.toolConfiguration});
+    const active=()=>{this.checkActive(execution);control.checkActive();if(execution.stopEpoch!==epoch)throw safeError('tool_cancelled');};
+    try {
+      active();this.store.startIntentRun!(execution.handle.runId,now());active();
+      const decision=this.intents!.service.read({runId:execution.handle.runId})?.decision;
+      if(!decision||decision.decisionSource!=='user_form'||!isDeepStrictEqual(decision.queryParams,form.params))throw safeError('state_conflict');
+      const query=await this.intents!.queries.execute(form.params,{runId:execution.handle.runId,sessionId:input.sessionId,inputId:input.inputId,
+        source:'user_form',callRef:`form:${execution.handle.runId}:${input.inputId}`,scope:input.scope,referenceDate:input.referenceDate,
+        timezone:input.timezone,signal:execution.abort.signal,checkActive:active,basedOnQueryId:form.basedOnQueryId,workspaceRevision:form.workspaceRevision});
+      if(!query.ok)throw query.error;active();
+      const record=query.data,text=`Query #${record.id} completed with ${record.rows.length} result rows.\n${JSON.stringify({parameters:record.params,interpretation:record.interpretation??null,warnings:record.warnings})}`;
+      execution.productStarted=true;
+      const turn=await this.agent!.appendProductTurn!({mode:'user_form',runId:execution.handle.runId,sessionId:input.sessionId,inputId:input.inputId!,
+        baseLeafId:form.baseLeafId,baseStorageVersion:form.baseStorageVersion,occurredAt:now(),text:input.text,decisionId:decision.id,
+        result:{kind:'result',text,queryIds:[record.id],missingSlots:[]},
+        execution:{contract:'medclaw.query-form-execution/v1',decisionId:decision.id,queryId:record.id,resultHash:record.resultHash},
+        adoptedContext:{contract:'medclaw.query-form-context/v1',decisionId:decision.id,sourceRunId:execution.handle.runId,sourceInputId:input.inputId!,
+          params:QueryParamsSchema.parse(record.params),queryIds:[record.id],scopeBatchHashes:[...new Set(input.workspace.batchRefs.map(batch=>batch.contentHash))].sort()}});
+      active();execution.acceptingInputs=false;execution.stopped=true;execution.executionStarted=false;execution.extensionReleaseBasis='not_loaded';
+      execution.budgetSummary=control.summary();
+      execution.productSettlement={contract:'medclaw.product-settlement/v1',basis:'product_history',nativeUserEntryId:turn.userEntryId,
+        runId:execution.handle.runId,sessionId:input.sessionId,inputId:input.inputId!,admissionClosed:true,requestSettled:true,routeSettled:true,requiredFactsSaved:true,pendingFactsEmpty:true};
+      execution.fact={status:'completed',resultSource:'user_form',outputText:text,error:null,calls:[],history:turn.history,productTurn:turn,
+        productSettlement:execution.productSettlement,stoppedAt:null,endedAt:now(),cancelRequestedAt:null,cleanup:this.cleanup(execution,true)};
+      this.saveFinal(execution);
+    }catch(error){
+      const parsed=AppErrorSchema.safeParse(error),failure=parsed.success?parsed.data:safeError('internal_error');
+      if(execution.cause!=='user')this.checkpoint(execution,failure);
+      execution.intentFailure={status:execution.cause==='user'?'cancelled':'failed',error:execution.cause==='user'?null:execution.primaryError??failure,at:execution.failureAt??now()};
+      await this.finishIntentFailure(execution);
+    }finally{if(execution.stopped)this.clearDeadline(execution);}
+  }
   private async runIntent(execution: Execution, input: StartRunInput<Resolved>) {
     this.deadline(execution,input.timeoutMs);
     const admission=execution.intentAdmission!,epoch=execution.stopEpoch;
@@ -697,8 +734,14 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       active();
       this.store.startIntentRun!(execution.handle.runId,now());active();
       const projection=this.intents!.service.prepareInput(execution.handle.runId);
+      const prior=projection.previousQueryContext;
+      const inherited=prior?.queryIds.map(queryId=>QueryParamsSchema.parse(this.intents!.queries.read(queryId,{runId:execution.handle.runId,sessionId:input.sessionId,
+        inputId:input.inputId,source:'intent',callRef:`intent-context:${execution.handle.runId}`,scope:input.scope,referenceDate:input.referenceDate,
+        timezone:input.timezone,signal:execution.abort.signal,checkActive:active}).params))??[];
+      execution.inheritedSnapshotMode=inherited.length&&inherited.every(params=>params.population==='snapshot'&&params.snapshotMode===inherited[0]!.snapshotMode)
+        ?inherited[0]!.snapshotMode:null;
       const {decision,decisionId}=await this.intents!.service.recognize(projection,admission.selection,{signal:execution.abort.signal,
-        control,checkActive:active,workspaceContext:toWorkspaceContext(input.workspace),expectedCancelEpoch:epoch,admission});
+        control,checkActive:active,workspaceContext:toWorkspaceContext(input.workspace),expectedCancelEpoch:epoch,admission,inheritedSnapshotMode:execution.inheritedSnapshotMode});
       active();
       if(decision.route==='agent') {
         const resolved=await this.modelRuntime.resolve({provider:input.model.provider,modelId:input.model.modelId,expectedConfigVersion:input.model.configVersion},
@@ -711,23 +754,40 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         callRef:`intent:${execution.handle.runId}:${decisionId}:${decision.adoptedIntents[0]?.id??'none'}`,scope:input.scope,
         referenceDate:input.referenceDate,timezone:input.timezone,signal:execution.abort.signal,checkActive:active};
       let query:Awaited<ReturnType<QueryService['execute']>>|null=null;
-      if(decision.route==='simple') {query=await this.intents!.queries.execute(decision.queryParams!,queryContext);if(!query.ok)throw query.error;}
+      const committedQueries:import('../../../contracts/src/query').QueryRecord[]=[],stepResults:IntentStepResult[]=[];
+      if(decision.executionPlan){
+        for(const step of decision.executionPlan.steps){
+          active();if(step.dependsOn.some(id=>!stepResults.some(result=>result.stepId===id)))throw safeError('state_conflict');
+          const refs:IntentStepResult['queryRefs']=[];
+          for(const [part,params] of step.queries.entries()){
+            active();const result=await this.intents!.queries.execute(params,{...queryContext,callRef:`intent:${execution.handle.runId}:${decisionId}:${step.stepId}:${part}`});
+            if(!result.ok)throw result.error;
+            committedQueries.push(result.data);refs.push({queryId:result.data.id,resultHash:result.data.resultHash});active();
+          }
+          const metadata=step.metadata?{stepId:step.stepId,part:0 as const,basis:'snapshot_date' as const,
+            batches:this.intents!.service.readFreshness(decision.adoptedIntents.find(item=>item.id===step.stepId)!,queryContext)}:undefined;
+          stepResults.push({stepId:step.stepId,queryRefs:refs,...(metadata?{metadata}:{})});
+        }
+      }else if(decision.route==='simple') {query=await this.intents!.queries.execute(decision.queryParams!,queryContext);if(!query.ok)throw query.error;}
       active();
       const record=query?.ok?query.data:null,queryIds=record?[record.id]:[];
-      const text=record?`Query #${record.id} completed with ${record.rows.length} result rows.\n${JSON.stringify({parameters:record.params,interpretation:record.interpretation??null,warnings:record.warnings})}`
+      const plannedResult=decision.executionPlan?renderQueryAnswer(decision.executionPlan,committedQueries,stepResults):null;
+      if(plannedResult)queryIds.push(...plannedResult.queryIds);
+      const text=plannedResult?.text??(record?`Query #${record.id} completed with ${record.rows.length} result rows.\n${JSON.stringify({parameters:record.params,interpretation:record.interpretation??null,warnings:record.warnings})}`
         :decision.route==='reject'?'This request is outside the supported medical device data tasks.'
         :decision.status==='UNSUPPORTED_DATA'?`The current data or tools cannot support this request. ${decision.issues.map(issue=>issue.message).join(' ')}`
-        :decision.missingSlots.length?`Please provide: ${decision.missingSlots.join(', ')}.`:'Please clarify the task before execution.';
+        :decision.missingSlots.length?`Please provide: ${decision.missingSlots.join(', ')}.`:'Please clarify the task before execution.');
       execution.productStarted=true;
       const productTurn=await this.agent!.appendProductTurn!({mode:'program',runId:execution.handle.runId,sessionId:input.sessionId,inputId:input.inputId!,
         text:input.text,baseLeafId:admission.baseLeafId,baseStorageVersion:admission.baseStorageVersion,occurredAt:now(),decisionId,
-        result:{kind:record?'result':decision.route==='reject'?'out_of_scope':decision.status==='UNSUPPORTED_DATA'?'insufficient_evidence':'clarification',
+        result:{kind:plannedResult||record?'result':decision.route==='reject'?'out_of_scope':decision.status==='UNSUPPORTED_DATA'?'insufficient_evidence':'clarification',
           text,queryIds,missingSlots:decision.missingSlots},
         execution:{contract:'medclaw.intent-execution/v1',decisionId,taskIntents:decision.adoptedIntents,
-          stepResults:record?[{stepId:decision.adoptedIntents[0]!.id,queryRefs:[{queryId:record.id,resultHash:record.resultHash}]}]:[]},
+          stepResults:decision.executionPlan?stepResults:record?[{stepId:decision.adoptedIntents[0]!.id,queryRefs:[{queryId:record.id,resultHash:record.resultHash}]}]:[]},
         adoptedContext:decision.contextIntentId&&decision.adoptedSlots?{contract:'medclaw.query-context-entry/v2',decisionId,
           sourceRunId:execution.handle.runId,sourceInputId:input.inputId!,taskIntents:decision.adoptedIntents,contextIntentId:decision.contextIntentId,
-          adoptedSlots:decision.adoptedSlots,scopeBatchHashes:projection.scopeBatchHashes,queryIds,
+          adoptedSlots:decision.adoptedSlots,scopeBatchHashes:projection.scopeBatchHashes,
+          queryIds:decision.executionPlan?stepResults.find(step=>step.stepId===decision.contextIntentId)?.queryRefs.map(ref=>ref.queryId)??[]:queryIds,
           pendingClarification:decision.route==='clarify'?{taskText:projection.pendingClarification?.taskText??input.text,missingSlots:decision.missingSlots}:null}:null});
       active();
       if(this.intents!.service.hasPendingSave(execution.handle.runId))throw safeError('storage_write_failed');
@@ -752,7 +812,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     execution.budgetSummary=execution.control!.summary();execution.acceptingInputs=false;
     execution.stopped=true;execution.executionStarted=false;execution.extensionReleaseBasis='not_loaded';
     this.clearDeadline(execution);
-    if(this.intents!.service.hasPendingSave(execution.handle.runId)){this.persistenceFailure(execution);return;}
+    if(!execution.form&&this.intents!.service.hasPendingSave(execution.handle.runId)){this.persistenceFailure(execution);return;}
     try {
       if(execution.intentFailure.status==='cancelled'&&execution.cancelAt)this.store.requestCancel(execution.handle.runId,execution.cancelAt);
       if(execution.productStarted){
@@ -764,7 +824,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         runId:execution.handle.runId,sessionId:execution.handle.sessionId!,inputId:execution.rootInputId!,
         admissionClosed:true,requestSettled:true,routeSettled:true,requiredFactsSaved:true,pendingFactsEmpty:true};
       const failure=execution.intentFailure;
-      execution.fact={status:failure.status,resultSource:'program',outputText:null,error:failure.error,calls:[],productSettlement:execution.productSettlement,
+      execution.fact={status:failure.status,resultSource:execution.form?'user_form':'program',outputText:null,error:failure.error,calls:[],productSettlement:execution.productSettlement,
         stoppedAt:null,endedAt:failure.at,cancelRequestedAt:execution.cancelAt,cleanup:this.cleanup(execution,true)};
       this.saveFinal(execution);
     }catch{this.persistenceFailure(execution);}
@@ -781,7 +841,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       const saved=this.intents!.service.read({runId:execution.handle.runId});
       if(saved?.decision?.id!==intent!.decisionId||saved.decision.route!=='agent'||!isDeepStrictEqual(saved.decision.adoptedIntents,task.taskIntents))throw safeError('state_conflict');
       const devices=saved.calls.find(call=>call.callId===intent!.decision.intentCallId)?.validation?.resolvedDeviceIds.find(value=>value.intentId===item.id)?.deviceIds??[];
-      return [item.id,compileIntentStepQueries(item,intent!.projection,devices)] as const;
+      return [item.id,compileIntentStepQueries(item,intent!.projection,devices,execution.inheritedSnapshotMode??null)] as const;
     }));
     try {
       const observed = await this.credentials({ purpose: "runtime", operationRef: execution.operationRef, credentialRef: input.model.credentialRef }, () => {
@@ -951,10 +1011,10 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   }
   cancelNow(runId: number): CancelRunResult {
     const execution = this.execution;
-    const saved=execution?.handle.runId===runId&&execution.intentAdmission&&!execution.finalCommitted?this.store.read({runId}):null;
+    const saved=execution?.handle.runId===runId&&(execution.intentAdmission||execution.form)&&!execution.finalCommitted?this.store.read({runId}):null;
     const pendingIntent=saved?.kind==='one'&&!!saved.run&&['created','running'].includes(saved.run.status);
-    const pendingProduct=pendingIntent&&execution!.stopped&&execution!.fact&&'calls' in execution!.fact&&execution!.fact.resultSource==='program'&&execution!.fact.status==='completed';
-    const pendingAgent=pendingIntent&&execution!.stopped&&execution!.fact&&'calls' in execution!.fact&&execution!.fact.resultSource!=='program'&&execution!.fact.status==='completed';
+    const pendingProduct=pendingIntent&&execution!.stopped&&execution!.fact&&'calls' in execution!.fact&&['program','user_form'].includes(execution!.fact.resultSource??'pi')&&execution!.fact.status==='completed';
+    const pendingAgent=pendingIntent&&execution!.stopped&&execution!.fact&&'calls' in execution!.fact&&!['program','user_form'].includes(execution!.fact.resultSource??'pi')&&execution!.fact.status==='completed';
     if (execution?.handle.runId === runId && (!execution.stopped||pendingProduct||pendingAgent)) {
       execution.acceptingInputs = false; execution.stopEpoch++;
       if ((pendingIntent||!execution.nativeTerminal)&&!execution.cause&&!execution.primaryError) { execution.cause = "user"; execution.cancelAt ??= now(); }
@@ -1010,7 +1070,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       if (!execution || execution.handle.runId !== runId || !execution.pendingSave || !execution.stopped || !execution.fact) throw new Error("run_save_unavailable");
       if (!execution.finalCommitted && execution.handle.kind === 'agent') {
         this.retryCompactionPersistence(execution);
-        if(!('calls' in execution.fact&&execution.fact.resultSource==='program')){
+        if(!('calls' in execution.fact&&['program','user_form'].includes(execution.fact.resultSource??'pi'))){
           this.agent?.retryContextPersistence?.(runId); this.agent?.retryToolPersistence?.(runId); this.agent?.retryInputPersistence?.(runId);
           this.agent?.retryHistoryPersistence?.(runId);
         }
@@ -1039,7 +1099,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     }
     if(execution?.handle.runId===runId&&execution.pendingSave&&execution.stopped&&execution.fact){
       this.retryCompactionPersistence(execution);await this.agent?.retrySubagentPersistence?.(runId);
-      if(!('calls' in execution.fact&&execution.fact.resultSource==='program')){
+      if(!('calls' in execution.fact&&['program','user_form'].includes(execution.fact.resultSource??'pi'))){
         this.agent?.retryContextPersistence?.(runId);this.agent?.retryToolPersistence?.(runId);this.agent?.retryInputPersistence?.(runId);this.agent?.retryHistoryPersistence?.(runId);
         await this.agent?.retryProductPersistence?.(runId);
       }

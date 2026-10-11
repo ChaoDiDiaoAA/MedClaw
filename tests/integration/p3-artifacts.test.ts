@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { openDatabase } from '../../packages/storage/src/database';
 import { ArtifactStore, PACKAGE_LIMITS, hashFile, listPackageFiles, permittedRelativePath } from '../../packages/storage/src/artifact-store';
 import { SqliteImportStore } from '../../packages/storage/src/import-store';
+import { ArtifactSchema } from '../../packages/contracts/src/data';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -19,7 +20,8 @@ test('P3 managed package keeps original delivery manifest separate and cannot im
     expect(readFileSync(join(artifacts.inputPath(id), 'manifest.json'), 'utf8')).toBe('{"status":"complete"}');
     expect(artifacts.manifestPath(id)).toBe(join(root, 'artifacts', String(id), 'manifest.json'));
     expect(artifacts.manifestPath(id)).not.toBe(join(artifacts.inputPath(id), 'manifest.json'));
-    const read = await artifacts.read(id); expect(read.ok && read.data?.status).toBe('reserved'); expect(read.ok && read.data?.sourceLockHash).toBeNull();
+    const read = await artifacts.read(id), artifact = read.ok ? ArtifactSchema.parse(read.data) : null;
+    expect(artifact?.status).toBe('reserved'); expect(artifact?.sourceLockHash).toBeNull();
     expect(imports.read('reserved')?.operation.result).toBeNull(); expect(imports.revision()).toBe(0);
     await expect(artifacts.copy(id, 'other-operation', source, new AbortController().signal)).rejects.toThrow('state_conflict');
     await expect(artifacts.verifyManifest(id, 'reserved')).rejects.toThrow('artifact_not_ready');

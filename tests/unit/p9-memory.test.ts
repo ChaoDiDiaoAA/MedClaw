@@ -13,7 +13,8 @@ test('p9 operation read output must match the requested kind, including a nullab
   expect(publicOutputSchema('evidence.readOperation',{kind:'session_checkpoint',operationRef:receipt.operationRef}).parse(receipt)).toEqual(receipt);
   expect(publicOutputSchema('evidence.readOperation',{kind:'session_checkpoint',operationRef:receipt.operationRef}).parse(null)).toBeNull();
   expect(()=>publicOutputSchema('evidence.readOperation',{kind:'import',operationRef:receipt.operationRef}).parse(receipt)).toThrow();
-  expect(()=>publicOutputSchema('evidence.readOperation',{kind:'export',operationRef:receipt.operationRef})).toThrow();
+  expect(()=>publicOutputSchema('evidence.readOperation',{kind:'export',operationRef:receipt.operationRef}).parse(receipt)).toThrow();
+  expect(publicOutputSchema('evidence.readOperation',{kind:'export',operationRef:receipt.operationRef}).parse(null)).toBeNull();
 });
 
 test('p9 raw history preserves SDK provider tool IDs containing a pipe',async()=>{
@@ -148,7 +149,8 @@ test('p9 checkpoint receipt operation reads are strict and remain read only', ()
   const route = publicMethodSchemas['evidence.readOperation'];
   expect(route.input.safeParse({ kind: 'session_checkpoint', operationRef: 'restore-1' }).success).toBe(true);
   expect(route.input.safeParse({ kind: 'import', operationRef: 'import-1' }).success).toBe(true);
-  expect(route.input.safeParse({ kind: 'export', operationRef: 'future' }).success).toBe(false);
+  expect(route.input.safeParse({ kind: 'export', operationRef: 'export-1' }).success).toBe(true);
+  expect(route.input.safeParse({ kind: 'unknown', operationRef: 'future' }).success).toBe(false);
   expect(route.input.safeParse({ kind: 'session_checkpoint', operationRef: 'restore-1', targetLeafId: 'no-write' }).success).toBe(false);
   expect(isReadOnlyMethod('evidence.readOperation')).toBe(true);
 });
@@ -165,7 +167,7 @@ test('p9 persisted history event records its original version and leaf, never pr
 test('p9 safe errors and actual runner registration expose this stage', () => {
   expect(safeError('answer_evidence_invalid')).toMatchObject({ code: 'answer_evidence_invalid', category: 'runtime', retryable: false });
   for (const reason of ['checkpoint_invalid', 'history_version_mismatch', 'session_restore_failed'] as const) expect(safeError('state_conflict', undefined, { reason })).toMatchObject({ reason });
-  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p14-v1'); expect(DATABASE_SCHEMA_VERSION).toBe(13);
+  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p15-v3'); expect(DATABASE_SCHEMA_VERSION).toBe(15);
   expect(discoverTests('unit', 'P9')).toContain(join(import.meta.dir, 'p9-memory.test.ts'));
 });
 

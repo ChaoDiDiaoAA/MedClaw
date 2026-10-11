@@ -9,6 +9,7 @@ import type { AppError, Result } from "./error";
 import type { StoredOperation, RunHandle, RegisterAgentInput } from "./run";
 import type { ReadSessionMessagesInput, SessionMessagePage } from "./messages";
 import { ResourceInputPlanSchema, NativeInputReceiptSchema, RESOURCE_LIMITS, type ResourceInputPlan, type NativeInputReceipt } from './resources';
+import { QueryParamsSchema } from './query';
 
 export const NewSessionInputSchema = z.strictObject({ selectOnCreate: z.literal(true).default(true), expectedWorkspaceRevision: RevisionSchema });
 export const SelectSessionInputSchema = z.strictObject({ sessionId: PositiveIdSchema, expectedWorkspaceRevision: RevisionSchema });
@@ -161,6 +162,7 @@ export const SubmitInputSchema = z.discriminatedUnion("mode", [
   z.strictObject({ ...submissionFields, mode: z.literal("send"), routing: z.discriminatedUnion('mode', [
     z.strictObject({ mode: z.literal('intent'), originRunId: PositiveIdSchema.nullable() }),
     z.strictObject({ mode: z.literal('explicit_agent_fallback'), originRunId: PositiveIdSchema }),
+    z.strictObject({ mode: z.literal('user_form'), params: QueryParamsSchema }),
   ]).optional() }),
   z.strictObject({ ...submissionFields, mode: z.literal("steer"), targetRunId: PositiveIdSchema }),
   z.strictObject({ ...submissionFields, mode: z.literal("follow_up"), targetRunId: PositiveIdSchema }),

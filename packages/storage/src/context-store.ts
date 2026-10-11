@@ -18,6 +18,7 @@ import { freezeWorkspaceScope, resolveQueryRow, readWorkspaceQuery, readWorkspac
 import { PrepareChildContextInputSchema, type PrepareChildContextInput } from '../../contracts/src/context';
 import { readFrozenChild, readDeliveredChild } from './child-identity';
 import { IntentStageInputSchema, ProductResultDetailsSchema, QueryContextRecordSchema, type QueryContextRecord } from '../../contracts/src/intent';
+import { readIntentContext, intentContextSource } from '../../contracts/src/context';
 import { PrepareIntentContextInputSchema, type PrepareIntentContextInput } from '../../contracts/src/context';
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
@@ -42,14 +43,13 @@ export class SqliteContextStore implements ContextStore {
     const body = checked(ContextSnapshotBodySchema, JSON.parse(row.snapshot_json));
     if (hash(body.renderedProjection) !== body.projectionHash || hash(body.runtimeFeedback) !== body.feedbackHash || !body.renderedProjection.startsWith(CONTEXT_MATERIAL_PREFIX)) fail('storage_read_failed');
     const material = body.renderedProjection.slice(CONTEXT_MATERIAL_PREFIX.length);
-    const projection = JSON.parse(body.intentSource ? material.split('\n', 1)[0]! : material);
     if (body.intentSource) {
-      const stage = checked(IntentStageInputSchema, projection), input = stage.input;
+      const stage = readIntentContext(body.renderedProjection, body.intentSource.stageInput), input = stage.input;
       if (renderIntentContext(stage) !== body.renderedProjection) fail('storage_read_failed');
       if (body.delegationSource || input.runId !== row.run_id || input.sessionId !== row.session_id || input.inputId !== row.input_id
         || body.intentSource.inputId !== input.inputId || body.intentSource.baseLeafId !== input.baseLeafId
         || body.intentSource.baseStorageVersion !== input.baseStorageVersion) fail('storage_read_failed');
-    } else checked(ContextProjectionSchema, projection);
+    } else checked(ContextProjectionSchema, JSON.parse(material));
     return body;
   }
   private snapshot(row: SnapshotRow): ContextSnapshot {
@@ -254,7 +254,7 @@ export class SqliteContextStore implements ContextStore {
       const body = checked(ContextSnapshotBodySchema, { contract: 'medclaw.context/v1', workspaceContext: input.workspaceContext, selectedRefs,
         projectionHash: hash(renderedProjection), renderedProjection, runtimeFeedback, feedbackHash: hash(runtimeFeedback), resourceVersions: {},
         nativeRefs, omitted: [], projectionLimitBytes: 24 * 1024 + Buffer.byteLength(CONTEXT_MATERIAL_PREFIX),
-        intentSource: { contract: 'medclaw.intent-context/v1', inputId: input.inputId, baseLeafId: input.baseLeafId, baseStorageVersion: input.baseStorageVersion } }, 'intent_input_too_large');
+        intentSource: intentContextSource(input.projection) }, 'intent_input_too_large');
       return { input, body, sourceFingerprint: digest({ accepted: accepted.content_json, config: run.config_json, scope: run.scope_json,
         baseline: { leafId: session.current_leaf_id, storageVersion: session.storage_version }, batches, body }) };
     }).deferred(), 'storage_read_failed');

@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./export": "./src/export.ts",
     "./intent": "./src/intent.ts",
     "./error": "./src/error.ts",
     "./model": "./src/model.ts",

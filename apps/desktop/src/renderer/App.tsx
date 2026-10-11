@@ -21,6 +21,9 @@ import { ExtensionsPage } from './extensions-page';
 import { DataWorkspace } from "./data-workspace";
 import { QueryHistory } from "./query-history";
 import { useRunEvents } from "./use-run-events";
+import { canonicalRequest } from '../../../../packages/contracts/src/run';
+import type { QueryParams } from '../../../../packages/contracts/src/query';
+import type { DesktopExportDestinationSchema, DesktopExportDestinationResultSchema } from '../../../../packages/contracts/src/export';
 import "./styles.css";
 
 export interface DesktopBridge {
@@ -30,6 +33,7 @@ export interface DesktopBridge {
   discardSecret(token: string): Promise<void>;
   openAuthLink(url: string): Promise<Result<null>>;
   pickImportDirectory(operationRef: string): Promise<Result<{ fileToken: string; directoryName: string } | null>>;
+  chooseExportDestination(input: import('zod').z.infer<typeof DesktopExportDestinationSchema>): Promise<Result<import('zod').z.infer<typeof DesktopExportDestinationResultSchema>>>;
 }
 declare global { interface Window { medclaw: DesktopBridge } }
 export type ViewPage = "chat" | "data" | "queries" | "models" | "prompt" | "skills" | "extensions" | "settings";
@@ -63,6 +67,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   const [workspace, setWorkspace] = useState<WorkspaceView | null>(null), [workspaceConfirmed, setWorkspaceConfirmed] = useState(false), [selecting, setSelecting] = useState(false);
   const [catalog, setCatalog] = useState<PublicReturn<"data.read"> | null>(null), catalogRead = useRef(0);
   const [requestedQuery, setRequestedQuery] = useState<{ queryId: number; ownerSessionId: number } | null>(null);
+  const [queryFormRun,setQueryFormRun]=useState<{sessionId:number;runId:number;inputId:number}|null>(null);
   const [sessions, setSessions] = useState<SessionView[]>([]), [nextSession, setNextSession] = useState<number | null>(null);
   const [details, setDetails] = useState<Record<number, SessionDetail>>({}), [drafts, setDrafts] = useState<Record<number, SessionDraft>>({});
   const [management, setManagement] = useState<ManagementEditor | null>(null), managementRef = useRef(management);
@@ -598,6 +603,8 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
         editDraft(value.sessionId, { confirmedFailure: original.status !== 'delivery_unknown', resendConfirmed: false });
         setError(original.error ? errorMessage(original.error) : `Input ${original.id} ${original.status === 'delivery_unknown' ? 'consumption is unconfirmed' : 'failed or was cancelled'}. The original draft is retained.`);
       } else healthy = original.status === 'queued' || original.status === 'consumed';
+      if(original&&original.clientSequence===value.clientSequence&&original.mode===pending.input.mode&&value.runId!==null
+        &&pending.input.mode==='send'&&pending.input.routing?.mode==='user_form')setQueryFormRun({sessionId:value.sessionId,runId:value.runId,inputId:value.inputId});
     } else if (value.runId !== null) {
       const original = await readRun(value.runId);
       if (instance !== hostRef.current.instanceId || !ownsPending(pending.input.sessionId, pending)) return;
@@ -619,6 +626,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   }
   async function startIntentAction(source:RunView,mode:IntentAction) {
     if(source.kind!=='agent'||!canStartIntentAction(source))return;
+    if(mode==='explicit_agent_fallback'){setPage('queries');setError('Review and confirm query conditions before execution.');return;}
     const sessionId=source.sessionId,instance=hostRef.current.instanceId,workspace=workspaceRef.current!,draft=draftsRef.current[sessionId]!;
     const unchanged=()=>mounted.current&&hostRef.current.state==='ready'&&hostRef.current.instanceId===instance&&workspaceRef.current?.sessionId===sessionId
       &&workspaceRef.current.revision===workspace.revision&&!workspaceMutation.current&&!selectBusy.current&&runRef.current?.id===source.id
@@ -647,6 +655,11 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       await sendSession(false,next);
     }catch(error){if(unchanged())setError(error instanceof Error?error.message:'The original task could not be read. Refresh the original Run.');}
     finally{sendBusy.current=null;setSending(null);}
+  }
+  async function submitQueryForm(params:QueryParams) {
+    const sessionId=workspaceRef.current?.sessionId,draft=sessionId?draftsRef.current[sessionId]:null;
+    if(!draft)return;
+    await sendSession(false,{...draft,text:'Query form: '+canonicalRequest(params),mode:'send',routing:{mode:'user_form',params}});
   }
   async function sendSession(retry = false,preparedDraft?:SessionDraft) {
     const sessionId = workspaceRef.current?.sessionId, draft = preparedDraft??(sessionId ? draftsRef.current[sessionId] : null), instance = hostRef.current.instanceId;
@@ -764,7 +777,10 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
         onResumeCheckpoint={resumeCheckpoint} onRestoreSession={restoreSession} onHistoryVerified={refreshHistory}
         onDraft={patch => { if (current) editDraft(current, patch); }} onUseForSession={useForSession} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onNewAttempt={pending => { if (current) startNewAttempt({ instanceId: host.instanceId, sessionId: current, pending }); }} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} /></section>
       <section className="page-content" hidden={page !== "data"}><DataWorkspace host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} onDeleteCommit={commitDataDeletion} onDeleteResult={confirmDataDeletion} catalog={catalog} batches={catalog?.batches ?? []} onRefresh={page => void readCatalog(page)} onUpdate={updateWorkspace} onError={setError} /></section>
-      <section className="page-content" hidden={page !== "queries"}><QueryHistory visible={page === "queries"} requestedQuery={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} active={active} onUpdate={updateWorkspace} onError={setError} /></section>
+      <section className="page-content" hidden={page !== "queries"}><QueryHistory visible={page === "queries"} requestedQuery={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} writable={!!control?.acceptingNewRuns} active={active} onUpdate={updateWorkspace} onError={setError}
+        formRun={queryFormRun} formPending={draft?.pending??null} formResendConfirmed={!!draft?.resendConfirmed} onSubmitForm={submitQueryForm}
+        onReadSubmission={lookupSubmission} onResendSubmission={()=>sendSession(true)}
+        formReason={sending!==null?'A submission is being confirmed.':draft?.pending?'Read the original submission before starting another query.':!control?.acceptingNewRuns?'Wait for execution and saving to settle.':!draft?.model?'Select valid model metadata for this Session.':!draft.referenceDate||!draft.timezone?'Set the reference date and timezone in the Session.':null}/></section>
       <section className="page-content" hidden={page !== "models"}><ModelsPage directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control}
         sessionTarget={workspaceConfirmed && !selecting && current && currentDetail && host.instanceId ? { instanceId: host.instanceId, sessionId: current } : null} onUseForSession={useForSession}
         prompt={prompt} notification={authNotify} attempt={authAttempt} onChanged={changed} onAccepted={acceptedProvider} onError={setError} /></section>

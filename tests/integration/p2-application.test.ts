@@ -34,7 +34,7 @@ async function setup(beforeCommit?: () => void) {
   if (!modules[0] || !modules[1]) throw new Error("P2 Session/Workspace services are missing");
   const root = mkdtempSync(join(tmpdir(), "medclaw-p2-services-")); roots.push(root);
   const db = openDatabase(join(root, "db.sqlite")); handles.push(db);
-  const repo = new Repositories(db, beforeCommit);
+  const repo = new Repositories(db, beforeCommit, undefined, undefined, sqliteHistory(db).store);
   const previews = new Map<number, SessionDetail["history"] & { leafId: string | null }>();
   let allocated = 0, discarded = 0, delegated = 0, active: RunHandle | null = null;
   const bindings = {
@@ -79,6 +79,7 @@ test("selection CAS can browse B while A runs without creating execution or anot
   expect(selected.revision).toBe(2);
   expect(unwrap(await c.service.read(a.session.id)).runningRunId).toBe(7);
   expect(unwrap(await c.service.read(b.session.id)).runningRunId).toBeNull();
+  expect(unwrap(await c.service.read(b.session.id)).currentQueryContext).toBeNull();
   expect(await c.service.select({ sessionId: a.session.id, expectedWorkspaceRevision: 1 })).toMatchObject({ ok: false, error: { code: "state_conflict", reason: "workspace_revision_mismatch" } });
   expect(await c.service.select({ sessionId: 999, expectedWorkspaceRevision: 2 })).toMatchObject({ ok: false, error: { code: "input_invalid", reason: "session_not_found" } });
   expect(c.stats()).toEqual({ allocated: 2, discarded: 0, delegated: 0 });
@@ -90,6 +91,7 @@ test("metadata survives absent native binding and readonly restore/read never in
   const read = unwrap(await c.service.read(created.session.id));
   expect(read.session.nativeSessionId).toBe(created.session.nativeSessionId);
   expect(read.history).toEqual({ available: false, reason: "host_restart", messages: [], truncated: false });
+  expect(read.currentQueryContext).toBeNull();
   expect(unwrap(await c.workspace.restore())).toEqual(created.workspace); expect(unwrap(await c.service.list({})).sessions).toHaveLength(1);
   expect(c.db.query("SELECT * FROM sessions").all()).toEqual(before); expect(c.stats().allocated).toBe(1);
   expect(await c.service.read(999)).toMatchObject({ ok: false, error: { code: "input_invalid", reason: "session_not_found" } });

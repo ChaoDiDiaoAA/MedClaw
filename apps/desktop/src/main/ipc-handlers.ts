@@ -8,12 +8,27 @@ import { HostController } from "./host-controller.ts";
 import { MainSettings, type PublishOptions } from "./settings.ts";
 import { MainCredentials, SecretInputs } from "./credentials.ts";
 import { FileTokens } from "./file-tokens.ts";
+import { DestinationTokens } from './destination-tokens';
+import { DesktopExportDestinationSchema } from '../../../../packages/contracts/src/export';
 import { EventSubscribeInputSchema, EventSubscribeResultSchema, type OpenEventSubscriptionInput } from '../../../../packages/contracts/src/event.ts';
+import { canonicalRequest } from '../../../../packages/contracts/src/run';
+import { SubmitInputSchema } from '../../../../packages/contracts/src/session';
 
-export async function privateCredentialRequest(credentials: MainCredentials, frame: PrivateCredentialFrame, fileTokens?: FileTokens, windowId?: number): Promise<Result<unknown>> {
+export async function privateCredentialRequest(credentials: MainCredentials, frame: PrivateCredentialFrame, fileTokens?: FileTokens, windowId?: number, destinations?: DestinationTokens): Promise<Result<unknown>> {
   try {
     let data: unknown;
     switch (frame.method) {
+      case 'export.destination.describe': case 'export.destination.copy': {
+        if (!destinations || windowId === undefined) throw new Error('export_destination_invalid');
+        data = frame.method === 'export.destination.describe' ? await destinations.describe(windowId, frame.instanceId, frame.payload)
+          : await destinations.copy(windowId, frame.instanceId, frame.payload); break;
+      }
+      case 'export.destination.cancel': {
+        if (!destinations) throw new Error('export_copy_failed'); data = await destinations.cancel(frame.payload.operationRef); break;
+      }
+      case 'export.destination.settlePrevious': {
+        if (!destinations) throw new Error('export_copy_failed'); data = await destinations.settlePrevious(); break;
+      }
       case "file.resolve": {
         if (!fileTokens || windowId === undefined) throw new Error("file_token_invalid");
         data = fileTokens.resolve(frame.payload.fileToken, windowId, frame.instanceId, frame.payload.operationRef); break;
@@ -28,7 +43,7 @@ export async function privateCredentialRequest(credentials: MainCredentials, fra
     return { ok: true, data };
   } catch (error) { return { ok: false, error: safeError(error instanceof Error ? error.message : "credential_read_failed", error) }; }
 }
-export function registerIpc(options: { window: BrowserWindow; host: HostController; settings: MainSettings; credentials: MainCredentials; inputs: SecretInputs; fileTokens?: FileTokens; diagnostics(categories: string[]): Promise<DiagnosticsView>; report(error: ReturnType<typeof safeError>): void; notify(notice: RuntimeNotice): void }) {
+export function registerIpc(options: { window: BrowserWindow; host: HostController; settings: MainSettings; credentials: MainCredentials; inputs: SecretInputs; fileTokens?: FileTokens; destinations?: DestinationTokens; diagnostics(categories: string[]): Promise<DiagnosticsView>; report(error: ReturnType<typeof safeError>): void; notify(notice: RuntimeNotice): void }) {
   const { window, host, settings, credentials, inputs } = options;
   const operations = new Map<string, { method: PublicMethod; payload: unknown }>();
   // Only display subscriptions are owned by a renderer. Pi/Recorder listeners
@@ -212,6 +227,10 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       const schema = ['data.read', 'data.rows', 'query.read', 'query.list', 'evidence.read', 'tool.read'].includes(method)
         ? createPublicMethodSchemas()[method].input : publicMethodSchemas[method].input;
       const parsed = JSON.parse(JSON.stringify(schema.parse(payload))) as unknown;
+      if(method==='session.submit'){
+        const submission=SubmitInputSchema.parse(parsed);
+        if(submission.mode==='send'&&submission.routing?.mode==='user_form'&&submission.text!=='Query form: '+canonicalRequest(submission.routing.params))throw new Error('invalid_argument');
+      }
       parsingPayload = false;
       if ((method === "import.preview" || method === "import.commit") && (parsed as { operationRef: string }).operationRef !== operationRef) throw new Error("state_conflict");
       if (method === "model.request" || method === "model.diagnose" || method === "session.submit" || method === "session.create" || method === "session.rename" || method === "session.delete" || method==='session.restoreCheckpoint'||method==='session.restore') {
@@ -241,12 +260,23 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       return { ok: true, data: options.fileTokens.issue(window.id, instanceId, request.operationRef, selected.filePaths[0]!) };
     } catch (error) { return { ok: false, error: safeError(error instanceof Error ? error.message : "file_token_invalid") }; }
   });
+  ipcMain.handle('medclaw:export-destination', async (event, raw): Promise<Result<unknown>> => {
+    try {
+      trusted(event); requireHost(); const input = DesktopExportDestinationSchema.parse(raw), instanceId = host.read().instanceId!;
+      const selected = await dialog.showSaveDialog(window, { title: input.format === 'csv' ? 'Save CSV export bundle' : 'Save export',
+        defaultPath: `query-${input.queryId}.${input.format === 'csv' ? 'csv-export' : input.format === 'json' ? 'json' : 'md'}`,
+        buttonLabel: 'Choose destination', ...(input.format === 'csv' ? {} : { filters: [{ name: input.format === 'json' ? 'JSON' : 'Markdown', extensions: [input.format === 'json' ? 'json' : 'md'] }] }) });
+      if (selected.canceled || !selected.filePath) return { ok: true, data: null };
+      if (host.read().instanceId !== instanceId || host.read().state !== 'ready' || window.isDestroyed() || !options.destinations) throw new Error('export_destination_invalid');
+      return { ok: true, data: options.destinations.issue(window.id, instanceId, input, selected.filePath) };
+    } catch (error) { return { ok: false, error: safeError(error instanceof z.ZodError ? 'invalid_argument' : 'export_destination_invalid') }; }
+  });
   const observerFailure = (event: Electron.IpcMainEvent) => { try { trusted(event); options.report(safeError('preview_delivery_failed')); } catch { /* Fixed diagnostics never cross into execution control. */ } };
   ipcMain.on?.('medclaw:observer-error', observerFailure);
   window.webContents.on?.('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => { if (isMainFrame) clearEventOwners(); });
   window.webContents.on?.('render-process-gone', () => clearEventOwners());
   window.webContents.on?.('destroyed', () => clearEventOwners());
-  window.on("closed", () => { clearEventOwners(); ipcMain.removeListener?.('medclaw:observer-error', observerFailure); inputs.closeWindow(window.id); options.fileTokens?.closeWindow(window.id); ["medclaw:request", "medclaw:secret-input", "medclaw:secret-discard", "medclaw:open-auth-link", "medclaw:import-directory"].forEach(channel => ipcMain.removeHandler(channel)); });
+  window.on("closed", () => { clearEventOwners(); ipcMain.removeListener?.('medclaw:observer-error', observerFailure); inputs.closeWindow(window.id); options.fileTokens?.closeWindow(window.id); options.destinations?.closeWindow(window.id); ["medclaw:request", "medclaw:secret-input", "medclaw:secret-discard", "medclaw:open-auth-link", "medclaw:import-directory", 'medclaw:export-destination'].forEach(channel => ipcMain.removeHandler(channel)); });
   return { synchronize,
     closeInstance: (instanceId: string) => clearEventOwners(instanceId, false),
     acceptEventNotice: (notice: RuntimeNotice, instanceId: string | null): boolean => {

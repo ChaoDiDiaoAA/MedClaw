@@ -275,7 +275,7 @@ export type AgentRuntimePort<Resolved, Control = unknown> = {
 };
 export type FinalAgentFact = Omit<FinalProviderFact, "call" | "cleanup"> & { calls: FinalCallFact[]; cleanup: RunCleanupRecord; history?: NativeHistoryCommit; compactions?: import('./session').CompactionSaveFact[] } & (
   { resultSource?: 'pi'; inputSettlement?: InputSettlementProof; productTurn?: import('./intent').ProductTurnFact; productSettlement?: never }
-  | { resultSource: 'program'; inputSettlement?: never; productSettlement: import('./intent').ProductSettlement } & (
+  | { resultSource: 'program' | 'user_form'; inputSettlement?: never; productSettlement: import('./intent').ProductSettlement } & (
       { status:'completed'; history: NativeHistoryCommit; productTurn: import('./intent').ProductTurnFact }
       | { status:'failed'|'cancelled'; outputText:null; history?:never; productTurn?:never })
 );

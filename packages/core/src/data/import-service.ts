@@ -176,7 +176,8 @@ export class ImportService implements ImportServicePort {
   private closing = false;
   private readonly active = new Map<string, { controller: AbortController; method: 'preview' | 'commit'; request: string; promise: Promise<Result<ImportPreview> | Result<ImportOperation>> }>();
   private readonly diff = new DiffService();
-  constructor(private readonly dependencies: { store: ImportStore; artifacts: ArtifactStore; resolveToken: (fileToken: string, operationRef: string) => string | Promise<string>; instanceId?: string }) { this.instanceId = dependencies.instanceId ?? randomUUID(); }
+  constructor(private readonly dependencies: { store: ImportStore; artifacts: ArtifactStore; resolveToken: (fileToken: string, operationRef: string) => string | Promise<string>; instanceId?: string; assertWritable?: () => void }) { this.instanceId = dependencies.instanceId ?? randomUUID(); }
+  get busy() { return this.active.size > 0; }
   private previewOf(operationRef: string, pkg: CheckedPackage, catalogRevision: number): ImportPreview {
     const classification = this.dependencies.store.classify(pkg), first = pkg.days[0]!.metadata;
     const preview: ImportPreview = { operationRef, previewHash: '', sourceHash: pkg.sourceHash, metadataHash: pkg.metadataHash, inputKind: 'snapshot_package', fileCount: pkg.fileCount, totalBytes: pkg.totalBytes, batchCount: pkg.days.length, entityCount: pkg.masters.length, mappingVersion: first.mappingVersion, rowCount: pkg.rowCount, sourceBundleId: first.sourceBundleId, materialVersion: first.materialVersion, region: first.region, dateRange: { start: first.snapshotDate, endInclusive: pkg.days.at(-1)!.metadata.snapshotDate }, referenceDate: first.referenceDate, timezone: first.timezone, catalogRevision, ...classification, scopeKeys: [...new Set(pkg.days.map(day => day.metadata.scopeKey))], snapshotDates: pkg.days.map(day => day.metadata.snapshotDate), canCommit: true, issues: [] };
@@ -190,6 +191,7 @@ export class ImportService implements ImportServicePort {
       const running = this.active.get(parsed.operationRef);
       if (running) { if (running.method !== 'preview' || running.request !== canonicalRequest(parsed)) throw new Error('state_conflict'); const result = await running.promise; if (!result.ok) throw result.error; return result.data as ImportPreview; }
       if (current) { if (current.operation.preview) return current.operation.preview; throw current.operation.error ?? new Error('operation_result_unknown'); }
+      this.dependencies.assertWritable?.();
       const controller = new AbortController();
       const promise = this.prepare(parsed, controller.signal);
       this.active.set(parsed.operationRef, { controller, method: 'preview', request: canonicalRequest(parsed), promise });
@@ -234,6 +236,7 @@ export class ImportService implements ImportServicePort {
       const active = this.active.get(parsed.operationRef);
       if (active) { if (active.method !== 'commit' || active.request !== canonicalRequest(parsed)) throw new Error('state_conflict'); const result = await active.promise; if (!result.ok) throw result.error; return result.data as ImportOperation; }
       if (['imported', 'duplicate', 'cancelled', 'rejected', 'failed', 'interrupted'].includes(record.operation.state)) return record.operation;
+      this.dependencies.assertWritable?.();
       if (record.operation.state !== 'ready' || !record.operation.preview?.canCommit) throw new Error('operation_result_unknown');
       if (record.operation.preview.previewHash !== parsed.previewHash) throw new Error('state_conflict');
       const controller = new AbortController();
@@ -282,6 +285,7 @@ export class ImportService implements ImportServicePort {
         this.dependencies.store.verifyCommitted(operationRef);
         await this.dependencies.artifacts.verifyManifest(record.operation.artifactId!, operationRef); return record.operation;
       }
+      this.dependencies.assertWritable?.();
       if (record.operation.state === 'preparing' || record.operation.state === 'committing') {
         if (record.instanceId === this.instanceId) throw new Error('operation_result_unknown');
         return this.dependencies.store.update(operationRef, { state: 'interrupted', error: safeError('host_interrupted') });

@@ -68,6 +68,7 @@ async function fixture(withQuery = false, text?: string, sharedBatchHash = false
     inputId: accepted.input.inputId, baseLeafId: null, baseStorageVersion: 1, occurredAt: contextAt, mode: 'program',
     text: accepted.request.text, decisionId: 1, result: { kind: 'clarification', text: 'ENGINEERING_PROGRAM_CLARIFICATION', queryIds: [], missingSlots: ['region'] },
     execution, adoptedContext: null });
+  if(input.mode!=='program')throw new Error('Expected the engineering program fixture');
   const discard = (snapshot: NativeHistorySnapshot = loaded.data) => ({ runId: input.runId, sessionId: input.sessionId,
     requestSettled: true as const, routeSettled: true as const, requiredFactsSaved: true as const, committedSnapshot: snapshot });
   return { root, db, manager, memory, store, transactions, input, commits, failures, discard, repos, accepted, fault(value: boolean) { fault = value; }, owner(value: number) { ownerRunId = value; },
@@ -129,6 +130,7 @@ async function queryFinalFixture(mode: 'rule' | 'classify' | 'verify' = 'rule', 
     adoptedContext: { contract: 'medclaw.query-context-entry/v2', sourceRunId: f.input.runId, sourceInputId: f.input.inputId,
       taskIntents: decision.adoptedIntents, contextIntentId: decision.contextIntentId, adoptedSlots: decision.adoptedSlots,
       scopeBatchHashes: projection.scopeBatchHashes, queryIds: [query.id], pendingClarification: null, decisionId } });
+  if(input.mode!=='program')throw new Error('Expected the engineering query program fixture');
   const productTurn = appendProductTurn(f.manager, f.memory, input);
   const fact: FinalAgentFact = { status: 'completed', resultSource: 'program', productTurn, history: productTurn.history, calls: [],
     outputText: input.mode === 'program' ? input.result.text : '', error: null, stoppedAt: null, endedAt: mode === 'rule' ? contextAt : new Date().toISOString(), cancelRequestedAt: null,

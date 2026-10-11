@@ -107,8 +107,9 @@ export class OllamaIntentClient implements IntentModelClient {
       signal = AbortSignal.any([external, AbortSignal.timeout(selection.timeoutMs)]);
       // Classification JSON repeats labels and keys; do not inherit creative-generation penalties.
       const body = { model: selection.modelTag, messages: [{ role: 'system', content: this.prompts[input.stage].text },
-        { role: 'user', content: projection }], format: intentJsonSchema, think: false, stream: false,
-        options: { temperature: 0, repeat_penalty: 1, presence_penalty: 0, frequency_penalty: 0 } };
+        { role: 'user', content: projection }], format: intentJsonSchema, think: false, stream: false, truncate: false,
+        // The frozen taxonomy and bounded projection exceed Ollama's 4K default; never classify a truncated task.
+        options: { num_ctx: 65536, temperature: 0, repeat_penalty: 1, presence_penalty: 0, frequency_penalty: 0 } };
       response = await request(selection.baseUrl, '/api/chat', signal, body); outcome.httpStatus = response.status;
       outcome.observation = { contract: 'medclaw.context-observation/v1', api: 'ollama-chat', transport: 'json', observedAt: new Date().toISOString(),
         httpStatus: response.status, payloadHash: hash(JSON.stringify(body)), projectionHash: hash(projection), feedbackHash: hash(''), verifiedNativeRefs: [] };

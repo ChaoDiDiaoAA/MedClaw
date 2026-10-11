@@ -296,7 +296,7 @@ test('deleted Session keeps original native and SQLite history readable and reje
 test('actual schema6 Host routes immutable management receipts and permits deleting B while A streams', async () => {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-session-management-host-')), http = provider();
   const host = new HostController({ dataRoot: root, hostEntry: resolve('apps/host/src/main.ts'), bunExecutable: process.execPath,
-    onCredentialRequest: async frame => frame.method === 'credential.list' ? { ok: true, data: [] } : frame.method === 'credential.read'
+    onCredentialRequest: async frame => frame.method === 'export.destination.settlePrevious' ? { ok: true, data: { stopped: true } } : frame.method === 'credential.list' ? { ok: true, data: [] } : frame.method === 'credential.read'
       ? { ok: true, data: frame.payload.providerId === 'p5-management' ? { type: 'api_key', key: 'fixture-only' } : null } : { ok: false, error: safeError('access_denied') } });
   const initial = new MainSettings(host.paths.settingsPath).read();
   atomicWriteJson(host.paths.settingsPath, PublishedSettingsSchema.parse({ ...initial, model: { provider: 'p5-management', modelId: 'fixture' },
@@ -330,6 +330,7 @@ test.each([['agent', 'rename'], ['agent', 'delete'], ['provider', 'rename'], ['p
   let holdResolve = false;
   const host = new HostController({ dataRoot: root, hostEntry: resolve('apps/host/src/main.ts'), bunExecutable: process.execPath,
     onCredentialRequest: async frame => {
+      if (frame.method === 'export.destination.settlePrevious') return { ok: true, data: { stopped: true } };
       if (frame.method === 'credential.list') return { ok: true, data: [] };
       if (frame.method !== 'credential.read') return { ok: false, error: safeError('access_denied') };
       if (holdResolve && frame.payload.providerId === 'p5-management') { entered.release(); await resume.promise; }

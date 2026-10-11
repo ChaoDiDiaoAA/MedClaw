@@ -30,7 +30,7 @@ if(context.operationRef==='held-rename'){writeFileSync(${JSON.stringify(entered)
 return original.call(this,input,context);};await import(${JSON.stringify(resolve('apps/host/src/main.ts'))});`
     : `await import(${JSON.stringify(resolve('apps/host/src/main.ts'))});`);
   const host = new HostController({ dataRoot: temporary, hostEntry: entry, bunExecutable: process.execPath,
-    onCredentialRequest: async frame => frame.method === 'credential.list' ? { ok: true, data: [{ providerId: 'management-fixture', type: 'api_key' }] }
+    onCredentialRequest: async frame => frame.method==='export.destination.settlePrevious'?{ok:true,data:{stopped:true}}:frame.method === 'credential.list' ? { ok: true, data: [{ providerId: 'management-fixture', type: 'api_key' }] }
       : frame.method === 'credential.read' ? { ok: true, data: frame.payload.providerId === 'management-fixture' ? { type: 'api_key', key: 'fixture-only' } : null }
       : { ok: false, error: safeError('access_denied') } });
   const initial = new MainSettings(host.paths.settingsPath).read();
@@ -79,7 +79,7 @@ test('M01/M10/M12 real Host management keeps original receipts across later rena
     expect(f.sql('SELECT count(*) AS n FROM business_events WHERE type IN (\'session_renamed\',\'session_deleted\')')).toEqual([{ n: 4 }]);
     expect(f.service.requests).toHaveLength(0);
     const oldInstance = f.host.read().instanceId!;
-    expect(await f.host.restart(oldInstance)).toMatchObject({ state: 'ready', schemaVersion:13 });
+    expect(await f.host.restart(oldInstance)).toMatchObject({ state: 'ready', schemaVersion:15 });
     expect(await f.host.request('session.readManagementOperation', { operationRef: 'rename-a' }, undefined, undefined, oldInstance)).toMatchObject({ ok: false, error: { code: 'host_interrupted' } });
     expect(unwrap(await f.host.request('session.readManagementOperation', { operationRef: 'rename-a' }))).toEqual(first);
     expect(SessionDetailSchema.parse(unwrap(await f.host.request('session.read', { sessionId: a.session.id }))).session.status).toBe('deleted');

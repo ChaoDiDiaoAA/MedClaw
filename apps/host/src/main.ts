@@ -1,7 +1,7 @@
 import { open, readFile, unlink, realpath } from "node:fs/promises";
 import { createResourceSource } from '@medclaw/runtime-pi/resource-loader';
 import { dirname, isAbsolute, relative, resolve, sep, join } from "node:path";
-import { HostHelloSchema, HostRequestSchema, HostPrivateRequestSchema, PrivateCredentialReplySchema, NoticeFrameSchema, encodeHostFrame, publicMethodSchemas, createPublicMethodSchemas, hostPrivateMethodSchemas, isReadOnlyMethod, MAX_FRAME_BYTES, HOST_PROTOCOL_VERSION, type HostHello, type HostRequest, type RuntimeNotice, type PrivateCredentialMethod } from "../../../packages/contracts/src/protocol.ts";
+import { HostHelloSchema, HostRequestSchema, HostPrivateRequestSchema, PrivateCredentialReplySchema, NoticeFrameSchema, encodeHostFrame, publicMethodSchemas, createPublicMethodSchemas, hostPrivateMethodSchemas, privateCredentialMethodSchemas, isReadOnlyMethod, MAX_FRAME_BYTES, HOST_PROTOCOL_VERSION, type HostHello, type HostRequest, type RuntimeNotice, type PrivateCredentialMethod } from "../../../packages/contracts/src/protocol.ts";
 import { PublishedSettingsSchema } from "../../../packages/contracts/src/model.ts";
 import { AppErrorSchema, safeError, OpaqueIdSchema, type Result } from "../../../packages/contracts/src/error.ts";
 import { openDatabase, SCHEMA_VERSION } from "../../../packages/storage/src/database.ts";
@@ -28,6 +28,9 @@ import { ArtifactStore } from '../../../packages/storage/src/artifact-store.ts';
 import { CatalogService } from '../../../packages/core/src/data/catalog-service.ts';
 import { QueryService } from '../../../packages/core/src/data/query-service.ts';
 import { ImportService } from '../../../packages/core/src/data/import-service.ts';
+import { ExportService } from '../../../packages/core/src/data/export-service';
+import { SqliteExportStore } from '../../../packages/storage/src/export-store';
+import { ExportDestinationSchema, ExportCopyReceiptSchema } from '../../../packages/contracts/src/export';
 import { EvidenceReader } from '../../../packages/core/src/evidence/evidence-reader.ts';
 import { createBusinessTools } from '../../../packages/core/src/tools/tools.ts';
 import { ToolRegistry } from '../../../packages/core/src/tools/registry.ts';
@@ -111,7 +114,9 @@ async function credentials(method: string, payload: unknown): Promise<unknown> {
   if (!hello || terminating) throw new Error("host_interrupted");
   const requestId = crypto.randomUUID();
   const promise = new Promise<unknown>((resolve, reject) => {
-    const timer = setTimeout(() => { pending.delete(requestId); reject(new Error("operation_result_unknown")); }, 10000);
+    // Copy includes Windows publication and receipt persistence, beyond a credential lookup deadline.
+    const timeoutMs = method === 'export.destination.copy' ? 120000 : 10000;
+    const timer = setTimeout(() => { pending.delete(requestId); reject(new Error("operation_result_unknown")); }, timeoutMs);
     pending.set(requestId, { method: method as PrivateCredentialMethod, resolve, reject, timer });
   });
   void promise.catch(() => {});
@@ -217,18 +222,28 @@ async function initialize(raw: unknown) {
     catch(error){try{const proof=memory.confirmCommitted(change);if(proof)return proof;}catch{/* Read failure keeps the original write unconfirmed. */}throw error;}
   }}, { ...configure(), recorder, configure },contexts,resolve(import.meta.dir, '../../../resources/extensions'));
   imports = new ImportService({ store: new SqliteImportStore(database), artifacts, instanceId: config.instanceId,
+    assertWritable: () => { if (application?.exports?.busy) throw new Error('runtime_busy'); },
     resolveToken: async (fileToken, operationRef) => AbsolutePathSchema.parse(await credentials('file.resolve', { fileToken, operationRef })) });
+  const exports = new ExportService(config.instanceId, { store: new SqliteExportStore(database), artifacts,
+    assertWritable: () => { if (application!.busy || imports.busy || deletions?.busy) throw new Error('runtime_busy'); },
+    destination: {
+      describe: async input => ExportDestinationSchema.pick({ destinationIdentity: true }).parse(await credentials('export.destination.describe', input)),
+      copy: async input => ExportCopyReceiptSchema.parse(await credentials('export.destination.copy', input)),
+      cancel: async operationRef => privateCredentialMethodSchemas['export.destination.cancel'].output.parse(await credentials('export.destination.cancel', { operationRef })),
+      settlePrevious: async () => privateCredentialMethodSchemas['export.destination.settlePrevious'].output.parse(await credentials('export.destination.settlePrevious', {})),
+    } });
   application = new Application(config.instanceId, settings, runtime, repositories,
     (context, action) => credentialStore.withContext(context, action),
     Object.assign((...args:Parameters<ModelCallStarter>) => new ModelCallRecorder(repositories, ...args),
       {forCompaction:(owner:CompactionCallOwner,time:string)=>ModelCallRecorder.forCompaction(repositories!,owner,time)}),
     notice, error => errorLog.add(error), agent, events,transactions, createResourceSource(resolve(import.meta.dir, '../../../resources')),
-    {service:new IntentService(repositories,contexts,new OllamaIntentClient({classify:CLASSIFY_PROMPT,verify:VERIFY_PROMPT}),new IntentValidator(catalogService),events,transactions),queries});
+    {service:new IntentService(repositories,contexts,new OllamaIntentClient({classify:CLASSIFY_PROMPT,verify:VERIFY_PROMPT}),new IntentValidator(catalogService),events,transactions),queries}, exports);
+  await exports.recoverInterrupted();
   application.runs.recoverInterrupted(true); // The writer lock proves that the previous owning process exited.
   sessions = new SessionService(config.instanceId, repositories, agent, (input, context) => application!.runs.submitAgent(input, context),
     () => application!.runs.activeHandle, sessionId => application!.runs.readInputControl(sessionId),
     (inputId, context) => application!.runs.cancelInput(inputId, context), application.runs,transactions);
-  workspace = new WorkspaceService(repositories, artifacts,()=>application!.runs.assertNoHistoryMutation());
+  workspace = new WorkspaceService(repositories, artifacts,()=>{ if (application!.exports?.busy) throw new Error('runtime_busy'); application!.runs.assertNoHistoryMutation(); });
   deletions=new DataDeletionService(new SqliteDataDeletionStore(database,repositories,()=>{if(application!.busy)throw new Error('runtime_busy');}),artifacts,config.instanceId);
   await sendRaw(`${JSON.stringify({ protocolVersion: HOST_PROTOCOL_VERSION, instanceId: config.instanceId, sdkVersion: actualVersion, schemaVersion: SCHEMA_VERSION, configVersion: settings.configVersion, dataRoot: config.paths.dataRoot })}\n`);
   runtimeLog.add("host_ready");
@@ -273,6 +288,7 @@ function dataCatalog(page: number, pageSize: number) {
 async function dispatch(request: HostRequest): Promise<unknown> {
   const app = application;
   if (!app || !hello) throw new Error("host_not_ready");
+  if (app.exports?.busy && !isReadOnlyMethod(request.method) && !['host.shutdown', 'export.create', 'export.cancel', 'export.recover', 'run.cancel', 'session.cancelInput', 'import.cancel', 'operation.cancel'].includes(request.method)) throw new Error('runtime_busy');
   switch (request.method) {
     case "model.list": case "model.read": return app.directory();
     case "model.refresh": return { ...await app.refresh(request.operationRef, request.payload.providerId), directory: await app.directory() };
@@ -310,6 +326,15 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case "session.list": return unwrap(await sessions!.list(request.payload));
     case "session.read": return unwrap(await sessions!.read(request.payload.sessionId));
     case 'intent.read': return repositories.readIntent(request.payload);
+    case 'answer.read': return repositories.readAnswer(request.payload.runId);
+    case 'activity.list': return repositories.listActivity(request.payload);
+    case 'export.create':
+      if (request.operationRef !== request.payload.operationRef) throw new Error('invalid_argument');
+      return unwrap(await app.exports!.export(request.payload));
+    case 'export.read': return unwrap(await app.exports!.read(request.payload.operationRef));
+    case 'export.list': return unwrap(await app.exports!.list(request.payload));
+    case 'export.cancel': return unwrap(await app.exports!.cancel(request.payload.operationRef));
+    case 'export.recover': return unwrap(await app.exports!.recover(request.payload.operationRef));
     case 'model.intent.inspect': return app.inspectIntentModel(request.payload);
     case "session.submit": return unwrap(await sessions!.submit(request.payload, request));
     case "session.messages.read": return unwrap(await sessions!.readMessages(request.payload));
@@ -333,7 +358,7 @@ async function dispatch(request: HostRequest): Promise<unknown> {
       if (request.operationRef !== request.payload.operationRef) throw new Error('invalid_argument');
       return unwrap(await imports.commit(request.payload));
     case 'import.read':return unwrap(await imports.read(request.payload.operationRef));
-    case 'evidence.readOperation':return request.payload.kind==='import'?unwrap(await imports.read(request.payload.operationRef)):unwrap(await evidence.readCheckpointOperation(request.payload));
+    case 'evidence.readOperation':return request.payload.kind==='import'?unwrap(await imports.read(request.payload.operationRef)):request.payload.kind==='export'?unwrap(await app.exports!.read(request.payload.operationRef)):unwrap(await evidence.readCheckpointOperation(request.payload));
     case 'import.cancel': return unwrap(await imports.cancel(request.payload.operationRef));
     case 'import.recover': return unwrap(await imports.recover(request.payload.operationRef));
     case 'data.delete.preview':
@@ -360,21 +385,6 @@ async function dispatch(request: HostRequest): Promise<unknown> {
       const items = kind === 'devices' ? catalog.readSnapshotsById(ids) : catalog.readChanges([batchId], previousIds, null).slice((page - 1) * pageSize, page * pageSize);
       const batches = catalog.readBatches([...new Set([batchId, ...previousIds])]);
       return { kind, items, selections: items.map(item => describeDataSelection(item, batches)), totalRows, page, pageSize };
-    }
-    case 'query.execute': {
-      const previous = database!.query<{ id: number }, [string]>("SELECT id FROM queries WHERE source='user_form' AND call_ref=CAST(run_id AS TEXT)||':'||?").get(request.operationRef);
-      if (previous) {
-        const saved = toolStore.readQuery(previous.id)!;
-        const configuration = frozenConfiguration(saved.runId);
-        const params = createStoredQuerySchemas(configuration).QueryParamsSchema.parse(request.payload.params);
-        if (canonicalRequest(saved.params) !== canonicalRequest(params)) throw new Error('state_conflict');
-        const activity = database!.query<{ details_json: string }, [number]>("SELECT details_json FROM business_events WHERE query_id=? AND type='query_committed'").get(saved.id);
-        if (!activity || JSON.parse(activity.details_json).workspaceRevision !== request.payload.expectedRevision) throw new Error('state_conflict');
-        return queryView(saved.id, params.page, params.pageSize);
-      }
-      const context = app.runs.bindQueryContext(request.operationRef, request.payload.expectedRevision);
-      const saved = unwrap(await queries.execute(request.payload.params, context));
-      return queryView(saved.id, saved.params.page, saved.params.pageSize);
     }
     case 'query.read': {
       const { queryId, page, pageSize } = createPublicMethodSchemas()['query.read'].input.parse(request.payload);

@@ -19,7 +19,8 @@ export const ApiIdSchema = nonblank(128);
 export const CredentialRefSchema = OpaqueIdSchema;
 export const SecretInputTokenSchema = OpaqueIdSchema;
 export type SecretInputToken = z.infer<typeof SecretInputTokenSchema>;
-export const ReferenceDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(value => {
+// The inference grammar accepts ASCII ranges but drops unsupported \d escapes.
+export const ReferenceDateSchema = z.string().regex(/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/).refine(value => {
   const date = new Date(`${value}T00:00:00.000Z`);
   return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
 }, "Expected a real YYYY-MM-DD date");
@@ -28,9 +29,13 @@ export const TimezoneSchema = z.string().min(1).max(128).refine(value => {
 }, "Expected an IANA timezone");
 export const INTENT_VERSIONS = Object.freeze({
   taxonomyVersion: 'medclaw.intent-taxonomy/v1', ruleVersion: 'medclaw.intent-rules/v1',
-  classifyPromptVersion: 'medclaw.intent-classify-prompt/v1', verifyPromptVersion: 'medclaw.intent-verify-prompt/v1',
-  schemaVersion: 'medclaw.intent/v2', policyVersion: 'medclaw.intent-policy/v2',
+  classifyPromptVersion: 'medclaw.intent-classify-prompt/v3', verifyPromptVersion: 'medclaw.intent-verify-prompt/v4',
+  schemaVersion: 'medclaw.intent/v2', policyVersion: 'medclaw.intent-policy/v5',
 } as const);
+// Old frozen calls remain readable; new admissions use INTENT_VERSIONS.
+export const IntentClassifyPromptVersionSchema = z.enum(['medclaw.intent-classify-prompt/v1', 'medclaw.intent-classify-prompt/v2', 'medclaw.intent-classify-prompt/v3']);
+export const IntentVerifyPromptVersionSchema = z.enum(['medclaw.intent-verify-prompt/v1', 'medclaw.intent-verify-prompt/v2', 'medclaw.intent-verify-prompt/v3', 'medclaw.intent-verify-prompt/v4']);
+export const IntentPolicyVersionSchema = z.enum(['medclaw.intent-policy/v2', 'medclaw.intent-policy/v3', 'medclaw.intent-policy/v4', 'medclaw.intent-policy/v5']);
 
 export const IntentBaseUrlSchema = z.string().regex(/^http:\/\/(?:127\.0\.0\.1|\[::1\])(?::[1-9]\d{0,4})?\/?$/)
   .refine(value => {
@@ -50,8 +55,8 @@ export const DEFAULT_INTENT_MODEL: Readonly<IntentModelConfiguration> = Object.f
 export const IntentModelSelectionSchema = IntentModelConfigurationSchema.safeExtend({
   configVersion: ConfigVersionSchema, api: z.literal('ollama-chat'),
   taxonomyVersion: z.literal(INTENT_VERSIONS.taxonomyVersion), ruleVersion: z.literal(INTENT_VERSIONS.ruleVersion),
-  classifyPromptVersion: z.literal(INTENT_VERSIONS.classifyPromptVersion), verifyPromptVersion: z.literal(INTENT_VERSIONS.verifyPromptVersion),
-  schemaVersion: z.literal(INTENT_VERSIONS.schemaVersion), policyVersion: z.literal(INTENT_VERSIONS.policyVersion),
+  classifyPromptVersion: IntentClassifyPromptVersionSchema, verifyPromptVersion: IntentVerifyPromptVersionSchema,
+  schemaVersion: z.literal(INTENT_VERSIONS.schemaVersion), policyVersion: IntentPolicyVersionSchema,
 });
 export type IntentModelSelection = z.infer<typeof IntentModelSelectionSchema>;
 const positiveLimit = PositiveIdSchema;

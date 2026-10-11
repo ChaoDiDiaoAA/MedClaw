@@ -15,14 +15,14 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 function unwrap<T>(result:Result<T>):T { if (!result.ok) throw new Error(result.error.code); return result.data; }
 test('p8 real Host reads original Context across navigation without requests or fact writes', async () => {
   const root = mkdtempSync(join(tmpdir(),'medclaw-p8-host-'));
-  const host = new HostController({dataRoot:root,hostEntry:resolve('apps/host/src/main.ts'),bunExecutable:process.execPath,onCredentialRequest:async frame => frame.method === 'credential.list' ? {ok:true,data:[]} : frame.method === 'credential.read' ? {ok:true,data:null} : {ok:false,error:safeError('access_denied')}});
+  const host = new HostController({dataRoot:root,hostEntry:resolve('apps/host/src/main.ts'),bunExecutable:process.execPath,onCredentialRequest:async frame => frame.method==='export.destination.settlePrevious'?{ok:true,data:{stopped:true}}:frame.method === 'credential.list' ? {ok:true,data:[]} : frame.method === 'credential.read' ? {ok:true,data:null} : {ok:false,error:safeError('access_denied')}});
   new MainSettings(host.paths.settingsPath).read();
   const db = openDatabase(host.paths.databasePath), f = acceptContextInput(db), contexts = new SqliteContextStore(db), snapshot = contexts.save(contexts.select(f.input));
   f.repos.startCall(f.input.runId,'host-call','main',contextAt,{snapshotId:snapshot.id,inputId:f.input.inputId});
   contexts.recordDelivery({runId:f.input.runId,sessionId:f.input.sessionId,inputId:f.input.inputId,callId:'host-call',snapshotId:snapshot.id,observation:{contract:'medclaw.context-observation/v1',api:'openai-completions',transport:'sse',httpStatus:200,observedAt:contextAt,projectionHash:snapshot.projectionHash,feedbackHash:snapshot.feedbackHash,verifiedNativeRefs:[]}}); db.close();
   const sql = (query:string) => {const read = new Database(host.paths.databasePath,{readonly:true});try{return read.query(query).all();}finally{read.close();}};
   try {
-    expect(await host.start()).toMatchObject({state:'ready',schemaVersion:13});
+    expect(await host.start()).toMatchObject({state:'ready',schemaVersion:15});
     const workspace = unwrap(await host.request('workspace.read',{})) as {revision:number};
     unwrap(await host.request('session.create',{expectedWorkspaceRevision:workspace.revision},'browse-other'));
     const before = {runs:sql('SELECT * FROM runs'),calls:sql('SELECT * FROM model_calls'),snapshots:sql('SELECT * FROM context_snapshots'),deliveries:sql('SELECT * FROM context_deliveries'),events:sql('SELECT * FROM runtime_events')};
@@ -37,7 +37,7 @@ test('p8 real Host reads original Context across navigation without requests or 
 
 for(const saved of [false,true]) test(`p8 abrupt real Host restart preserves original Context evidence (saved=${saved})`,async()=>{
   const root=mkdtempSync(join(tmpdir(),'medclaw-p8-restart-'));
-  const host=new HostController({dataRoot:root,hostEntry:resolve('apps/host/src/main.ts'),bunExecutable:process.execPath,onCredentialRequest:async frame=>frame.method==='credential.list'?{ok:true,data:[]}:{ok:true,data:null}});
+  const host=new HostController({dataRoot:root,hostEntry:resolve('apps/host/src/main.ts'),bunExecutable:process.execPath,onCredentialRequest:async frame=>frame.method==='export.destination.settlePrevious'?{ok:true,data:{stopped:true}}:frame.method==='credential.list'?{ok:true,data:[]}:{ok:true,data:null}});
   new MainSettings(host.paths.settingsPath).read();
   const db=openDatabase(host.paths.databasePath),f=acceptContextInput(db),contexts=new SqliteContextStore(db),snapshot=contexts.save(contexts.select(f.input));
   f.repos.startCall(f.input.runId,'restart-host-call','main',contextAt,{snapshotId:snapshot.id,inputId:f.input.inputId});

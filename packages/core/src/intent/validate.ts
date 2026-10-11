@@ -1,13 +1,14 @@
 import { z } from 'zod';
 import { IntentInputProjectionSchema, IntentItemSchema, IntentResultSchema, IntentValidationSchema, IntentStageInputSchema,
-  INTENT_TAXONOMY, L0Schema, L1Schema, L2Schema,
+  INTENT_TAXONOMY, L0Schema, L1Schema, L2Schema, TimeRangeSchema,
   type IntentInputProjection, type IntentItem, type IntentResult, type IntentValidation, type ValidationIssue, type IntentCandidate, type IntentStageInput } from '../../../contracts/src/intent';
 import { safeError, type Result } from '../../../contracts/src/error';
-import { type QueryExecutionContext, type Snapshot } from '../../../contracts/src/query';
+import { type QueryExecutionContext, type IntentSnapshot } from '../../../contracts/src/query';
 import { canonicalRequest } from '../../../contracts/src/run';
 import { CatalogService, nextDate } from '../data/catalog-service';
 import { INTENT_CAPABILITIES, CONFUSABLE_PAIRS } from './taxonomy';
 import { compileIntentStepQueries } from './route-policy';
+import { groundIntentInput, readExplicitConstraints, clearsCondition } from './explicit-constraints';
 
 export function validateIntentResult(raw: string): Result<IntentResult> {
   try {
@@ -25,6 +26,10 @@ const hierarchyHeader = z.object({ status: z.literal('RESOLVED'), intents: z.arr
 
 export class IntentValidator {
   constructor(private readonly catalog: CatalogService) {}
+  groundInput(input:IntentInputProjection,context:QueryExecutionContext) {
+    this.catalog.assertContext(context);
+    return groundIntentInput(input,input.scope.batchIds.length?this.catalog.intentSnapshots(input.scope.batchIds,context):[]);
+  }
   readFreshness(raw:IntentItem,context:import('../../../contracts/src/query').QueryContext) {
     const item=IntentItemSchema.parse(raw);
     if(item.l2!=='FRESHNESS'||item.parameters.basis!=='snapshot_date')throw safeError('access_denied');
@@ -46,26 +51,38 @@ export class IntentValidator {
       intentId: item.id, slot: 'devices', severity: 'invalid', message: 'A comparison requires distinct devices.', candidates: [] });
     return { deviceIds: issues.length ? [] : [...new Set(ids)], issues };
   }
-  validateQueryParams(raw: IntentResult, context: QueryExecutionContext, frozen: IntentInputProjection, checkedAt: string): IntentValidation {
+  validateQueryParams(raw: IntentResult, context: QueryExecutionContext, frozen: IntentInputProjection, checkedAt: string,inheritedSnapshotMode:'exact_date'|'as_of'|null=null): IntentValidation {
     const result = IntentResultSchema.parse(raw), input = IntentInputProjectionSchema.parse(frozen);
     if (input.runId !== context.runId || input.inputId !== context.inputId || input.sessionId !== context.sessionId
       || input.referenceDate !== context.referenceDate || input.timezone !== context.timezone || !same(input.scope, context.scope)) throw new Error('access_denied');
     this.catalog.assertContext(context);
     const batches = input.scope.batchIds.length ? this.catalog.batches(input.scope.batchIds, context) : [];
-    const rows = batches.length ? this.catalog.snapshots(input.scope.batchIds, context) : [];
+    const rows = batches.length ? this.catalog.intentSnapshots(input.scope.batchIds, context) : [];
+    if(input.grounding&&!same(input.grounding,groundIntentInput(input,rows).grounding))throw safeError('state_conflict');
     if (!same(distinct(batches.map(batch => batch.contentHash)), input.scopeBatchHashes)
       || !same(distinct(batches.map(batch => batch.region)), distinct(input.availableData.regions))
       || !same(distinct(batches.map(batch => batch.snapshotDate)), distinct(input.availableData.dates))
       || !same(distinct(rows.map(row => row.currency)), distinct(input.availableData.currencies))
       || !same(distinct(rows.map(row => row.unit)), distinct(input.availableData.units))) throw new Error('state_conflict');
     const issues: ValidationIssue[] = [], resolvedDeviceIds: IntentValidation['resolvedDeviceIds'] = [], adopted = structuredClone(result.intents);
-    const issue = (item: IntentItem | null, code: ValidationIssue['code'], slot: string, severity: ValidationIssue['severity'], message: string, candidates: string[] = []) => {
-      issues.push({ code, intentId: item?.id ?? null, slot, severity, message, candidates: candidates.slice(0, 20).map(value => value.slice(0, 256)) });
+    const issue = (item: IntentItem | null, code: ValidationIssue['code'], slot: string, severity: ValidationIssue['severity'], message: string, candidates: string[] = [], sourceSpan?: ValidationIssue['sourceSpan']) => {
+      issues.push({ code, intentId: item?.id ?? null, slot, severity, message, candidates: candidates.slice(0, 20).map(value => value.slice(0, 256)), ...(sourceSpan ? { sourceSpan } : {}) });
     };
     if (result.status === 'UNSUPPORTED_DATA' && !adopted.length) issue(null, 'unsupported_capability', 'taxonomy', 'needs_input',
       'This domain task has no registered L2. Start an explicit Agent run to analyze it.');
+    if (adopted.some(item => item.l1 !== 'RESULT_DELIVERY')) {
+      const previous = input.previousQueryContext;
+      if (previous && 'contract' in previous && (previous.params.deviceIds?.length ?? 0) > 1) issue(null, 'unsupported_capability', 'deviceIds', 'needs_input',
+        'Multiple saved device filters cannot be inherited by this language route. Use the query form or an explicit Agent run.');
+      const requestedMode = /\bas_of\b|\bas of\b|截至(?:日期|某日)|最近(?:的)?快照/i.test(input.text) ? 'as_of'
+        : /\bexact_date\b|精确(?:日期|快照)|指定日期.*快照|当天.*快照/i.test(input.text) ? 'exact_date' : null;
+      if (requestedMode !== null && requestedMode !== (inheritedSnapshotMode ?? 'exact_date')) issue(null, 'unsupported_capability', 'snapshotMode', 'needs_input',
+        'Change snapshot semantics explicitly in the query form or start an explicit Agent run.');
+    }
     for (const item of adopted) {
       const cap = INTENT_CAPABILITIES[item.l2], slots = item.slots;
+      if(['medclaw.intent-policy/v4','medclaw.intent-policy/v5'].includes(input.versions.policyVersion)&&item.resultRef!==null&&item.l1!=='RESULT_DELIVERY')issue(item,'unsupported_capability','resultRef','needs_input',
+        'Result-dependent query filters cannot be frozen from this reference. Confirm complete query conditions.');
       if (cap.state === 'disabled' || !input.enabledL2.includes(item.l2) || cap.tools.some(tool => !input.availableToolNames.includes(tool) || !input.scope.allowedToolNames.includes(tool))) {
         issue(item, 'unsupported_capability', 'capability', 'needs_input', 'The required data or execution capability is not enabled.');
       }
@@ -90,6 +107,13 @@ export class IntentValidator {
         }
       }
       const entities = this.resolveEntities(item, context); issues.push(...entities.issues);
+      const previous = input.previousQueryContext;
+      if (previous && 'contract' in previous && previous.params.deviceIds?.length === 1
+        && !same(previous.params.deviceIds, entities.deviceIds)
+        && !(slots.device !== null && input.text.includes(slots.device))
+        && !/(?:不限|不限制)(?:器械|设备|产品)(?!状态)|(?:取消|清除)(?:器械|设备|产品)(?:条件|过滤|限制|筛选)/.test(input.text)) {
+        issue(item, 'unsupported_capability', 'deviceIds', 'needs_input', 'The saved device filter was not preserved. Select the device explicitly or use the query form.');
+      }
       if (entities.deviceIds.length) resolvedDeviceIds.push({ intentId: item.id, deviceIds: entities.deviceIds });
       if (item.l2 === 'NEW_RECORDS' && slots.changeKind !== null && slots.changeKind !== 'added'
         || item.l2 === 'FIELD_CHANGES' && slots.changeKind !== null && slots.changeKind !== 'field_changed'
@@ -118,13 +142,19 @@ export class IntentValidator {
       const targetTime = slots.time ?? (!cap.requiredSlots.includes('time') && latest ? { start: latest, endExclusive: nextDate(latest) } : null);
       const times = item.l2 === 'PERIOD_COMPARE' ? item.parameters.periods : targetTime === null ? [] : [targetTime];
       const changes=changePurposes.has(item.l2)||['change_count','changed_device_count'].includes(slots.metric??'');
+      let asOf = false;
+      try {
+        const queries = compileIntentStepQueries(item, input, entities.deviceIds, inheritedSnapshotMode);
+        asOf = queries.length > 0 && queries.every(query => query.snapshotMode === 'as_of');
+      } catch { /* The invalid query combination is reported below. */ }
       for (const time of times) {
-        if (currentPurposes.has(item.l2) && nextDate(time.start) !== time.endExclusive) issue(item, 'invalid_combination', 'time', 'invalid', 'A current snapshot needs one exact target day.');
-        const selectedRows: Snapshot[] = [];
+        if (currentPurposes.has(item.l2) && !asOf && nextDate(time.start) !== time.endExclusive) issue(item, 'invalid_combination', 'time', 'invalid', 'A current snapshot needs one exact target day.');
+        const selectedRows: IntentSnapshot[] = [];
         for (const scopeKey of new Set(selected.map(batch => batch.scopeKey))) {
           const group = selected.filter(batch => batch.scopeKey === scopeKey);
-          for (let date = time.start; date < time.endExclusive; date = nextDate(date)) {
-            const batch = group.find(value => value.snapshotDate === date);
+          const start = asOf ? new Date(Date.parse(time.endExclusive + 'T00:00:00Z') - 86400000).toISOString().slice(0, 10) : time.start;
+          for (let date = start; date < time.endExclusive; date = nextDate(date)) {
+            const batch = asOf?group.filter(value=>value.snapshotDate<=date).sort((a,b)=>a.snapshotDate.localeCompare(b.snapshotDate)).at(-1):group.find(value => value.snapshotDate === date);
             if (!batch || changes && (batch.previousBatchId === null || !input.scope.batchIds.includes(batch.previousBatchId))) {
               issue(item, 'data_coverage_missing', 'time', 'needs_input', 'The exact requested period or its predecessor is missing.'); break;
             }
@@ -142,9 +172,14 @@ export class IntentValidator {
       }
       if (adopted.length === 1) this.explicitConditions(item, input, issue);
       if (!issues.some(value => value.intentId === item.id)) {
-        try { compileIntentStepQueries(item, input, entities.deviceIds); }
+        try { compileIntentStepQueries(item, input, entities.deviceIds,inheritedSnapshotMode); }
         catch { issue(item, 'invalid_combination', 'queryParams', 'invalid', 'The requested metric, population or filters cannot form a valid query.'); }
       }
+    }
+    if(['medclaw.intent-policy/v4','medclaw.intent-policy/v5'].includes(input.versions.policyVersion)){
+      const requested=readExplicitConstraints(input.text,input.referenceDate).filter(value=>value.kind==='metric');
+      const missing=requested.find(value=>!adopted.some(item=>item.slots.metric===value.value));
+      if(missing)issue(adopted[0]??null,'explicit_condition_conflict','metric','invalid','Every explicit metric must be covered by a predicted task.',[],{start:missing.start,end:missing.end});
     }
     if (!issues.length && ['NEED_PARAMETERS', 'UNSUPPORTED_DATA'].includes(result.status)) issue(null, 'invalid_combination', 'status', 'invalid',
       'The predicted missing or unsupported conclusion has no matching program evidence.');
@@ -157,7 +192,7 @@ export class IntentValidator {
       adoptedIntents: invalid ? [] : adopted, missingSlots: missingSlots.slice(0, 20), issues: issues.slice(0, 64),
       resolvedDeviceIds: invalid ? [] : resolvedDeviceIds, reviewRequired: false, rawOutputTruncated: false, checkedAt });
   }
-  checkPrediction(raw: string, context: QueryExecutionContext, rawStage: IntentStageInput, checkedAt: string, truncated = false): PredictionCheck {
+  checkPrediction(raw: string, context: QueryExecutionContext, rawStage: IntentStageInput, checkedAt: string, truncated = false,inheritedSnapshotMode:'exact_date'|'as_of'|null=null): PredictionCheck {
     const stage = IntentStageInputSchema.parse(rawStage), parsed = validateIntentResult(raw);
     const failed = (prediction: IntentResult | null, code: ValidationIssue['code'], candidates: IntentCandidate[] = []): PredictionCheck => ({ prediction,
       candidates, validation: IntentValidationSchema.parse({ contract: 'medclaw.intent-validation/v2', state: truncated ? 'not_run' : 'invalid',
@@ -176,23 +211,29 @@ export class IntentValidator {
         }
       } catch { /* Only the two legal parent labels can be repaired into review candidates. */ }
       if (repaired) {
-        const checked = this.validateQueryParams(repaired, context, stage.input, checkedAt);
+        const checked = this.validateQueryParams(repaired, context, stage.input, checkedAt,inheritedSnapshotMode);
         if (checked.state === 'valid' && checked.finalStatus === 'RESOLVED') return failed(null, 'hierarchy_conflict', [{ reasonCode: 'hierarchy_conflict', intents: checked.adoptedIntents }]);
       }
       return failed(null, 'invalid_value');
     }
     const prediction = parsed.data;
     if (stage.stage === 'verify') {
+      if (stage.review!.mode === 'semantic_correction') return { prediction,
+        validation: this.validateQueryParams(prediction, context, stage.input, checkedAt,inheritedSnapshotMode), candidates: [] };
       const candidates = stage.review!.candidates;
       if (prediction.intents.length && !candidates.some(candidate => same(candidate.intents, prediction.intents))
         || prediction.candidateIntents.some(candidate => !candidates.some(allowed => same(allowed.intents, candidate.intents)))) return failed(prediction, 'scope_violation');
-      return { prediction, validation: this.validateQueryParams(prediction, context, stage.input, checkedAt), candidates: [] };
+      return { prediction, validation: this.validateQueryParams(prediction, context, stage.input, checkedAt,inheritedSnapshotMode), candidates: [] };
     }
-    const validation = this.validateQueryParams(prediction, context, stage.input, checkedAt);
+    const validation = this.validateQueryParams(prediction, context, stage.input, checkedAt,inheritedSnapshotMode);
+    if (['medclaw.intent-policy/v3','medclaw.intent-policy/v4','medclaw.intent-policy/v5'].includes(stage.input.versions.policyVersion) && validation.state === 'invalid'
+      && validation.issues.length > 0 && validation.issues.every(issue => issue.code === 'explicit_condition_conflict')) {
+      return { prediction, validation: IntentValidationSchema.parse({ ...validation, reviewRequired: true }), candidates: [] };
+    }
     if (validation.state !== 'valid' || validation.finalStatus !== 'AMBIGUOUS' || !prediction.candidateIntents.length) return { prediction, validation, candidates: [] };
     const candidates: IntentCandidate[] = [];
     for (const candidate of prediction.candidateIntents) {
-      const checked = this.validateQueryParams({ contract: 'medclaw.intent/v2', status: 'RESOLVED', intents: candidate.intents, candidateIntents: [], clarification: null }, context, stage.input, checkedAt);
+      const checked = this.validateQueryParams({ contract: 'medclaw.intent/v2', status: 'RESOLVED', intents: candidate.intents, candidateIntents: [], clarification: null }, context, stage.input, checkedAt,inheritedSnapshotMode);
       if (checked.state !== 'valid') return failed(prediction, 'scope_violation');
       candidates.push({ ...candidate, intents: checked.adoptedIntents });
     }
@@ -204,12 +245,60 @@ export class IntentValidator {
     return { prediction, validation: IntentValidationSchema.parse({ ...validation, reviewRequired: true }), candidates };
   }
   private explicitConditions(item: IntentItem, input: IntentInputProjection,
-    issue: (item: IntentItem, code: ValidationIssue['code'], slot: string, severity: ValidationIssue['severity'], message: string) => void) {
+    issue: (item: IntentItem, code: ValidationIssue['code'], slot: string, severity: ValidationIssue['severity'], message: string, candidates?: string[], sourceSpan?: ValidationIssue['sourceSpan']) => void) {
     const { text, referenceDate } = input, slots = item.slots;
-    const conflict = (slot: string) => issue(item, 'explicit_condition_conflict', slot, 'invalid', 'The prediction contradicts an explicit user condition.');
-    for (const [slot, expression] of [['manufacturer', '厂家|生产企业'], ['distributor', '配送商|配送企业'], ['region', '区域|地区'], ['category', '类别'], ['status', '器械状态']] as const) {
-      if (new RegExp(`(?:不限|不限制|取消|清除)(?:${expression})`).test(text) && slots[slot] !== null) conflict(slot);
+    const constraints=readExplicitConstraints(text,referenceDate);
+    const supplied = input.pendingClarification ? input.pendingClarification.taskText + '\n' + text : text;
+    const conflict = (slot: string, expected?: unknown, quote = text) => {
+      const start = text.indexOf(quote), sourceSpan = start < 0 || !quote.length ? undefined : { start, end: start + quote.length };
+      issue(item, 'explicit_condition_conflict', slot, 'invalid', expected === undefined
+        ? 'The prediction contradicts an explicit user condition. Read the original request at sourceSpan.'
+        : `The original request requires ${slot}=${JSON.stringify(expected)}. Correct the prediction without changing other user conditions.`, [], sourceSpan);
+    };
+    const compare = /^\s*(?:请(?:帮我)?\s*|please\s+)?(?:比较|对比|compare\b)/i.exec(text);
+    if (compare && INTENT_CAPABILITIES[item.l2].queryKind === 'current') conflict('l2', 'a comparison task, not a current listing', compare[0]);
+    if (/趋势/.test(text) && INTENT_CAPABILITIES[item.l2].queryKind === 'current') conflict('l2', 'PRICE_TREND for price trends', '趋势');
+    const comparisonDates = [...text.matchAll(/[0-9]{4}-[0-9]{2}-[0-9]{2}/g)];
+    if (compare && comparisonDates.length === 2 && !/(?:至|到)\s*[0-9]{4}-/.test(text)) {
+      try {
+        const periods = comparisonDates.map(value => TimeRangeSchema.parse({ start: value[0], endExclusive: nextDate(value[0]) }));
+        if (item.l2 !== 'PERIOD_COMPARE') conflict('l2', 'PERIOD_COMPARE', compare[0]);
+        else if (!same(item.parameters.periods, periods)) conflict('periods', periods);
+      } catch { /* Invalid user dates are not a correction recipe. */ }
     }
+    const metrics=constraints.filter(value=>value.kind==='metric').filter(value=>['medclaw.intent-policy/v4','medclaw.intent-policy/v5'].includes(input.versions.policyVersion)||value.quote!=='均价');
+    if (new Set(metrics.map(value=>value.value)).size===1 && slots.metric!==metrics[0]!.value) conflict('metric',metrics[0]!.value,metrics[0]!.quote);
+    const cleared = (expression: string) => clearsCondition(text,expression);
+    const aliases: Record<string, Record<string, RegExp>> = {
+      status: { active: /在售/, suspended: /暂停|停用/, delisted: /下架/, recalled: /召回/ },
+      direction: { increase: /上涨|涨幅|增加价格/, decrease: /下跌|跌幅|下降/ },
+      changeField: { price: /价格|涨幅|跌幅|上涨|下跌/, status: /状态|在售|暂停|停用|下架|召回/, distributor: /配送商|配送企业/ },
+      changeKind: { added: /新增/, missing: /缺失|缺记录/, field_changed: /变化|变更|涨幅|跌幅|上涨|下跌/ },
+    };
+    if (INTENT_CAPABILITIES[item.l2].queryKind !== 'changes' && !cleared('器械状态|状态')) {
+      const statusText = /在售|暂停|停用|下架|召回|\b(?:active|suspended|delisted|recalled)\b/i.test(text) ? text : supplied;
+      const statusFacts=readExplicitConstraints(statusText,referenceDate).filter(value=>value.kind==='status');
+      const negations=statusFacts.filter(value=>value.operation==='exclude');
+      const explicitStatuses=[...new Set(statusFacts.filter(value=>value.operation==='set').map(value=>value.value!))];
+      if(['medclaw.intent-policy/v4','medclaw.intent-policy/v5'].includes(input.versions.policyVersion)&&explicitStatuses.length>1)issue(item,'unsupported_capability','status','needs_input',
+        'Multiple positive statuses cannot be represented by the current single-status filter. Select a positive status.');
+      if (negations.length && !explicitStatuses.length) issue(item, 'unsupported_capability', 'status', 'needs_input',
+        'A complement of device statuses cannot be represented by the current single-status filter. Select a positive status.');
+      if (explicitStatuses.length === 1 && slots.status !== explicitStatuses[0]) {
+        const expected = explicitStatuses[0]!;
+        conflict('status', expected, aliases.status![expected]!.exec(text)?.[0] ?? text);
+      }
+    }
+    for (const [slot, expression] of [['manufacturer', '厂家|生产企业'], ['distributor', '配送商|配送企业'], ['region', '区域|地区'], ['category', '类别'], ['status', '器械状态|状态'], ['direction', '涨跌方向|方向'], ['changeField', '变化字段|异动字段'], ['changeKind', '变化类型|异动类型']] as const) {
+      if (cleared(expression) && slots[slot] !== null) conflict(slot, null);
+      const previous = input.previousQueryContext;
+      const prior = previous === null ? undefined : 'contract' in previous ? previous.params[slot] : previous.adoptedSlots[slot];
+      if (prior === null && slots[slot] !== null && !supplied.includes(slots[slot]!) && !aliases[slot]?.[slots[slot]!]?.test(supplied)) conflict(slot);
+    }
+    const previous = input.previousQueryContext;
+    const priorThreshold = previous === null ? undefined : 'contract' in previous ? previous.params.threshold : previous.adoptedSlots.threshold;
+    if (slots.threshold !== null && (/(?:不限|不限制|取消|清除).*(?:阈值|涨幅|跌幅|价格条件)/.test(text)
+      || priorThreshold === null && !/\d+(?:\.\d+)?\s*[%％]|阈值/.test(supplied))) conflict('threshold');
     const percentages = [...text.matchAll(/(\d+(?:\.\d+)?)\s*[%％]/g)];
     if (percentages.length === 1 && slots.threshold !== null) {
       if (slots.threshold.value !== Number(`${percentages[0]![1]}e-2`)) conflict('threshold');
@@ -220,7 +309,21 @@ export class IntentValidator {
     }
     if (/涨幅|上涨|增加价格/.test(text) && !/跌幅|下降|下跌/.test(text) && slots.direction === 'decrease') conflict('direction');
     if (/跌幅|下降|下跌/.test(text) && !/涨幅|上涨/.test(text) && slots.direction === 'increase') conflict('direction');
+    if(['medclaw.intent-policy/v4','medclaw.intent-policy/v5'].includes(input.versions.policyVersion)){
+      const dates=constraints.filter(value=>value.kind==='date');
+      if(dates.some(value=>value.time===null))issue(item,'invalid_value','time','invalid','The original date expression is invalid or cannot be resolved safely.');
+      if(dates.length===1&&dates[0]!.time&&item.l2!=='PERIOD_COMPARE'
+        &&(currentPurposes.has(item.l2)||/至|到|昨天|前天|今天|上个月/.test(dates[0]!.quote))&&!same(dates[0]!.time,slots.time))conflict('time',dates[0]!.time,dates[0]!.quote);
+      return;
+    }
     const anchors = [...text.matchAll(/\d{4}-\d{2}-\d{2}|昨天|上个月|今天|前天/g)];
+    const range = anchors.length === 2 ? /(\d{4}-\d{2}-\d{2})\s*(?:至|到)\s*(\d{4}-\d{2}-\d{2})/.exec(text) : null;
+    if (range && INTENT_CAPABILITIES[item.l2].queryKind !== null && !/不含|不包含|不包括|半开|endExclusive|exclusive/i.test(text)) {
+      try {
+        const expected = TimeRangeSchema.parse({ start: range[1], endExclusive: nextDate(range[2]!) });
+        if (!same(expected, slots.time)) conflict('time', expected, range[0]);
+      } catch { conflict('time'); }
+    }
     if (anchors.length === 1 && slots.time !== null && item.l2 !== 'PERIOD_COMPARE') {
       let expected: { start: string; endExclusive: string } | null = null;
       if (anchors[0]![0] === '昨天') expected = { start: new Date(Date.parse(referenceDate + 'T00:00:00Z') - 86400000).toISOString().slice(0, 10), endExclusive: referenceDate };
@@ -228,7 +331,7 @@ export class IntentValidator {
       else if (anchors[0]![0] === '今天') expected = { start: referenceDate, endExclusive: nextDate(referenceDate) };
       else if (anchors[0]![0] === '上个月') { const date = new Date(referenceDate + 'T00:00:00Z'); date.setUTCDate(1); const endExclusive = date.toISOString().slice(0, 10); date.setUTCMonth(date.getUTCMonth() - 1); expected = { start: date.toISOString().slice(0, 10), endExclusive }; }
       else if (currentPurposes.has(item.l2)) { try { expected = { start: anchors[0]![0], endExclusive: nextDate(anchors[0]![0]) }; } catch { conflict('time'); } }
-      if (expected && !same(expected, slots.time)) conflict('time');
+      if (expected && !same(expected, slots.time)) conflict('time', expected, anchors[0]![0]);
     }
   }
 }

@@ -35,6 +35,7 @@ function unwrap<T>(result: Result<T>): T { if (!result.ok) throw result.error; r
 async function setup() {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p11-host-')), privateMethods: string[] = [];
   const host = new HostController({ dataRoot: root, hostEntry: resolve('apps/host/src/main.ts'), bunExecutable: process.execPath, onCredentialRequest: async frame => {
+    if (frame.method === 'export.destination.settlePrevious') return { ok: true, data: { stopped: true } };
     privateMethods.push(frame.method); return frame.method === 'credential.list' ? { ok: true, data: [] } : frame.method === 'credential.read' ? { ok: true, data: null } : { ok: false, error: safeError('access_denied') };
   } });
   const initial = new MainSettings(host.paths.settingsPath).read();
@@ -56,7 +57,7 @@ async function setup() {
   invoke = async (name, envelope) => handlers.get(name)!({ sender: { id: 10, mainFrame }, senderFrame: mainFrame }, envelope);
   await import('../../apps/desktop/src/preload/index.ts');
   const client = bridge;
-  try { expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion:13 }); } catch (error) { rmSync(root, { recursive: true, force: true }); throw error; }
+  try { expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion:15 }); } catch (error) { rmSync(root, { recursive: true, force: true }); throw error; }
   const first = unwrap(await host.request('session.create', { expectedWorkspaceRevision: 0 }, 'create-a')) as { session: { id: number }; workspace: { revision: number } };
   const second = unwrap(await host.request('session.create', { expectedWorkspaceRevision: first.workspace.revision }, 'create-b')) as { session: { id: number } };
   const sql = (query: string) => { const db = new Database(host.paths.databasePath, { readonly: true }); try { return db.query(query).all(); } finally { db.close(); } };

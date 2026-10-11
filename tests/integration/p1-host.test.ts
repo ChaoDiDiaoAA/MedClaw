@@ -110,6 +110,7 @@ test("actual Host can request Main credentials before ready and restarts only af
     dataRoot: root, hostEntry: join(import.meta.dir, "../../apps/host/src/main.ts"), bunExecutable: process.execPath,
     onStarting: instance => credentials.attachInstance(instance), onExit: instance => credentials.confirmHostExit(instance),
     onCredentialRequest: async frame => {
+      if (frame.method === 'export.destination.settlePrevious') return { ok: true, data: { stopped: true } };
       calls.push(frame.method);
       if (frame.method === "credential.read") return { ok: true, data: await credentials.read(frame.instanceId, frame.payload) };
       if (frame.method === "credential.list") return { ok: true, data: await credentials.list(frame.instanceId) };
@@ -203,6 +204,7 @@ test("actual Host recovers an interrupted slow Run only after its owned writer e
   const host = new HostController({ dataRoot: root, hostEntry: join(import.meta.dir, "../../apps/host/src/main.ts"), bunExecutable: process.execPath,
     onExit: instance => exits.push(instance),
     onCredentialRequest: async frame => {
+      if (frame.method === 'export.destination.settlePrevious') return { ok: true, data: { stopped: true } };
       if (frame.method === "credential.list") return { ok: true, data: [{ providerId: "p1-fixture", type: "api_key" }] };
       if (frame.method === "credential.read") return { ok: true, data: frame.payload.providerId === "p1-fixture" ? { type: "api_key", key: "fixture-only" } : null };
       throw new Error("Unexpected credential mutation in interruption fixture");
@@ -302,6 +304,7 @@ test("actual Host orderly shutdown aborts native retry wait and restart never re
   const service = providerFixture("retry"), exits: string[] = [];
   const host = new HostController({ dataRoot: root, hostEntry: join(import.meta.dir, "../../apps/host/src/main.ts"), bunExecutable: process.execPath,
     onExit: instance => exits.push(instance), onCredentialRequest: async frame => {
+      if (frame.method === 'export.destination.settlePrevious') return { ok: true, data: { stopped: true } };
       if (frame.method === "credential.list") return { ok: true, data: [{ providerId: "p1-fixture", type: "api_key" }] };
       if (frame.method === "credential.read") return { ok: true, data: frame.payload.providerId === "p1-fixture" ? { type: "api_key", key: "fixture-only" } : null };
       throw new Error("Unexpected credential mutation in retry shutdown fixture");
@@ -373,6 +376,7 @@ test("actual Host keeps a failed required save closed through forced shutdown an
   const host = new HostController({ dataRoot: root, hostEntry: join(import.meta.dir, "../../apps/host/src/main.ts"), bunExecutable: process.execPath,
     onExit: instance => exits.push(instance), onNotice: notice => { if (notice.type === "provider.persistence_failed") failed(notice.runId); },
     onCredentialRequest: async frame => {
+      if (frame.method === 'export.destination.settlePrevious') return { ok: true, data: { stopped: true } };
       if (frame.method === "credential.list") return { ok: true, data: [{ providerId: "p1-fixture", type: "api_key" }] };
       if (frame.method === "credential.read") return { ok: true, data: frame.payload.providerId === "p1-fixture" ? { type: "api_key", key: "fixture-only" } : null };
       throw new Error("Unexpected credential mutation in required save fixture");
@@ -481,7 +485,7 @@ test("a silent handshake times out once and only confirmed close makes a failed 
     expect(await host.start()).toMatchObject({ state: "failed", canStart: true, error: { code: "host_start_failed" } });
     expect(events).toEqual([`start:${host.read().instanceId}`, `exit:${host.read().instanceId}`]);
   } finally { rmSync(root, { recursive: true, force: true }); }
-}, 20000);
+}, 75000);
 
 test("shutdown acknowledgement never substitutes for exit and an unconfirmed owned child blocks a second writer", async () => {
   const { HostController } = await import("../../apps/desktop/src/main/host-controller");
@@ -540,7 +544,7 @@ test("actual Host invalid UTF8 input is rejected before it can become a replacem
   const { HOST_PROTOCOL_VERSION } = await import("../../packages/contracts/src/protocol");
   const root = mkdtempSync(join(tmpdir(), "medclaw-p1-host-utf8-"));
   const host = new HostController({ dataRoot: root, hostEntry: join(import.meta.dir, "../../apps/host/src/main.ts"), bunExecutable: process.execPath,
-    onCredentialRequest: async frame => ({ ok: true, data: frame.method === "credential.list" ? [] : null }),
+    onCredentialRequest: async frame => ({ ok: true, data: frame.method === 'export.destination.settlePrevious' ? { stopped: true } : frame.method === "credential.list" ? [] : null }),
   });
   try {
     new MainSettings(host.paths.settingsPath).read();
@@ -566,7 +570,7 @@ test("actual Host duplicate shutdown commands share one application and database
   const { MainSettings } = await import("../../apps/desktop/src/main/settings");
   const root = mkdtempSync(join(tmpdir(), "medclaw-p1-host-shutdown-"));
   const host = new HostController({ dataRoot: root, hostEntry: join(import.meta.dir, "../../apps/host/src/main.ts"), bunExecutable: process.execPath,
-    onCredentialRequest: async frame => ({ ok: true, data: frame.method === "credential.list" ? [] : null }),
+    onCredentialRequest: async frame => ({ ok: true, data: frame.method === 'export.destination.settlePrevious' ? { stopped: true } : frame.method === "credential.list" ? [] : null }),
   });
   try {
     new MainSettings(host.paths.settingsPath).read();

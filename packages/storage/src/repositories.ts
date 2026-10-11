@@ -8,7 +8,7 @@ import { ToolControlObservationSchema } from "../../contracts/src/model";
 import { SqliteInputStore } from "./input-store";
 import { SqliteIntentStore } from './intent-store';
 import type { IntentCallRegistration, IntentCallCompletion, RouteCommit, ReadIntentInput } from '../../contracts/src/intent';
-import { IntentReadResultSchema, IntentDecisionSchema, INTENT_VERSIONS, ProductResultDetailsSchema, ProductSettlementSchema, IntentExecutionFactSchema, IntentQueryStepInputSchema, IntentStepMetadataSchema, AdoptedContextFactSchema, QueryContextRecordSchema, FrozenIntentAdmissionSchema, type PrepareIntentInput } from '../../contracts/src/intent';
+import { IntentReadResultSchema, IntentDecisionSchema, INTENT_VERSIONS, ProductResultDetailsSchema, ProductSettlementSchema, IntentExecutionFactSchema, IntentQueryStepInputSchema, IntentStepMetadataSchema, AdoptedContextFactSchema, QueryContextRecordSchema, QueryContextFactSchema, FormContextFactSchema, FormExecutionFactSchema, FrozenIntentAdmissionSchema, type PrepareIntentInput, type QueryContextFact } from '../../contracts/src/intent';
 import type { SqliteMemoryStore } from './memory-store';
 import { SqliteEventStore } from './event-store';
 import { SqliteWriteTransactions } from './write-transactions';
@@ -28,7 +28,8 @@ import { SqliteToolStore } from "./tool-store";
 import { SqliteCatalogStore } from './catalog-store';
 import { HistorySourceStore } from './history-source-store';
 import { readWorkspaceBatchReferences, readWorkspaceQuery, validateWorkspaceSelection, freezeWorkspaceScope } from './workspace-selection';
-import type { QueryRecord } from '../../contracts/src/query';
+import { AnswerRecordSchema, type AnswerRecord, type QueryRecord } from '../../contracts/src/query';
+import { ActivityListInputSchema, ActivityListSchema, BusinessActivitySchema } from '../../contracts/src/export';
 import { RenameSessionInputSchema, DeleteSessionInputSchema, ReadManagementOperationInputSchema, SessionManagementDetailsSchema, SessionManagementReceiptSchema,
   type RenameSessionInput, type DeleteSessionInput, type ReadManagementOperationInput, type SessionManagementReceipt, type SessionManagementDetails,
   NewSessionInputSchema, NewSessionResultSchema, SelectSessionInputSchema, SessionViewSchema, ListSessionsRequestSchema, SubmitInputSchema, ReadSubmissionRequestSchema,
@@ -197,7 +198,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const store=new SqliteToolStore(this.db),queryIds=this.db.query<{id:number},[number]>('SELECT id FROM queries WHERE run_id=? ORDER BY id').all(row.id).map(query=>{
         const saved=store.readQuery(query.id);if(!saved||saved.runId!==row.id||saved.sessionId!==row.session_id)fail('storage_read_failed');return query.id;
       });
-      return checked(IntentReadResultSchema,{...facts,execution:{runStatus:row.status,queryIds,stepResults:final?.proof.execution.stepResults??[],
+      return checked(IntentReadResultSchema,{...facts,execution:{runStatus:row.status,queryIds,stepResults:final&&'stepResults' in final.proof.execution?final.proof.execution.stepResults:[],
         answerId:answer?.id??null,finalHistorySaved:history!==null,requiredPersistenceComplete:cleanup?.requiredPersistenceComplete??null},
         effectiveContext:snapshot?this.readEffectiveIntentContext(snapshot):null});
     }catch{fail('storage_read_failed');}
@@ -226,14 +227,14 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     const entries=new Map((snapshot.entries as Entry[]).map(entry=>[entry.id,entry])),leaf=entries.get(nativeLeafId);
     const condition=leaf?.type==='custom'&&leaf.customType==='medclaw-query-context'?leaf:null;
     const execution=condition?.parentId?entries.get(condition.parentId):leaf;
-    if(!execution||execution.type!=='custom'||execution.customType!=='medclaw-intent-execution')fail('storage_read_failed');
+    if(!execution||execution.type!=='custom'||!['medclaw-intent-execution','medclaw-query-form-execution'].includes(execution.customType??''))fail('storage_read_failed');
     const input=this.inputs.required(inputId),decision=this.intents!.readIntentFacts({runId:row.id})?.decision;
     if(!decision||input.status!=='consumed'||input.processing_status!=='completed'||input.run_id!==row.id||input.session_id!==row.session_id)fail('storage_read_failed');
     const program=decision.route!=='agent',turn={userEntryId:program?input.native_entry_id:null,resultEntryId:program?execution.parentId:null,
       executionEntryId:execution.id,conditionEntryId:condition?.id??null,history};
     const base={status:'completed' as const,outputText:row.output_text,error:null,calls:[],history,productTurn:turn,cleanup:checked(RunCleanupRecordSchema,decoded(row.cleanup_json)),
       endedAt,stoppedAt:row.stopped_at,cancelRequestedAt:row.cancel_requested_at};
-    const fact:FinalAgentFact=program?{...base,resultSource:'program',productSettlement:{contract:'medclaw.product-settlement/v1',basis:'product_history',nativeUserEntryId:turn.userEntryId,
+    const fact:FinalAgentFact=program?{...base,resultSource:decision.decisionSource==='user_form'?'user_form':'program',productSettlement:{contract:'medclaw.product-settlement/v1',basis:'product_history',nativeUserEntryId:turn.userEntryId,
       runId:row.id,sessionId:snapshot.sessionId,inputId,admissionClosed:true,requestSettled:true,routeSettled:true,requiredFactsSaved:true,pendingFactsEmpty:true}}:base;
     if(!program)this.validateFinalAnswer(row,fact);
     const proof=program?this.validateProgramFinal(row,fact,false):this.validateAgentIntentFinal(row,fact,false);
@@ -248,7 +249,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     const entries=new Map((snapshot.entries as Entry[]).map(entry=>[entry.id,entry])),path=this.checkpointPath(snapshot,snapshot.activeLeafId);
     const nearest=[...path].map(id=>entries.get(id)!).find(entry=>entry.type==='custom'&&entry.customType==='medclaw-query-context');
     if(!nearest)return null;
-    const adopted=checked(AdoptedContextFactSchema,nearest.data),source=this.row(adopted.sourceRunId);
+    const adopted=checked(QueryContextFactSchema,nearest.data),source=this.row(adopted.sourceRunId);
     if(!source||source.session_id!==snapshot.sessionId||source.input_id!==adopted.sourceInputId)fail('storage_read_failed');
     let final:ReturnType<Repositories['readSavedIntentFinal']>;
     try{final=this.readSavedIntentFinal(source,snapshot);}catch{fail('storage_read_failed');}
@@ -259,12 +260,15 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     const cached=this.db.query<Record<string,unknown>,[number]>('SELECT * FROM query_contexts WHERE session_id=?').get(snapshot.sessionId);
     const condition=this.reachableIntentCondition(snapshot);if(!condition){if(cached)fail('storage_read_failed');return null;}
     const {nearest,adopted,path}=condition;
-    if(!cached||cached.schema_version!=='medclaw.intent/v2'||!path.has(cached.native_leaf_id as string)
+    if(!cached||!path.has(cached.native_leaf_id as string)
       ||!this.checkpointPath(snapshot,cached.native_leaf_id as string).has(nearest.id))fail('storage_read_failed');
-    const context=checked(QueryContextRecordSchema,{sessionId:cached.session_id,nativeLeafId:cached.native_leaf_id,version:cached.version,
-      sourceRunId:cached.source_run_id,sourceInputId:cached.source_input_id,taskIntents:decoded(cached.task_intents_json as string),contextIntentId:cached.context_intent_id,
-      adoptedSlots:decoded(cached.adopted_slots_json as string),scopeBatchHashes:decoded(cached.scope_batch_hashes_json as string),queryIds:decoded(cached.query_ids_json as string),
-      pendingClarification:decoded(cached.pending_clarification_json as string|null)});
+    const context=this.intents!.readContextProjection(cached);
+    if(adopted.contract==='medclaw.query-form-context/v1'){
+      if(!('contract' in context))fail('storage_read_failed');
+      const {sessionId:_session,nativeLeafId:_leaf,version:_version,pendingClarification:_pending,...fact}=context;
+      if(!isDeepStrictEqual(fact,adopted))fail('storage_read_failed');return context;
+    }
+    if('contract' in context)fail('storage_read_failed');
     const {contract:_contract,decisionId:_decision,...fields}=adopted,
       {sessionId:_session,nativeLeafId:_leaf,version:_version,...projection}=context;
     if(!isDeepStrictEqual(fields,projection))fail('storage_read_failed');
@@ -415,7 +419,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     this.inputRead(()=>this.db.transaction(()=>{
       const request=checked(SubmitInputSchema,raw);
       if(request.mode!=='send')fail('invalid_argument');
-      if(request.routing?.originRunId==null)return;
+      if(!request.routing||!('originRunId' in request.routing)||request.routing.originRunId==null)return;
       const row=this.row(request.routing.originRunId),session=this.readSession(request.sessionId);
       if(!row||row.kind!=='agent'||row.parent_run_id!==null||row.session_id!==request.sessionId||row.input_id===null
         ||!session||session.kind!=='user'||session.status!=='active'||!['failed','cancelled','completed'].includes(row.status)||row.ended_at===null)fail('state_conflict');
@@ -486,6 +490,14 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if(request.mode==='send'&&request.routing?.mode==='explicit_agent_fallback'){
         const decision=IntentDecisionSchema.parse({intentCallId:null,matchedBy:null,route:'agent',status:null,adoptedIntents:[],contextIntentId:null,adoptedSlots:null,
           queryParams:null,missingSlots:[],issues:[],ruleEvaluation:null,decisionSource:'explicit_agent_fallback',schemaVersion:INTENT_VERSIONS.schemaVersion,policyVersion:INTENT_VERSIONS.policyVersion});
+        (this.intents??fail('state_conflict')).commitRoute({runId:target!,sessionId:session.id,inputId,decision,expectedCancelEpoch:0,createdAt:plan.createdAt});
+      }
+      if(request.mode==='send'&&request.routing?.mode==='user_form'){
+        const run=plan.execution.mode==='send'?plan.execution.run:fail('invalid_argument'),params=request.routing.params;
+        if(content.text!=='Query form: '+canonicalRequest(params)||!isDeepStrictEqual(params.batchIds,content.scope.batchIds)
+          ||content.intentAdmission||content.resourceInputPlan||run.extensions||run.resources||run.scope.allowedToolNames.length)fail('invalid_argument');
+        const decision=IntentDecisionSchema.parse({intentCallId:null,matchedBy:null,route:'simple',status:'RESOLVED',adoptedIntents:[],contextIntentId:null,
+          adoptedSlots:null,queryParams:params,missingSlots:[],issues:[],ruleEvaluation:null,decisionSource:'user_form',schemaVersion:INTENT_VERSIONS.schemaVersion,policyVersion:INTENT_VERSIONS.policyVersion});
         (this.intents??fail('state_conflict')).commitRoute({runId:target!,sessionId:session.id,inputId,decision,expectedCancelEpoch:0,createdAt:plan.createdAt});
       }
       return this.inputs.result(this.inputs.required(inputId));
@@ -1071,6 +1083,75 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       inputControl: null, storageVersion: row.storage_version, leafId: row.current_leaf_id??null, nextSubmissionSequence: sequence + 1 }, "storage_read_failed");
   }
 
+  readAnswer(runId: number): AnswerRecord | null {
+    id(runId);
+    const run = this.row(runId);
+    if (!run) return null;
+    const session = run.session_id === null ? null : this.readSession(run.session_id);
+    if (run.kind !== 'agent' || !session || session.kind !== 'user' || session.status !== 'active') fail('access_denied');
+    const row = this.db.query<{ id: number; run_id: number; session_id: number; input_id: number | null; kind: string; text: string;
+      query_ids_json: string; missing_slots_json: string; native_leaf_id: string | null; created_at: string }, [number]>('SELECT * FROM answers WHERE run_id=?').get(runId);
+    if (!row) return null;
+    if (run.status !== 'completed' || row.session_id !== session.id || row.input_id !== run.input_id) fail('storage_read_failed');
+    const route = this.db.query<{ session_id: number; input_id: number; route: string; decision_source: string; query_params_json: string | null }, [number]>('SELECT * FROM route_decisions WHERE run_id=?').get(runId);
+    let resultSource: AnswerRecord['resultSource'] = 'agent';
+    if (route) {
+      if (route.session_id !== session.id || route.input_id !== run.input_id) fail('storage_read_failed');
+      const input = this.db.query<{ content_json: string; session_id: number; target_run_id: number | null }, [number]>('SELECT * FROM session_inputs WHERE id=?').get(route.input_id);
+      if (!input || input.session_id !== session.id || input.target_run_id !== runId) fail('storage_read_failed');
+      const original = checked(InputContentSchema, JSON.parse(input.content_json), 'storage_read_failed').originalSubmitInput;
+      if (original.mode !== 'send' || original.sessionId !== session.id) fail('storage_read_failed');
+      if (route.decision_source === 'user_form') {
+        if (!original.routing || String(original.routing.mode) !== 'user_form' || !('params' in original.routing)
+          || route.route !== 'simple' || canonicalRequest(original.routing.params) !== canonicalRequest(JSON.parse(route.query_params_json!))) fail('storage_read_failed');
+        resultSource = 'user_form';
+      } else if (route.decision_source !== 'explicit_agent_fallback') {
+        if (original.routing?.mode !== 'intent') fail('storage_read_failed');
+        resultSource = route.route === 'agent' ? 'agent' : 'program';
+      }
+    }
+    const answer = checked(AnswerRecordSchema, { id: row.id, runId, sessionId: session.id, inputId: row.input_id, kind: row.kind, text: row.text,
+      queryIds: JSON.parse(row.query_ids_json), missingSlots: JSON.parse(row.missing_slots_json), nativeLeafId: row.native_leaf_id, createdAt: row.created_at, resultSource }, 'storage_read_failed');
+    const scope = checked(RunScopeSchema, JSON.parse(run.scope_json!), 'storage_read_failed'), store = new SqliteToolStore(this.db);
+    if (answer.queryIds.some(queryId => {
+      const query = store.readQuery(queryId);
+      return !query || query.sessionId !== session.id || query.batchIds.some(batchId => !scope.batchIds.includes(batchId))
+        || scope.deviceIds !== null && (query.scopeDeviceIds === null || query.scopeDeviceIds.some(deviceId => !scope.deviceIds!.includes(deviceId)));
+    })) fail('access_denied');
+    return answer;
+  }
+
+  listActivity(value: z.input<typeof ActivityListInputSchema>) {
+    const input = ActivityListInputSchema.parse(value);
+    return this.inputRead(() => {
+    if (input.sessionId !== null) {
+      const session = this.readSession(input.sessionId);
+      if (!session || session.kind !== 'user' || session.status !== 'active') fail('access_denied');
+    }
+    const rows = this.db.query<{ id: number; operation_ref: string; type: string; actor: string; occurred_at: string;
+      session_id: number | null; run_id: number | null; import_id: number | null; query_id: number | null; artifact_id: number | null; export_id: number | null; details_json: string },
+      [number | null, number | null, number]>('SELECT * FROM business_events WHERE session_id IS ? AND (?2 IS NULL OR id<?2) ORDER BY id DESC LIMIT ?3')
+      .all(input.sessionId, input.beforeEventId ?? null, input.limit + 1);
+    const page = rows.slice(0, input.limit).map(row => {
+      const details = { source: null, answerId: null, rowCount: null, batchCount: null, resultHash: null, copyState: null } as z.infer<typeof BusinessActivitySchema>['details'];
+      if (['import.imported', 'import.duplicate', 'query_committed', 'answer_committed', 'export_registered', 'export_copied'].includes(row.type)) {
+        const saved = checked(z.record(z.string(), z.unknown()), JSON.parse(row.details_json), 'storage_read_failed');
+        if (row.type.startsWith('import.')) {
+          const counts = checked(z.object({ acceptedRows: z.number().int().nonnegative().safe(), duplicateRows: z.number().int().nonnegative().safe(), batchIds: z.array(PositiveIdSchema) }), saved, 'storage_read_failed');
+          details.rowCount = counts.acceptedRows + counts.duplicateRows; details.batchCount = counts.batchIds.length;
+        } else {
+          details.source = saved.source as typeof details.source ?? (saved.resultSource === 'program' ? 'intent' : saved.resultSource === 'user_form' ? 'user_form' : null);
+          details.answerId = saved.answerId as number ?? null; details.rowCount = saved.rowCount as number ?? null;
+          details.resultHash = saved.resultHash as string ?? null; details.copyState = saved.copyState as typeof details.copyState ?? null;
+        }
+      }
+      return checked(BusinessActivitySchema, { id: row.id, operationRef: row.operation_ref, type: row.type, actor: row.actor, occurredAt: row.occurred_at,
+        sessionId: row.session_id, runId: row.run_id, importId: row.import_id, queryId: row.query_id, artifactId: row.artifact_id, exportId: row.export_id, details }, 'storage_read_failed');
+    });
+    return checked(ActivityListSchema, { items: page, nextBeforeEventId: rows.length > input.limit ? page.at(-1)!.id : null }, 'storage_read_failed');
+    });
+  }
+
   readChildIdentity(runId: number): BoundChildIdentity | null {
     id(runId);
     const row = this.row(runId); if (!row || row.kind !== 'child') return null;
@@ -1125,8 +1206,9 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if(request.afterAnswerId!==null&&!eligible.some(row=>row.id===request.afterAnswerId))throw safeError('session_history_invalid',undefined,{reason:'checkpoint_invalid'});
       const rows=eligible.filter(row=>request.afterAnswerId===null||row.id<request.afterAnswerId),page=rows.slice(0,request.limit),hasMore=rows.length>request.limit;
       return checked(SessionCheckpointPageSchema,{sessionId:session.id,storageVersion:history.storageVersion,items:page.map(row=>{
-        const slots=this.intents?this.reachableIntentCondition({...history,activeLeafId:row.native_leaf_id})?.adopted.adoptedSlots:null;
-        const summary=slots?[slots.region,slots.manufacturer,slots.device,slots.category,slots.status??'All statuses',slots.time?`${slots.time.start} ≤ date < ${slots.time.endExclusive}`:null].filter(Boolean).join(' · '):null;
+        const adopted=this.intents?this.reachableIntentCondition({...history,activeLeafId:row.native_leaf_id})?.adopted:null;
+        const slots=adopted?.contract==='medclaw.query-form-context/v1'?adopted.params:adopted?.adoptedSlots;
+        const summary=slots?[slots.region,slots.manufacturer,'device' in slots?slots.device:slots.deviceIds?.join(', '),slots.category,slots.status??'All statuses',slots.time?`${slots.time.start} ≤ date < ${slots.time.endExclusive}`:null].filter(Boolean).join(' · '):null;
         return {answerId:row.id,runId:row.run_id,nativeLeafId:row.native_leaf_id,committedAt:row.created_at,questionSummary:safePreview(row.input_text,512).text,answerSummary:safePreview(row.text,512).text,conditionSummary:summary===null?null:safePreview(summary,1024).text,isCurrentBranch:current.has(row.native_leaf_id)};
       }),nextAnswerId:hasMore?page.at(-1)!.id:null,hasMore},'storage_read_failed');
     }).deferred());
@@ -1564,8 +1646,10 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     id(runId);timestamp(at);
     this.transactions.immediate(()=>{
       const row=this.row(runId);
+      const request=row?.input_id?this.inputs.content(this.inputs.required(row.input_id)).originalSubmitInput:null;
       if(!row||row.kind!=='agent'||row.parent_run_id!==null||row.cancel_requested_at!==null||!['created','running'].includes(row.status)
-        ||!checked(agentConfigSchema,decoded(row.config_json)).intentAdmission)fail('state_conflict');
+        ||!checked(agentConfigSchema,decoded(row.config_json)).intentAdmission
+          &&!(request?.mode==='send'&&request.routing?.mode==='user_form'))fail('state_conflict');
       if(row.status==='running')return;
       if(this.db.query("UPDATE runs SET status='running',started_at=? WHERE id=? AND status='created' AND cancel_requested_at IS NULL").run(at,runId).changes!==1)fail('state_conflict');
       this.runLifecycle(row,'run_started',at);
@@ -1733,14 +1817,17 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       ||!this.db.query("SELECT id FROM memories WHERE session_id=? AND native_entry_id=? AND run_id=? AND entry_type='message' AND json_extract(entry_json,'$.message.role')='user'").get(row.session_id,input.native_entry_id,row.id))fail('session_history_invalid');}
   }
   private validateProgramFailure(row:RunRow,fact:FinalAgentFact) {
-    if(fact.resultSource!=='program'||fact.status==='completed'||fact.outputText!==null||fact.history||fact.productTurn||fact.inputSettlement
+    if(!['program','user_form'].includes(fact.resultSource??'pi')||fact.status==='completed'||fact.outputText!==null||fact.history||fact.productTurn||fact.inputSettlement
       ||fact.calls.length||fact.compactions?.length||row.input_id===null||row.session_id===null)fail('state_conflict');
     const settlement=checked(ProductSettlementSchema,fact.productSettlement),cleanup=checked(RunCleanupRecordSchema,fact.cleanup);
     if(settlement.runId!==row.id||settlement.sessionId!==row.session_id||settlement.inputId!==row.input_id||settlement.nativeUserEntryId!==null
       ||cleanup.executionStarted!==false||cleanup.stopConfirmed!==true||cleanup.requiredPersistenceComplete!==true
       ||cleanup.inputsSettled!==true||cleanup.resourcesReleased!==true||cleanup.unconfirmedItems.length)fail('state_conflict');
     const content=this.inputs.content(this.inputs.required(row.input_id)),configuration=checked(agentConfigSchema,decoded(row.config_json));
-    if(!content.intentAdmission||!isDeepStrictEqual(content.intentAdmission,configuration.intentAdmission)
+    const request=content.originalSubmitInput,form=fact.resultSource==='user_form';
+    if(form?(request.mode!=='send'||request.routing?.mode!=='user_form'||!!content.intentAdmission||!!configuration.intentAdmission)
+      :!content.intentAdmission||!isDeepStrictEqual(content.intentAdmission,configuration.intentAdmission))fail('state_conflict');
+    if(form&&this.db.query('SELECT id FROM model_calls WHERE run_id=?').get(row.id)
       ||this.db.query('SELECT id FROM memories WHERE run_id=?').get(row.id)||this.db.query('SELECT id FROM answers WHERE run_id=?').get(row.id)
       ||this.db.query("SELECT id FROM model_calls WHERE run_id=? AND kind!='intent'").get(row.id))fail('state_conflict');
   }
@@ -1816,7 +1903,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     return {execution,adopted,queryIds};
   }
   private validateProgramFinal(row:RunRow,fact:FinalAgentFact,requireAvailable:boolean) {
-    if(fact.resultSource!=='program'||fact.status!=='completed'||fact.error!==null||fact.inputSettlement!==undefined||!fact.history
+    if(!['program','user_form'].includes(fact.resultSource??'pi')||fact.status!=='completed'||fact.error!==null||fact.inputSettlement!==undefined||!fact.history
       ||row.input_id===null||row.session_id===null||fact.calls.length||fact.compactions?.length)fail('state_conflict');
     const cleanup=checked(RunCleanupRecordSchema,fact.cleanup);
     if(cleanup.executionStarted!==false||cleanup.stopConfirmed!==true||cleanup.requiredPersistenceComplete!==true
@@ -1843,10 +1930,29 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     if(requireAvailable&&!isDeepStrictEqual(readWorkspaceBatchReferences(this.db,scope.batchIds).refs,frozenBatches))fail('state_conflict');
     if(user.type!=='message'||user.message?.role!=='user'||!isDeepStrictEqual(user.message.content,[{type:'text',text:content.text}])
       ||content.text!==row.input_text||result.type!=='custom_message'||result.customType!=='medclaw-query-result'||result.display!==true
-      ||result.parentId!==user.id||result.content!==fact.outputText||executionEntry.type!=='custom'||executionEntry.customType!=='medclaw-intent-execution'
+      ||result.parentId!==user.id||result.content!==fact.outputText||executionEntry.type!=='custom'
       ||executionEntry.parentId!==result.id)fail('session_history_invalid');
-    const details=checked(ProductResultDetailsSchema,result.details),execution=checked(IntentExecutionFactSchema,executionEntry.data);
+    const details=checked(ProductResultDetailsSchema,result.details);
     const decision=this.intents?.readIntentFacts({runId:row.id})?.decision;
+    if(fact.resultSource==='user_form'){
+      if(!decision||decision.decisionSource!=='user_form'||details.source!=='user_form'||details.runId!==row.id||details.inputId!==row.input_id
+        ||details.decisionId!==decision.id||executionEntry.customType!=='medclaw-query-form-execution'||turn.conditionEntryId===null
+        ||history.newEntries.length!==4||history.activeLeafId!==turn.conditionEntryId||content.intentAdmission||content.resourceInputPlan
+        ||this.db.query('SELECT id FROM model_calls WHERE run_id=?').get(row.id)||this.db.query('SELECT id FROM tool_calls WHERE run_id=?').get(row.id))fail('state_conflict');
+      const execution=checked(FormExecutionFactSchema,executionEntry.data),condition=read(turn.conditionEntryId);
+      if(condition.type!=='custom'||condition.customType!=='medclaw-query-context'||condition.parentId!==executionEntry.id)fail('session_history_invalid');
+      const adopted=checked(FormContextFactSchema,condition.data),query=new SqliteToolStore(this.db).readQuery(execution.queryId),request=content.originalSubmitInput;
+      if(request.mode!=='send'||request.routing?.mode!=='user_form'||!query||query.source!=='user_form'||query.runId!==row.id
+        ||query.sessionId!==row.session_id||query.inputId!==row.input_id||query.callRef!==`form:${row.id}:${row.input_id}`
+        ||query.basedOnQueryId!==request.expectedQueryId||query.resultHash!==execution.resultHash||execution.decisionId!==decision.id
+        ||!isDeepStrictEqual(query.params,request.routing.params)||!isDeepStrictEqual(query.params,decision.queryParams)
+        ||!isDeepStrictEqual(details.queryIds,[query.id])||adopted.decisionId!==decision.id||adopted.sourceRunId!==row.id
+        ||adopted.sourceInputId!==row.input_id||!isDeepStrictEqual(adopted.params,query.params)||!isDeepStrictEqual(adopted.queryIds,[query.id])
+        ||!isDeepStrictEqual(adopted.scopeBatchHashes,[...new Set(frozenBatches.map(batch=>batch.contentHash))].sort()))fail('answer_evidence_invalid');
+      this.answerReferences(row,requireAvailable,[query.id]);return {details,execution,adopted,queryIds:[query.id]};
+    }
+    if(details.source!=='program'||executionEntry.customType!=='medclaw-intent-execution'||decision?.decisionSource==='user_form')fail('state_conflict');
+    const execution=checked(IntentExecutionFactSchema,executionEntry.data);
     if(!decision||details.runId!==row.id||details.inputId!==row.input_id||details.decisionId!==decision.id||execution.decisionId!==decision.id
       ||!isDeepStrictEqual(execution.taskIntents,decision.adoptedIntents)||!isDeepStrictEqual(details.missingSlots,decision.missingSlots))fail('state_conflict');
     const expectedKind=decision.route==='simple'?'result':decision.route==='reject'?'out_of_scope':decision.route==='clarify'
@@ -1854,11 +1960,32 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     if(details.kind!==expectedKind)fail('state_conflict');
     const store=new SqliteToolStore(this.db),refs=execution.stepResults.flatMap(step=>step.queryRefs),queryIds=[...new Set(refs.map(ref=>ref.queryId))].sort((a,b)=>a-b);
     if(!isDeepStrictEqual([...details.queryIds].sort((a,b)=>a-b),queryIds))fail('answer_evidence_invalid');
+    if(decision.executionPlan){
+      if(execution.stepResults.length!==decision.executionPlan.steps.length||queryIds.length!==refs.length)fail('answer_evidence_invalid');
+      for(const [index,step] of decision.executionPlan.steps.entries()){
+        const result=execution.stepResults[index];
+        if(!result||result.stepId!==step.stepId||result.queryRefs.length!==step.queries.length)fail('answer_evidence_invalid');
+        if(step.metadata){
+          if(!result.metadata||result.metadata.stepId!==step.stepId||result.metadata.basis!==step.metadata.basis
+            ||result.metadata.batches.length===0||result.metadata.batches.some(batch=>!frozenBatches.some(ref=>ref.id===batch.id&&ref.contentHash===batch.contentHash)
+              ||step.metadata!.region!==null&&batch.region!==step.metadata!.region))fail('answer_evidence_invalid');
+          if(requireAvailable&&!isDeepStrictEqual(result.metadata.batches,new SqliteCatalogStore(this.db).readBatches(scope.batchIds).filter(batch=>step.metadata!.region===null||batch.region===step.metadata!.region)))fail('answer_evidence_invalid');
+        }else if(result.metadata)fail('answer_evidence_invalid');
+        for(const [part,params] of step.queries.entries()){
+          const ref=result.queryRefs[part]!,query=store.readQuery(ref.queryId);
+          if(!query||query.runId!==row.id||query.sessionId!==row.session_id||query.inputId!==row.input_id||query.source!=='intent'
+            ||query.resultHash!==ref.resultHash||query.callRef!==`intent:${row.id}:${decision.id}:${step.stepId}:${part}`||!isDeepStrictEqual(query.params,params))fail('answer_evidence_invalid');
+        }
+      }
+      const actual=this.db.query<{id:number},[number]>('SELECT id FROM queries WHERE run_id=? ORDER BY id').all(row.id).map(query=>query.id);
+      if(!isDeepStrictEqual(actual,queryIds))fail('answer_evidence_invalid');
+    }else{
     if(decision.route==='simple'&&(execution.stepResults.length!==1||execution.stepResults[0]!.stepId!==decision.adoptedIntents[0]!.id||refs.length!==1)
       ||decision.route!=='simple'&&refs.length)fail('answer_evidence_invalid');
     for(const ref of refs){const query=store.readQuery(ref.queryId);
       if(!query||query.runId!==row.id||query.sessionId!==row.session_id||query.inputId!==row.input_id||query.source!=='intent'||query.resultHash!==ref.resultHash
         ||query.callRef!==`intent:${row.id}:${decision.id}:${execution.stepResults[0]!.stepId}`||!isDeepStrictEqual(query.params,decision.queryParams))fail('answer_evidence_invalid');}
+    }
     this.answerReferences(row,requireAvailable,queryIds);
     const adopted=turn.conditionEntryId===null?null:(()=>{const entry=read(turn.conditionEntryId);
       if(entry.type!=='custom'||entry.customType!=='medclaw-query-context'||entry.parentId!==executionEntry.id)fail('session_history_invalid');
@@ -1868,27 +1995,30 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     const expectedPending=decision.route==='clarify'?{
       taskText:(decision.intentCallId===null?null:this.intents!.readIntentStageInput(decision.intentCallId).input.pendingClarification)?.taskText??content.text,
       missingSlots:decision.missingSlots}:null;
+    const contextQueryIds=decision.executionPlan?(execution.stepResults.find(step=>step.stepId===decision.contextIntentId)?.queryRefs.map(ref=>ref.queryId)??[]):queryIds;
     if(adopted&&(adopted.sourceRunId!==row.id||adopted.sourceInputId!==row.input_id||adopted.decisionId!==decision.id
       ||adopted.contextIntentId!==decision.contextIntentId||!isDeepStrictEqual(adopted.taskIntents,execution.taskIntents)
-      ||!isDeepStrictEqual(adopted.adoptedSlots,decision.adoptedSlots)||!isDeepStrictEqual(adopted.pendingClarification,expectedPending)||!isDeepStrictEqual([...adopted.queryIds].sort((a,b)=>a-b),queryIds)
+      ||!isDeepStrictEqual(adopted.adoptedSlots,decision.adoptedSlots)||!isDeepStrictEqual(adopted.pendingClarification,expectedPending)||!isDeepStrictEqual([...adopted.queryIds].sort((a,b)=>a-b),contextQueryIds)
       ||!isDeepStrictEqual(adopted.scopeBatchHashes,[...new Set(frozenBatches.map(batch=>batch.contentHash))].sort())))fail('state_conflict');
     return {details,execution,adopted,queryIds};
   }
-  private adoptProgramContext(row:RunRow,fact:FinalAgentFact,adopted:import('../../contracts/src/intent').AdoptedContextFact|null):void {
+  private adoptProgramContext(row:RunRow,fact:FinalAgentFact,adopted:QueryContextFact|null):void {
     if(!adopted)return;
     this.writeIntentContext(row.session_id!,fact.history!.activeLeafId!,adopted,fact.endedAt);
   }
-  private writeIntentContext(sessionId:number,nativeLeafId:string,adopted:import('../../contracts/src/intent').AdoptedContextFact,time:string):void {
+  private writeIntentContext(sessionId:number,nativeLeafId:string,adopted:QueryContextFact,time:string):void {
     const previous=this.db.query<{version:number},[number]>('SELECT version FROM query_contexts WHERE session_id=?').get(sessionId);
     const version=(previous?.version??0)+1;
     const {contract:_contract,decisionId:_decisionId,...fields}=adopted;
-    checked(QueryContextRecordSchema,{sessionId,nativeLeafId,version,...fields});
+    const form=adopted.contract==='medclaw.query-form-context/v1';
+    checked(QueryContextRecordSchema,{sessionId,nativeLeafId,version,...(form?{...adopted,pendingClarification:null}:fields)});
     this.db.query(`INSERT INTO query_contexts(session_id,native_leaf_id,version,source_input_id,source_run_id,context_intent_id,task_intents_json,schema_version,adopted_slots_json,scope_batch_hashes_json,query_ids_json,pending_clarification_json,updated_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET native_leaf_id=excluded.native_leaf_id,version=excluded.version,source_input_id=excluded.source_input_id,source_run_id=excluded.source_run_id,
       context_intent_id=excluded.context_intent_id,task_intents_json=excluded.task_intents_json,schema_version=excluded.schema_version,adopted_slots_json=excluded.adopted_slots_json,
       scope_batch_hashes_json=excluded.scope_batch_hashes_json,query_ids_json=excluded.query_ids_json,pending_clarification_json=excluded.pending_clarification_json,updated_at=excluded.updated_at`)
-      .run(sessionId,nativeLeafId,version,adopted.sourceInputId,adopted.sourceRunId,adopted.contextIntentId,canonicalRequest(adopted.taskIntents),'medclaw.intent/v2',
-        canonicalRequest(adopted.adoptedSlots),canonicalRequest(adopted.scopeBatchHashes),canonicalRequest(adopted.queryIds),json(adopted.pendingClarification),time);
+      .run(sessionId,nativeLeafId,version,adopted.sourceInputId,adopted.sourceRunId,form?'user_form':adopted.contextIntentId,
+        canonicalRequest(form?[]:adopted.taskIntents),form?'medclaw.query-form/v1':'medclaw.intent/v2',
+        canonicalRequest(form?adopted.params:adopted.adoptedSlots),canonicalRequest(adopted.scopeBatchHashes),canonicalRequest(adopted.queryIds),json(form?null:adopted.pendingClarification),time);
   }
   private validateCleanup(row: RunRow, input: RunCleanupRecord): RunCleanupRecord {
     const previous = decoded(row.cleanup_json);
@@ -1936,7 +2066,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     return this.transactions.immediate(() => {
       const row = this.row(runId);
       if (!row || row.kind !== kind) fail("state_conflict");
-      const program=kind==='agent'&&(fact as FinalAgentFact).resultSource==='program';
+      const program=kind==='agent'&&['program','user_form'].includes((fact as FinalAgentFact).resultSource??'pi');
       let programProof:ReturnType<Repositories['validateProgramFinal']>|null=null;
       if(program&&fact.status==='completed'&&(row.cancel_requested_at!==null||fact.cancelRequestedAt!=null))fail('state_conflict');
       if(program&&fact.status!=='completed')this.validateProgramFailure(row,fact as FinalAgentFact);
@@ -2045,7 +2175,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
           const saved = this.db.query("INSERT INTO answers(run_id,session_id,input_id,kind,text,query_ids_json,missing_slots_json,native_leaf_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
             .run(runId, row.session_id, row.input_id, answerKind, text, JSON.stringify(queryIds),JSON.stringify(missingSlots),history?.activeLeafId??null, fact.endedAt);
           this.db.query("INSERT INTO business_events(operation_ref,type,actor,session_id,run_id,details_json,occurred_at) VALUES(?,'answer_committed',?,?,?,?,?)")
-            .run(`answer:${runId}`,program?'system':'agent', row.session_id, runId, JSON.stringify({ answerId: Number(saved.lastInsertRowid), queryIds,...(program?{resultSource:'program'}:{}) }), fact.endedAt);
+            .run(`answer:${runId}`,program?'system':'agent', row.session_id, runId, JSON.stringify({ answerId: Number(saved.lastInsertRowid), queryIds,...(program?{resultSource:(fact as FinalAgentFact).resultSource}:{}) }), fact.endedAt);
         }
       }
       if(!terminal)this.runTerminal(row,fact.status,error,cleanup,fact.endedAt);
@@ -2068,7 +2198,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       || row.output_text !== fact.outputText || row.stopped_at !== fact.stoppedAt || row.ended_at !== fact.endedAt
       || row.cancel_requested_at !== (fact.cancelRequestedAt ?? null) || !isDeepStrictEqual(decoded(row.error_json), fact.error)
       || !isDeepStrictEqual(decoded(row.usage_json), fact.usage ?? null) || !isDeepStrictEqual(decoded(row.cleanup_json), expectedCleanup)) return false;
-    const program='calls' in fact&&fact.resultSource==='program';
+    const program='calls' in fact&&(fact.resultSource==='program'||fact.resultSource==='user_form');
     let programProof:ReturnType<Repositories['validateProgramFinal']>|null=null;
     if(program&&fact.status==='completed'){
       try{programProof=this.validateProgramFinal(row,fact,false);}catch{return false;}
@@ -2081,10 +2211,12 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if(payload.phase!=='product_history_saved'||payload.inputId!==row.input_id||payload.runId!==runId)return false;
       if(programProof.adopted&&this.db.query<{current_leaf_id:string|null},[number]>('SELECT current_leaf_id FROM sessions WHERE id=?').get(row.session_id!)?.current_leaf_id===fact.history.activeLeafId){
         const context=this.readIntent({runId})?.effectiveContext,adopted=programProof.adopted;
+        const matches=context&&adopted.contract==='medclaw.query-form-context/v1'?'contract' in context&&context.decisionId===adopted.decisionId&&isDeepStrictEqual(context.params,adopted.params)
+          :context&&!('contract' in context)&&adopted.contract==='medclaw.query-context-entry/v2'&&context.contextIntentId===adopted.contextIntentId
+            &&isDeepStrictEqual(context.taskIntents,adopted.taskIntents)&&isDeepStrictEqual(context.adoptedSlots,adopted.adoptedSlots);
         if(!context||context.nativeLeafId!==fact.history.activeLeafId||context.sourceRunId!==runId||context.sourceInputId!==row.input_id
-          ||context.contextIntentId!==adopted.contextIntentId||!isDeepStrictEqual(context.taskIntents,adopted.taskIntents)
-          ||!isDeepStrictEqual(context.adoptedSlots,adopted.adoptedSlots)||!isDeepStrictEqual(context.scopeBatchHashes,adopted.scopeBatchHashes)
-          ||!isDeepStrictEqual(context.queryIds,adopted.queryIds)||!isDeepStrictEqual(context.pendingClarification,adopted.pendingClarification))return false;
+          ||!matches||!isDeepStrictEqual(context.scopeBatchHashes,adopted.scopeBatchHashes)
+          ||!isDeepStrictEqual(context.queryIds,adopted.queryIds)||!isDeepStrictEqual(context.pendingClarification,adopted.contract==='medclaw.query-form-context/v1'?null:adopted.pendingClarification))return false;
       }
     }
     if(program&&fact.status!=='completed'){
@@ -2105,7 +2237,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
           ||answer.kind!==(programProof?.details.kind??'result')||!isDeepStrictEqual(decoded(answer.missing_slots_json),programProof?.details.missingSlots??[])
           ||!isDeepStrictEqual(decoded(answer.query_ids_json),queryIds))return false;
         const activity=this.db.query<{details_json:string},[string,string]>("SELECT details_json FROM business_events WHERE operation_ref=? AND type='answer_committed' AND actor=?").get(`answer:${runId}`,program?'system':'agent');
-        if(!activity||!isDeepStrictEqual(decoded(activity.details_json),{answerId:answer.id,queryIds,...(program?{resultSource:'program'}:{})}))return false;
+        if(!activity||!isDeepStrictEqual(decoded(activity.details_json),{answerId:answer.id,queryIds,...(program?{resultSource:fact.resultSource}:{})}))return false;
       }
       const terminal=this.db.query<{payload_json:string},[number,string]>('SELECT payload_json FROM runtime_events WHERE run_id=? AND type=?').get(runId,`run_${fact.status}`);
       if(!terminal)return false;

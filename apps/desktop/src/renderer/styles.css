@@ -200,3 +200,6 @@ legend { padding: 0 6px; font-weight: 600; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
 .resource-panel article { border-top: 1px solid var(--line); padding: 12px 0; }
 .resource-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 420px; overflow: auto; }
+/* The chart shares the saved result table and remains usable in a narrow panel. */
+.query-trend { margin: 1rem 0; }
+.query-trend svg { display: block; width: 100%; height: auto; min-height: 160px; }

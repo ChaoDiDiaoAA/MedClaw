@@ -16,7 +16,7 @@ export interface StageReport {
   exitCode: number;
 }
 const projectRoot = resolve(import.meta.dir, "..");
-const stagePrefixes = { P1: "p1", P2: "p2", P3: "p3", P4: "p4", P5: "p5", P6: "p6", P7: "p7", P8: "p8", P9: "p9", P10: "p10", P11: "p11", P12: "p12", P13: "p13", P14: "p14" } as const;
+const stagePrefixes = { P1: "p1", P2: "p2", P3: "p3", P4: "p4", P5: "p5", P6: "p6", P7: "p7", P8: "p8", P9: "p9", P10: "p10", P11: "p11", P12: "p12", P13: "p13", P14: "p14", P15: "p15" } as const;
 
 export function discoverTests(category: TestCategory, stage: string, root = projectRoot): string[] {
   if (!["unit", "integration", "e2e"].includes(category)) throw new Error(`Unknown test category: ${category}`);
@@ -73,7 +73,7 @@ export async function runStage(category: TestCategory, stage: string, options: {
     }
     result.executed = result.pass + result.fail;
     result.discovered = result.executed + result.skip;
-    result.exitCode = exitCode || (result.executed === 0 || result.fail > 0 || reportErrors || ['P12', 'P13', 'P14'].includes(stage) && result.skip > 0 ? 1 : 0);
+    result.exitCode = exitCode || (result.executed === 0 || result.fail > 0 || reportErrors || ['P12', 'P13', 'P14', 'P15'].includes(stage) && result.skip > 0 ? 1 : 0);
     return result;
   } finally {
     rmSync(temporary, { recursive: true, force: true });
@@ -83,7 +83,7 @@ export async function runStage(category: TestCategory, stage: string, options: {
 if (import.meta.main) {
   try {
     const args = Bun.argv.slice(2).filter(arg => arg !== "--");
-    if (args.length !== 3 || args[1] !== "--stage") throw new Error("Usage: bun tests/run.ts unit|integration|e2e [--] --stage P1|P2|P3|P4|P5|P6|P7|P8|P9|P10|P11|P12|P13|P14");
+    if (args.length !== 3 || args[1] !== "--stage") throw new Error(`Usage: bun tests/run.ts unit|integration|e2e [--] --stage ${Object.keys(stagePrefixes).join('|')}`);
     const report = await runStage(args[0] as TestCategory, args[2]!);
     console.log(JSON.stringify(report));
     process.exitCode = report.exitCode;

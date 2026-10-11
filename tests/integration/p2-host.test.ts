@@ -32,6 +32,7 @@ async function setup(mode: Parameters<typeof providerFixture>[0] = "success") {
   const root = mkdtempSync(join(tmpdir(), "medclaw-p2-host-")), service = providerFixture(mode), notices: DesktopNotice[] = [];
   const host = new HostController({ dataRoot: root, hostEntry: resolve("apps/host/src/main.ts"), bunExecutable: process.execPath,
     onNotice: notice => notices.push(notice), onCredentialRequest: async frame => {
+      if (frame.method === 'export.destination.settlePrevious') return { ok: true, data: { stopped: true } };
       if (frame.method === "credential.list") return { ok: true, data: [{ providerId: "p2-fixture", type: "api_key" }] };
       if (frame.method === "credential.read") return { ok: true, data: frame.payload.providerId === "p2-fixture" ? { type: "api_key", key: "fixture-only" } : null };
       return { ok: false, error: safeError("access_denied") };

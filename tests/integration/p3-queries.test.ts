@@ -98,10 +98,10 @@ test('public aggregate/trend execute uses explicit populations, dates, metric un
   const { db, context, queries } = fixture();
   // SQL summaries and lightweight evidence references must not decode complete snapshot JSON.
   db.query("UPDATE snapshots SET source_refs_json='{}'").run();
-  const execution: QueryExecutionContext = { runId: 1, sessionId: 1, inputId: null, source: 'user_form', callRef: '1:form-count', scope: context.scope,
+  const execution: QueryExecutionContext = { runId: 1, sessionId: 1, inputId: null, source: 'agent_tool', callRef: '1:form-count', scope: context.scope,
     referenceDate: context.referenceDate, timezone: context.timezone, signal: context.signal };
   const count = await queries.execute(QueryParamsSchema.parse({ kind: 'aggregate', population: 'snapshot', snapshotMode: 'exact_date', batchIds: [1, 2], metric: 'count' }), execution);
-  expect(count).toMatchObject({ ok: true, data: { source: 'user_form', kind: 'aggregate', rows: [{ metric: 'count', value: 3, unit: 'devices' }],
+  expect(count).toMatchObject({ ok: true, data: { source: 'agent_tool', kind: 'aggregate', rows: [{ metric: 'count', value: 3, unit: 'devices' }],
     interpretation: { requestedDate: '2026-01-02', dataDates: ['2026-01-02'], basis: 'distinct_device_identifiers_per_scope', quantity: 3, unit: 'identifiers', isStale: false } } });
   const changed = await queries.execute(QueryParamsSchema.parse({ kind: 'aggregate', population: 'changes', snapshotMode: null, batchIds: [1, 2], metric: 'changed_device_count', time: { start: '2026-01-02', endExclusive: '2026-01-03' } }), { ...execution, callRef: '1:form-changed' });
   expect(changed).toMatchObject({ ok: true, data: { rows: [{ value: 3, unit: 'devices' }], interpretation: { requestedDate: null,
@@ -117,7 +117,7 @@ test('public aggregate/trend execute uses explicit populations, dates, metric un
 test('SQL price aggregation separates units, counts valid/zero/missing prices and keeps grouped trend gaps explicit', async () => {
   const { db, context, queries } = fixture();
   db.query("UPDATE snapshots SET unit='box',price_cents=NULL WHERE device_id=3").run();
-  const execution: QueryExecutionContext = { runId: 1, sessionId: 1, inputId: null, source: 'user_form', callRef: '1:mean', scope: context.scope,
+  const execution: QueryExecutionContext = { runId: 1, sessionId: 1, inputId: null, source: 'agent_tool', callRef: '1:mean', scope: context.scope,
     referenceDate: context.referenceDate, timezone: context.timezone, signal: context.signal };
   const mean = await queries.execute(QueryParamsSchema.parse({ kind: 'aggregate', population: 'snapshot', snapshotMode: 'exact_date', batchIds: [1, 2], metric: 'mean_price',
     time: { start: '2026-01-01', endExclusive: '2026-01-02' } }), execution);
@@ -194,7 +194,7 @@ test('excluded regions cannot make a fresh regional count stale or require a mis
   const input = CurrentQuerySchema.parse({ batchIds: [1, 2, 3], region: '浙江', snapshotMode: 'as_of' });
   expect(queries.current(input, context)).toMatchObject({ totalRows: 3, warnings: [], interpretation: { dataDates: ['2026-01-02'], quantity: 3, isStale: false } });
   expect(queries.current({ ...input, snapshotMode: 'exact_date' }, { ...context, nativeToolCallId: 'region-exact' })).toMatchObject({ totalRows: 3 });
-  const execution: QueryExecutionContext = { runId: 1, sessionId: 1, inputId: null, source: 'user_form', callRef: '1:region-summary', scope: context.scope,
+  const execution: QueryExecutionContext = { runId: 1, sessionId: 1, inputId: null, source: 'agent_tool', callRef: '1:region-summary', scope: context.scope,
     referenceDate: context.referenceDate, timezone: context.timezone, signal: context.signal };
   expect(await queries.execute(QueryParamsSchema.parse({ kind: 'aggregate', population: 'snapshot', snapshotMode: 'as_of', batchIds: [1, 2, 3], region: '浙江', metric: 'count' }), execution))
     .toMatchObject({ ok: true, data: { warnings: [], interpretation: { dataDates: ['2026-01-02'], quantity: 3, isStale: false } } });
@@ -251,7 +251,7 @@ test('trusted deadline after synchronous SQLite calculation rolls back query and
     }
   }
   const queries = new QueryService(new CatalogService(new ExpiringCatalog(db)), new SqliteToolStore(db));
-  const execution: QueryExecutionContext = { runId: 1, sessionId: 1, inputId: null, source: 'user_form', callRef: '1:expired', scope: context.scope,
+  const execution: QueryExecutionContext = { runId: 1, sessionId: 1, inputId: null, source: 'agent_tool', callRef: '1:expired', scope: context.scope,
     referenceDate: context.referenceDate, timezone: context.timezone, signal: context.signal,
     checkActive: () => { if (expired) throw safeError('run_timeout'); } };
   expect(await queries.execute(QueryParamsSchema.parse({ kind: 'current', population: 'snapshot', snapshotMode: 'exact_date', batchIds: [1, 2] }), execution))

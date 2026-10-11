@@ -25,7 +25,7 @@ export async function launchActualDev(temporary: string, dataRoot: string, impor
     const Module=require('module'), original=Module._load;let observed=false;
     Module._load=function(name,...rest){const value=original.call(this,name,...rest);
       if(name==='electron'&&value.app&&!observed){observed=true;
-        ${controlledMainEntry ? `require(${JSON.stringify(controlledMainEntry)});` : ''}
+        ${controlledMainEntry ? `const observe=require(${JSON.stringify(controlledMainEntry)});if(typeof observe==='function')observe(value);` : ''}
         value.app.commandLine.appendSwitch('remote-debugging-port',${JSON.stringify(String(port))});
         value.app.commandLine.appendSwitch('remote-debugging-address','127.0.0.1');
         value.app.on('browser-window-created',(_,window)=>window.hide());
@@ -70,8 +70,7 @@ export async function launchActualDev(temporary: string, dataRoot: string, impor
     if (!page) page = await context.waitForEvent('page', { timeout: 15000 });
     await page.waitForLoadState('domcontentloaded');
     return { page, browser, child, async close() {
-      try { if (!page.isClosed()) await page.close(); }
-      finally { try { await confirmExit(); } finally { await browser!.close(); } }
+      try { await confirmExit(); } finally { await browser!.close(); }
       if (child.exitCode !== 0) throw new Error(`Actual dev launcher exited ${child.exitCode}`);
     } };
   } catch (error) {

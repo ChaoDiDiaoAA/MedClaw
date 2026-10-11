@@ -44,6 +44,7 @@ async function fixture(options?:{mainAuth?:boolean;verify?:boolean}){
     return new Response(`data: ${JSON.stringify({id:'ENGINEERING',model:'fixture',choices:[{index:0,delta:{role:'assistant',content:'ENGINEERING answer'},finish_reason:'stop'}]})}\n\ndata: [DONE]\n\n`,{headers:{'content-type':'text/event-stream'}});
   }});
   const host=new HostController({dataRoot:root,hostEntry:resolve('apps/host/src/main.ts'),bunExecutable:process.execPath,onCredentialRequest:async frame=>
+    frame.method==='export.destination.settlePrevious'?{ok:true,data:{stopped:true}}:
     frame.method==='credential.list'?{ok:true,data:options?.mainAuth===false?[]:[{providerId:'p14-fixture',type:'api_key'}]}:
     frame.method==='credential.read'?{ok:true,data:options?.mainAuth!==false&&frame.payload.providerId==='p14-fixture'?{type:'api_key',key:'ENGINEERING'}:null}:
     frame.method==='file.resolve'&&frame.payload.operationRef==='fixture-import'?{ok:true,data:source}:{ok:false,error:safeError('access_denied')}});
@@ -55,7 +56,7 @@ async function fixture(options?:{mainAuth?:boolean;verify?:boolean}){
     abort:async token=>unwrap(await host.request('settings.abort',{token})),
     readVersion:async()=>{const directory=unwrap(await host.request('model.read',{})) as {configVersion:string};return directory.configVersion;},
   });
-  const started=await host.start();if(started.state!=='ready')await close();expect(started).toMatchObject({state:'ready',schemaVersion:13});
+  const started=await host.start();if(started.state!=='ready')await close();expect(started).toMatchObject({state:'ready',schemaVersion:15});
   const sql=(query:string)=>{const db=new Database(host.paths.databasePath,{readonly:true});try{return db.query(query).all();}finally{db.close();}};
   const workspace=async()=>WorkspaceViewSchema.parse(unwrap(await host.request('workspace.read',{})));
   const create=async(op:string)=>NewSessionResultSchema.parse(unwrap(await host.request('session.create',{expectedWorkspaceRevision:(await workspace()).revision},op)));
@@ -152,7 +153,7 @@ test('p14 actual Host strong restart retains program context without replay and 
     const instance=f.host.read().instanceId!,child=(f.host as unknown as {child:ChildProcessWithoutNullStreams}).child;
     const exited=new Promise<void>(done=>child.once('close',()=>done()));
     expect(child.kill('SIGKILL')).toBe(true);await exited;
-    expect(await f.host.restart(instance)).toMatchObject({state:'ready',schemaVersion:13});await f.idle();
+    expect(await f.host.restart(instance)).toMatchObject({state:'ready',schemaVersion:15});await f.idle();
     const detail=SessionDetailSchema.parse(unwrap(await f.host.request('session.read',{sessionId:session})));
     expect(detail).toMatchObject({runtime:{availability:'unloaded'},currentQueryContext:{sourceRunId:second.runId}});
     const messages=SessionMessagePageSchema.parse(unwrap(await f.host.request('session.messages.read',{sessionId:session})));
@@ -186,7 +187,7 @@ test('p14 actual Host interrupted classify is terminal after strong restart and 
     expect(f.sql("SELECT state FROM model_calls WHERE kind='intent'")).toEqual([{state:'started'}]);
     const instance=f.host.read().instanceId!,child=(f.host as unknown as {child:ChildProcessWithoutNullStreams}).child;
     const exited=new Promise<void>(done=>child.once('close',()=>done()));expect(child.kill('SIGKILL')).toBe(true);await exited;f.holdIntent(false);
-    expect(await f.host.restart(instance)).toMatchObject({state:'ready',schemaVersion:13});await f.idle();
+    expect(await f.host.restart(instance)).toMatchObject({state:'ready',schemaVersion:15});await f.idle();
     expect(unwrap(await f.host.request('run.read',{runId:pending.runId!}))).toMatchObject({kind:'one',run:{status:'failed'}});
     const intent=IntentReadResultSchema.parse(unwrap(await f.host.request('intent.read',{runId:pending.runId!})));
     expect(intent).toMatchObject({decision:null,calls:[{stage:'classify',state:'failed'}],execution:{runStatus:'failed',answerId:null,finalHistorySaved:false}});

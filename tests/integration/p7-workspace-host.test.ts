@@ -17,11 +17,11 @@ async function fixture(held = false, savedQueries = false) {
   const entry=join(root,'host.ts');
   writeFileSync(entry, `import {existsSync,writeFileSync,appendFileSync} from 'node:fs';import {WorkspaceService} from ${JSON.stringify(resolve('packages/core/src/workspace/workspace-service.ts'))};
 const original=WorkspaceService.prototype.restore;WorkspaceService.prototype.restore=async function(){appendFileSync(${JSON.stringify(calls)},'restore\\n');writeFileSync(${JSON.stringify(entered)},'entered');${held ? `while(!existsSync(${JSON.stringify(release)}))await Bun.sleep(20);` : ''}return original.call(this);};await import(${JSON.stringify(resolve('apps/host/src/main.ts'))});`);
-  const host=new HostController({dataRoot:root,hostEntry:entry,bunExecutable:process.execPath,onCredentialRequest:async frame=>frame.method==='credential.list'?{ok:true,data:[]} : frame.method==='credential.read'?{ok:true,data:null}:{ok:false,error:safeError('access_denied')}});
+  const host=new HostController({dataRoot:root,hostEntry:entry,bunExecutable:process.execPath,onCredentialRequest:async frame=>frame.method==='export.destination.settlePrevious'?{ok:true,data:{stopped:true}}:frame.method==='credential.list'?{ok:true,data:[]} : frame.method==='credential.read'?{ok:true,data:null}:{ok:false,error:safeError('access_denied')}});
   new MainSettings(host.paths.settingsPath).read();
   const db=openDatabase(host.paths.databasePath), saved=savedQueries?seedWorkspaceQueries(db):null;
   if(!savedQueries)db.run('UPDATE workspace SET selection_json=? WHERE id=1',[JSON.stringify({formatVersion:1,kind:'device',targetId:'999',targetVersion:'a'.repeat(64),rowKey:'snapshot:999',field:null})]);db.close();
-  expect(await host.start()).toMatchObject({state:'ready',schemaVersion:13,sdkVersion:'0.87.1'});
+  expect(await host.start()).toMatchObject({state:'ready',schemaVersion:15,sdkVersion:'0.87.1'});
   const read=async()=>WorkspaceViewSchema.parse(unwrap(await host.request('workspace.read',{})));
   const sql=(query:string)=>{const db=new Database(host.paths.databasePath,{readonly:true});try{return db.query(query).all();}finally{db.close();}};
   const count=()=>existsSync(calls)?readFileSync(calls,'utf8').trim().split('\n').length:0;

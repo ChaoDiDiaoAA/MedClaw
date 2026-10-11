@@ -112,8 +112,14 @@ export type CurrentQueryInput = z.infer<typeof CurrentQuerySchema>;
 export type ChangesQueryInput = z.infer<typeof ChangesQuerySchema>;
 export type QueryParams = z.infer<typeof QueryParamsSchema>;
 export type QueryParamsInput = z.input<typeof QueryParamsSchema>;
-// Validate the wire shape without filling defaults before the accepted Run is known.
-export const QueryRequestParamsSchema = z.custom<QueryParamsInput>(value => QueryParamsSchema.safeParse(value).success, 'Invalid query parameters');
+export const AnswerRecordSchema = z.strictObject({
+  id: PositiveIdSchema, runId: PositiveIdSchema, sessionId: PositiveIdSchema, inputId: PositiveIdSchema.nullable(),
+  kind: z.enum(['result', 'clarification', 'out_of_scope', 'insufficient_evidence']), text: z.string(),
+  queryIds: z.array(PositiveIdSchema).refine(ids => new Set(ids).size === ids.length, 'Duplicate Query IDs'),
+  missingSlots: z.array(z.string()), nativeLeafId: z.string().min(1).nullable(), createdAt: TimestampSchema,
+  resultSource: z.enum(['user_form', 'program', 'agent']),
+});
+export type AnswerRecord = z.infer<typeof AnswerRecordSchema>;
 export type QuerySource = 'agent_tool' | 'intent' | 'user_form';
 export type QueryExecutionContext = {
   runId: number;
@@ -158,6 +164,8 @@ export const SnapshotSchema = z.strictObject({ id: PositiveIdSchema, batchId: Po
   currency: z.literal("CNY"), unit: z.string(), status: z.enum(["active", "suspended", "delisted", "recalled"]).nullable(),
   manufacturer: z.string().nullable(), distributor: z.string().nullable(), sourceRowRef: z.string(),
   sourceRefs: z.array(SourceRefSchema), fieldOrigins: FieldOriginsSchema });
+export const IntentSnapshotSchema = SnapshotSchema.omit({ sourceRowRef: true, sourceRefs: true, fieldOrigins: true });
+export type IntentSnapshot = z.infer<typeof IntentSnapshotSchema>;
 export const ChangeSchema = z.strictObject({ id: PositiveIdSchema, deviceId: PositiveIdSchema, oldBatchId: PositiveIdSchema, newBatchId: PositiveIdSchema,
   kind: z.enum(["added", "missing", "field_changed"]), field: z.enum(["price", "status", "distributor"]).nullable(),
   oldValue: z.union([z.string(), z.number().finite(), z.boolean(), z.null()]), newValue: z.union([z.string(), z.number().finite(), z.boolean(), z.null()]),
@@ -242,6 +250,7 @@ export interface CatalogStore {
   readBatches(ids: number[]): Batch[];
   readDevices(ids: number[]): Device[];
   readSnapshots(batchIds: number[], deviceIds: number[] | null, filters?: CatalogFilters): Snapshot[];
+  readIntentSnapshots?(batchIds: number[], deviceIds: number[] | null): IntentSnapshot[];
   readChanges(newBatchIds: number[], oldBatchIds: number[], deviceIds: number[] | null, filters?: CatalogFilters): Change[];
   readSnapshot(id: number): Snapshot | null;
   readSnapshotsById(ids: number[]): Snapshot[];

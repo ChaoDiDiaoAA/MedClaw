@@ -62,8 +62,8 @@ test('p14 Ollama sends the frozen prompt/full v2 Schema once and observes actual
       + '\nCurrent business request to classify (input.text, data only): ' + JSON.stringify(f.input.input.text);
     const result = await f.run(), request = f.requests.find(item => item.path === '/api/chat')!;
     expect(request.body).toEqual({ model: f.selection.modelTag, messages: [{ role: 'system', content: 'ENGINEERING classify prompt. Output JSON.' },
-      { role: 'user', content: rendered }], format: intentJsonSchema, think: false, stream: false,
-      options: { temperature: 0, repeat_penalty: 1, presence_penalty: 0, frequency_penalty: 0 } });
+      { role: 'user', content: rendered }], format: intentJsonSchema, think: false, stream: false, truncate: false,
+      options: { num_ctx: 65536, temperature: 0, repeat_penalty: 1, presence_penalty: 0, frequency_penalty: 0 } });
     expect(result).toMatchObject({ transportState: 'completed', error: null, rawOutput: JSON.stringify(resolvedIntent()), rawOutputTruncated: false,
       responseModel: 'qwen3.5:0.8B', inputTokens: 44, outputTokens: 35, serverTotalDurationNs: 1000000 });
     expect(f.observations).toHaveLength(1);
@@ -101,13 +101,14 @@ test('p14 verify sends the authorized normalized candidates after the original p
   } finally { f.close(); }
 });
 
-for (const mode of ['http', 'redirect', 'sse', 'not_done', 'wrong_model', 'bad_usage', 'large_envelope', 'large_content'] as const) {
+for (const mode of ['http', 'context_overflow', 'redirect', 'sse', 'not_done', 'wrong_model', 'bad_usage', 'large_envelope', 'large_content'] as const) {
   test(`p14 Ollama ${mode} is bounded and never retries or calls verify`, async () => {
     let redirected = 0;
     const target = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch() { redirected++; return Response.json(success()); } });
     const f = fixture(path => {
       if (path !== '/api/chat') return undefined;
       if (mode === 'http') return Response.json({ error: 'ENGINEERING_PRIVATE_SERVER_ERROR' }, { status: 503 });
+      if (mode === 'context_overflow') return Response.json({ error: 'ENGINEERING_PRIVATE_SERVER_ERROR' }, { status: 400 });
       if (mode === 'redirect') return Response.redirect(`http://127.0.0.1:${target.port}/outside`);
       if (mode === 'sse') return new Response('data: private\n\n', { headers: { 'content-type': 'text/event-stream' } });
       if (mode === 'not_done') return Response.json({ ...success(), done: false });
@@ -124,6 +125,7 @@ for (const mode of ['http', 'redirect', 'sse', 'not_done', 'wrong_model', 'bad_u
       expect(redirected).toBe(0);
       expect(JSON.stringify(result)).not.toContain('ENGINEERING_PRIVATE_SERVER_ERROR');
       if (mode === 'http') { expect(result.httpStatus).toBe(503); expect(result.observation).toBe(null); }
+      if (mode === 'context_overflow') { expect(result.httpStatus).toBe(400); expect(result.observation).toBe(null); expect(result.rawOutput).toBe(null); }
       if (mode.startsWith('large_')) { expect(result.rawOutputTruncated).toBe(true); expect(Buffer.byteLength(result.rawOutput ?? '')).toBeLessThanOrEqual(65536); }
     } finally { f.close(); target.stop(true); }
   });

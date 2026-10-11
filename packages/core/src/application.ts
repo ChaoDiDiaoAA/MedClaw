@@ -14,6 +14,7 @@ import { ResourceService } from './resources/resource-service';
 import type { ResourceSource } from '../../contracts/src/resources';
 import { ExtensionsReadResultSchema, type ExtensionsReadResult } from '../../contracts/src/protocol';
 import { ExtensionsReadInputSchema, ExtensionsCommandInputSchema, type ExtensionsReadInput, type ExtensionsCommandInput } from '../../contracts/src/extensions';
+import type { ExportServicePort } from '../../contracts/src/export';
 
 type Login = { view: AuthAttemptView; abort: AbortController; pending?: { id: string; allowedIds: string[] | null; resolve: (value: string) => void; reject: (reason: unknown) => void }; task: Promise<void> };
 const now = () => new Date().toISOString();
@@ -27,10 +28,10 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
   private closing = false;
   private readonly intentAbort = new AbortController();
   private readonly intentInspections = new Set<Promise<IntentModelInspection>>();
-  constructor(readonly instanceId: string, private settings: PublishedSettings, readonly runtime: ModelRuntimePort<Resolved>, readonly repositories: RuntimeRunStore, private readonly scope: CredentialScope, startCall: ModelCallStarter, private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void = () => {}, private readonly agent?: AgentRuntimePort<Resolved,RunControl> & NativeSessionBindings, events?: Pick<EventService, 'notifyStream'>,transactions?:WriteTransactions, resourceSource?:ResourceSource, private readonly intents?:IntentRoutingDependencies) {
+  constructor(readonly instanceId: string, private settings: PublishedSettings, readonly runtime: ModelRuntimePort<Resolved>, readonly repositories: RuntimeRunStore, private readonly scope: CredentialScope, startCall: ModelCallStarter, private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void = () => {}, private readonly agent?: AgentRuntimePort<Resolved,RunControl> & NativeSessionBindings, events?: Pick<EventService, 'notifyStream'>,transactions?:WriteTransactions, resourceSource?:ResourceSource, private readonly intents?:IntentRoutingDependencies, readonly exports: ExportServicePort | null = null) {
     this.resources = resourceSource ? new ResourceService(() => this.settings, repositories, resourceSource, () => agent?.toolNames ?? []) : null;
     this.runs = new RuntimeService(instanceId, () => this.settings, runtime, repositories, scope, startCall, notice, report, agent,
-      () => this.closing || this.prepared !== null || this.refreshes.size > 0 || [...this.logins.values()].some(login => !login.view.endedAt), snapshot => events?.notifyStream(snapshot),transactions,this.resources ?? undefined,intents);
+      () => this.closing || this.exports?.busy === true || this.prepared !== null || this.refreshes.size > 0 || [...this.logins.values()].some(login => !login.view.endedAt), snapshot => events?.notifyStream(snapshot),transactions,this.resources ?? undefined,intents);
   }
   get config() { return this.settings; }
   get busy() { return this.runs.busy; }
@@ -95,6 +96,7 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
     this.intentInspections.add(pending);try{return await pending;}finally{this.intentInspections.delete(pending);}
   }
   async prepareConfig(token: string, input: PublishedSettings) {
+    if (this.exports?.busy) throw safeError('runtime_busy');
     this.runs.assertNoHistoryMutation();
     if (this.prepared && this.prepared.token === token && isDeepStrictEqual(this.prepared.candidate, input)) return { prepared: true as const, selection: (await this.directory()).selection };
     if (this.prepared || this.closing) throw new Error("runtime_busy");
@@ -200,6 +202,7 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
     this.refreshes.forEach(a => a.abort()); this.logins.forEach(l => l.abort.abort());
     await Promise.all([...this.logins.values()].map(l => l.task));
     await Promise.allSettled([...this.intentInspections]);
+    await this.exports?.shutdown();
     return this.runs.shutdown();
   }
 }

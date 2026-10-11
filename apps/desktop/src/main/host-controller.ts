@@ -252,7 +252,8 @@ export class HostController {
     });
     this.options.onStarting?.(instanceId);
     this.view.state = "handshaking"; this.status();
-    const timer = setTimeout(() => { if (this.child === child && this.handshake) this.fail("host_start_failed"); }, 10000);
+    // The full imported catalog requires a synchronous integrity check before ready.
+    const timer = setTimeout(() => { if (this.child === child && this.handshake) this.fail("host_start_failed"); }, 60000);
     try {
       const hello = HostHelloSchema.parse({ protocolVersion: HOST_PROTOCOL_VERSION, instanceId, startupToken, sdkVersion: SDK_VERSION, expectedSchemaVersion: DATABASE_SCHEMA_VERSION, paths: this.paths });
       await this.write(`${JSON.stringify(hello)}\n`);

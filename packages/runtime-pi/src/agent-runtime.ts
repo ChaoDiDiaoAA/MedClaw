@@ -248,7 +248,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel,RunControl
     if(this.loading.has(input.sessionId))throw safeError('runtime_busy');
     const availability=this.readAvailability(input.sessionId);if(availability.availability==='blocked')throw availability.error;
     if(!this.sessions.has(input.sessionId)) {
-      if(input.mode!=='program')throw safeError('state_conflict');
+      if(input.mode!=='program'&&input.mode!=='user_form')throw safeError('state_conflict');
       // Program results load a native manager without selecting, authenticating or assembling a main model.
       const load=(async()=>{
         const loaded=await this.history.store.load(input.sessionId);if(!loaded.ok)throw loaded.error;
@@ -271,7 +271,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel,RunControl
       ||input.mode==='agent_task'&&binding.lastRunId!==input.runId)throw safeError('stop_unconfirmed');
     if(binding.lastRunId!==undefined&&(this.inputPersistencePending(binding.lastRunId)||this.toolPersistencePending(binding.lastRunId)
       ||this.hasPendingContextPersistence(binding.lastRunId)||this.hasPendingSubagentPersistence(binding.lastRunId)))throw safeError('storage_write_failed');
-    if(input.mode==='program'){binding.session?.dispose();binding.session=undefined;binding.commandPrompt=undefined;}
+    if(input.mode==='program'||input.mode==='user_form'){binding.session?.dispose();binding.session=undefined;binding.commandPrompt=undefined;}
     binding.ownerRunId=input.runId;binding.product={identity};
     try {
       const fact=appendProductTurn(binding.manager,binding.memory,input);

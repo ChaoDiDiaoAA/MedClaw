@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { errorMessage } from '../../../../packages/contracts/src/error';
 import type { Artifact, ImportOperation, ImportPreview } from '../../../../packages/contracts/src/data';
+import { ArtifactSchema } from '../../../../packages/contracts/src/data';
 import type { HostView } from '../../../../packages/contracts/src/model';
 import type { Batch } from '../../../../packages/contracts/src/query';
 import type { PublicReturn } from '../../../../packages/contracts/src/protocol';
@@ -49,7 +50,8 @@ export function DataWorkspace(props: { host: HostView; workspace: WorkspaceView 
     if (result.data?.artifactId) {
       const copy = await window.medclaw.request('evidence.readArtifact', { artifactId: result.data.artifactId });
       if (!mounted.current || instanceId !== current.current.instanceId || ref !== current.current.operationRef || order !== readOrder.current) return;
-      if (copy.ok) setArtifact(copy.data); else props.onError(errorMessage(copy.error));
+      if (copy.ok) { const imported = ArtifactSchema.nullable().safeParse(copy.data); if (imported.success) setArtifact(imported.data); else props.onError('The artifact does not match this import.'); }
+      else props.onError(errorMessage(copy.error));
     } else setArtifact(null);
     if (result.data?.result?.status === 'imported' || result.data?.result?.status === 'duplicate') props.onRefresh();
   }

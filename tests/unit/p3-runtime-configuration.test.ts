@@ -47,5 +47,8 @@ test('transport preserves omitted defaults until the trusted fixed business cont
   expect('payload' in frame && frame.payload).toEqual({ queryId: 1 });
   expect(createPublicMethodSchemas()['query.read'].input.parse(payload)).toEqual({ queryId: 1, page: 1, pageSize: 50 });
   const query = { kind: 'current' as const, population: 'snapshot' as const, snapshotMode: 'exact_date' as const, batchIds: [1] };
-  expect(publicMethodSchemas['query.execute'].input.parse({ params: query, expectedRevision: 1 }).params).toEqual(query);
+  const form=publicMethodSchemas['session.submit'].input.parse({mode:'send',sessionId:1,clientSequence:1,text:'Engineering form',
+    expectedRevision:1,expectedBatchIds:[1],expectedQueryId:null,model:{provider:'fixture',modelId:'fixture',expectedConfigVersion:'1'},
+    referenceDate:'2026-10-11',timezone:'Asia/Shanghai',routing:{mode:'user_form',params:query}});
+  expect(form.mode==='send'&&form.routing?.mode==='user_form'&&form.routing.params).toMatchObject({...query,page:1,pageSize:50,sort:'asc',distributor:null});
 });

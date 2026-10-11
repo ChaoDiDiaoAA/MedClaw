@@ -16,7 +16,7 @@ import { decideIntentRoute, type IntentDecisionSource } from './route-policy';
 import { INTENT_CAPABILITIES } from './taxonomy';
 
 export type IntentExecution = { signal: AbortSignal; checkActive: () => void; control: RunControl;
-  workspaceContext: WorkspaceContext; expectedCancelEpoch: number; admission?: FrozenIntentAdmission };
+  workspaceContext: WorkspaceContext; expectedCancelEpoch: number; admission?: FrozenIntentAdmission; inheritedSnapshotMode?:'exact_date'|'as_of'|null };
 const now = () => new Date().toISOString();
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 function stageInput(value: IntentStageInput): IntentStageInput {
@@ -80,14 +80,15 @@ export class IntentService {
       const callIds: string[] = [];
       const route = (result: Parameters<typeof decideIntentRoute>[0], validation: IntentValidation, source: IntentDecisionSource) => {
         active();
-        const decision = decideIntentRoute(result, validation, input, source);
+        const decision = decideIntentRoute(result, validation, input, source,execution.inheritedSnapshotMode??null);
         const { decisionId } = this.store.commitRoute({ runId: input.runId, sessionId: input.sessionId, inputId: input.inputId,
           decision, expectedCancelEpoch: execution.expectedCancelEpoch, createdAt: now() });
         active();
         return { callIds, ruleEvaluation: rule.evaluation, decision, decisionId };
       };
-      if (rule.result) return route(rule.result, this.validator.validateQueryParams(rule.result, context, input, now()), { rule: rule.evaluation });
+      if (rule.result) return route(rule.result, this.validator.validateQueryParams(rule.result, context, input, now(),execution.inheritedSnapshotMode??null), { rule: rule.evaluation });
       if (!selection.enabled || selection.configVersion !== input.versions.configVersion) throw safeError('intent_model_unavailable');
+      const modelInput=this.validator.groundInput(input,context);
       const stage = async (projection: IntentStageInput) => {
         active(); execution.control.previewModelCall();
         const configuration = IntentModelConfigurationSchema.parse(Object.fromEntries(Object.keys(IntentModelConfigurationSchema.shape).map(key => [key, selection[key as keyof IntentModelSelection]])));
@@ -115,7 +116,7 @@ export class IntentService {
         try {
           active();
           if (outcome.transportState === 'completed' && !outcome.error && outcome.rawOutput !== null) {
-            checked = this.validator.checkPrediction(outcome.rawOutput, context, projection, now(), outcome.rawOutputTruncated);
+            checked = this.validator.checkPrediction(outcome.rawOutput, context, projection, now(), outcome.rawOutputTruncated,execution.inheritedSnapshotMode??null);
             if (checked.validation.state === 'invalid' && !checked.validation.reviewRequired) outcome.error = safeError('intent_output_invalid');
           }
         } catch (error) { interrupted = error; checked = { ...checked, validation: notRun(outcome.rawOutputTruncated) }; }
@@ -135,11 +136,12 @@ export class IntentService {
         if (completion.state !== 'completed') throw safeError('intent_model_unavailable');
         return { ...checked, callId, outcome };
       };
-      const first = await stage(stageInput({ input, stage: 'classify', review: null }));
+      const first = await stage(stageInput({ input:modelInput, stage: 'classify', review: null }));
       active();
-      const adopted = first.validation.reviewRequired ? await stage(stageInput({ input, stage: 'verify', review: {
+      const adopted = first.validation.reviewRequired ? await stage(stageInput({ input:modelInput, stage: 'verify', review: {
         previousCallId: first.callId, prediction: first.prediction, rawHash: hash(first.outcome.rawOutput ?? ''),
-        rawPreview: (first.outcome.rawOutput ?? '').slice(0, 4096), issues: first.validation.issues, candidates: first.candidates } })) : first;
+        rawPreview: (first.outcome.rawOutput ?? '').slice(0, 4096), issues: first.validation.issues, candidates: first.candidates,
+        mode: first.candidates.length ? 'candidate_selection' : 'semantic_correction' } })) : first;
       active();
       if (!adopted.prediction) throw safeError('intent_output_invalid');
       return route(adopted.prediction, adopted.validation, { stage: adopted === first ? 'classify' : 'verify', callId: adopted.callId });

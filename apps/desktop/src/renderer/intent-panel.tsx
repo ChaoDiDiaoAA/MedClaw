@@ -44,7 +44,7 @@ export function QueryConditions(props:{sessionId:number|null;context:QueryContex
   if(!context||context.sessionId!==props.sessionId)return null;
   return <section className="panel" aria-label="Current query conditions"><h3>Current query conditions</h3>
     <p className="tiny">Source: Run {context.sourceRunId} · Input {context.sourceInputId} · Version {context.version}</p>
-    <p className="tiny">Leaf: <code>{context.nativeLeafId}</code></p><Slots slots={context.adoptedSlots}/>
+    <p className="tiny">Leaf: <code>{context.nativeLeafId}</code></p>{'contract' in context?<pre className="tiny">{JSON.stringify(context.params,null,2)}</pre>:<Slots slots={context.adoptedSlots}/>}
     <p>Saved queries: {context.queryIds.map((id,index)=><span key={id}>{index>0?', ':''}{props.onQuery?<button onClick={()=>props.onQuery!(id,context.sessionId)}>Query #{id}</button>:`Query #${id}`}</span>)}</p>
     {context.pendingClarification&&<p role="status">Pending task: {context.pendingClarification.taskText} · Missing: {context.pendingClarification.missingSlots.join(', ')}</p>}
   </section>;
@@ -73,9 +73,9 @@ export function IntentPanel(props:{host:HostView;runId:number;sessionId:number;i
     {!data?<p className="muted">Intent facts unconfirmed.</p>:<>
       <p>Intent calls: {data.calls.length}</p>
       {props.onAction&&['completed','failed','cancelled'].includes(data.execution.runStatus)&&data.execution.requiredPersistenceComplete===true&&<div className="actions">
-        <p className="tiny">Creates a new Run using the full original task and its data scope.</p>
+        <p className="tiny">Retry creates a new Run using the full original task and scope. Review opens query conditions without executing.</p>
         <button disabled={props.actionsDisabled||!ready||busy===key||notice?.key===key} onClick={()=>props.onAction!('intent')}>Retry recognition</button>
-        {(data.execution.runStatus!=='completed'||decision?.route==='clarify'||decision?.route==='reject')&&<button disabled={props.actionsDisabled||!ready||busy===key||notice?.key===key} onClick={()=>props.onAction!('explicit_agent_fallback')}>Analyze with main agent</button>}
+        {(data.execution.runStatus!=='completed'||decision?.route==='clarify'||decision?.route==='reject')&&<button disabled={props.actionsDisabled||!ready||busy===key||notice?.key===key} onClick={()=>props.onAction!('explicit_agent_fallback')}>Review query conditions</button>}
       </div>}
       <section><h4>Rule</h4>{data.ruleEvaluation?<><p>{data.ruleEvaluation.outcome} · {data.ruleEvaluation.ruleId??'No matched rule'}</p><p className="tiny">{data.ruleEvaluation.reasonCode} · {data.ruleEvaluation.ruleVersion} · {data.ruleEvaluation.checkedAt}</p></>:<p>Not evaluated</p>}</section>
       {(['classify','verify'] as const).map(stage=>{const call=data.calls.find(value=>value.stage===stage);return <section key={stage}>
@@ -97,6 +97,7 @@ export function IntentPanel(props:{host:HostView;runId:number;sessionId:number;i
         <p>Decision {decision.id} · {decision.decisionSource} · {decision.matchedBy??'No classifier'} · {decision.status??'Unspecified'}</p>
         {decision.status&&<p>{statusText[decision.status]}</p>}
         <p>Planned route: {decision.route}</p><p className="tiny">Adopted call: <code>{decision.intentCallId??'None'}</code></p>
+        {decision.executionPlan&&<p>Product program: {decision.executionPlan.steps.length} steps · {decision.executionPlan.steps.reduce((sum,step)=>sum+step.queries.length,0)} query parts · No main model execution</p>}
         <TaskIntents items={decision.adoptedIntents}/><p>Missing slots: {decision.missingSlots.join(', ')||'None'}</p>
         {decision.issues.map((issue,index)=><p key={index}>{issue.code}: {issue.message}</p>)}
       </>}</section>
@@ -104,7 +105,7 @@ export function IntentPanel(props:{host:HostView;runId:number;sessionId:number;i
         <p>Required persistence complete: {data.execution.requiredPersistenceComplete===null?'Unconfirmed':data.execution.requiredPersistenceComplete?'Yes':'No'}</p>
         <p>Answer: {data.execution.answerId===null?'None':`#${data.execution.answerId}`}</p>
         <p>Saved queries: {data.execution.queryIds.length?data.execution.queryIds.map((id,index)=><span key={id}>{index>0?', ':''}{props.onQuery?<button onClick={()=>props.onQuery!(id,props.sessionId)}>Query #{id}</button>:`Query #${id}`}</span>):'None'}</p>
-        {data.execution.stepResults.map(step=><p key={step.stepId}>{step.stepId}: {step.queryRefs.map(ref=>`Query #${ref.queryId}`).join(', ')||'No saved queries'}</p>)}
+        {data.execution.stepResults.map(step=><p key={step.stepId}>{step.stepId}: {step.metadata?`Snapshot dates: ${step.metadata.batches.map(batch=>batch.snapshotDate).join(', ')}`:step.queryRefs.map(ref=>`Query #${ref.queryId}`).join(', ')||'No saved queries'}</p>)}
       </section>
     </>}
   </section>;

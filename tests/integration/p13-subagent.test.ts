@@ -760,8 +760,8 @@ test('p13 schema11 migration preserves original data and rejects partial upgrade
       db.close();
     }
     db = openDatabase(path);
-    expect(SCHEMA_VERSION).toBe(13);
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(13);
+    expect(SCHEMA_VERSION).toBe(15);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(15);
     for (const name of tables.filter(n => n !== 'schema_migrations')) {
       const rows = db.query<Record<string, unknown>, []>(`SELECT * FROM ${name} ORDER BY id`).all();
       expect(rows.map((row, i) => Object.fromEntries(Object.keys(before.get(name)![i]!).map(key => [key, row[key]])))).toEqual(before.get(name)!);

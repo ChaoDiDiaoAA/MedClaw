@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { AppErrorSchema, ConfigVersionSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } from './error';
-import { INTENT_VERSIONS, IntentModelSelectionSchema, ReferenceDateSchema, TimezoneSchema, type IntentModelSelection } from './model';
+import { INTENT_VERSIONS, IntentModelSelectionSchema, IntentClassifyPromptVersionSchema, IntentVerifyPromptVersionSchema, IntentPolicyVersionSchema, ReferenceDateSchema, TimezoneSchema, type IntentModelSelection } from './model';
 import { BatchSchema, QueryParamsSchema } from './query';
 import { RunScopeSchema, RunStatusSchema } from './run';
 import { ResourceHashSchema } from './resources';
@@ -142,20 +142,38 @@ function hasAdoptedQuery(value: { taskIntents: IntentItem[]; contextIntentId: st
   const item = value.taskIntents.find(item => item.id === value.contextIntentId);
   return item !== undefined && item.l1 !== 'RESULT_DELIVERY' && JSON.stringify(item.slots) === JSON.stringify(value.adoptedSlots);
 }
-export const QueryContextRecordSchema = z.strictObject({
+const AutomaticQueryContextRecordSchema = z.strictObject({
   sessionId: PositiveIdSchema, nativeLeafId: OpaqueIdSchema, version: PositiveIdSchema, ...adoptedFields,
 }).refine(hasAdoptedQuery, 'Context requires the unique adopted query and its exact full slots');
-export type QueryContextRecord = z.infer<typeof QueryContextRecordSchema>;
 export const AdoptedContextFactSchema = z.strictObject({
   contract: z.literal('medclaw.query-context-entry/v2'), ...adoptedFields, decisionId: PositiveIdSchema,
 }).refine(hasAdoptedQuery, 'Context requires a determined query');
 export type AdoptedContextFact = z.infer<typeof AdoptedContextFactSchema>;
+export const FormContextFactSchema = z.strictObject({
+  contract: z.literal('medclaw.query-form-context/v1'), decisionId: PositiveIdSchema,
+  sourceRunId: PositiveIdSchema, sourceInputId: PositiveIdSchema, params: QueryParamsSchema,
+  queryIds: queryIds.length(1), scopeBatchHashes: hashes,
+});
+export type FormContextFact = z.infer<typeof FormContextFactSchema>;
+export const FormExecutionFactSchema = z.strictObject({ contract: z.literal('medclaw.query-form-execution/v1'),
+  decisionId: PositiveIdSchema, queryId: PositiveIdSchema, resultHash: ResourceHashSchema });
+export type FormExecutionFact = z.infer<typeof FormExecutionFactSchema>;
+export const FormQueryContextRecordSchema = FormContextFactSchema.extend({
+  sessionId: PositiveIdSchema, nativeLeafId: OpaqueIdSchema, version: PositiveIdSchema, pendingClarification: z.null(),
+});
+export type FormQueryContextRecord = z.infer<typeof FormQueryContextRecordSchema>;
+export const QueryContextRecordSchema = z.union([AutomaticQueryContextRecordSchema, FormQueryContextRecordSchema]);
+export type QueryContextRecord = z.infer<typeof QueryContextRecordSchema>;
+export const QueryContextFactSchema = z.union([AdoptedContextFactSchema, FormContextFactSchema]);
+export type QueryContextFact = z.infer<typeof QueryContextFactSchema>;
 export const ValidationIssueSchema = z.strictObject({
   code: z.enum(['missing_slot', 'ambiguous_entity', 'entity_not_found', 'data_missing', 'data_coverage_missing',
     'unsupported_capability', 'hierarchy_conflict', 'confusable_pair', 'suspected_ood', 'invalid_combination',
     'explicit_condition_conflict', 'scope_violation', 'invalid_value']),
   intentId: stepId.nullable(), slot: label, severity: z.enum(['needs_input', 'warning', 'invalid']),
   message: z.string().min(1).max(1024), candidates: uniqueLabels,
+  sourceSpan: z.strictObject({ start: z.number().int().nonnegative(), end: z.number().int().positive() })
+    .refine(value => value.end > value.start).optional(),
 });
 export type ValidationIssue = z.infer<typeof ValidationIssueSchema>;
 export const IntentValidationSchema = z.strictObject({
@@ -181,14 +199,29 @@ export const RuleEvaluationSchema = z.strictObject({
   outcome: z.enum(['hit', 'miss', 'conflict']), reasonCode: label, checkedAt: TimestampSchema,
 }).refine(value => value.outcome !== 'hit' || value.ruleId !== null, 'A complete rule hit needs its registered identity');
 export type RuleEvaluation = z.infer<typeof RuleEvaluationSchema>;
+export const IntentQueryPlanSchema = z.strictObject({ contract: z.literal('medclaw.intent-query-plan/v1'),
+  steps: z.array(z.strictObject({ stepId, dependsOn: z.array(stepId).max(7),
+    queries: z.array(z.lazy(() => QueryParamsSchema)).max(64),
+    metadata: z.strictObject({ basis: z.literal('snapshot_date'), region: label.nullable() }).nullable(),
+  }).refine(step => step.metadata === null ? step.queries.length > 0 : step.queries.length === 0, 'A step has queries or metadata')).min(1).max(8),
+}).superRefine((plan, ctx) => {
+  const seen = new Set<string>();
+  for (const step of plan.steps) {
+    if (seen.has(step.stepId) || step.dependsOn.some(id => !seen.has(id)) || new Set(step.dependsOn).size !== step.dependsOn.length)
+      ctx.addIssue({ code: 'custom', message: 'Plan steps require unique identities and earlier dependencies' });
+    seen.add(step.stepId);
+  }
+});
+export type IntentQueryPlan = z.infer<typeof IntentQueryPlanSchema>;
 export const IntentDecisionSchema = z.strictObject({
   intentCallId: OpaqueIdSchema.nullable(), matchedBy: z.enum(['rule', 'qwen_prompt', 'paper_enhanced']).nullable(),
   route: z.enum(['simple', 'agent', 'clarify', 'reject']), status: IntentStatusSchema.nullable(),
   adoptedIntents: IntentItemsSchema, contextIntentId: stepId.nullable(), adoptedSlots: IntentSlotsSchema.nullable(),
   queryParams: z.lazy(() => QueryParamsSchema).nullable(), missingSlots: uniqueSlots, issues: z.array(ValidationIssueSchema).max(64),
+  executionPlan: IntentQueryPlanSchema.optional(),
   ruleEvaluation: RuleEvaluationSchema.nullable(),
   decisionSource: z.enum(['deterministic_rule', 'validated_model', 'user_form', 'explicit_agent_fallback']),
-  schemaVersion: z.literal(INTENT_VERSIONS.schemaVersion), policyVersion: z.literal(INTENT_VERSIONS.policyVersion),
+  schemaVersion: z.literal(INTENT_VERSIONS.schemaVersion), policyVersion: IntentPolicyVersionSchema,
 }).superRefine((value, ctx) => {
   const invalid = (message: string) => ctx.addIssue({ code: 'custom', message });
   const automatic = value.decisionSource === 'deterministic_rule' || value.decisionSource === 'validated_model';
@@ -197,18 +230,31 @@ export const IntentDecisionSchema = z.strictObject({
   if (!automatic && (value.intentCallId !== null || value.matchedBy !== null || value.adoptedIntents.length || value.ruleEvaluation !== null)) invalid('A user entry cannot claim model or rule predictions');
   if (automatic && value.status === null) invalid('An automatic route needs its semantic status');
   if (automatic && ['simple', 'agent'].includes(value.route) && (value.status !== 'RESOLVED' || !value.adoptedIntents.length)) invalid('Only resolved tasks may execute');
-  if (value.route === 'simple' && (value.queryParams === null || value.status !== 'RESOLVED' || automatic && value.adoptedIntents.length !== 1)) invalid('Simple requires one resolved compiled query');
+  const planned = ['medclaw.intent-policy/v4', 'medclaw.intent-policy/v5'].includes(value.policyVersion) && automatic;
+  if (planned && value.status === 'RESOLVED' && (value.route !== 'simple' || !value.executionPlan)) invalid('Resolved v4 tasks require a deterministic plan');
+  if (value.executionPlan && (!planned || value.route !== 'simple' || value.executionPlan.steps.length !== value.adoptedIntents.length
+    || value.executionPlan.steps.some((step, index) => step.stepId !== value.adoptedIntents[index]!.id
+      || JSON.stringify(step.dependsOn) !== JSON.stringify(value.adoptedIntents[index]!.dependsOn)))) invalid('Plan must cover the exact adopted tasks');
+  if (value.route === 'simple' && (value.status !== 'RESOLVED' || !value.executionPlan && (value.queryParams === null || automatic && value.adoptedIntents.length !== 1))) invalid('Simple requires a resolved query or complete plan');
+  if (value.executionPlan) {
+    const queries = value.executionPlan.steps.flatMap(step => step.queries);
+    const single = value.executionPlan.steps.length === 1 && queries.length === 1;
+    if (single ? JSON.stringify(value.queryParams) !== JSON.stringify(queries[0]) : value.queryParams !== null) invalid('Single QueryParams must match the plan; other plans have no single QueryParams');
+  }
   if (value.route !== 'simple' && value.queryParams !== null) invalid('Only simple stores compiled QueryParams');
   if (value.route === 'reject' && value.status !== 'OUT_OF_SCOPE') invalid('Rejection is reserved for out of scope');
   if (value.route === 'clarify' && !['AMBIGUOUS', 'NEED_PARAMETERS', 'UNSUPPORTED_DATA'].includes(value.status ?? '')) invalid('Clarification needs a nonexecutable business status');
   if ((value.contextIntentId === null) !== (value.adoptedSlots === null)) invalid('Adopted context ID and slots must be paired');
   if (value.contextIntentId !== null && value.adoptedSlots !== null && !hasAdoptedQuery({ taskIntents: value.adoptedIntents, contextIntentId: value.contextIntentId, adoptedSlots: value.adoptedSlots })) invalid('Adopted conditions must exactly match the selected task');
   if (value.decisionSource === 'explicit_agent_fallback' && (value.route !== 'agent' || value.status !== null || value.contextIntentId !== null)) invalid('Explicit fallback starts an Agent without adopting a failed prediction');
+  if (value.decisionSource === 'user_form' && (value.route !== 'simple' || value.status !== 'RESOLVED'
+    || value.contextIntentId !== null || value.adoptedSlots !== null || value.missingSlots.length || value.issues.length)) invalid('A form requires its complete query without predictions');
 });
 export type IntentDecision = z.infer<typeof IntentDecisionSchema>;
 export const IntentStepResultSchema = z.strictObject({
   stepId, queryRefs: z.array(z.strictObject({ queryId: PositiveIdSchema, resultHash: ResourceHashSchema }))
     .refine(refs => new Set(refs.map(ref => ref.queryId)).size === refs.length, 'Duplicate Query references'),
+  metadata: z.lazy(() => IntentStepMetadataSchema).optional(),
 });
 export type IntentStepResult = z.infer<typeof IntentStepResultSchema>;
 export const IntentExecutionFactSchema = z.strictObject({
@@ -228,9 +274,22 @@ export const IntentStepMetadataSchema=z.strictObject({stepId,part:z.literal(0),b
 export const IntentVersionsSchema = z.strictObject({
   configVersion: ConfigVersionSchema,
   taxonomyVersion: z.literal(INTENT_VERSIONS.taxonomyVersion), ruleVersion: z.literal(INTENT_VERSIONS.ruleVersion),
-  classifyPromptVersion: z.literal(INTENT_VERSIONS.classifyPromptVersion), verifyPromptVersion: z.literal(INTENT_VERSIONS.verifyPromptVersion),
-  schemaVersion: z.literal(INTENT_VERSIONS.schemaVersion), policyVersion: z.literal(INTENT_VERSIONS.policyVersion),
+  classifyPromptVersion: IntentClassifyPromptVersionSchema, verifyPromptVersion: IntentVerifyPromptVersionSchema,
+  schemaVersion: z.literal(INTENT_VERSIONS.schemaVersion), policyVersion: IntentPolicyVersionSchema,
 });
+const groundingSource = {
+  source: z.enum(['current_input','pending_task']), quote: z.string().min(1).max(256),
+  start: z.number().int().nonnegative(), end: z.number().int().positive(),
+};
+export const IntentGroundingFactSchema = z.discriminatedUnion('kind', [
+  z.strictObject({...groundingSource,kind:z.literal('date'),time:TimeRangeSchema.nullable()}),
+  z.strictObject({...groundingSource,kind:z.literal('status'),operation:z.enum(['set','clear','exclude']),value:IntentSlotsSchema.shape.status}),
+  z.strictObject({...groundingSource,kind:z.literal('metric'),value:IntentSlotsSchema.shape.metric.unwrap()}),
+  z.strictObject({...groundingSource,kind:z.literal('entity'),field:z.enum(['device','region','manufacturer','category','distributor']),value:label,deviceIds:queryIds.max(10000)}),
+]);
+export type IntentGroundingFact = z.infer<typeof IntentGroundingFactSchema>;
+export const IntentGroundingSchema = z.strictObject({contract:z.literal('medclaw.intent-grounding/v1'),
+  textHash:ResourceHashSchema,pendingTaskHash:ResourceHashSchema.nullable(),facts:z.array(IntentGroundingFactSchema).max(128)});
 export const IntentInputProjectionSchema = z.strictObject({
   contract: z.literal('medclaw.intent-input/v2'), sessionId: PositiveIdSchema, inputId: PositiveIdSchema, runId: PositiveIdSchema,
   baseLeafId: OpaqueIdSchema.nullable(), baseStorageVersion: z.number().int().nonnegative().safe(),
@@ -241,15 +300,24 @@ export const IntentInputProjectionSchema = z.strictObject({
   selectedEntities: z.array(z.strictObject({ deviceId: PositiveIdSchema, label })).max(10000),
   availableData: z.strictObject({ regions: z.array(label), dates: z.array(ReferenceDateSchema), currencies: uniqueLabels, units: uniqueLabels }),
   enabledL2: z.array(L2Schema).max(23).refine(values => new Set(values).size === values.length), availableToolNames: z.array(label).max(1000),
-  versions: IntentVersionsSchema,
-}).refine(value => value.previousQueryContext === null || value.previousQueryContext.sessionId === value.sessionId, 'Previous context must belong to the frozen Session');
+  versions: IntentVersionsSchema, grounding:IntentGroundingSchema.optional(),
+}).refine(value => value.previousQueryContext === null || value.previousQueryContext.sessionId === value.sessionId, 'Previous context must belong to the frozen Session')
+  .superRefine((value,ctx)=>{
+    if(!value.grounding)return;
+    if(!['medclaw.intent-policy/v4','medclaw.intent-policy/v5'].includes(value.versions.policyVersion))ctx.addIssue({code:'custom',message:'Grounding requires policy v4 or v5'});
+    for(const fact of value.grounding.facts){
+      const text=fact.source==='current_input'?value.text:value.pendingClarification?.taskText;
+      if(text===undefined||fact.end<=fact.start||text.slice(fact.start,fact.end)!==fact.quote
+        ||fact.kind==='status'&&(fact.operation==='clear'?fact.value!==null:fact.value===null))ctx.addIssue({code:'custom',message:'Grounding source or meaning is invalid'});
+    }
+  });
 export type IntentInputProjection = z.infer<typeof IntentInputProjectionSchema>;
 export const FrozenIntentAdmissionSchema = z.strictObject({
   contract: z.literal('medclaw.intent-admission/v1'), selection: z.lazy(() => IntentModelSelectionSchema),
   baseLeafId: OpaqueIdSchema.nullable(), baseStorageVersion: z.number().int().nonnegative().safe(),
   prompts: z.strictObject({
-    classify: z.strictObject({ text: z.string().min(1).max(65536), hash: ResourceHashSchema, version: z.literal(INTENT_VERSIONS.classifyPromptVersion) }),
-    verify: z.strictObject({ text: z.string().min(1).max(65536), hash: ResourceHashSchema, version: z.literal(INTENT_VERSIONS.verifyPromptVersion) }),
+    classify: z.strictObject({ text: z.string().min(1).max(65536), hash: ResourceHashSchema, version: IntentClassifyPromptVersionSchema }),
+    verify: z.strictObject({ text: z.string().min(1).max(65536), hash: ResourceHashSchema, version: IntentVerifyPromptVersionSchema }),
   }),
 }).refine(value => value.selection.enabled, 'Intent admission requires enabled verified model configuration');
 export type FrozenIntentAdmission = z.infer<typeof FrozenIntentAdmissionSchema>;
@@ -260,8 +328,14 @@ export const INTENT_STAGE_INPUT_BYTES = 24 * 1024;
 export const IntentStageInputSchema = z.strictObject({
   input: IntentInputProjectionSchema, stage: IntentStageSchema,
   review: z.strictObject({ previousCallId: OpaqueIdSchema, prediction: IntentResultSchema.nullable(), rawHash: ResourceHashSchema,
-    rawPreview: z.string().max(4096), issues: z.array(ValidationIssueSchema).max(64), candidates: z.array(IntentCandidateSchema).min(1).max(3) }).nullable(),
-}).refine(value => (value.stage === 'classify') === (value.review === null), 'Only verify contains the saved first prediction and finite candidates')
+    rawPreview: z.string().max(4096), issues: z.array(ValidationIssueSchema).max(64), candidates: z.array(IntentCandidateSchema).max(3),
+    mode: z.enum(['candidate_selection', 'semantic_correction']).optional() }).nullable(),
+}).refine(value => (value.stage === 'classify') === (value.review === null), 'Only verify contains a review')
+  .refine(value => !value.review || (value.review.mode === 'semantic_correction'
+    ? ['medclaw.intent-verify-prompt/v2','medclaw.intent-verify-prompt/v3','medclaw.intent-verify-prompt/v4'].includes(value.input.versions.verifyPromptVersion) && ['medclaw.intent-policy/v3','medclaw.intent-policy/v4','medclaw.intent-policy/v5'].includes(value.input.versions.policyVersion)
+      && value.review.prediction !== null && value.review.candidates.length === 0 && value.review.issues.length > 0
+      && value.review.issues.every(issue => issue.code === 'explicit_condition_conflict')
+    : value.review.candidates.length > 0), 'Correction requires a complete prediction and only explicit conflicts; selection requires candidates')
   .refine(value => new TextEncoder().encode(JSON.stringify(value)).byteLength <= INTENT_STAGE_INPUT_BYTES, 'Intent stage projection exceeds 24 KiB');
 export type IntentStageInput = z.infer<typeof IntentStageInputSchema>;
 export const IntentModelInspectionSchema = z.strictObject({
@@ -342,10 +416,11 @@ export interface IntentStore {
   readIntent(input: ReadIntentInput): IntentReadResult | null;
 }
 
-export const ProductResultDetailsSchema = z.strictObject({ contract: z.literal('medclaw.product-result/v1'), source: z.literal('program'),
+export const ProductResultDetailsSchema = z.strictObject({ contract: z.literal('medclaw.product-result/v1'), source: z.enum(['program', 'user_form']),
   runId: PositiveIdSchema, inputId: PositiveIdSchema, decisionId: PositiveIdSchema,
   kind: z.enum(['result', 'clarification', 'out_of_scope', 'insufficient_evidence']), queryIds,
-  missingSlots: uniqueLabels });
+  missingSlots: uniqueLabels }).refine(value => value.source !== 'user_form'
+    || value.kind === 'result' && value.queryIds.length === 1 && value.missingSlots.length === 0, 'A form result requires its one Query');
 export type ProductResultDetails = z.infer<typeof ProductResultDetailsSchema>;
 export type ProductTurnResult = Pick<ProductResultDetails, 'kind' | 'queryIds' | 'missingSlots'> & { text: string };
 export type ProductTurnOwner = {
@@ -361,8 +436,17 @@ export const ProductTurnInputSchema = z.discriminatedUnion('mode', [
   z.strictObject({ ...productTurnFields, mode: z.literal('program'), text: z.string().refine(value => value.trim().length > 0),
     decisionId: PositiveIdSchema, result: z.strictObject({ kind: ProductResultDetailsSchema.shape.kind, text: z.string().min(1), queryIds, missingSlots: uniqueLabels }) }),
   z.strictObject({ ...productTurnFields, mode: z.literal('agent_task') }),
+  z.strictObject({ ...productTurnFields, mode: z.literal('user_form'), text: z.string().min(1), decisionId: PositiveIdSchema,
+    result: z.strictObject({ kind: z.literal('result'), text: z.string().min(1), queryIds: queryIds.length(1), missingSlots: uniqueLabels.length(0) }),
+    execution: FormExecutionFactSchema, adoptedContext: FormContextFactSchema }),
 ]).superRefine((value, ctx) => {
   const invalid = (message: string) => ctx.addIssue({ code: 'custom', message });
+  if (value.mode === 'user_form') {
+    if (value.decisionId !== value.execution.decisionId || value.adoptedContext.decisionId !== value.decisionId
+      || value.adoptedContext.sourceRunId !== value.runId || value.adoptedContext.sourceInputId !== value.inputId
+      || value.result.queryIds[0] !== value.execution.queryId || value.adoptedContext.queryIds[0] !== value.execution.queryId) invalid('Form evidence must belong to its exact input and Query');
+    return;
+  }
   const refs = new Set(value.execution.stepResults.flatMap(step => step.queryRefs.map(ref => ref.queryId)));
   if (value.mode === 'program' && (value.decisionId !== value.execution.decisionId
     || value.result.queryIds.length !== refs.size || value.result.queryIds.some(id => !refs.has(id)))) invalid('Program result must reference its exact decision and executed Queries');

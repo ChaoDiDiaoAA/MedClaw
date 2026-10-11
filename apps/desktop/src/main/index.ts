@@ -5,6 +5,7 @@ import { HostController } from "./host-controller.ts";
 import { MainCredentials, SecretInputs } from "./credentials.ts";
 import { MainSettings } from "./settings.ts";
 import { FileTokens } from "./file-tokens.ts";
+import { DestinationTokens } from './destination-tokens';
 import { privateCredentialRequest, registerIpc } from "./ipc-handlers.ts";
 import { safeError, type Result } from "../../../../packages/contracts/src/error.ts";
 import { HOST_PROTOCOL_VERSION, type DesktopNotice, type DiagnosticsView } from "../../../../packages/contracts/src/protocol.ts";
@@ -28,6 +29,7 @@ const dataRoot = explicitRoot ?? app.getPath("userData");
 mkdirSync(join(dataRoot, "data"), { recursive: true }); mkdirSync(join(dataRoot, "runtime"), { recursive: true });
 const credentials = new MainCredentials(join(dataRoot, "data", "credentials.enc.json"), safeStorage);
 const fileTokens = new FileTokens();
+const destinations = new DestinationTokens(dataRoot);
 const notify = (notice: DesktopNotice) => {
   if ((notice.type === 'event.available' || notice.type === 'event.stream') && !ipc?.acceptEventNotice(notice, host.read().instanceId)) return;
   const frame = { ...notice, instanceId: host.read().instanceId };
@@ -39,9 +41,9 @@ const notify = (notice: DesktopNotice) => {
 const hostEntry = process.env.MEDCLAW_HOST_ENTRY ?? resolve(desktopEntryDir, "../../../apps/host/src/main.ts");
 if (!isAbsolute(hostEntry)) throw new Error("Controlled Host entry must be absolute");
 const host = new HostController({ dataRoot, hostEntry, bunExecutable: process.env.MEDCLAW_BUN_EXECUTABLE,
-  onStarting: instanceId => credentials.attachInstance(instanceId),
-  onExit: instanceId => { ipc?.closeInstance(instanceId); credentials.confirmHostExit(instanceId); if (shuttingDown) app.exit(0); },
-  onCredentialRequest: frame => privateCredentialRequest(credentials, frame, fileTokens, window && !window.isDestroyed() ? window.id : undefined),
+  onStarting: instanceId => { credentials.attachInstance(instanceId); destinations.retainInstance(instanceId); },
+  onExit: instanceId => { ipc?.closeInstance(instanceId); credentials.confirmHostExit(instanceId); destinations.retainInstance(null); },
+  onCredentialRequest: frame => privateCredentialRequest(credentials, frame, fileTokens, window && !window.isDestroyed() ? window.id : undefined, destinations),
   onError: error => errors.add(error),
   onStartupFailure: failure => runtimeLog.addHostStartupFailure(failure),
   onNotice: notice => {
@@ -80,7 +82,7 @@ void app.whenReady().then(async () => {
   window.webContents.on('preload-error', () => startupFailure('preload_failed'));
   window.webContents.on('did-fail-load', (_event, _code, _description, _url, isMainFrame) => { if (isMainFrame) startupFailure('renderer_load_failed'); });
   window.webContents.on('render-process-gone', () => startupFailure('renderer_process_gone'));
-  ipc = registerIpc({ window, host, settings, credentials, inputs: new SecretInputs(), fileTokens, diagnostics, report: error => errors.add(error), notify });
+  ipc = registerIpc({ window, host, settings, credentials, inputs: new SecretInputs(), fileTokens, destinations, diagnostics, report: error => errors.add(error), notify });
   ipcMain.on("medclaw:subscribe", event => { if (window && event.sender.id === window.webContents.id && event.senderFrame === event.sender.mainFrame) { event.sender.send("medclaw:notice", { type: "host.status", host: host.read(), instanceId: host.read().instanceId }); if (lastPreview) event.sender.send("medclaw:notice", lastPreview); } });
   runtimeLog.add('renderer_load_start');
   try { await window.loadFile(join(desktopEntryDir, "../renderer/index.html")); }
@@ -98,10 +100,13 @@ if (explicitRoot && process.env.MEDCLAW_DEV_CONTROL_TOKEN) {
 }
 app.on("window-all-closed", () => app.quit());
 app.on("before-quit", event => {
-  if (host.read().state === "stopped" || host.read().state === "failed") return;
   event.preventDefault();
   if (shuttingDown) return;
   shuttingDown = true;
-  const instanceId = host.read().instanceId;
-  if (instanceId) void host.stop(instanceId).then(state => { if (state.canStart) app.exit(0); else errors.add(safeError("host_stop_unconfirmed")); });
+  void (async () => {
+    const instanceId = host.read().instanceId;
+    if (instanceId && !host.read().canStart) await host.stop(instanceId);
+    await destinations.settlePrevious();
+    if (host.read().canStart) app.exit(0); else { errors.add(safeError('host_stop_unconfirmed')); shuttingDown = false; }
+  })().catch(() => { errors.add(safeError('host_stop_unconfirmed')); shuttingDown = false; });
 });

@@ -236,7 +236,7 @@ export class PiMemoryAdapter {
     if(this.disposed||this.pending||this.final||this.compaction||this.product)throw safeError('state_conflict');
     if(input.runId!==this.options.getRunId()||input.sessionId!==this.saved.sessionId
       ||input.baseLeafId!==this.saved.activeLeafId||input.baseStorageVersion!==this.saved.storageVersion)throw safeError('state_conflict');
-    if(input.mode==='program') {
+    if(input.mode==='program'||input.mode==='user_form') {
       if(this.heldFrom!==null||this.saved.activeLeafId!==this.observed.activeLeafId
         ||nativeHistoryJSON(this.saved.entries)!==nativeHistoryJSON(this.observed.entries))throw safeError('storage_write_failed');
     } else if(input.mode==='agent_task') {
@@ -247,7 +247,7 @@ export class PiMemoryAdapter {
   }
   discardProductTurn(proof:ProductTurnDiscardProof):void {
     const product=this.product;
-    if(!product||product.mode!=='program'||proof.runId!==product.runId||proof.sessionId!==this.saved.sessionId
+    if(!product||!['program','user_form'].includes(product.mode)||proof.runId!==product.runId||proof.sessionId!==this.saved.sessionId
       ||proof.requestSettled!==true||proof.routeSettled!==true||proof.requiredFactsSaved!==true||this.pending||this.compaction
       ||this.options.getRunId()!==product.runId||nativeHistoryJSON(this.saved)!==nativeHistoryJSON(product.base)
       ||nativeHistoryJSON(validateNativeHistory(proof.committedSnapshot))!==nativeHistoryJSON(product.base))throw safeError('storage_write_failed');

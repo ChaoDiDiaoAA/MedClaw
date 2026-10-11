@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { createBusinessToolSchemas } from '@medclaw/contracts/business-tools';
 import { PositiveIdSchema } from "../../../contracts/src/error";
-import { BusinessDataSchema, BusinessDateSchema, createQuerySchemas, TimeRangeSchema, type Batch, type BusinessData, type CatalogFilters, type CatalogStore, type Device, type PageInput, type QueryContext, type QueryParams, type Snapshot, type SnapshotReference } from "../../../contracts/src/query";
+import { BusinessDataSchema, BusinessDateSchema, createQuerySchemas, TimeRangeSchema, type Batch, type BusinessData, type CatalogFilters, type CatalogStore, type Device, type IntentSnapshot, type PageInput, type QueryContext, type QueryParams, type Snapshot, type SnapshotReference } from "../../../contracts/src/query";
 import { RunScopeSchema } from "../../../contracts/src/run";
 import { TimezoneSchema } from "../../../contracts/src/model";
 import { ToolContextIdentitySchema, type ToolExecutionContext } from "../../../contracts/src/tool";
@@ -150,7 +150,12 @@ export class CatalogService {
     this.assertSnapshots(rows, ids, context);
     return rows;
   }
-  private assertSnapshots(rows: Snapshot[], batchIds: number[], context: QueryContext): void {
+  intentSnapshots(ids: number[], context: QueryContext): IntentSnapshot[] {
+    this.batches(ids, context);
+    const rows = this.store?.readIntentSnapshots ? this.store.readIntentSnapshots(ids, context.scope.deviceIds) : this.snapshots(ids, context);
+    this.assertSnapshots(rows, ids, context); return rows;
+  }
+  private assertSnapshots(rows: IntentSnapshot[], batchIds: number[], context: QueryContext): void {
     const pairs = new Set<string>(), ids = new Set<number>();
     const allowedBatches = new Set(batchIds), allowedDevices = context.scope.deviceIds === null ? null : new Set(context.scope.deviceIds);
     for (const [index, row] of rows.entries()) {

@@ -12,7 +12,7 @@ function unwrap<T>(result: Result<T>): T { if (!result.ok) throw result.error; r
 test('p12 actual Main publication and Host read prove configuration without creating a run or model call', async () => {
   const root = mkdtempSync(join(tmpdir(),'medclaw-p12-host-'));
   const host = new HostController({dataRoot:root,hostEntry:resolve('apps/host/src/main.ts'),bunExecutable:process.execPath,onStartupFailure:failure=>process.stderr.write(JSON.stringify(failure)+'\n'),onError:error=>process.stderr.write(JSON.stringify(error)+'\n'),
-    onCredentialRequest:async frame => frame.method==='credential.list' ? {ok:true,data:[]} : frame.method==='credential.read' ? {ok:true,data:null} : {ok:false,error:safeError('access_denied')} });
+    onCredentialRequest:async frame => frame.method==='export.destination.settlePrevious'?{ok:true,data:{stopped:true}}:frame.method==='credential.list' ? {ok:true,data:[]} : frame.method==='credential.read' ? {ok:true,data:null} : {ok:false,error:safeError('access_denied')} });
   let failWrite = false, loseCommit = false; const commits: string[] = [];
   const settings = new MainSettings(host.paths.settingsPath, {
     prepare: async (token,candidate) => unwrap(await host.request('settings.prepare',{token,candidate})),
@@ -22,7 +22,7 @@ test('p12 actual Main publication and Host read prove configuration without crea
   }, (path,value)=>{if(failWrite)throw new Error('ENGINEERING failed write');atomicWriteJson(path,value);});
   settings.read();
   try {
-    expect(await host.start()).toMatchObject({state:'ready',schemaVersion:13});
+    expect(await host.start()).toMatchObject({state:'ready',schemaVersion:15});
     const created=unwrap(await host.request('session.create',{expectedWorkspaceRevision:0},'create-a')) as {session:{id:number}};
     const sessionId=created.session.id;
     const read=ExtensionsReadResultSchema.parse(unwrap(await host.request('extensions.read',{source:'selection',sessionId})));

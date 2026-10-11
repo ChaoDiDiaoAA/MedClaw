@@ -122,10 +122,10 @@ test('p11 resource routes validate managed identity and distinguish reads from c
   expect(select.input.safeParse({ ...choice, selection: { prompt: ref, skills: [] } }).success).toBe(false);
   expect(select.input.safeParse({ ...choice, selection: { prompt: null, skills: [ref, { ...ref, version: 'v2' }] } }).success).toBe(false);
   expect(isReadOnlyMethod('resources.list')).toBe(true); expect(isReadOnlyMethod('resources.read')).toBe(true); expect(isReadOnlyMethod('resources.select')).toBe(false);
-  const frame = { protocolVersion: 'medclaw.host/p14-v1', kind: 'request', requestId: 'r', instanceId: 'host', operationRef: 'resource', method: 'resources.select', payload: choice };
+  const frame = { protocolVersion: 'medclaw.host/p15-v3', kind: 'request', requestId: 'r', instanceId: 'host', operationRef: 'resource', method: 'resources.select', payload: choice };
   expect(PublicHostRequestSchema.safeParse(frame).success).toBe(true);
   expect(PublicHostRequestSchema.safeParse({ ...frame, protocolVersion: 'medclaw.host/p10-v1' }).success).toBe(false);
-  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p14-v1'); expect(DATABASE_SCHEMA_VERSION).toBe(13);
+  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p15-v3'); expect(DATABASE_SCHEMA_VERSION).toBe(15);
 });
 
 test('p11 resource HTTP observations cannot certify a different or incomplete expected payload', () => {

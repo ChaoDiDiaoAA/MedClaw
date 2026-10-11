@@ -2,7 +2,7 @@ import type { Database } from 'bun:sqlite';
 import { z } from 'zod';
 import { PositiveIdSchema } from '../../contracts/src/error';
 import { DataCatalogSchema } from '../../contracts/src/data';
-import { BatchSchema, ChangeSchema, DeviceSchema, QueryRowSchema, SnapshotSchema, type Batch, type CatalogFilters, type CatalogStore, type CatalogSummary, type Change, type Device, type QueryParams, type Snapshot, type SnapshotReference } from '../../contracts/src/query';
+import { BatchSchema, ChangeSchema, DeviceSchema, IntentSnapshotSchema, QueryRowSchema, SnapshotSchema, type Batch, type CatalogFilters, type CatalogStore, type CatalogSummary, type Change, type Device, type QueryParams, type Snapshot, type SnapshotReference } from '../../contracts/src/query';
 
 type Row = Record<string, unknown>;
 type Binding = string | number | null;
@@ -29,12 +29,16 @@ export class SqliteCatalogStore implements CatalogStore {
     return this.db.transaction(()=>{
       const records=this.rows("SELECT id,metadata_json,cohort_json FROM batches WHERE status='active' ORDER BY snapshot_date,id LIMIT ? OFFSET ?",[pageSize,(page-1)*pageSize]),selected=records.map(row=>PositiveIdSchema.parse(row.id));
       const batches=this.readBatches(selected),counts=this.rows('SELECT batch_id,COUNT(*) n,COUNT(DISTINCT device_id) devices,json_group_array(device_id) ids FROM snapshots WHERE batch_id IN (SELECT value FROM json_each(?)) GROUP BY batch_id',[ids(selected)]);
+      const cohorts=new Map<string,{byDevice:Map<number,string>;bySource:Map<string,number>;length:number}>();
       for(const batch of batches){const count=counts.find(row=>row.batch_id===batch.id),actual=Number(count?.n??0),devices=decode(count?.ids??'[]') as number[],missing=batch.declaredMissingDeviceIds;
-        const cohort=z.array(z.object({deviceId:PositiveIdSchema,sourceDeviceId:z.string().min(1)})).safeParse(decode(records.find(row=>row.id===batch.id)!.cohort_json));
+        const cohortText=z.string().parse(records.find(row=>row.id===batch.id)!.cohort_json);
         const metadata=z.object({expectedEntityCount:z.number().int().positive(),observedEntityCount:z.number().int().nonnegative(),declaredMissingEntityIds:z.array(z.string())}).safeParse(decode(records.find(row=>row.id===batch.id)!.metadata_json));
-        if(!cohort.success||!metadata.success||cohort.data.length!==batch.expectedEntityCount||new Set(cohort.data.map(member=>member.deviceId)).size!==batch.expectedEntityCount||new Set(cohort.data.map(member=>member.sourceDeviceId)).size!==batch.expectedEntityCount||devices.some(id=>!cohort.data.some(member=>member.deviceId===id))||missing.some(id=>!cohort.data.some(member=>member.deviceId===id))||metadata.data.declaredMissingEntityIds.some(sourceId=>!cohort.data.some(member=>member.sourceDeviceId===sourceId&&missing.includes(member.deviceId))))throw new Error('tool_output_inconsistent');
-        const live=this.readDevices(cohort.data.map(member=>member.deviceId));if(live.some(device=>!cohort.data.some(member=>member.deviceId===device.id&&member.sourceDeviceId===device.sourceDeviceId)))throw new Error('tool_output_inconsistent');
-        if(!metadata.success||metadata.data.expectedEntityCount!==batch.expectedEntityCount||metadata.data.observedEntityCount!==actual||metadata.data.declaredMissingEntityIds.length!==missing.length||new Set(metadata.data.declaredMissingEntityIds).size!==missing.length||actual!==batch.observedEntityCount||Number(count?.devices??0)!==actual||actual+missing.length!==batch.expectedEntityCount||new Set(missing).size!==missing.length||missing.some(id=>devices.includes(id)))throw new Error('tool_output_inconsistent');}
+        if(!metadata.success)throw new Error('tool_output_inconsistent');
+        let cohort=cohorts.get(cohortText);
+        if(!cohort){const parsed=z.array(z.object({deviceId:PositiveIdSchema,sourceDeviceId:z.string().min(1)})).safeParse(decode(cohortText));if(!parsed.success)throw new Error('tool_output_inconsistent');cohort={byDevice:new Map(parsed.data.map(member=>[member.deviceId,member.sourceDeviceId])),bySource:new Map(parsed.data.map(member=>[member.sourceDeviceId,member.deviceId])),length:parsed.data.length};const live=this.readDevices([...cohort.byDevice.keys()]);if(live.some(device=>cohort!.byDevice.get(device.id)!==device.sourceDeviceId))throw new Error('tool_output_inconsistent');cohorts.set(cohortText,cohort);}
+        const {byDevice,bySource}=cohort,observed=new Set(devices),absent=new Set(missing);
+        if(cohort.length!==batch.expectedEntityCount||byDevice.size!==batch.expectedEntityCount||bySource.size!==batch.expectedEntityCount||devices.some(id=>!byDevice.has(id))||missing.some(id=>!byDevice.has(id))||metadata.data.declaredMissingEntityIds.some(sourceId=>!absent.has(bySource.get(sourceId)!)))throw new Error('tool_output_inconsistent');
+        if(metadata.data.expectedEntityCount!==batch.expectedEntityCount||metadata.data.observedEntityCount!==actual||metadata.data.declaredMissingEntityIds.length!==missing.length||new Set(metadata.data.declaredMissingEntityIds).size!==missing.length||actual!==batch.observedEntityCount||Number(count?.devices??0)!==actual||actual+missing.length!==batch.expectedEntityCount||absent.size!==missing.length||missing.some(id=>observed.has(id)))throw new Error('tool_output_inconsistent');}
       const count=(sql:string)=>Number(this.rows(sql)[0]?.n??0);
       const contexts=this.rows("SELECT DISTINCT json_extract(metadata_json,'$.referenceDate') reference_date,json_extract(metadata_json,'$.timezone') timezone FROM batches WHERE status='active' LIMIT 2");
       return DataCatalogSchema.parse({batches,page,pageSize,batchCount:count("SELECT COUNT(*) n FROM batches WHERE status='active'"),deviceCount:count('SELECT COUNT(DISTINCT device_id) n FROM snapshots'),snapshotCount:count('SELECT COUNT(*) n FROM snapshots'),changeCount:count('SELECT COUNT(*) n FROM change_events'),catalogRevision:this.readRevision(),referenceDate:contexts.length===1?contexts[0]!.reference_date??null:null,timezone:contexts.length===1?contexts[0]!.timezone??null:null});
@@ -111,6 +115,12 @@ export class SqliteCatalogStore implements CatalogStore {
     return this.parse(() => {
       const selected = this.snapshotSelection(batchIds, deviceIds, filters);
       return this.rows(`SELECT s.* ${selected.from} ORDER BY s.device_id,b.scope_key,b.snapshot_date,s.id`, selected.params).map(row => this.snapshot(row));
+    });
+  }
+  readIntentSnapshots(batchIds: number[], deviceIds: number[] | null) {
+    return this.parse(() => {
+      const selected = this.snapshotSelection(batchIds, deviceIds, {});
+      return this.rows(`SELECT s.id,s.batch_id AS batchId,s.device_id AS deviceId,s.device_name AS deviceName,s.category,s.region,s.price_cents AS priceCents,s.currency,s.unit,s.status,s.manufacturer,s.distributor ${selected.from} ORDER BY s.device_id,b.scope_key,b.snapshot_date,s.id`, selected.params).map(row => IntentSnapshotSchema.parse(row));
     });
   }
   private changeSelection(newBatchIds: number[], oldBatchIds: number[], deviceIds: number[] | null, filters: CatalogFilters) {

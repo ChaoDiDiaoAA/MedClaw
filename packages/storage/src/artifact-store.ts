@@ -1,15 +1,73 @@
 import type { Database } from 'bun:sqlite';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { lstat, mkdir, readdir, realpath, writeFile, readFile, unlink } from 'node:fs/promises';
+import { lstat, mkdir, readdir, realpath, writeFile, readFile, unlink, rmdir } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createHash } from 'node:crypto';
 import { ArtifactSchema, type Artifact, type CheckedPackage } from '../../contracts/src/data';
-import { PositiveIdSchema, serviceResult, type Result } from '../../contracts/src/error';
+import { AppErrorSchema, PositiveIdSchema, serviceResult, type Result } from '../../contracts/src/error';
 import { canonicalRequest } from '../../contracts/src/run';
 import type { ManagedImportInspection } from '../../contracts/src/workspace';
 import type {DataDeleteFile} from '../../contracts/src/data-deletion';
 import { z } from 'zod';
+import { EXPORT_VERSION, ExportArtifactSchema, ExportManifestSchema, FrozenExportSourceSchema, type ExportArtifact, type ExportFile, type ExportPublication, type FrozenExportSource, type PublishedExport } from '../../contracts/src/export';
+import { SqliteExportStore } from './export-store';
+import { publishNoReplace } from './publish-no-replace';
+
+const exportHash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
+const currentColumns = ['snapshotId', 'batchId', 'deviceId', 'date', 'scopeKey', 'deviceName', 'region', 'category', 'manufacturer', 'distributor', 'status', 'priceCents', 'priceCNY', 'currency', 'unit'];
+const changesColumns = ['eventId', 'deviceId', 'deviceName', 'oldBatchId', 'newBatchId', 'date', 'scopeKey', 'kind', 'field', 'region', 'category', 'manufacturer', 'status', 'currency', 'unit', 'oldValue', 'newValue', 'deltaCents', 'deltaCNY', 'ratio'];
+function cny(value: number): string {
+  const cents = Math.round(value), absolute = Math.abs(cents);
+  return `${cents < 0 ? '-' : ''}${Math.trunc(absolute / 100)}.${String(absolute % 100).padStart(2, '0')}`;
+}
+function markdown(value: string): string {
+  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+    .replace(/[\\`|*_[\]{}()#!~]/g, '\\$&').replaceAll('\r', '\\r').replaceAll('\n', '\\n');
+}
+function exportContent(input: ExportPublication) {
+  const source = FrozenExportSourceSchema.parse(input.source), query = source.query, params = query.params;
+  const priceMetric = 'metric' in params && (params.metric === 'sum_price' || params.metric === 'mean_price');
+  const group = 'groupBy' in params ? params.groupBy : null;
+  const columns = query.kind === 'current' ? currentColumns : query.kind === 'changes' ? changesColumns : [
+    ...(query.kind === 'trend' || group === 'date' ? ['date'] : []), ...(group && group !== 'date' ? [group] : []),
+    ...(priceMetric ? ['currency', 'priceUnit'] : []), 'metric', 'value', ...(priceMetric ? ['valueCNY'] : []), 'unit', 'matchedRows',
+    ...(priceMetric ? ['validCount', 'zeroCount', 'missingCount'] : []), ...(query.kind === 'trend' ? ['gap'] : []),
+  ];
+  const derived: Record<string, string> = { priceCNY: 'priceCents', deltaCNY: 'deltaCents', valueCNY: 'value' };
+  const numeric = new Set(['snapshotId', 'batchId', 'deviceId', 'eventId', 'oldBatchId', 'newBatchId', 'priceCents', 'deltaCents', 'ratio', 'value', 'matchedRows', 'validCount', 'zeroCount', 'missingCount']);
+  const nullCells: { row: number; column: string }[] = [], escapedCells: { row: number; column: string; original: string }[] = [];
+  const display = query.rows.map((row, index) => columns.map(column => {
+    const from = derived[column], raw = row[from ?? column] ?? null, value = from && typeof raw === 'number' ? cny(raw) : raw;
+    if (value === null) nullCells.push({ row: index + 1, column });
+    if (typeof value === 'string' && (/^[\t\r\n]/.test(value) || /^\s*[=+\-@]/.test(value))) escapedCells.push({ row: index + 1, column, original: value });
+    return value;
+  }));
+  const { rows: _rows, snapshotIds: _snapshots, eventIds: _events, ...queryMetadata } = query;
+  const metadata = { contract: 'medclaw.export-metadata/v1', exportVersion: EXPORT_VERSION, originOperationRef: input.originOperationRef, artifactId: input.artifactId,
+    query: queryMetadata, referenceDate: source.referenceDate, timezone: source.timezone, totalRows: query.rows.length, scope: 'all_saved',
+    topN: 'topN' in params ? params.topN : null, evidence: source.evidence, answer: source.answer,
+    sourceAvailability: source.sourceAvailability, deletedBatchIds: source.deletedBatchIds,
+    columns: columns.map(name => ({ name, type: name === 'gap' ? 'boolean' : ['oldValue', 'newValue'].includes(name) ? 'scalar' : numeric.has(name) ? 'number' : 'string',
+      nullable: true, unit: ['priceCents', 'deltaCents'].includes(name) || name === 'value' && priceMetric ? 'CNY cents' : name in derived ? 'CNY' : name === 'ratio' ? 'ratio' : null,
+      derivedFrom: derived[name] ?? null, representation: name in derived ? 'csv/markdown display' : 'original' })), nullCells, escapedCells };
+  const metadataText = canonicalRequest(metadata), metadataHash = exportHash(metadataText);
+  const files: { path: ExportFile['path']; content: Buffer }[] = [];
+  if (input.format === 'csv') {
+    const cell = (value: string | number | boolean | null) => value === null ? '' : typeof value !== 'string' ? String(value)
+      : `"${(/^[\t\r\n]/.test(value) || /^\s*[=+\-@]/.test(value) ? "'" : '') + value.replaceAll('"', '""')}"`;
+    files.push({ path: 'result.csv', content: Buffer.from('\uFEFF' + [columns.map(cell).join(','), ...display.map(row => row.map(cell).join(','))].join('\r\n') + '\r\n') },
+      { path: 'metadata.json', content: Buffer.from(metadataText) });
+  } else if (input.format === 'json') {
+    files.push({ path: 'result.json', content: Buffer.from(canonicalRequest({ metadata, rows: query.rows, answer: source.answer })) });
+  } else {
+    const safeMetadata = metadataText.replaceAll('`', '\\u0060').replaceAll('<', '\\u003c').replaceAll('>', '\\u003e').replaceAll('&', '\\u0026');
+    const table = [columns.map(markdown), columns.map(() => '---'), ...display.map(row => row.map(value => value === null ? 'Missing' : markdown(String(value))))]
+      .map(row => `| ${row.join(' | ')} |`).join('\n');
+    files.push({ path: 'result.md', content: Buffer.from(`# Query ${query.id}\n\n${table}\n${source.answer ? `\n## Answer\n\n${markdown(source.answer.text)}\n` : ''}\n## Metadata\n\n\`\`\`json\n${safeMetadata}\n\`\`\`\n`) });
+  }
+  return { files, metadataHash };
+}
 
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
 const managedManifest = z.strictObject({ schema: z.literal('medclaw.artifact/import/v1'), artifactId: PositiveIdSchema,
@@ -58,6 +116,103 @@ export class ArtifactStore {
   }
   inputPath(id: number): string { return join(this.artifactsRoot, String(PositiveIdSchema.parse(id)), 'input'); }
   manifestPath(id: number): string { return join(this.artifactsRoot, String(PositiveIdSchema.parse(id)), 'manifest.json'); }
+  async publishExport(input: ExportPublication, signal: AbortSignal): Promise<PublishedExport> {
+    PositiveIdSchema.parse(input.artifactId); signal.throwIfAborted();
+    const row = this.db.query<{ operation_ref: string; kind: string; status: string; query_id: number; format: string }, [number]>('SELECT * FROM artifacts WHERE id=?').get(input.artifactId);
+    if (!row || row.kind !== 'export' || row.status !== 'reserved' || row.operation_ref !== input.originOperationRef || row.query_id !== input.source.query.id || row.format !== input.format) throw new Error('state_conflict');
+    const source = new SqliteExportStore(this.db).readSource(input.source.query.id, input.source.answer?.id ?? null);
+    if (canonicalRequest(source) !== canonicalRequest(input.source)) throw new Error('state_conflict');
+    const content = exportContent(input), files = content.files.map(file => ({ path: file.path, bytes: file.content.length, sha256: exportHash(file.content) })).sort((a, b) => a.path.localeCompare(b.path));
+    const manifest = ExportManifestSchema.parse({ contract: 'medclaw.export-manifest/v1', artifactId: input.artifactId, originOperationRef: input.originOperationRef,
+      queryId: source.query.id, resultHash: source.query.resultHash, answerId: source.answer?.id ?? null, format: input.format, exportVersion: EXPORT_VERSION, metadataHash: content.metadataHash, files });
+    await mkdir(this.artifactsRoot, { recursive: true });
+    const root = await this.exportRoot(), initialRoot = await lstat(root), opKey = exportHash(input.originOperationRef);
+    const temporary = join(root, `.${input.artifactId}.${opKey}.tmp`), target = join(root, String(input.artifactId));
+    await mkdir(temporary);
+    const initialTemporary = await lstat(temporary);
+    let published = false;
+    try {
+      for (const file of content.files) { signal.throwIfAborted(); await writeFile(join(temporary, file.path), file.content, { flag: 'wx', signal }); }
+      await writeFile(join(temporary, 'manifest.json'), canonicalRequest(manifest), { flag: 'wx', signal });
+      for (const file of files) {
+        const path = join(temporary, file.path), stat = await lstat(path), actual = await hashFile(path, signal);
+        if (!stat.isFile() || stat.isSymbolicLink() || actual.bytes !== file.bytes || actual.sha256 !== file.sha256) throw new Error('artifact_not_ready');
+      }
+      const nowRoot = await lstat(root), nowTemporary = await lstat(temporary);
+      if (initialRoot.dev !== nowRoot.dev || initialRoot.ino !== nowRoot.ino || nowRoot.isSymbolicLink()
+        || initialTemporary.dev !== nowTemporary.dev || initialTemporary.ino !== nowTemporary.ino || nowTemporary.isSymbolicLink()) throw new Error('access_denied');
+      await publishNoReplace(temporary, target, 'directory', signal); published = true;
+      const proof = await this.verifyExport(input.artifactId);
+      return { ...proof, publishedAt: new Date().toISOString() };
+    } finally {
+      if (!published) {
+        try {
+          const stat = await lstat(temporary), parent = await lstat(root);
+          if (!stat.isSymbolicLink() && stat.dev === initialTemporary.dev && stat.ino === initialTemporary.ino
+            && !parent.isSymbolicLink() && parent.dev === initialRoot.dev && parent.ino === initialRoot.ino && await realpath(temporary) === temporary) {
+            for (const file of [...content.files.map(file => file.path), 'manifest.json']) { try { await unlink(join(temporary, file)); } catch {} }
+            await rmdir(temporary);
+          }
+        } catch { /* Preserve unconfirmed temporary ownership or cleanup; never delete the published directory. */ }
+      }
+    }
+  }
+
+  async verifyExport(artifactId: number): Promise<PublishedExport> {
+    PositiveIdSchema.parse(artifactId);
+    const row = this.db.query<{ operation_ref: string; kind: string; query_id: number; format: string; status: string; metadata_json: string;
+      sha256: string | null; bytes: number | null; metadata_sha256: string | null; published_at: string | null }, [number]>('SELECT * FROM artifacts WHERE id=?').get(artifactId);
+    if (!row || row.kind !== 'export') throw new Error('artifact_not_ready');
+    try {
+      const root = await this.exportRoot(), directory = join(root, String(artifactId)), stat = await lstat(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(directory) !== directory) throw new Error('artifact_not_ready');
+      const manifestStat = await lstat(join(directory, 'manifest.json'));
+      if (!manifestStat.isFile() || manifestStat.isSymbolicLink() || manifestStat.size > 65536) throw new Error('artifact_not_ready');
+      const manifest = ExportManifestSchema.parse(JSON.parse(await readFile(join(directory, 'manifest.json'), 'utf8')));
+      if (manifest.artifactId !== artifactId || manifest.originOperationRef !== row.operation_ref || manifest.queryId !== row.query_id || manifest.format !== row.format) throw new Error('artifact_not_ready');
+      if (canonicalRequest((await readdir(directory)).sort()) !== canonicalRequest([...manifest.files.map(file => file.path), 'manifest.json'].sort())) throw new Error('artifact_not_ready');
+      for (const file of manifest.files) {
+        const path = join(directory, file.path), stat = await lstat(path);
+        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('artifact_not_ready');
+        const actual = await hashFile(path);
+        if (actual.bytes !== file.bytes || actual.sha256 !== file.sha256) throw new Error('artifact_not_ready');
+      }
+      const source = new SqliteExportStore(this.db).readSource(manifest.queryId, manifest.answerId);
+      if (source.query.resultHash !== manifest.resultHash) throw new Error('artifact_not_ready');
+      let metadata: unknown;
+      if (manifest.format === 'csv') metadata = JSON.parse(await readFile(join(directory, 'metadata.json'), 'utf8'));
+      else if (manifest.format === 'json') metadata = z.object({ metadata: z.unknown() }).parse(JSON.parse(await readFile(join(directory, 'result.json'), 'utf8'))).metadata;
+      else {
+        const text = await readFile(join(directory, 'result.md'), 'utf8'), start = text.lastIndexOf('```json\n');
+        if (start < 0 || !text.endsWith('\n```\n')) throw new Error('artifact_not_ready');
+        metadata = JSON.parse(text.slice(start + 8, -5));
+      }
+      const availability = z.object({ sourceAvailability: z.enum(['available', 'deleted']), deletedBatchIds: z.array(PositiveIdSchema) })
+        .refine(value => value.deletedBatchIds.every(id => source.query.batchIds.includes(id)) && new Set(value.deletedBatchIds).size === value.deletedBatchIds.length
+          && (value.sourceAvailability === 'deleted') === (value.deletedBatchIds.length > 0)).parse(metadata);
+      const expected = exportContent({ artifactId, originOperationRef: manifest.originOperationRef, format: manifest.format, source: { ...source, ...availability } });
+      if (expected.metadataHash !== manifest.metadataHash || expected.files.some(file => {
+        const stored = manifest.files.find(item => item.path === file.path);
+        return !stored || stored.bytes !== file.content.length || stored.sha256 !== exportHash(file.content);
+      })) throw new Error('artifact_not_ready');
+      const sha256 = exportHash(canonicalRequest(manifest.files)), sizeBytes = manifest.files.reduce((sum, file) => sum + file.bytes, 0);
+      if (row.status === 'ready' && (row.sha256 !== sha256 || row.bytes !== sizeBytes || row.metadata_sha256 !== manifest.metadataHash
+        || canonicalRequest(JSON.parse(row.metadata_json)) !== canonicalRequest(manifest))) throw new Error('artifact_not_ready');
+      return { artifactId, relativePath: `artifacts/${artifactId}`, manifest, sha256, sizeBytes, metadataSha256: manifest.metadataHash, publishedAt: row.published_at };
+    } catch (error) {
+      if (AppErrorSchema.safeParse(error).success) throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (error instanceof z.ZodError || error instanceof SyntaxError || ['ENOENT', 'ENOTDIR'].includes(code ?? '')
+        || error instanceof Error && error.message === 'artifact_not_ready') throw new Error('artifact_not_ready');
+      throw new Error('storage_read_failed');
+    }
+  }
+
+  private async exportRoot(): Promise<string> {
+    const stat = await lstat(this.artifactsRoot);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('artifact_not_ready');
+    return realpath(this.artifactsRoot);
+  }
   async copy(id: number, operationRef: string, root: string, signal: AbortSignal): Promise<void> {
     const record = this.db.query<{ status: string; operation_ref: string }, [number]>('SELECT status,operation_ref FROM artifacts WHERE id=?').get(id);
     if (!record || record.status !== 'reserved' || record.operation_ref !== operationRef) throw new Error('state_conflict');
@@ -180,10 +335,22 @@ export class ArtifactStore {
       return {status:'unavailable',reason: error instanceof Error && error.name==='SQLiteError' ? 'storage_unavailable' : 'temporary_io'};
     }
   }
-  read(id: number): Promise<Result<Artifact | null>> {
+  read(id: number): Promise<Result<Artifact | ExportArtifact | null>> {
     return serviceResult(async () => {
-      const row = this.db.query<{ id: number; operation_ref: string; status: string; bytes: number | null; sha256: string | null; metadata_json: string }, [number]>('SELECT id,operation_ref,status,bytes,sha256,metadata_json FROM artifacts WHERE id=?').get(PositiveIdSchema.parse(id));
+      const row = this.db.query<{ id: number; operation_ref: string; kind: string; query_id: number | null; format: string; relative_path: string | null; metadata_sha256: string | null;
+        published_at: string | null; registered_at: string | null; status: string; bytes: number | null; sha256: string | null; metadata_json: string }, [number]>('SELECT * FROM artifacts WHERE id=?').get(PositiveIdSchema.parse(id));
       if (!row) return null;
+      if (row.kind === 'export') {
+        new SqliteExportStore(this.db).readSource(row.query_id!, null);
+        if (row.status !== 'ready') throw new Error('artifact_not_ready');
+        const manifest = ExportManifestSchema.parse(JSON.parse(row.metadata_json));
+        new SqliteExportStore(this.db).readSource(manifest.queryId, manifest.answerId);
+        if (manifest.artifactId !== row.id || manifest.queryId !== row.query_id || manifest.originOperationRef !== row.operation_ref || manifest.format !== row.format
+          || row.metadata_sha256 !== manifest.metadataHash || row.bytes !== manifest.files.reduce((total, file) => total + file.bytes, 0)
+          || row.sha256 !== exportHash(canonicalRequest([...manifest.files].sort((a, b) => a.path.localeCompare(b.path))))) throw new Error('storage_read_failed');
+        return ExportArtifactSchema.parse({ id: row.id, operationRef: row.operation_ref, queryId: row.query_id, format: row.format, relativePath: row.relative_path,
+          sha256: row.sha256, metadataSha256: row.metadata_sha256, sizeBytes: row.bytes, publishedAt: row.published_at, registeredAt: row.registered_at });
+      }
       const metadata = JSON.parse(row.metadata_json) as Record<string, unknown>;
       const deletedBatchIds=this.db.query("SELECT name FROM sqlite_schema WHERE name='data_deletions'").get()?this.db.query<{id:number},[number]>("SELECT b.id FROM imports i,batches b WHERE i.artifact_id=? AND b.status='deleted' AND b.id IN (SELECT value FROM json_each(i.result_json,'$.batchIds')) ORDER BY b.id").all(row.id).map(batch=>batch.id):[];
       return ArtifactSchema.parse({ id: row.id, operationRef: row.operation_ref, status: row.status, format: 'csv', mimeType: 'application/x-directory', bytes: row.bytes, sha256: row.sha256, sourceLockHash: typeof metadata.sourceLockHash === 'string' ? metadata.sourceLockHash : null, metadata,sourceAvailability:deletedBatchIds.length?'deleted':'available',deletedBatchIds,unavailableFiles:this.deletedFilePaths(row.id) });

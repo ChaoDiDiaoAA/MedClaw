@@ -11,19 +11,23 @@ import { canonicalRequest } from '../../packages/contracts/src/run';
 const at = '2026-10-04T00:00:00.000Z';
 
 /** Saved SQLite facts used by read-only Host and transaction fault tests. */
-export function seedWorkspaceQueries(db: Database, repositories?:Repositories) {
+export function seedWorkspaceQueries(db: Database, repositories?:Repositories, options: {
+  deviceCount?: number; deviceName?: (id: number) => string; priceCents?: (id: number) => number | null;
+} = {}) {
   const repos = repositories??new Repositories(db);
+  const deviceCount = options.deviceCount ?? 3;
   if(repos.readWorkspace().sessionId===null)repos.createSession({ expectedWorkspaceRevision: 0 }, 'create-a', 'native-a', at);
   db.query(`INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_hash,preview_request_json,created_at,updated_at)
     VALUES(1,'import','host','imported','hash','{}',?,?)`).run(at, at);
   db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,
     expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at)
-    VALUES(1,1,'scope','2026-10-04','浙江','material/v1','bundle','lock',?,'full','cohort',3,3,'[]','{"expectedEntityCount":3,"observedEntityCount":3,"declaredMissingEntityIds":[]}',1,NULL,1,?)`).run('a'.repeat(64), at);
-  for (const id of [1, 2, 3]) {
+    VALUES(1,1,'scope','2026-10-04','浙江','material/v1','bundle','lock',?,'full','cohort',?,?,'[]',?,1,NULL,1,?)`)
+    .run('a'.repeat(64), deviceCount, deviceCount, JSON.stringify({ expectedEntityCount: deviceCount, observedEntityCount: deviceCount, declaredMissingEntityIds: [] }), at);
+  for (let id = 1; id <= deviceCount; id++) {
     db.query(`INSERT INTO devices(id,source_device_id,source_bundle_id,source_submission_id,source_refs_json,created_at)
       VALUES(?,?,'bundle','submission','[]',?)`).run(id, `device-${id}`, at);
     db.query(`INSERT INTO snapshots(id,batch_id,device_id,device_name,region,price_cents,currency,unit,status,source_row_ref,source_refs_json,field_origins_json)
-      VALUES(?,1,?,'器械','浙江',100,'CNY','台','active',?,'[]','{}')`).run(id, id, `row-${id}`);
+      VALUES(?,1,?,?,'浙江',?,'CNY','台','active',?,'[]','{}')`).run(id, id, options.deviceName?.(id) ?? '器械', options.priceCents ? options.priceCents(id) : 100, `row-${id}`);
   }
   if(db.query("SELECT name FROM pragma_table_info('batches') WHERE name='cohort_json'").get())db.query("UPDATE batches SET cohort_json=(SELECT json_group_array(json_object('deviceId',id,'sourceDeviceId',source_device_id)) FROM devices) WHERE id=1").run();
   if(repositories)db.query("UPDATE batches SET metadata_json=json_set(metadata_json,'$.referenceDate','2026-10-04','$.timezone','Asia/Shanghai') WHERE id=1").run();
@@ -32,7 +36,7 @@ export function seedWorkspaceQueries(db: Database, repositories?:Repositories) {
   db.query(`INSERT INTO runs(id,session_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at)
     VALUES(10,1,'agent','host','query-submit',1,'{"sessionId":1,"clientSequence":1}','running','answer','query','{"agent":{"nativeSessionId":"native-a"}}',?,'{}','2026-10-04','Asia/Shanghai',?)`).run(JSON.stringify(scope), at);
   const store = new SqliteToolStore(db), queries = new QueryService(new CatalogService(new SqliteCatalogStore(db)), store);
-  const context = { sessionId: 1, runId: 10, inputId: null, source: 'user_form' as const, callRef: 'saved-current', scope,
+  const context = { sessionId: 1, runId: 10, inputId: null, source: 'agent_tool' as const, callRef: 'saved-current', scope,
     referenceDate: '2026-10-04', timezone: 'Asia/Shanghai', signal: new AbortController().signal };
   const params = CurrentQuerySchema.parse({ batchIds: [1], time: { start: '2026-10-04', endExclusive: '2026-10-05' } });
   const toolContext = { sessionId: 1, runId: 10, nativeToolCallId: 'saved-current', scope,

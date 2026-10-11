@@ -14,7 +14,7 @@ import { ListSessionsRequestSchema, NewSessionInputSchema, NewSessionResultSchem
 import { WorkspaceViewSchema, UpdateWorkspaceRequestSchema } from "./workspace";
 import { ImportPreviewRequestSchema, ImportCommitRequestSchema, ImportPreviewSchema, ImportOperationSchema, ImportReferenceSchema, ArtifactSchema, DataCatalogSchema, DataRowsSchema } from "./data";
 import {DataDeletePreviewRequestSchema,DataDeleteCommitRequestSchema,DataDeleteReferenceSchema,DataDeleteOperationSchema} from './data-deletion';
-import { BUSINESS_RULES, createQuerySchemas, EvidenceViewSchema, PageSchema, QueryRequestParamsSchema, QuerySummarySchema, QueryViewSchema } from './query';
+import { AnswerRecordSchema, BUSINESS_RULES, createQuerySchemas, EvidenceViewSchema, PageSchema, QuerySummarySchema, QueryViewSchema } from './query';
 import { TOOL_READ_RULES, RunToolsViewSchema } from './tool';
 import { StoredToolConfigurationSchema, normalizeToolConfiguration } from './tool-config';
 import { RuntimeConfigurationSchema, normalizeRuntimeConfiguration, projectRuntimePolicies } from './runtime-config';
@@ -28,9 +28,10 @@ import { ExtensionAssemblyProofSchema, ExtensionDescriptorSchema, ExtensionSelec
 
 import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, EventSubscribeResultSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema } from './event';
 import { IntentBaseUrlSchema, IntentModelConfigurationSchema, IntentModelInspectionSchema, IntentReadResultSchema, ReadIntentInputSchema } from './intent';
+import { ExportDestinationSchema, ExportDestinationCopySchema, ExportCopyReceiptSchema, ExportReferenceSchema, ExportRequestSchema, ExportOperationSchema, ExportArtifactSchema, ExportListInputSchema, ExportListSchema, ActivityListInputSchema, ActivityListSchema } from './export';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p14-v1" as const;
-export const DATABASE_SCHEMA_VERSION = 13 as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p15-v3" as const;
+export const DATABASE_SCHEMA_VERSION = 15 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
@@ -180,8 +181,14 @@ export const publicMethodSchemas = {
   'data.delete.commit': {input:DataDeleteCommitRequestSchema,output:DataDeleteOperationSchema},
   'data.delete.read': {input:DataDeleteReferenceSchema,output:DataDeleteOperationSchema.nullable()},
   'data.delete.recover': {input:DataDeleteReferenceSchema,output:DataDeleteOperationSchema},
-  'query.execute': { input: z.strictObject({ params: QueryRequestParamsSchema, expectedRevision: z.number().int().nonnegative() }), output: QueryViewSchema },
   'query.read': { input: PageSchema.extend({ page: PositiveIdSchema.optional(), pageSize: PositiveIdSchema.optional(), queryId: PositiveIdSchema }), output: QueryViewSchema },
+  'answer.read': { input: z.strictObject({ runId: PositiveIdSchema }), output: AnswerRecordSchema.nullable() },
+  'activity.list': { input: ActivityListInputSchema, output: ActivityListSchema },
+  'export.create': { input: ExportRequestSchema, output: ExportOperationSchema },
+  'export.read': { input: ExportReferenceSchema, output: ExportOperationSchema.nullable() },
+  'export.list': { input: ExportListInputSchema, output: ExportListSchema },
+  'export.cancel': { input: ExportReferenceSchema, output: ExportOperationSchema },
+  'export.recover': { input: ExportReferenceSchema, output: ExportOperationSchema },
   'query.list': { input: z.union([
     z.strictObject({ sessionId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.optional() }),
     z.strictObject({ childRunId: PositiveIdSchema, beforeQueryId: PositiveIdSchema.optional(), limit: PositiveIdSchema.optional() }),
@@ -193,8 +200,8 @@ export const publicMethodSchemas = {
   "import.read": { input: ImportReferenceSchema, output: ImportOperationSchema.nullable() },
   "import.cancel": { input: ImportReferenceSchema, output: ImportOperationSchema },
   "import.recover": { input: ImportReferenceSchema, output: ImportOperationSchema },
-  "evidence.readOperation": { input: z.discriminatedUnion('kind', [z.strictObject({ kind: z.literal('import'), operationRef: OpaqueIdSchema }), z.strictObject({ kind: z.literal('session_checkpoint'), operationRef: OpaqueIdSchema })]), output: z.union([ImportOperationSchema, SessionCheckpointReceiptSchema]).nullable() },
-  "evidence.readArtifact": { input: z.strictObject({ artifactId: PositiveIdSchema }), output: ArtifactSchema.nullable() },
+  "evidence.readOperation": { input: z.discriminatedUnion('kind', [z.strictObject({ kind: z.literal('import'), operationRef: OpaqueIdSchema }), z.strictObject({ kind: z.literal('session_checkpoint'), operationRef: OpaqueIdSchema }), z.strictObject({ kind: z.literal('export'), operationRef: OpaqueIdSchema })]), output: z.union([ImportOperationSchema, SessionCheckpointReceiptSchema, ExportOperationSchema]).nullable() },
+  "evidence.readArtifact": { input: z.strictObject({ artifactId: PositiveIdSchema }), output: z.union([ArtifactSchema, ExportArtifactSchema]).nullable() },
   "run.control.read": { input: EmptyPayloadSchema, output: RuntimeControlViewSchema },
   "run.active": { input: EmptyPayloadSchema, output: ActiveRunViewSchema.nullable() },
   "run.read": { input: ReadRunRequestSchema, output: ReadRunResultSchema },
@@ -235,7 +242,7 @@ export type ParsedPublicPayload<M extends PublicMethod> = z.output<(typeof publi
 export type PublicReturn<M extends PublicMethod> = z.output<(typeof publicMethodSchemas)[M]["output"]>;
 /** The operation-read result is selected by its trusted request, not by whichever union arm happens to parse. */
 export function publicOutputSchema(method:PublicMethod,payload:unknown):z.ZodType {
-  if(method==='evidence.readOperation'){const input=publicMethodSchemas[method].input.parse(payload);return input.kind==='import'?ImportOperationSchema.nullable():SessionCheckpointReceiptSchema.nullable();}
+  if(method==='evidence.readOperation'){const input=publicMethodSchemas[method].input.parse(payload);return input.kind==='import'?ImportOperationSchema.nullable():input.kind==='export'?ExportOperationSchema.nullable():SessionCheckpointReceiptSchema.nullable();}
   return publicMethodSchemas[method].output;
 }
 export const PublicMethodSchema = z.enum(Object.keys(publicMethodSchemas) as [PublicMethod, ...PublicMethod[]]);
@@ -330,8 +337,14 @@ export const PublicHostRequestSchema = z.discriminatedUnion("method", [
   hostRequest('data.delete.commit',publicMethodSchemas['data.delete.commit'].input),
   hostRequest('data.delete.read',publicMethodSchemas['data.delete.read'].input),
   hostRequest('data.delete.recover',publicMethodSchemas['data.delete.recover'].input),
-  hostRequest('query.execute', publicMethodSchemas['query.execute'].input),
   hostRequest('query.read', publicMethodSchemas['query.read'].input),
+  hostRequest('answer.read', publicMethodSchemas['answer.read'].input),
+  hostRequest('activity.list', publicMethodSchemas['activity.list'].input),
+  hostRequest('export.create', publicMethodSchemas['export.create'].input),
+  hostRequest('export.read', publicMethodSchemas['export.read'].input),
+  hostRequest('export.list', publicMethodSchemas['export.list'].input),
+  hostRequest('export.cancel', publicMethodSchemas['export.cancel'].input),
+  hostRequest('export.recover', publicMethodSchemas['export.recover'].input),
   hostRequest('query.list', publicMethodSchemas['query.list'].input),
   hostRequest('evidence.read', publicMethodSchemas['evidence.read'].input),
   hostRequest('tool.read', publicMethodSchemas['tool.read'].input),
@@ -406,6 +419,10 @@ const credentialCommit = z.discriminatedUnion("changed", [
 ]);
 export const privateCredentialMethodSchemas = {
   "file.resolve": { input: z.strictObject({ fileToken: OpaqueIdSchema, operationRef: OpaqueIdSchema }), output: AbsolutePathSchema },
+  'export.destination.describe': { input: ExportDestinationSchema, output: ExportDestinationSchema.pick({ destinationIdentity: true }) },
+  'export.destination.copy': { input: ExportDestinationCopySchema, output: ExportCopyReceiptSchema },
+  'export.destination.cancel': { input: z.strictObject({ operationRef: OpaqueIdSchema }), output: z.strictObject({ stopped: z.boolean() }) },
+  'export.destination.settlePrevious': { input: EmptyPayloadSchema, output: z.strictObject({ stopped: z.literal(true) }) },
   "credential.read": { input: z.strictObject(credentialProvider), output: CredentialSchema.nullable() },
   "credential.list": { input: EmptyPayloadSchema, output: z.array(CredentialInfoSchema).max(10000) },
   "credential.delete": { input: z.strictObject(credentialProvider), output: z.null() },
@@ -422,6 +439,10 @@ export type PrivateCredentialReturn<M extends PrivateCredentialMethod> = z.infer
 const privateFields = { protocolVersion: z.literal(HOST_PROTOCOL_VERSION), kind: z.literal("private"), instanceId: OpaqueIdSchema, requestId: OpaqueIdSchema, secret: z.literal(true) };
 const privateRequest = <M extends string, S extends z.ZodType>(method: M, payload: S) => z.strictObject({ ...privateFields, method: z.literal(method), payload });
 export const PrivateCredentialFrameSchema = z.discriminatedUnion("method", [
+  privateRequest('export.destination.describe', privateCredentialMethodSchemas['export.destination.describe'].input),
+  privateRequest('export.destination.copy', privateCredentialMethodSchemas['export.destination.copy'].input),
+  privateRequest('export.destination.cancel', privateCredentialMethodSchemas['export.destination.cancel'].input),
+  privateRequest('export.destination.settlePrevious', privateCredentialMethodSchemas['export.destination.settlePrevious'].input),
   privateRequest("file.resolve", privateCredentialMethodSchemas["file.resolve"].input),
   privateRequest("credential.read", privateCredentialMethodSchemas["credential.read"].input),
   privateRequest("credential.list", privateCredentialMethodSchemas["credential.list"].input),
@@ -432,6 +453,10 @@ export const PrivateCredentialFrameSchema = z.discriminatedUnion("method", [
 ]);
 const privateReply = <M extends string, S extends z.ZodType>(method: M, output: S) => z.strictObject({ ...privateFields, method: z.literal(method), result: resultSchema(output) });
 export const PrivateCredentialReplySchema = z.discriminatedUnion("method", [
+  privateReply('export.destination.describe', privateCredentialMethodSchemas['export.destination.describe'].output),
+  privateReply('export.destination.copy', privateCredentialMethodSchemas['export.destination.copy'].output),
+  privateReply('export.destination.cancel', privateCredentialMethodSchemas['export.destination.cancel'].output),
+  privateReply('export.destination.settlePrevious', privateCredentialMethodSchemas['export.destination.settlePrevious'].output),
   privateReply("file.resolve", privateCredentialMethodSchemas["file.resolve"].output),
   privateReply("credential.read", privateCredentialMethodSchemas["credential.read"].output),
   privateReply("credential.list", privateCredentialMethodSchemas["credential.list"].output),

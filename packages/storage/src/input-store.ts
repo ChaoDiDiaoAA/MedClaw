@@ -96,7 +96,8 @@ export class SqliteInputStore {
  settleProgramFailure(inputId:number,fact:{runId:number;sessionId:number;status:'failed'|'cancelled';at:string;error:AppError|null}):void {
   check(PositiveIdSchema,fact.runId);check(PositiveIdSchema,fact.sessionId);check(TimestampSchema,fact.at);
   const row=this.required(inputId),content=this.content(row),error=fact.error===null?null:canonicalRequest(check(AppErrorSchema,fact.error));
-  if(!content.intentAdmission||row.mode!=='send'||row.session_id!==fact.sessionId||row.target_run_id!==fact.runId
+  const request=content.originalSubmitInput;
+  if(!content.intentAdmission&&!(request.mode==='send'&&request.routing?.mode==='user_form')||row.mode!=='send'||row.session_id!==fact.sessionId||row.target_run_id!==fact.runId
     ||row.run_id!==null||row.native_entry_id!==null||content.deliveryAttempt!==null||content.nativeInput!==undefined)fail('state_conflict');
   if(row.status===fact.status&&row.processing_status===fact.status&&row.error_json===error&&row.processed_at===fact.at)return;
   if(row.status!=='queued'||row.processing_status!=='pending')fail('state_conflict');

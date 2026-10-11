@@ -69,6 +69,9 @@ async function routedFixture(mode: 'rule' | 'classify' | 'verify' | 'http' | 'js
   const f = await agentRuntimeFixture(options?.respond??(mode==='multi'?(index=>index===1?{role:'assistant',tool_calls:['s1','s2'].map((stepId,index)=>({index,id:`intent-step-${stepId}`,type:'function',
     function:{name:'query_intent_step',arguments:JSON.stringify({stepId,part:0})}}))}:{role:'assistant',content:'ENGINEERING completed both validated steps.'}):undefined), false, undefined, { client: new OllamaIntentClient({ classify: CLASSIFY_PROMPT, verify: VERIFY_PROMPT }),
     configuration: IntentModelConfigurationSchema.parse({ ...disabledIntentModel(), enabled: true, baseUrl: `http://127.0.0.1:${server.port}`, modelDigest: 'sha256:' + 'a'.repeat(64), verifiedEvidenceRef: 'ENGINEERING' }) });
+  // Exercise the retained v3 Agent path; P15 tests independently exercise new v4 program execution.
+  const freeze=f.intentService!.freeze.bind(f.intentService);
+  f.intentService!.freeze=(selection,...args)=>freeze({...selection,policyVersion:'medclaw.intent-policy/v3'},...args);
   seedWorkspaceQueries(f.db, f.repos);
   // The seed performs synchronous queries without a native execution; history mutation requires its closed facts too.
   f.db.query('UPDATE runs SET cleanup_json=? WHERE id=10').run(JSON.stringify({contract:'medclaw.run-cleanup/v1',executionStarted:false,stopConfirmed:true,
@@ -129,20 +132,15 @@ test('p14 explicit retry creates a new root and calls recognition again with the
   }finally{await f.close();}
 });
 
-test('p14 explicit main fallback saves its own unique decision without reusing the failed classifier',async()=>{
+test('p15 unplanned main fallback requires confirmed conditions without admitting a new Run',async()=>{
   const f=await routedFixture('http',{allowMain:true});
   try{
-    const original=await f.app.runs.submitAgent(f.request,{instanceId:'host',operationRef:'original-fallback'});
-    expect(original.ok).toBe(true);if(!original.ok)throw original.error;await f.settle();
+    const original=await f.app.runs.submitAgent(f.request,{instanceId:'host',operationRef:'original-fallback'});if(!original.ok)throw original.error;await f.settle();
+    const before=f.db.query('SELECT (SELECT COUNT(*) FROM runs) runs,(SELECT COUNT(*) FROM session_inputs) inputs,(SELECT COUNT(*) FROM runtime_events) events').get();
     const request={...nextRequest(f),mode:'send' as const,routing:{mode:'explicit_agent_fallback' as const,originRunId:original.data.runId!}};
-    const fallback=await f.app.runs.submitAgent(request,{instanceId:'host',operationRef:'new-main-fallback'});
-    if(!fallback.ok)throw new Error(JSON.stringify(fallback.error));expect(fallback.ok).toBe(true);await f.settle();
-    expect(fallback.data.runId).not.toBe(original.data.runId);expect(f.chats()).toBe(1);expect(f.requests).toHaveLength(1);
-    const saved=f.repos.readIntent({runId:fallback.data.runId!});
-    expect(saved).toMatchObject({calls:[],decision:{route:'agent',decisionSource:'explicit_agent_fallback',intentCallId:null,matchedBy:null,status:null,adoptedIntents:[]},execution:{runStatus:'completed',finalHistorySaved:true,requiredPersistenceComplete:true}});
-    expect(f.db.query('SELECT id FROM route_decisions WHERE run_id=?').all(fallback.data.runId!)).toHaveLength(1);
-    expect(f.content(fallback.data.inputId!)).toMatchObject({text:f.request.text,originalSubmitInput:{routing:{mode:'explicit_agent_fallback',originRunId:original.data.runId}}});
-    const again=await f.app.runs.submitAgent(request,{instanceId:'host',operationRef:'new-main-fallback'});expect(again).toEqual(fallback);expect(f.requests).toHaveLength(1);
+    for(let n=0;n<2;n++)expect(await f.app.runs.submitAgent(request,{instanceId:'host',operationRef:'unplanned-fallback'})).toMatchObject({ok:false,error:{code:'intent_confirmation_required'}});
+    expect(f.db.query('SELECT (SELECT COUNT(*) FROM runs) runs,(SELECT COUNT(*) FROM session_inputs) inputs,(SELECT COUNT(*) FROM runtime_events) events').get()).toEqual(before);
+    expect(f.chats()).toBe(1);expect(f.requests).toHaveLength(0);
   }finally{await f.close();}
 });
 
@@ -179,22 +177,6 @@ test('p14 an executable completed origin cannot be relabelled as an explicit fal
   }finally{await f.close();}
 });
 
-test('p14 fallback decision failure rolls back the input, root and events before any main inference',async()=>{
-  const f=await routedFixture('http',{allowMain:true});
-  try{
-    const original=await f.app.runs.submitAgent(f.request,{instanceId:'host',operationRef:'atomic-origin'});if(!original.ok)throw original.error;await f.settle();
-    const request={...nextRequest(f),mode:'send' as const,routing:{mode:'explicit_agent_fallback' as const,originRunId:original.data.runId!}};
-    const before=f.db.query('SELECT (SELECT COUNT(*) FROM runs) runs,(SELECT COUNT(*) FROM session_inputs) inputs,(SELECT COUNT(*) FROM runtime_events) events').get();
-    f.db.exec("CREATE TRIGGER fallback_admission_fault BEFORE INSERT ON route_decisions BEGIN SELECT RAISE(ABORT,'ENGINEERING_FALLBACK_ADMISSION'); END;");
-    expect(await f.app.runs.submitAgent(request,{instanceId:'host',operationRef:'failed-fallback-admission'})).toMatchObject({ok:false,error:{code:'storage_write_failed'}});
-    expect(f.db.query('SELECT (SELECT COUNT(*) FROM runs) runs,(SELECT COUNT(*) FROM session_inputs) inputs,(SELECT COUNT(*) FROM runtime_events) events').get()).toEqual(before);
-    expect(f.requests).toHaveLength(0);expect(f.chats()).toBe(1);
-    f.db.exec('DROP TRIGGER fallback_admission_fault');
-    const accepted=await f.app.runs.submitAgent(request,{instanceId:'host',operationRef:'recovered-fallback-admission'});if(!accepted.ok)throw accepted.error;await f.settle();
-    expect(f.repos.readIntent({runId:accepted.data.runId!})?.execution.finalHistorySaved).toBe(true);expect(f.requests).toHaveLength(1);
-  }finally{await f.close();}
-});
-
 test('p14 origin release is rechecked inside admission after asynchronous model resolution',async()=>{
   const f=await routedFixture('http',{allowMain:true});
   try{
@@ -206,7 +188,7 @@ test('p14 origin release is rechecked inside admission after asynchronous model 
       return selected;
     };
     const before=f.db.query('SELECT (SELECT COUNT(*) FROM runs) runs,(SELECT COUNT(*) FROM session_inputs) inputs').get();
-    const request={...nextRequest(f),mode:'send' as const,routing:{mode:'explicit_agent_fallback' as const,originRunId:original.data.runId!}};
+    const request={...nextRequest(f),mode:'send' as const,routing:{mode:'intent' as const,originRunId:original.data.runId!}};
     expect(await f.app.runs.submitAgent(request,{instanceId:'host',operationRef:'origin-race-new'})).toMatchObject({ok:false,error:{code:'state_conflict'}});
     expect(f.db.query('SELECT (SELECT COUNT(*) FROM runs) runs,(SELECT COUNT(*) FROM session_inputs) inputs').get()).toEqual(before);
     expect(f.requests).toHaveLength(0);expect(f.chats()).toBe(1);
@@ -227,19 +209,6 @@ test('p14 retry accepts a returned original workspace with a newer revision and 
   }finally{await f.close();}
 });
 
-test('p14 explicit fallback history is an ordinary verified checkpoint and corruption cannot be read as saved',async()=>{
-  const f=await routedFixture('http',{allowMain:true});
-  try{
-    const original=await f.app.runs.submitAgent(f.request,{instanceId:'host',operationRef:'fallback-proof-origin'});if(!original.ok)throw original.error;await f.settle();
-    const fallback=await f.app.runs.submitAgent({...nextRequest(f),mode:'send',routing:{mode:'explicit_agent_fallback',originRunId:original.data.runId!}},{instanceId:'host',operationRef:'fallback-proof'});
-    if(!fallback.ok)throw fallback.error;await f.settle();
-    expect(f.repos.readCheckpoints({sessionId:1}).items.some(item=>item.runId===fallback.data.runId)).toBe(true);
-    f.db.query("UPDATE answers SET text='FORGED' WHERE run_id=?").run(fallback.data.runId!);
-    const before=f.db.query('SELECT total_changes() n').get();
-    expect(()=>f.repos.readIntent({runId:fallback.data.runId!})).toThrow('storage_read_failed');
-    expect(f.db.query('SELECT total_changes() n').get()).toEqual(before);
-  }finally{await f.close();}
-});
 test('p14 committed program turns are verified checkpoints and SessionDetail exposes the actual current condition',async()=>{
   const f=await routedFixture('rule'),sessions=sessionsFor(f);
   try{
@@ -683,6 +652,7 @@ test('p14 company comparison executes two real aggregate parts and adopts only t
     const queries=f.db.query<{id:number;kind:string;params_json:string},[number]>('SELECT id,kind,params_json FROM queries WHERE run_id=? ORDER BY id').all(read.run.id);
     expect(queries.map(query=>[query.kind,JSON.parse(query.params_json).manufacturer])).toEqual([['aggregate','甲厂家'],['aggregate','乙厂家']]);
     const context=f.repos.readIntent({runId:read.run.id})!.effectiveContext!;
+    if('contract' in context)throw new Error('Expected the automatic comparison context');
     expect(context.queryIds).toEqual(queries.map(query=>query.id));expect(context.contextIntentId).toBe('s1');expect(context.adoptedSlots.manufacturer).toBeNull();
     expect(f.chats()).toBe(1);expect(f.requests).toHaveLength(2);
   }finally{await f.close();}
