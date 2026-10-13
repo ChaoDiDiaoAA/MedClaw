@@ -87,7 +87,7 @@ export function RunDetails(props: { inputs?:InputQueueSnapshot|null;cancellingIn
   const retryRunId = props.active?.persistencePending ? props.active.runId : props.control?.blockReasons.find(reason => reason.code === "storage_write_failed" && reason.runId)?.runId ?? null;
   useEffect(() => {
     const media = matchMedia("(max-width: 1279px)");
-    const change = () => setNarrow(media.matches); media.addEventListener("change", change);
+    const change = () => setNarrow(media.matches); change(); media.addEventListener("change", change);
     return () => media.removeEventListener("change", change);
   }, []);
   useEffect(() => { if (narrow) close.current?.focus(); }, [narrow]);

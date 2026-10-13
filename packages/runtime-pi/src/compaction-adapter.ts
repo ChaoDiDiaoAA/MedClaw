@@ -112,6 +112,7 @@ export class CompactionAdapter {
     let stream:Awaited<ReturnType<Stream>>;
     try {
       stream=await this.original(model,{...context,messages:context.messages.map(message=>message.role==='system'?{...message,toolsAdded:[],toolsRemoved:[]}:message)},{...options,
+        onPayload:async(payload,model)=>{const replacement=await options?.onPayload?.(payload,model);recorder.recordPayload?.(replacement===undefined?payload:replacement,now());return replacement;},
         signal:AbortSignal.any([this.source.input.signal,...(options?.signal?[options.signal]:[])]),maxRetries:0,
         timeoutMs:Math.max(1,Math.ceil(this.source.input.deadlineAt-performance.now()))});
     } catch(error) {

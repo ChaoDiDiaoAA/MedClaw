@@ -338,6 +338,7 @@ export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputSt
 }
 export interface ModelCallRecorderPort {
   readonly callId?: string;
+  recordPayload?(payload:unknown,observedAt:string):void;
   finish(outcome: ProviderOutcome, endedAt: string): FinalCallFact;
 }
 export type ModelCallStarter = ((runId: number, kind: "main" | "diagnostic", time: string, context?: StartCallContext) => ModelCallRecorderPort)

@@ -4,7 +4,8 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
-import { ModelDirectoryViewSchema } from '../../packages/contracts/src/model';
+import { ModelDirectoryViewSchema, DEFAULT_REQUEST_POLICY, DEFAULT_AGENT_POLICY } from '../../packages/contracts/src/model';
+import { publicMethodSchemas } from '../../packages/contracts/src/protocol';
 import { DataCatalogSchema } from '../../packages/contracts/src/data';
 
 // Only the external desktop bridge is substituted. These tests run the actual
@@ -21,6 +22,7 @@ const authenticatedDirectory = ModelDirectoryViewSchema.parse({ ...directory,
   selection: { provider: 'offline-provider', modelId: 'offline-model', endpointRef: null, api: 'openai-completions', configVersion: '0',
     credentialRef: 'fixture-credential-ref', maxOutputTokens: 1024, capabilitySource: 'pi_catalog', sdkVersion: '0.87.1' } });
 const failure = { ok: false, error: { code: 'resource_unavailable', category: 'storage', message: 'The requested resource is temporarily unavailable.', retryable: true } };
+const modelConfiguration = publicMethodSchemas['model.config.read'].output.parse({ configVersion: '0', policy: DEFAULT_REQUEST_POLICY, agentPolicy: DEFAULT_AGENT_POLICY, intentModel: null, previousConfigVersion: null, rollbackFromVersion: null });
 const emptyCatalog = DataCatalogSchema.parse({ batches: [], page: 1, pageSize: 50, batchCount: 0, deviceCount: 0, snapshotCount: 0, changeCount: 0, catalogRevision: 0, referenceDate: null, timezone: null });
 const importedCatalog = DataCatalogSchema.parse({ ...emptyCatalog, batchCount: 1, catalogRevision: 1, referenceDate: '2026-01-02', timezone: 'Asia/Shanghai', batches: [{ id: 1, scopeKey: 'imported-scope', snapshotDate: '2026-01-02', region: '浙江', coverage: 'full', previousBatchId: null, materialVersion: 'fixture/v1', sourceBundleId: 'fixture', sourceLockHash: 'a'.repeat(64), contentHash: 'b'.repeat(64), cohortHash: 'c'.repeat(64), catalogRevision: 1, expectedEntityCount: 0, observedEntityCount: 0, declaredMissingDeviceIds: [] }] });
 type Fixture = { deletionReadResult?:unknown;deletionLost?:boolean;bridge?: 'missing' | 'subscribe_throw' | 'request_reject'; host?: typeof ready; modelResult?: unknown; catalogResult?: unknown; restoredSession?: boolean; hostReadResult?: unknown; hostReadReject?: boolean; holds?: string[] };
@@ -58,6 +60,7 @@ async function launch(config: Fixture = {}) {
       if(method==='host.read'){if(${JSON.stringify(config.hostReadReject ?? false)})throw new Error('private late host error');return hostReadResult;}
       if(method==='settings.ui.read')return ok({configVersion:'0',ui:{navCollapsed:false,detailOpen:false,detailTab:'conditions'}});
       if(method==='model.read')return state.modelResult;
+      if(method==='model.config.read')return ok({...${JSON.stringify(modelConfiguration)},configVersion:state.modelResult.data?.configVersion??'0'});
       if(method==='model.custom.read')return ok({definitions:[]});
       if(method==='data.read')return state.catalogResult;
       if(method==='data.delete.preview'){deletion={operationRef:payload.operationRef,state:'ready',preview:{operationRef:payload.operationRef,previewHash:'a'.repeat(64),catalogRevision:payload.expectedCatalogRevision,workspaceRevision:payload.expectedWorkspaceRevision,batches:[{id:1,snapshotDate:'2026-01-02'}],snapshotCount:0,changeCount:0,deviceCount:0,queryCount:0,workspaceWillChange:false,files:[]},receipt:null,cleanup:{state:'pending',remainingCount:0,error:null},updatedAt:'2026-10-04T00:00:00Z'};return ok(deletion);}

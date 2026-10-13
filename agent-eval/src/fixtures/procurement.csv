@@ -1,0 +1,25 @@
+key,device,name,submission,applicant,category,region,date,price,status,manufacturer,distributor
+ZJ-A|2026-09-28,SYN-ZJ-A,合成输注泵 A,SYN-ZJ-A-REG,合成申请人,输注泵,浙江,2026-09-28,10000,active,合成厂甲,配送甲
+ZJ-B|2026-09-28,SYN-ZJ-B,合成监护仪 B,SYN-ZJ-B-REG,合成申请人,监护仪,浙江,2026-09-28,0,active,合成厂乙,配送乙
+ZJ-C|2026-09-28,SYN-ZJ-C,合成试剂 C,SYN-ZJ-C-REG,合成申请人,试剂,浙江,2026-09-28,null,suspended,合成厂甲,null
+ZJ-A|2026-09-29,SYN-ZJ-A,合成输注泵 A,SYN-ZJ-A-REG,合成申请人,输注泵,浙江,2026-09-29,9500,active,合成厂甲,配送甲
+ZJ-B|2026-09-29,SYN-ZJ-B,合成监护仪 B,SYN-ZJ-B-REG,合成申请人,监护仪,浙江,2026-09-29,0,suspended,合成厂乙,配送乙
+ZJ-C|2026-09-29,SYN-ZJ-C,合成试剂 C,SYN-ZJ-C-REG,合成申请人,试剂,浙江,2026-09-29,null,suspended,合成厂甲,null
+ZJ-A|2026-10-01,SYN-ZJ-A,合成输注泵 A,SYN-ZJ-A-REG,合成申请人,输注泵,浙江,2026-10-01,9000,active,合成厂甲,配送丙
+ZJ-B|2026-10-01,SYN-ZJ-B,合成监护仪 B,SYN-ZJ-B-REG,合成申请人,监护仪,浙江,2026-10-01,2000,suspended,合成厂乙,配送乙
+ZJ-C|2026-10-01,SYN-ZJ-C,合成试剂 C,SYN-ZJ-C-REG,合成申请人,试剂,浙江,2026-10-01,null,active,合成厂甲,null
+ZJ-A|2026-10-02,SYN-ZJ-A,合成输注泵 A,SYN-ZJ-A-REG,合成申请人,输注泵,浙江,2026-10-02,8100,active,合成厂甲,配送丙
+ZJ-B|2026-10-02,SYN-ZJ-B,合成监护仪 B,SYN-ZJ-B-REG,合成申请人,监护仪,浙江,2026-10-02,2000,active,合成厂乙,配送乙
+ZJ-C|2026-10-02,SYN-ZJ-C,合成试剂 C,SYN-ZJ-C-REG,合成申请人,试剂,浙江,2026-10-02,null,active,合成厂甲,null
+HN-A|2026-09-28,SYN-HN-A,合成输注泵 A,SYN-HN-A-REG,合成申请人,输注泵,河南,2026-09-28,10100,active,合成厂甲,配送甲
+HN-B|2026-09-28,SYN-HN-B,合成监护仪 B,SYN-HN-B-REG,合成申请人,监护仪,河南,2026-09-28,100,active,合成厂乙,配送乙
+HN-C|2026-09-28,SYN-HN-C,合成试剂 C,SYN-HN-C-REG,合成申请人,试剂,河南,2026-09-28,null,suspended,合成厂甲,null
+HN-A|2026-09-29,SYN-HN-A,合成输注泵 A,SYN-HN-A-REG,合成申请人,输注泵,河南,2026-09-29,9600,active,合成厂甲,配送甲
+HN-B|2026-09-29,SYN-HN-B,合成监护仪 B,SYN-HN-B-REG,合成申请人,监护仪,河南,2026-09-29,100,suspended,合成厂乙,配送乙
+HN-C|2026-09-29,SYN-HN-C,合成试剂 C,SYN-HN-C-REG,合成申请人,试剂,河南,2026-09-29,null,suspended,合成厂甲,null
+HN-A|2026-10-01,SYN-HN-A,合成输注泵 A,SYN-HN-A-REG,合成申请人,输注泵,河南,2026-10-01,9100,active,合成厂甲,配送丙
+HN-B|2026-10-01,SYN-HN-B,合成监护仪 B,SYN-HN-B-REG,合成申请人,监护仪,河南,2026-10-01,2100,suspended,合成厂乙,配送乙
+HN-C|2026-10-01,SYN-HN-C,合成试剂 C,SYN-HN-C-REG,合成申请人,试剂,河南,2026-10-01,null,active,合成厂甲,null
+HN-A|2026-10-02,SYN-HN-A,合成输注泵 A,SYN-HN-A-REG,合成申请人,输注泵,河南,2026-10-02,8200,active,合成厂甲,配送丙
+HN-B|2026-10-02,SYN-HN-B,合成监护仪 B,SYN-HN-B-REG,合成申请人,监护仪,河南,2026-10-02,2100,active,合成厂乙,配送乙
+HN-C|2026-10-02,SYN-HN-C,合成试剂 C,SYN-HN-C-REG,合成申请人,试剂,河南,2026-10-02,null,active,合成厂甲,null

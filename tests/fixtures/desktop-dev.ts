@@ -7,6 +7,8 @@ import { join, resolve } from 'node:path';
 import { canonicalRequest } from '../../packages/contracts/src/run';
 
 export const projectRoot = resolve(import.meta.dirname, '../..');
+// Windows occlusion must not stop the frames used by Playwright actionability and screenshots.
+export const electronTestWindowArgs=['--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows','--disable-features=CalculateNativeWinOcclusion'];
 export const bunExecutable = process.env.MEDCLAW_BUN_EXECUTABLE ?? execFileSync('bun', ['-e', 'process.stdout.write(process.execPath)'], { encoding: 'utf8' }).trim();
 
 export async function launchActualDev(temporary: string, dataRoot: string, importDirectory?: string, beforePageAcquisition?: () => void, controlledHostEntry?: string, controlledMainEntry?: string): Promise<{ page: Page; browser: Browser; child: ChildProcess; close(): Promise<void> }> {
@@ -28,7 +30,10 @@ export async function launchActualDev(temporary: string, dataRoot: string, impor
         ${controlledMainEntry ? `const observe=require(${JSON.stringify(controlledMainEntry)});if(typeof observe==='function')observe(value);` : ''}
         value.app.commandLine.appendSwitch('remote-debugging-port',${JSON.stringify(String(port))});
         value.app.commandLine.appendSwitch('remote-debugging-address','127.0.0.1');
-        value.app.on('browser-window-created',(_,window)=>window.hide());
+        value.app.commandLine.appendSwitch('disable-renderer-backgrounding');
+        value.app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+        value.app.commandLine.appendSwitch('disable-features','CalculateNativeWinOcclusion');
+        value.app.on('browser-window-created',(_,window)=>{window.webContents.setBackgroundThrottling(false);});
         require('fs').writeFileSync(${JSON.stringify(join(temporary, 'observed-main.json'))},JSON.stringify({pid:process.pid}));
         const quitCheck=setInterval(()=>{if(require('fs').existsSync(${JSON.stringify(quitRequest)}))value.app.quit();},100);quitCheck.unref();
         value.app.once('will-quit',()=>clearInterval(quitCheck));

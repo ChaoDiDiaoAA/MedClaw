@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ControllerEvidenceInputSchema,ControllerEvidenceOutputSchema } from './controller-evidence';
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, resultSchema, type Result } from "./error";
 import {
   AgentPolicySchema, ApiIdSchema, AuthAttemptViewSchema, AuthNotifyViewSchema, AuthPromptViewSchema, AuthStatusViewSchema,
@@ -263,6 +264,7 @@ export const AbsolutePathSchema = z.string().min(1).max(32768).refine(path => !/
 export const HostHelloSchema = z.strictObject({
   protocolVersion: z.literal(HOST_PROTOCOL_VERSION), instanceId: OpaqueIdSchema, startupToken: OpaqueIdSchema,
   sdkVersion: z.literal(SDK_VERSION), expectedSchemaVersion: z.literal(DATABASE_SCHEMA_VERSION),
+  controlledToolFault: z.literal('query-timeout-once').optional(),
   paths: z.strictObject({ dataRoot: AbsolutePathSchema, databasePath: AbsolutePathSchema, settingsPath: AbsolutePathSchema, cachePath: AbsolutePathSchema, lockPath: AbsolutePathSchema }),
 });
 export const HostReadySchema = z.strictObject({
@@ -272,6 +274,7 @@ export const HostReadySchema = z.strictObject({
 export const HostShutdownRequestSchema = instanceControl;
 export const HostShutdownResultSchema = z.strictObject({ executionStopped: z.boolean(), databaseClosed: z.boolean() });
 export const hostPrivateMethodSchemas = {
+  'controller.evidence.read': {input:ControllerEvidenceInputSchema,output:ControllerEvidenceOutputSchema},
   "host.shutdown": { input: HostShutdownRequestSchema, output: HostShutdownResultSchema },
   "settings.prepare": { input: z.strictObject({ token: OpaqueIdSchema, candidate: PublishedSettingsSchema }), output: z.strictObject({ prepared: z.literal(true), selection: ModelSelectionSchema.nullable() }) },
   "settings.commit": { input: z.strictObject({ token: OpaqueIdSchema, publishedVersion: ConfigVersionSchema }), output: z.strictObject({ configVersion: ConfigVersionSchema, selection: ModelSelectionSchema.nullable() }) },
@@ -369,6 +372,7 @@ export const PublicHostRequestSchema = z.discriminatedUnion("method", [
   hostRequest("host.restart", publicMethodSchemas["host.restart"].input),
 ]);
 export const HostPrivateRequestSchema = z.discriminatedUnion("method", [
+  hostRequest('controller.evidence.read',hostPrivateMethodSchemas['controller.evidence.read'].input),
   hostRequest("host.shutdown", hostPrivateMethodSchemas["host.shutdown"].input),
   hostRequest("settings.prepare", hostPrivateMethodSchemas["settings.prepare"].input),
   hostRequest("settings.commit", hostPrivateMethodSchemas["settings.commit"].input),

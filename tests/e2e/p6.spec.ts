@@ -1,3 +1,4 @@
+import {electronTestWindowArgs} from '../fixtures/desktop-dev';
 import { test, expect, _electron as electron, type ElectronApplication, type Page } from '@playwright/test';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync } from 'node:fs';
@@ -84,7 +85,7 @@ test.beforeAll(async () => {
   const seam = join(temporary, 'public-gates.cjs');
   writeFileSync(seam, `const {ipcMain,app}=require('electron'); const original=ipcMain.handle.bind(ipcMain);
     const state=globalThis.__p6Gate={rules:[],entered:[],pending:{},calls:[],accepted:[],drop:[],notices:[]};
-    app.on('browser-window-created',(_,win)=>{const send=win.webContents.send.bind(win.webContents);win.webContents.send=(channel,...args)=>{if(channel==='medclaw:notice'){state.notices.push(structuredClone(args[0]));if(state.drop.includes(args[0].type))return;}return send(channel,...args);};});
+    app.on('browser-window-created',(_,win)=>{win.webContents.setBackgroundThrottling(false);const send=win.webContents.send.bind(win.webContents);win.webContents.send=(channel,...args)=>{if(channel==='medclaw:notice'){state.notices.push(structuredClone(args[0]));if(state.drop.includes(args[0].type))return;}return send(channel,...args);};});
     ipcMain.handle=(channel,listener)=>original(channel,async(event,envelope)=>{
       if(channel!=='medclaw:request')return listener(event,envelope);
       const p=envelope.payload; state.calls.push({method:envelope.method,payload:p,operationRef:envelope.operationRef});
@@ -106,7 +107,7 @@ test.beforeAll(async () => {
   const playwright = createRequire(createRequire(import.meta.url).resolve('@playwright/test/package.json')), core = createRequire(playwright.resolve('playwright/package.json')).resolve('playwright-core/package.json');
   const env: Record<string, string> = { ...Object.fromEntries(Object.entries(process.env).flatMap(([key, value]) => value === undefined ? [] : [[key, value]])), MEDCLAW_HOST_ENTRY: hostEntry, MEDCLAW_BUN_EXECUTABLE: execFileSync(bun, ['-e', 'process.stdout.write(process.execPath)'], { encoding: 'utf8' }).trim() };
   delete env.ELECTRON_RUN_AS_NODE;
-  app = await electron.launch({ executablePath: electronPath, args: ['-r', join(dirname(core), 'lib/server/electron/loader.js'), '-r', seam, join(root, '.build/desktop/main/index.cjs'), '--medclaw-data-root', join(temporary, 'data')], env, timeout: 30000 });
+  app = await electron.launch({ executablePath: electronPath, args: [...electronTestWindowArgs,'-r', join(dirname(core), 'lib/server/electron/loader.js'), '-r', seam, join(root, '.build/desktop/main/index.cjs'), '--medclaw-data-root', join(temporary, 'data')], env, timeout: 30000 });
   page = await app.firstWindow(); await page.setViewportSize({ width: 1440, height: 1000 }); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
   await app.evaluate(({dialog},path)=>{dialog.showOpenDialog=async()=>({canceled:false,filePaths:[path]});},join(temporary,'source'));
   const configured = await page.evaluate(async baseUrl => {
@@ -128,7 +129,7 @@ const timeline=()=>page.getByTestId('run-timeline');
 const temporaryBody=()=>page.getByTestId('temporary-run-area');
 async function drop(types:string[]){await app.evaluate((_,types)=>{(globalThis as MainGlobal).__p6Gate.drop=types;},types);}
 async function events(runId:number){const result=await page.evaluate(runId=>window.medclaw.request('event.read',{runId,afterSequence:0,limit:100}),runId);if(!result.ok)throw new Error(result.error.code);return result.data;}
-async function runtimeTab(){if(!await page.getByRole('tab',{name:'Run details',exact:true}).count())await page.getByRole('button',{name:'View run details',exact:true}).click();await page.getByRole('tab',{name:'Run details',exact:true}).click();}
+async function runtimeTab(){if(!await page.getByRole('tab',{name:'Run details',exact:true}).count())await page.getByRole('button',{name:'View run details',exact:true}).click();await page.getByRole('tab',{name:'Run details',exact:true}).click();await expect(page.getByRole('tabpanel',{name:'Run details',exact:true})).toBeVisible();}
 async function assertTimeline(runId:number){await runtimeTab();const facts=await events(runId);await expect(timeline()).toHaveAttribute('data-run-id',String(runId));await expect(timeline()).toHaveAttribute('data-cursor',String(facts.range.lastSequence));expect(await timeline().locator('[data-event-sequence]').evaluateAll(nodes=>nodes.map(n=>Number(n.getAttribute('data-event-sequence'))))).toEqual(facts.events.map(e=>e.sequence));return facts;}
 async function settled(text:string){await create();steps=[()=>({text})];const accepted=await clickSubmit(text);if(!accepted.runId)throw new Error('Missing Run');await idle();await expect(page.getByText('Saved',{exact:true})).toBeVisible();return {...accepted,runId:accepted.runId};}
 function receipt(wire:Wire,id:string):Record<string,unknown>{const returned=wire.messages.filter(m=>m.role==='tool'&&m.tool_call_id===id);expect(returned).toHaveLength(1);return JSON.parse(String(returned[0]!.content));}
@@ -153,7 +154,7 @@ test('reconnect_replays_without_new_execution',async()=>{
  await page.reload();await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible();await assertTimeline(origin.runId);expect(physical).toBe(before);expect(sql('SELECT COUNT(*) n FROM queries')).toEqual(beforeQueries);save('reconnect',{runId:origin.runId,facts,physicalDelta:physical-before});
 });
 test('lost_terminal_notice_reads_cleanup_and_gate',async()=>{
- await drop(['event.available','agent.settled']);const origin=await settled('P6 terminal notice lost'),before=physical,facts=await assertTimeline(origin.runId);const control=await page.evaluate(()=>window.medclaw.request('run.control.read',{}));
+ await drop(['event.available','agent.settled']);const origin=await settled('P6 terminal notice lost'),before=physical,facts=await assertTimeline(origin.runId);await idle();const control=await page.evaluate(()=>window.medclaw.request('run.control.read',{}));
  expect(control).toMatchObject({ok:true,data:{acceptingNewRuns:true,activeRootRun:null}});expect(facts.events.at(-1)?.type).toBe('run_completed');expect(physical).toBe(before);save('lost-terminal',{run:await readRun(origin.runId),facts,control});
 });
 test('lost_final_snapshot_refreshes_during_long_tool_without_new_execution',async()=>{
@@ -189,7 +190,13 @@ test('reading_anchor_survives_replay_and_back_to_latest_is_explicit',async()=>{
  await select(b);await select(a);await expect.poll(async()=>Math.abs(await offset()-before.offset)).toBeLessThanOrEqual(3);
  await assertTimeline(origin.runId!);
  const detail=page.getByTestId('run-details-scroll');
- async function placeTimelineAnchor(){await detail.evaluate(e=>{const anchor=e.querySelectorAll<HTMLElement>('[data-event-id]')[3]!;e.scrollTop+=anchor.getBoundingClientRect().top-e.getBoundingClientRect().top+20;e.dispatchEvent(new Event('scroll'));});await page.evaluate(()=>new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve()))));return detail.evaluate(e=>{const anchor=Array.from(e.querySelectorAll<HTMLElement>('[data-event-id]')).find(node=>node.getBoundingClientRect().bottom>e.getBoundingClientRect().top)!;return {eventId:anchor.dataset.eventId!,offset:anchor.getBoundingClientRect().top-e.getBoundingClientRect().top};});}
+ async function placeTimelineAnchor(){
+  await expect(detail).toBeVisible();
+  await expect.poll(()=>detail.evaluate(e=>e.scrollHeight-e.clientHeight)).toBeGreaterThan(64);
+  await detail.evaluate(e=>{const node=Array.from(e.querySelectorAll<HTMLElement>('[data-event-id]')).find(node=>node.offsetParent!==null);if(!node)throw Error('No displayed timeline event');const box=node.getBoundingClientRect();e.scrollTop+=box.top-e.getBoundingClientRect().top+Math.min(20,box.height/2);e.dispatchEvent(new Event('scroll'));});
+  const anchor=await detail.evaluate(e=>{const box=e.getBoundingClientRect();const node=Array.from(e.querySelectorAll<HTMLElement>('[data-event-id]')).find(node=>node.offsetParent!==null&&node.getBoundingClientRect().bottom>box.top&&node.getBoundingClientRect().top<box.bottom);if(!node)throw Error('No visible timeline event at the reading position');return {eventId:node.dataset.eventId!,offset:node.getBoundingClientRect().top-box.top};});
+  await expect(detail.locator('[data-event-id="'+anchor.eventId+'"]')).toBeVisible();return anchor;
+ }
  const firstTimeline=await placeTimelineAnchor();
  const secondText=Array.from({length:65},(_,i)=>`P6 second Run reading line ${i+1}`).join('\n');steps=[()=>({text:secondText})];const second=await clickSubmit('P6 same Session independent Run reading');await idle();await expect(temporaryBody()).toHaveCount(0);
  const secondHistory=await page.evaluate(sessionId=>window.medclaw.request('session.messages.read',{sessionId,limit:100}),a);if(!secondHistory.ok)throw Error(secondHistory.error.code);const secondSaved=secondHistory.data.items.find(item=>item.displayRole==='assistant'&&item.text===secondText);if(!secondSaved)throw Error('Missing second actual native answer');

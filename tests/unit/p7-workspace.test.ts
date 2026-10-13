@@ -97,16 +97,18 @@ test('P7 runner discovers all categories and refuses empty discovery or zero exe
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p7-runner-'));
   try {
     expect(() => discoverTests('unit', 'P7', root)).not.toThrow();
-    for (const category of ['unit', 'integration', 'e2e'] as const) {
-      mkdirSync(join(root, 'tests', category), { recursive: true });
+    for (const category of ['unit', 'integration', 'e2e', 'desktop'] as const) {
+      const directory = join(root, 'tests', category === 'desktop' ? 'e2e' : category === 'e2e' ? 'integration' : category);
+      mkdirSync(directory, { recursive: true });
       expect((await runStage(category, 'P7', { root })).exitCode).toBe(1);
-      writeFileSync(join(root, 'tests', category, `p7-empty.${category === 'e2e' ? 'spec' : 'test'}.ts`), 'export {};');
+      writeFileSync(join(directory, `p7-${category === 'e2e' ? 'host-' : ''}empty.${category === 'desktop' ? 'spec' : 'test'}.ts`), 'export {};');
       expect(discoverTests(category, 'P7', root)).toHaveLength(1);
     }
     expect((await runStage('unit', 'P7', { root })).exitCode).toBe(1);
     expect((await runStage('integration', 'P7', { root })).exitCode).toBe(1);
-    // Playwright's no-test case uses the real project dependency resolution.
     expect((await runStage('e2e', 'P7', { root })).exitCode).toBe(1);
+    // Playwright's no-test case uses the real project dependency resolution.
+    expect((await runStage('desktop', 'P7', { root })).exitCode).toBe(1);
     for (const stage of ['P1', 'P2', 'P3', 'P4', 'P5', 'P6']) expect(() => discoverTests('unit', stage, root)).not.toThrow();
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 30000);

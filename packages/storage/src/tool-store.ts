@@ -245,6 +245,10 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   readCall(context: ToolExecutionContext): ToolCallRecord | null {
     return protect(() => { this.identity(context, false); const row = this.callRow(context); return row ? this.call(row) : null; }, "storage_read_failed");
   }
+  readControllerOriginal(runId:number,sessionId:number,toolCallId:number):ToolCallRecord|null {
+    const row=this.db.query<CallRow,[number,number,number]>('SELECT * FROM tool_calls WHERE id=? AND run_id=? AND session_id=?').get(toolCallId,runId,sessionId);
+    return row?this.call(row):null;
+  }
   request(tool: ToolCallIdentity, input: unknown, context: ToolExecutionContext): ToolCallRecord {
     return protect(() => this.transactions.immediate(() => {
       this.identity(context, true);

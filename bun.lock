@@ -15,6 +15,12 @@
         "typescript": "7.0.2",
       },
     },
+    "agent-eval": {
+      "name": "@medclaw/agent-eval",
+      "dependencies": {
+        "zod": "4.6.5",
+      },
+    },
     "apps/desktop": {
       "name": "@medclaw/desktop",
       "dependencies": {

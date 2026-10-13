@@ -11,7 +11,7 @@ import { safeError } from '../../packages/contracts/src/error';
 const root = resolve(import.meta.dirname, '../..'), bun = process.env.MEDCLAW_BUN_EXECUTABLE ?? 'bun';
 let app: ElectronApplication, page: Page, temporary: string, server: Server;
 type Call = { method: string; payload: Record<string, unknown>; operationRef?: string };
-type Rule = { method: string; sessionId?: number; inputId?: number; hold?: string; before?: boolean; legacy?: boolean; requestPatch?: Record<string, unknown>; project?: unknown };
+type Rule = { method: string; sessionId?: number; inputId?: number; afterClientSequence?: number | null; hold?: string; before?: boolean; legacy?: boolean; requestPatch?: Record<string, unknown>; project?: unknown };
 type GateState = { rules: Rule[]; entered: string[]; pending: Record<string, () => void>; calls: Call[]; accepted: (SubmitResult & { mode: string; operationRef: string })[] };
 type MainGlobal = typeof globalThis & { __p5Gate: GateState };
 type Wire = { model: string; messages: { role: string; content: unknown }[] };
@@ -63,7 +63,7 @@ test.beforeAll(async () => {
     ipcMain.handle=(channel,listener)=>original(channel,async(event,envelope)=>{
       if(channel!=='medclaw:request')return listener(event,envelope);
       const p=envelope.payload; state.calls.push({method:envelope.method,payload:p,operationRef:envelope.operationRef});
-      const index=state.rules.findIndex(r=>r.method===envelope.method&&(r.sessionId===undefined||r.sessionId===p.sessionId)&&(r.inputId===undefined||r.inputId===p.inputId));
+      const index=state.rules.findIndex(r=>r.method===envelope.method&&(r.sessionId===undefined||r.sessionId===p.sessionId)&&(r.inputId===undefined||r.inputId===p.inputId)&&(r.afterClientSequence===undefined||r.afterClientSequence===p.afterClientSequence));
       const rule=index<0?null:state.rules.splice(index,1)[0];
       const hold=async()=>{state.entered.push(rule.hold);await new Promise(resolve=>state.pending[rule.hold]=resolve);delete state.pending[rule.hold];};
       if(rule?.hold&&rule.before)await hold();
@@ -321,7 +321,7 @@ test('legacy acceptance reads only its Run and an old Host input reply is ignore
   // A genuine Host restart provides a different instance; held old reads cannot populate its cache.
   const old = await page.evaluate(() => window.medclaw.request('host.read', {})); if (!old.ok || !old.data.instanceId) throw new Error('No Host');
   const unknown: SessionInput = { ...(await readInput(original.inputId)), status: 'delivery_unknown', processingStatus: 'pending', runId: null, nativeEntryId: null, processedAt: null, error: safeError('input_delivery_unknown') };
-  await inspectInputs(); await rules([{ method: 'session.listInputs', sessionId: a, hold: 'old-host-list', project: { ok: true, data: { sessionId: a, items: [unknown], nextClientSequence: null, hasMore: false } } }]); await queue().getByRole('button', { name: 'Refresh inputs', exact: true }).click(); await entered('old-host-list');
+  await inspectInputs(); await rules([{ method: 'session.listInputs', sessionId: a, afterClientSequence: null, hold: 'old-host-list', project: { ok: true, data: { sessionId: a, items: [unknown], nextClientSequence: null, hasMore: false } } }]); await queue().getByRole('button', { name: 'Refresh inputs', exact: true }).click(); await entered('old-host-list');
   const restarted = await page.evaluate(expectedInstanceId => window.medclaw.request('host.restart', { expectedInstanceId }), old.data.instanceId); expect(restarted.ok).toBe(true); if (!restarted.ok) throw new Error(restarted.error.code);
   await expect.poll(async () => { const host = await page.evaluate(() => window.medclaw.request('host.read', {})); return host.ok && host.data.state === 'ready' && host.data.instanceId !== old.data.instanceId; }).toBe(true);
   await inspectInputs(); await release('old-host-list'); await expect(queue()).not.toContainText('Delivery unknown'); await expect(item(original.inputId)).toContainText('Completed');

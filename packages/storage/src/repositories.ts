@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { isDeepStrictEqual } from "node:util";
 import { createHash } from 'node:crypto';
+import { ProviderRequestOriginalSchema } from '../../contracts/src/controller-evidence';
 import { z } from "zod";
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, safeError, type AppError } from "../../contracts/src/error";
 import { ToolSdkDeliverySchema } from "../../contracts/src/tool";
@@ -135,7 +136,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   private readonly batchLifecycle:boolean;
   private readonly events: EventWriter | undefined;
   constructor(private readonly db: Database, private readonly beforeCommit?: () => void, events?: EventWriter,
-    private readonly transactions = SqliteWriteTransactions.forDatabase(db),private readonly memory?:SqliteMemoryStore) {
+    private readonly transactions = SqliteWriteTransactions.forDatabase(db),private readonly memory?:SqliteMemoryStore,private readonly evidenceInstanceId?:string) {
     this.events = events ?? (db.query("SELECT name FROM sqlite_schema WHERE name='runtime_events'").get() ? new SqliteEventStore(db, transactions) : undefined);
     this.inputs = new SqliteInputStore(db, this.events);
     this.intents = db.query("SELECT name FROM sqlite_schema WHERE name='intent_calls'").get() ? new SqliteIntentStore(db, this.events, transactions) : null;
@@ -519,6 +520,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         sdkStopReason: z.enum(["stop", "length", "toolUse", "error", "aborted", "deferred"]).nullable(),
         context: ModelCallContextSchema.optional(),
         compaction: CompactionCallMetadataSchema.optional(),
+        requestOriginals:z.array(ProviderRequestOriginalSchema).optional(),
       }).strict(), decoded(row.model_json), "storage_write_failed");
       return checked(ModelCallViewSchema, {
         ...(model.compaction?{compaction:{operationRef:model.compaction.operationRef,reason:model.compaction.reason,nativeEntryId:model.compaction.nativeEntryId,savedStorageVersion:model.compaction.savedStorageVersion}}:{}),
@@ -1687,6 +1689,22 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         VALUES(?,?,?,?,?,1,'logical_request',1,?,'started',?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)`)
         .run(callId, runId, row.session_id, context?.inputId ?? row.input_id, kind, JSON.stringify({ selection: this.config(row).selection, responseModel: null, sdkStopReason: null, ...(context ? {context:checked(ModelCallContextSchema,{contract:'medclaw.context-call/v1',...context,observation:null,responseStatus:null,payloadVerified:null})} : {}) }), time);
       this.beforeCommit?.();
+    });
+  }
+
+  recordProviderRequest(callId:string,payload:unknown,observedAt:string):void {
+    const body=JSON.stringify(payload);if(typeof body!=='string')fail('invalid_argument');
+    this.transactions.immediate(()=>{
+      const row=this.db.query<{model_json:string;session_id:number|null;run_id:number|null;instance_id:string|null;state:string},[string]>(`SELECT c.model_json,c.session_id,c.run_id,c.state,r.instance_id FROM model_calls c LEFT JOIN runs r ON r.id=c.run_id WHERE c.call_id=?`).get(callId);
+      if(!row||row.state!=='started')fail('state_conflict');
+      const model=JSON.parse(row.model_json),originals=ProviderRequestOriginalSchema.array().parse(model.requestOriginals??[]);
+      const instanceId=this.evidenceInstanceId??row.instance_id;
+      // Legacy non-Host fixtures cannot attest a manual operation's Host identity.
+      if(!instanceId&&row.run_id===null)return;
+      if(!instanceId||row.instance_id&&row.instance_id!==instanceId)fail('access_denied');
+      originals.push(ProviderRequestOriginalSchema.parse({instanceId,sessionId:row.session_id,runId:row.run_id,callId,observedAt,boundary:'sdk_onPayload',sequence:originals.length+1,
+        body,sha256:createHash('sha256').update(body).digest('hex'),bytes:Buffer.byteLength(body)}));
+      this.db.query('UPDATE model_calls SET model_json=? WHERE call_id=?').run(JSON.stringify({...model,requestOriginals:originals}),callId);
     });
   }
 

@@ -9,6 +9,7 @@ import { VERSION } from '@earendil-works/pi-coding-agent';
 import { PiModelRuntime } from '../../packages/runtime-pi/src/model-runtime';
 import { PiAgentRuntime } from '../../packages/runtime-pi/src/agent-runtime';
 import { ModelCallRecorder } from '../../packages/runtime-pi/src/model-call-recorder';
+import { ControllerEvidenceReader } from '../../packages/storage/src/controller-evidence';
 import { contextMessageText, matchProviderContext } from '../../packages/runtime-pi/src/messages';
 import { openDatabase } from '../../packages/storage/src/database';
 import { SqliteContextStore } from '../../packages/storage/src/context-store';
@@ -261,6 +262,20 @@ test('p8 keeps the original positive receipt when an existing response callback 
   expect(f.requests).toHaveLength(1);expect(f.contexts.read({callId:result.calls[0]!.callId})).toMatchObject({kind:'snapshot',evidence:'saved'});
 });
 
+test('controller evidence reads full native history and SDK tool originals under the accepted Run owner',async()=>{
+  const f=await fixture({tools:true,respond:index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'original-tool',type:'function',function:{name:'read_data_scope',arguments:'{}'}}]}:{role:'assistant',content:'recorded original'}});
+  await f.execute();
+  const reader=new ControllerEvidenceReader(f.db,sqliteHistory(f.db).store,new SqliteToolStore(f.db),'host');
+  const common={expectedInstanceId:'host',ownerInstanceId:'host',offset:0,limit:65536};
+  const history=JSON.parse(Buffer.from(reader.read({...common,selector:{kind:'history',sessionId:f.input.sessionId,runId:f.input.runId}}).data,'base64').toString('utf8'));
+  expect(history).toHaveProperty('header');expect(history).toHaveProperty('activeLeafId');expect(history.storageVersion).toBeGreaterThan(0);
+  expect(history.entries.some((entry:any)=>entry.message?.content?.some?.((part:any)=>part.type==='toolCall'&&part.id==='original-tool'))).toBe(true);
+  const row=f.db.query<{id:number},[]>('SELECT id FROM tool_calls').get()!;
+  const tool=JSON.parse(Buffer.from(reader.read({...common,selector:{kind:'tool',sessionId:f.input.sessionId,runId:f.input.runId,toolCallId:row.id}}).data,'base64').toString('utf8'));
+  expect(tool).toMatchObject({id:row.id,nativeToolCallId:'original-tool',input:{},sdkReturned:true});expect(tool.sdkDelivery.content.length).toBeGreaterThan(0);
+  expect(()=>reader.read({...common,selector:{kind:'history',sessionId:f.input.sessionId+1,runId:f.input.runId}})).toThrow('access_denied');
+});
+
 for(const mode of ['mutation','replacement','async_replacement'] as const) test(`p8 preserves an existing ${mode} payload hook and verifies its effective request`,async()=>{
   const f=await fixture({payloadHook:payload=>{
     const original=payload as Record<string,unknown>;
@@ -268,6 +283,11 @@ for(const mode of ['mutation','replacement','async_replacement'] as const) test(
     const replacement={...original,fixtureHook:mode};return mode==='replacement'?replacement:Promise.resolve(replacement);
   }}),result=await f.execute();
   expect(f.requests).toHaveLength(1);expect(f.requests[0]!.fixtureHook).toBe(mode);
+  const saved=f.db.query<{model_json:string},[string]>('SELECT model_json FROM model_calls WHERE call_id=?').get(result.calls[0]!.callId)!;
+  const originals=JSON.parse(saved.model_json).requestOriginals;
+  expect(originals).toHaveLength(1);expect(JSON.parse(originals[0].body)).toEqual(f.requests[0]);
+  expect(originals[0]).toMatchObject({boundary:'sdk_onPayload',instanceId:'host',runId:f.input.runId,sessionId:f.input.sessionId});
+  expect(originals[0].body).not.toContain('Authorization');
   expect(f.contexts.read({callId:result.calls[0]!.callId})).toMatchObject({kind:'snapshot',evidence:'saved'});expect(f.errors).toEqual([]);
 });
 

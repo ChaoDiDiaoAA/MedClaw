@@ -1,3 +1,4 @@
+import {electronTestWindowArgs} from '../fixtures/desktop-dev';
 import { test, expect, _electron as electron, type ElectronApplication, type Page } from '@playwright/test';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync } from 'node:fs';
@@ -108,7 +109,7 @@ test.beforeAll(async () => {
   const playwright = createRequire(createRequire(import.meta.url).resolve('@playwright/test/package.json')), core = createRequire(playwright.resolve('playwright/package.json')).resolve('playwright-core/package.json');
   const env: Record<string, string> = { ...Object.fromEntries(Object.entries(process.env).flatMap(([key, value]) => value === undefined ? [] : [[key, value]])), MEDCLAW_HOST_ENTRY: hostEntry, MEDCLAW_BUN_EXECUTABLE: execFileSync(bun, ['-e', 'process.stdout.write(process.execPath)'], { encoding: 'utf8' }).trim() };
   delete env.ELECTRON_RUN_AS_NODE;
-  app = await electron.launch({ executablePath: electronPath, args: ['-r', join(dirname(core), 'lib/server/electron/loader.js'), '-r', seam, join(root, '.build/desktop/main/index.cjs'), '--medclaw-data-root', join(temporary, 'data')], env, timeout: 30000 });
+  app = await electron.launch({ executablePath: electronPath, args: [...electronTestWindowArgs,'-r', join(dirname(core), 'lib/server/electron/loader.js'), '-r', seam, join(root, '.build/desktop/main/index.cjs'), '--medclaw-data-root', join(temporary, 'data')], env, timeout: 30000 });
   page = await app.firstWindow(); await page.setViewportSize({ width: 1440, height: 1000 }); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
   await app.evaluate(({dialog},path)=>{dialog.showOpenDialog=async()=>({canceled:false,filePaths:[path]});},join(temporary,'source'));
   const configured = await page.evaluate(async baseUrl => {
@@ -122,7 +123,10 @@ test.afterAll(async () => { httpReleases.forEach(release => release()); await ap
 test.afterEach(async ({}, info) => {
   const name = info.title.replaceAll(/[^a-zA-Z0-9]+/g, '-'); mkdirSync(evidence, { recursive: true });
   if (info.status === info.expectedStatus) { save('dom-' + name, { currentSession: await page.getByTestId('current-session').innerText(), inputQueue: await queue().count() ? await queue().ariaSnapshot() : null, composer: await page.locator('.composer').count() ? await page.locator('.composer').ariaSnapshot() : null }); await page.screenshot({ path: join(evidence, name + '.png'), fullPage: true }); }
-  else await page?.screenshot({ path: join(evidence, 'failure-' + name + '.png'), fullPage: true }).catch(() => {});
+  else {
+    save('failure-' + name, { host: await page.evaluate(() => window.medclaw.request('host.read', {})), diagnostics: await page.evaluate(() => window.medclaw.request('diagnostics.read', { categories: ['host', 'errors', 'runtime'] })), calls: await calls() });
+    await page?.screenshot({ path: join(evidence, 'failure-' + name + '.png'), fullPage: true }).catch(() => {});
+  }
   await app?.evaluate(()=>{(globalThis as MainGlobal).__p7Gate.drop=[];}).catch(()=>{});
 });
 
@@ -130,7 +134,7 @@ const timeline=()=>page.getByTestId('run-timeline');
 const temporaryBody=()=>page.getByTestId('temporary-run-area');
 async function drop(types:string[]){await app.evaluate((_,types)=>{(globalThis as MainGlobal).__p7Gate.drop=types;},types);}
 async function events(runId:number){const result=await page.evaluate(runId=>window.medclaw.request('event.read',{runId,afterSequence:0,limit:100}),runId);if(!result.ok)throw new Error(result.error.code);return result.data;}
-async function runtimeTab(){if(!await page.getByRole('tab',{name:'Run details',exact:true}).count())await page.getByRole('button',{name:'View run details',exact:true}).click();await page.getByRole('tab',{name:'Run details',exact:true}).click();await page.getByRole('button',{name:'Refresh recent runs',exact:true}).click();}
+async function runtimeTab(){if(!await page.getByRole('tab',{name:'Run details',exact:true}).count())await page.getByRole('button',{name:'View run details',exact:true}).click();await page.getByRole('tab',{name:'Run details',exact:true}).click();await expect(page.getByRole('tab',{name:'Run details',exact:true})).toHaveAttribute('aria-selected','true');await page.getByRole('button',{name:'Refresh recent runs',exact:true}).click();}
 async function assertTimeline(runId:number){await runtimeTab();const facts=await events(runId);await expect(timeline()).toHaveAttribute('data-run-id',String(runId));await expect(timeline()).toHaveAttribute('data-cursor',String(facts.range.lastSequence));expect(await timeline().locator('[data-event-sequence]').evaluateAll(nodes=>nodes.map(n=>Number(n.getAttribute('data-event-sequence'))))).toEqual(facts.events.map(e=>e.sequence));return facts;}
 async function settled(text:string){await create();steps=[()=>({text})];const accepted=await clickSubmit(text);if(!accepted.runId)throw new Error('Missing Run');await idle();await expect(page.getByText('Saved',{exact:true})).toBeVisible();return {...accepted,runId:accepted.runId};}
 function receipt(wire:Wire,id:string):Record<string,unknown>{const returned=wire.messages.filter(m=>m.role==='tool'&&m.tool_call_id===id);expect(returned).toHaveLength(1);return JSON.parse(String(returned[0]!.content));}
@@ -258,6 +262,8 @@ test('A12 viewing B keeps the running A ownership, frozen Input and Stop target'
   await expect(page.getByTestId('frozen-input-context')).toContainText(`Input ${acceptedA.inputId}`);
   await expect(page.getByTestId('frozen-input-context')).toContainText(`Query ${original.queryId}`);
   await runtimeTab(); await page.getByRole('button', { name: `View Run ${original.runId}`, exact: true }).click();
+  await expect(timeline()).toHaveAttribute('data-run-id',String(original.runId));
+  await expect(page.getByRole('tabpanel',{name:'Run details',exact:true})).toBeVisible();
   const before = sql('SELECT * FROM workspace')[0];
   await page.getByRole('button', { name: `Read original Query ${original.queryId}`, exact: true }).first().click();
   await expect(page.getByTestId('query-results')).toBeVisible(); expect(sql('SELECT * FROM workspace')[0]).toEqual(before);
@@ -487,6 +493,7 @@ test('A10 truly slow restore stays locked after late commit and cannot be unlock
   await expect(page.getByRole('button', { name: 'Apply 2 selected batches', exact: true })).toBeDisabled();
   expect((await calls()).filter(call => call.method === 'workspace.restore')).toHaveLength(beforeCalls + 1);
   const runs = sql('SELECT count(*) AS n FROM runs')[0].n, models = physical;
+  expect(await page.evaluate(() => window.medclaw.request('host.read', {}))).toMatchObject({ ok: true, data: { state: 'ready', error: null } });
   await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('button', { name: 'Restart Host', exact: true }).click();
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Apply 2 selected batches', exact: true })).toBeEnabled();

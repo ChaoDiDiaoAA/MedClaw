@@ -1,3 +1,4 @@
+import {electronTestWindowArgs} from '../fixtures/desktop-dev';
 import { test, expect, _electron as electron, type ElectronApplication, type Page } from '@playwright/test';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -120,8 +121,8 @@ test.beforeAll(async () => {
       return listener(event, envelope);
     });
   `);
-  app = await electron.launch({ executablePath: electronPath, args: ['-r', join(dirname(core), 'lib/server/electron/loader.js'), '-r', delayedImport, join(root, '.build/desktop/main/index.cjs'), '--medclaw-data-root', join(temporary, 'data')], env, timeout: 30000 });
-  page = await app.firstWindow(); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
+  app = await electron.launch({ executablePath: electronPath, args: [...electronTestWindowArgs,'-r', join(dirname(core), 'lib/server/electron/loader.js'), '-r', delayedImport, join(root, '.build/desktop/main/index.cjs'), '--medclaw-data-root', join(temporary, 'data')], env, timeout: 30000 });
+  page = await app.firstWindow(); await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().forEach(window=>window.webContents.setBackgroundThrottling(false))); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
   await app.evaluate(({ dialog }, source) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [source] }); }, join(temporary, 'source'));
   const configured = await page.evaluate(async baseUrl => {
     const directory = await window.medclaw.request('model.read', {}); if (!directory.ok) throw new Error(directory.error.code);
@@ -245,7 +246,7 @@ test('P3 actual business tool creates a saved query with inspectable source evid
   await expect(interpretation.getByTestId('query-interpretation')).toContainText('2026-01-01');
   await page.getByRole('button', { name: 'Read evidence 1', exact: true }).click(); await expect(page.getByRole('heading', { name: 'Evidence 1', exact: true })).toBeVisible();
   await expect(page.getByLabel('Query evidence')).toContainText('synthetic'); await expect(page.getByLabel('Query evidence')).toContainText('original.csv');
-  await expect(page.getByRole('button', { name: 'Run query', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Run query', exact: true })).toBeEnabled();
   await app.evaluate(() => { (globalThis as typeof globalThis & { __p3DelayedImport: { catalogDefaultsUnknown: boolean } }).__p3DelayedImport.catalogDefaultsUnknown = true; });
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click();
   await page.getByRole('button', { name: 'Refresh imported data', exact: true }).click();
@@ -302,6 +303,9 @@ test('P3 query dates and quantities remain explicit across stale snapshots, resu
     await page.getByLabel('Message text', { exact: true }).fill('Hold date query scope'); await page.getByRole('button', { name: 'Send', exact: true }).click();
     await dateQueryGate.entered;
     await page.getByRole('button', { name: 'Query History', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Run query', exact: true })).toBeDisabled();
+    dateQueryGate.release();
+    await expect.poll(async()=>{const active=await page.evaluate(()=>window.medclaw.request('run.active',{}));return active.ok&&active.data===null;}).toBe(true);
     await expect(page.getByRole('button', { name: 'Run query', exact: true })).toBeEnabled();
     await expect(page.getByLabel('Start date', { exact: true })).toHaveCount(0);
     await page.getByLabel('On date', { exact: true }).fill('2026-01-01');
@@ -363,6 +367,7 @@ test('P3 query dates and quantities remain explicit across stale snapshots, resu
 
 test('P3 active and saved Runs retain frozen budgets while Settings changes apply to the next Run', async () => {
   test.setTimeout(60000);
+  await page.getByRole('button',{name:'New Session',exact:true}).click();
   let markEntered!: () => void, release!: () => void;
   dateQueryGate = { entered: new Promise<void>(resolve => { markEntered = resolve; }), reply: new Promise<void>(resolve => { release = resolve; }), markEntered: () => markEntered(), release: () => release() };
   try {

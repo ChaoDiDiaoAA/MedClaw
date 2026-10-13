@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { DATABASE_SCHEMA_VERSION } from '../../packages/contracts/src/protocol';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
@@ -67,7 +68,7 @@ test('S02 actual dev migrates an LF legacy root on Windows and preserves its ori
     await expect(desktop.page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
     await expect(desktop.page.getByRole('button', { name: 'New Session', exact: true })).toBeEnabled();
     const after = readStartupFacts(dataRoot);
-    expect(after.migrations.map(row => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    expect(after.migrations.map(row => row.version)).toEqual(Array.from({length:DATABASE_SCHEMA_VERSION},(_,i)=>i+1));
     expect(after.migrations.slice(0, 3)).toEqual(before.migrations);
     expect(after.sessions).toEqual(before.sessions);
     expect(after.workspace).toEqual(before.workspace);

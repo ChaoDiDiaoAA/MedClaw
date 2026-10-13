@@ -1,0 +1,7 @@
+{
+  "name": "@medclaw/agent-eval",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "bun test ./tests", "typecheck": "tsc --noEmit -p tsconfig.json" },
+  "dependencies": { "zod": "4.6.5" }
+}

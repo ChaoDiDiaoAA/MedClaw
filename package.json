@@ -3,13 +3,19 @@
   "private": true,
   "type": "module",
   "packageManager": "bun@1.4.0",
-  "workspaces": ["apps/desktop", "apps/host", "packages/contracts", "packages/core", "packages/runtime-pi", "packages/storage", "packages/logging", "packages/intent-ollama"],
+  "workspaces": ["apps/desktop", "apps/host", "packages/contracts", "packages/core", "packages/runtime-pi", "packages/storage", "packages/logging", "packages/intent-ollama", "agent-eval"],
   "scripts": {
+    "eval": "bun --no-env-file agent-eval/src/cli.ts",
+    "eval:smoke": "bun --no-env-file agent-eval/src/presets.ts smoke",
+    "eval:full": "bun --no-env-file agent-eval/src/presets.ts full",
+    "eval:upload": "bun --no-env-file agent-eval/src/presets.ts upload",
+    "test:eval": "bun test agent-eval/tests",
     "typecheck": "tsc --noEmit",
     "dev:desktop": "bun apps/desktop/dev.ts",
     "test:unit": "bun tests/run.ts unit",
     "test:integration": "bun tests/run.ts integration",
-    "test:e2e": "bun tests/run.ts e2e"
+    "test:e2e": "bun --no-env-file tests/run.ts e2e",
+    "test:e2e:desktop": "bun --no-env-file tests/run.ts desktop"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.87.1",

@@ -7,9 +7,12 @@ import type { CompactionCallOwner, SessionStore } from '../../contracts/src/sess
 export class ModelCallRecorder implements ModelCallRecorderPort {
   readonly callId = crypto.randomUUID();
   private readonly started = performance.now();
+  private capture?: (callId:string,payload:unknown,at:string)=>void;
   constructor(repositories: Pick<ProviderRunStore, "startCall">, runId: number, kind: "main" | "diagnostic", time: string, context?: StartCallContext);
   constructor(repositories: Pick<SessionStore, 'startCompactionCall'>, owner: CompactionCallOwner, time: string);
   constructor(...args: [Pick<ProviderRunStore, 'startCall'>, number, 'main' | 'diagnostic', string, StartCallContext?] | [Pick<SessionStore, 'startCompactionCall'>, CompactionCallOwner, string]) {
+    const store=args[0] as typeof args[0] & {recordProviderRequest?:(callId:string,payload:unknown,at:string)=>void};
+    if(store.recordProviderRequest)this.capture=store.recordProviderRequest.bind(store);
     if (typeof args[1] === 'number') {
       const [repositories, runId, kind, time, context] = args as [Pick<ProviderRunStore, 'startCall'>, number, 'main' | 'diagnostic', string, StartCallContext?];
       repositories.startCall(runId, this.callId, kind, time, context);
@@ -18,6 +21,7 @@ export class ModelCallRecorder implements ModelCallRecorderPort {
       repositories.startCompactionCall({ owner, callId: this.callId, startedAt: time });
     }
   }
+  recordPayload(payload:unknown,observedAt:string):void {this.capture?.(this.callId,payload,observedAt);}
   static forCompaction(repositories: Pick<SessionStore, 'startCompactionCall'>, owner: CompactionCallOwner, time: string): ModelCallRecorder {
     return new ModelCallRecorder(repositories, owner, time);
   }

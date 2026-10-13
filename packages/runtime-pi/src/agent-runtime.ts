@@ -661,6 +661,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
             matched = [];
             const replacement = await options?.onPayload?.(payload, callbackModel);
             const effective = replacement === undefined ? payload : replacement;
+                recorder.recordPayload?.(effective,new Date().toISOString());
             if (snapshot && callContext) {
               callContext.payloadVerified = matchProviderContext(model.api,effective,snapshot);
               if (!callContext.payloadVerified) { const error = safeError('context_payload_mismatch'); fail(error); throw error; }

@@ -1,0 +1,2 @@
+PRIVATE_SECRET_CANARY
+Synthetic privacy-test marker; no real credentials or personal information.

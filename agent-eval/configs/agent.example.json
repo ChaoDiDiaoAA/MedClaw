@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "environment": "development",
+  "model": {
+    "url": "https://REPLACE_WITH_AGENT_ENDPOINT/v1",
+    "key": "REPLACE_WITH_AGENT_API_KEY",
+    "model": "REPLACE_WITH_NATIVE_CATALOG_MODEL"
+  },
+  "intent": {
+    "baseUrl": "http://127.0.0.1:11434",
+    "model": "qwen3.5:0.8b"
+  },
+  "policy": {},
+  "retention": "preserve_on_failure"
+}

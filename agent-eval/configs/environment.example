@@ -1,0 +1,23 @@
+# 环境变量示例；复制为 environment 后，eval:smoke/full/upload 显式读取该固定文件。
+# 快捷命令以文件值为准，不由同名 Shell 变量补齐或覆盖；低层 eval CLI 仍显式接收调用环境。
+# 以下两项仅说明示例场景：Smoke/Full 固定本地保存，环境名取 agent.json，上传须单独执行。
+MEDCLAW_EVAL_BACKEND=local
+MEDCLAW_EVAL_ENVIRONMENT=development
+# 独立 Judge 只在这里配置以下三项，agent.json 不再填写 judge。
+# 不设置 Judge 输出 Token 上限或总输出预算；每个适用 Trial 最多一次，超时和取消仍有效。
+# 每次运行自动保存无密钥的实际配置；校准可独立执行，不是 Smoke/Full 的前提。
+# BASE_URL 为兼容接口地址（含 /v1）；MODEL 为独立裁判模型 ID，须替换占位值。
+MEDCLAW_JUDGE_BASE_URL=https://REPLACE_WITH_INDEPENDENT_JUDGE_ENDPOINT/v1
+MEDCLAW_JUDGE_MODEL=REPLACE_WITH_INDEPENDENT_JUDGE_MODEL
+# Judge API Key 仅供控制器读取，不能传给被测 Agent、写入快照或提交仓库。
+MEDCLAW_JUDGE_API_KEY=
+# Langfuse：仅选择 langfuse 后端并执行实际平台操作时需要这四项。
+# BASE_URL 是实际部署地址；localhost:3000 仅为本地示例。
+LANGFUSE_BASE_URL=http://localhost:3000
+# PUBLIC_KEY 和 SECRET_KEY 属于实际项目；SECRET_KEY 保留在控制端。
+LANGFUSE_PUBLIC_KEY=
+LANGFUSE_SECRET_KEY=
+# 实际部署的 Langfuse 服务端 release，用于平台协议核验；本地未用平台时留空。
+# 从部署记录、固定镜像 tag 或服务版本信息核实，例如实际镜像 tag 为 3.120.0 就填 3.120.0。
+# 不填 SDK、数据库版本或 latest，不根据示例猜测；平台命令启用时必须填写真实值。
+MEDCLAW_LANGFUSE_SERVER_VERSION=

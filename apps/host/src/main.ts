@@ -7,6 +7,7 @@ import { AppErrorSchema, safeError, OpaqueIdSchema, type Result } from "../../..
 import { openDatabase, SCHEMA_VERSION } from "../../../packages/storage/src/database.ts";
 import { Repositories } from "../../../packages/storage/src/repositories.ts";
 import { SqliteMemoryStore } from '../../../packages/storage/src/memory-store.ts';
+import { ControllerEvidenceReader } from '../../../packages/storage/src/controller-evidence.ts';
 import { validateNativeHistory } from '../../../packages/runtime-pi/src/memory-store.ts';
 import { describeDataSelection, queryRowKeys } from '../../../packages/storage/src/workspace-selection.ts';
 import { PiModelRuntime, CatalogStore, SDK_VERSION, installedSdkVersion, type ResolvedModel } from "../../../packages/runtime-pi/src/model-runtime.ts";
@@ -33,6 +34,7 @@ import { SqliteExportStore } from '../../../packages/storage/src/export-store';
 import { ExportDestinationSchema, ExportCopyReceiptSchema } from '../../../packages/contracts/src/export';
 import { EvidenceReader } from '../../../packages/core/src/evidence/evidence-reader.ts';
 import { createBusinessTools } from '../../../packages/core/src/tools/tools.ts';
+import { createControlledToolFault } from '../../../packages/core/src/tools/controlled-fault.ts';
 import { ToolRegistry } from '../../../packages/core/src/tools/registry.ts';
 import type { AnyToolDefinition } from '../../../packages/contracts/src/tool';
 import type { ToolConfiguration } from '../../../packages/contracts/src/tool-config';
@@ -66,6 +68,7 @@ let database: ReturnType<typeof openDatabase> | null = null;
 let deletions:DataDeletionService;
 let events: EventService | null = null;
 let contexts: ContextService;
+let controllerEvidence:ControllerEvidenceReader;
 let locked = false, closing = false, controlCount = 0;
 let terminating = false, shutdownTask: Promise<void> | null = null, fatalTask: Promise<void> | null = null;
 let startupPhase = "hello";
@@ -191,7 +194,7 @@ async function initialize(raw: unknown) {
     { readSnapshots: runId => agent?.readSnapshots(runId) ?? { streamConnection: null, snapshots: [], incomplete: false } },
     error => errorLog.add(error, { ...(error.runId ? { runId: error.runId } : {}) }), notice);
   const memory=new SqliteMemoryStore(database,validateNativeHistory,events,transactions);
-  repositories = new Repositories(database, undefined, events, transactions,memory);
+  repositories = new Repositories(database, undefined, events, transactions,memory,config.instanceId);
   try { repositories.recoverInterrupted(config.instanceId, new Date().toISOString()); }
   catch { errorLog.add(safeError("storage_write_failed")); }
   const credentialStore = new BridgeCredentialStore(credentials);
@@ -200,11 +203,13 @@ async function initialize(raw: unknown) {
   startupPhase = "custom_registration";
   await runtime.installCustom(settings.customProviders.map(p => p.definition));
   catalog = new SqliteCatalogStore(database); toolStore = new SqliteToolStore(database, events, transactions);
+  controllerEvidence=new ControllerEvidenceReader(database,memory,toolStore,config.instanceId);
   const catalogService = new CatalogService(catalog);
   queries = new QueryService(catalogService, toolStore); evidence = new EvidenceReader(catalogService, queries, toolStore,repositories);
   const recorder = new ToolRecorder(toolStore, (error, context) => application?.runs.failToolPersistence(context.runId, error));
+  const wrapControlledFault = createControlledToolFault(config.controlledToolFault);
   const configure = (_configuration?:ToolConfiguration,extraDefinitions:readonly AnyToolDefinition[]=[]) => {
-    const registry = new ToolRegistry([...createBusinessTools({ catalog: catalogService, queries, evidence }),...extraDefinitions]);
+    const registry = new ToolRegistry(wrapControlledFault([...createBusinessTools({ catalog: catalogService, queries, evidence }),...extraDefinitions]));
     const executor = new ToolExecutor(registry, recorder, {
       findCommittedChild:context=>repositories.findCommittedChild(context),
       findCommittedQuery: context => {
@@ -425,6 +430,7 @@ async function dispatch(request: HostRequest): Promise<unknown> {
       return { runId, scope: context.scope, items, totalRows, page, pageSize };
     }
     case "settings.prepare": return app.prepareConfig(request.payload.token, request.payload.candidate);
+    case 'controller.evidence.read':return controllerEvidence.read(request.payload);
     case "settings.commit": { app.commitConfig(request.payload.token, request.payload.publishedVersion); return { configVersion: app.config.configVersion, selection: (await app.directory()).selection }; }
     case "settings.abort": await app.abortConfig(request.payload.token); return { aborted: true };
     case "host.shutdown":

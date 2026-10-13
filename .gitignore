@@ -12,3 +12,8 @@ node_modules/
 **/pi-model-cache.json
 .env
 .env.local
+/agent-eval/runs/
+/agent-eval/configs/agent-frozen.json
+/agent-eval/configs/*.local.json
+/agent-eval/configs/environment
+/agent-eval/configs/agent.json

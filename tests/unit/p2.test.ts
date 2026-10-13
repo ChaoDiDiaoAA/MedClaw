@@ -65,7 +65,7 @@ test.each(["P2", "P4"])("%s runner discovers only its stage and rejects empty, s
     const file = join(root, `tests/unit/${prefix}-extra.test.ts`);
     writeFileSync(file, 'import {test,expect} from "bun:test"; test("stage is consumed by project runner",()=>expect(Bun.argv.includes("--stage")).toBe(false)); test.skip("explicit skip",()=>{});');
     expect(discoverTests("unit", stage, root)).toEqual([file]);
-    expect(discoverTests("e2e", stage, root)).toHaveLength(1);
+    expect(discoverTests("desktop", stage, root)).toHaveLength(1);
     expect(await runStage("unit", stage, { root })).toMatchObject({ stage, discoveredFiles: 1, discovered: 2, executed: 1, pass: 1, fail: 0, skip: 1, exitCode: 0 });
     for (const [source, expected] of [
       ['import {test} from "bun:test"; test.skip("unverified",()=>{});', { executed: 0, pass: 0, skip: 1, exitCode: 1 }],

@@ -1,3 +1,4 @@
+import {electronTestWindowArgs} from '../fixtures/desktop-dev';
 import { test, expect, _electron as electron, type ElectronApplication, type Page } from "@playwright/test";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -34,8 +35,9 @@ async function launchDesktop() {
       if(channel==='medclaw:request'&&envelope.method==='event.subscribe'&&result.ok){const p=envelope.payload;
         if(p.action==='open')state.active[p.subscriptionId]=structuredClone(p);else delete state.active[p.subscriptionId];}
       return result;});`);
-  app = await electron.launch({ executablePath: electronPath, args: ["-r", loader, '-r', eventSeam, join(root, ".build/desktop/main/index.cjs"), "--medclaw-data-root", dataRoot], env, timeout: 30000 });
+  app = await electron.launch({ executablePath: electronPath, args: [...electronTestWindowArgs,"-r", loader, '-r', eventSeam, join(root, ".build/desktop/main/index.cjs"), "--medclaw-data-root", dataRoot], env, timeout: 30000 });
   page = await app.firstWindow();
+  await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().forEach(window=>window.webContents.setBackgroundThrottling(false)));
   const startupErrors: string[] = [];
   const onError = (error: Error) => startupErrors.push(error.message);
   page.on("pageerror", onError);
@@ -245,7 +247,10 @@ test("draft survives navigation, IME Enter does not send, narrow drawer returns 
   await input.dispatchEvent("keydown", { key: "Enter", code: "Enter", isComposing: true });
   expect(requests).toHaveLength(before);
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setSize(1100, 720));
+  await page.setViewportSize({width:1100,height:720});
+  await expect.poll(() => page.evaluate(() => matchMedia('(max-width: 1279px)').matches)).toBe(true);
   await page.getByRole("button", { name: "Close run details" }).click();
+  await expect(page.getByRole("button", { name: "Close run details" })).toHaveCount(0);
   const open = page.getByRole("button", { name: "View run details" });
   await open.click();
   await expect(page.getByRole("dialog", { name: "Run details" })).toBeVisible();
@@ -267,6 +272,13 @@ test("draft survives navigation, IME Enter does not send, narrow drawer returns 
   await page.screenshot({ path: test.info().outputPath("desktop-minimum-text-200.png") });
   await page.evaluate(() => { document.documentElement.style.fontSize = ""; });
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setSize(1440, 900));
+  await page.setViewportSize({width:1440,height:900});
+  const frames = await page.evaluate(async () => {
+    const end = performance.now() + 300; let count = 0;
+    await new Promise<void>(resolve => { const frame = (at: number) => { count++; if (at < end) requestAnimationFrame(frame); else resolve(); }; requestAnimationFrame(frame); });
+    return count;
+  });
+  expect(frames).toBeGreaterThan(1);
 });
 
 test("custom definition updates all models and persisted Unicode output pages reconstruct the result", async () => {

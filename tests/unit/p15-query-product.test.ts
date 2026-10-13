@@ -317,10 +317,10 @@ test('p15 runner discovers only its stage and rejects unknown stages and zero ex
     writeFileSync(file, 'export {};');
     expect(discoverTests('unit', 'P15', root)).toEqual([file]);
     expect(await runStage('unit', 'P15', { root })).toMatchObject({ discoveredFiles: 1, executed: 0, pass: 0, exitCode: 1 });
-    for (const category of ['integration', 'e2e'] as const) {
-      const other = join(root, 'tests', category);
+    for (const category of ['integration', 'e2e', 'desktop'] as const) {
+      const other = join(root, 'tests', category === 'desktop' ? 'e2e' : 'integration');
       mkdirSync(other, { recursive: true });
-      const candidate = join(other, `p15-probe.${category === 'e2e' ? 'spec' : 'test'}.ts`);
+      const candidate = join(other, `p15-probe.${category === 'desktop' ? 'spec' : 'test'}.ts`);
       writeFileSync(candidate, 'export {};');
       expect(discoverTests(category, 'P15', root)).toEqual([candidate]);
     }
