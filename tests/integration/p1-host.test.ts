@@ -4,55 +4,27 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import {fixture,createHostDiagnostics,finishHostFixture} from '../fixtures/p1-host';
 import { mergeRuntimeConfigurationPolicies } from '../../packages/contracts/src/runtime-config';
-
-async function fixture(mode = "normal") {
-  const root = mkdtempSync(join(tmpdir(), "medclaw P1 中文 -"));
-  const entry = join(root, "host.ts");
-  await Bun.write(entry, `import {createInterface} from "node:readline";import {appendFileSync} from "node:fs";
-const mode=${JSON.stringify(mode)};const lines=createInterface({input:process.stdin});let hello,ready;const pending=new Map();
-function send(value){process.stdout.write(JSON.stringify(value)+"\\n");}
-function emitReady(){const text=JSON.stringify(ready)+"\\n";process.stdout.write(text.slice(0,17));setTimeout(()=>process.stdout.write(text.slice(17)),5);}
-lines.on("line",line=>{const frame=JSON.parse(line);if(!hello){hello=frame;
-if(process.env.AWS_MAX_ATTEMPTS!=="1"||process.env.MEDCLAW_INSTANCE_ID!==hello.instanceId||process.env.MEDCLAW_STARTUP_TOKEN!==hello.startupToken)process.exit(41);
-ready={protocolVersion:hello.protocolVersion,instanceId:hello.instanceId,sdkVersion:hello.sdkVersion,schemaVersion:hello.expectedSchemaVersion,configVersion:"1",dataRoot:hello.paths.dataRoot};
-if(mode==="wrong-instance")ready.instanceId="unrelated-instance";
-if(mode==="wrong-protocol")ready.protocolVersion="unrelated-protocol";
-if(mode==="wrong-sdk")ready.sdkVersion="0.0.0";
-if(mode==="wrong-schema")ready.schemaVersion=999;
-if(mode==="wrong-root")ready.dataRoot=hello.paths.databasePath;
-if(mode==="oversized"){process.stdout.write("x".repeat(4*1024*1024+1));return;}
-if(mode==="truncated"){process.stdout.write("{");setTimeout(()=>process.exit(0),5);return;}
-if(mode==="invalid-utf8"){process.stdout.write(Buffer.from([255,10]));return;}
-if(mode==="silence")return;
-if(mode==="pre-ready"||mode==="invalid-private"){
-for(const method of ["credential.read","credential.list"]){const requestId="initial-"+method;pending.set(requestId,{initial:true});send({protocolVersion:hello.protocolVersion,kind:"private",instanceId:hello.instanceId,requestId,secret:mode!=="invalid-private",method,payload:method==="credential.read"?{providerId:"p1-offline",context:{purpose:"runtime",operationRef:"catalog"}}:{}});}return;}
-emitReady();return;}
-if(frame.kind==="private"){const request=pending.get(frame.requestId);if(!request||!frame.result.ok)process.exit(42);pending.delete(frame.requestId);if(request.initial){if(!pending.size)emitReady();return;}if(frame.result.data!==null)process.exit(42);
-const reply={protocolVersion:hello.protocolVersion,kind:"reply",instanceId:hello.instanceId,requestId:request.requestId,result:{ok:true,data:{providers:[],models:[],configVersion:"1",selection:null,customApis:[]}}};
-if(mode==="duplicate"){process.stdout.write([reply,reply,{...reply,requestId:"unknown-reply"}].map(value=>JSON.stringify(value)+"\\n").join(""));return;}
-if(mode==="preview"){for(let i=0;i<64;i++)send({protocolVersion:hello.protocolVersion,kind:"notice",instanceId:hello.instanceId,notice:{type:"provider.preview",runId:1,text:"preview-"+i,truncated:false}});setTimeout(()=>send({protocolVersion:hello.protocolVersion,kind:"notice",instanceId:hello.instanceId,notice:{type:"provider.settled",runId:1}}),80);}
-send(reply);return;}
-if(frame.method==="host.shutdown"){send({protocolVersion:hello.protocolVersion,kind:"reply",instanceId:hello.instanceId,requestId:frame.requestId,result:{ok:true,data:{executionStopped:true,databaseClosed:true}}});if(mode!=="ack-without-exit")setTimeout(()=>process.exit(0),5);return;}
-if(mode==="lost-reply"&&["model.list","session.messages.read","session.readSubmission","session.create"].includes(frame.method)){appendFileSync(${JSON.stringify(join(root, "received.jsonl"))},JSON.stringify(frame)+"\\n");return;}
-if(frame.method==="model.list"){const requestId="private-"+frame.requestId;pending.set(requestId,frame);send({protocolVersion:hello.protocolVersion,kind:"private",instanceId:hello.instanceId,requestId,secret:true,method:"credential.read",payload:{providerId:"p1-offline",context:{purpose:"runtime",operationRef:frame.operationRef}}});}
-});lines.on("close",()=>process.exit(0));`);
-  return { root, entry };
-}
 
 test("controlled Host authenticates its split ready, routes private frames and confirms actual exit", async () => {
   const { HostController } = await import("../../apps/desktop/src/main/host-controller");
   const { root, entry } = await fixture();
   const events: string[] = [];
   const calls: string[] = [];
+  const diagnostic=createHostDiagnostics();
+  let failed=false;
   const host = new HostController({
     dataRoot: root, hostEntry: entry, bunExecutable: process.execPath,
-    onStarting: instance => events.push(`start:${instance}`), onExit: instance => events.push(`exit:${instance}`),
+    onStarting: instance => {events.push(`start:${instance}`);diagnostic.starting(instance,(host as unknown as {child:ChildProcessWithoutNullStreams}).child);},
+    onExit: instance => {events.push(`exit:${instance}`);diagnostic.onExit(instance);},
+    onError:diagnostic.onError,onNotice:diagnostic.onNotice,
     onCredentialRequest: async frame => { calls.push(frame.requestId); return { ok: true, data: null }; },
   });
   try {
     expect(host.read()).toMatchObject({ state: "stopped", canStart: true });
     expect((await host.request("model.list", {})).ok).toBe(false);
+    diagnostic.phase='first-start';
     expect(await host.start()).toMatchObject({ state: "ready", error: null });
     const instance = host.read().instanceId!;
     expect(host.paths.databasePath).toBe(join(root, "data/app.sqlite"));
@@ -62,19 +34,20 @@ test("controlled Host authenticates its split ready, routes private frames and c
     expect(calls).toEqual(["private-req-a", "private-req-b"]);
     await expect(host.stop("unrelated-instance")).rejects.toThrow();
     expect(host.read()).toMatchObject({ state: "ready", instanceId: instance, canStart: false });
+    diagnostic.phase='stop';
     expect((await host.stop(instance)).state).toBe("stopped");
     expect(events).toEqual([`start:${instance}`, `exit:${instance}`]);
     expect(host.read().canStart).toBe(true);
-    expect((await host.start()).state).toBe("ready");
+    diagnostic.phase='second-start';
+    expect(await host.start()).toMatchObject({state:'ready',error:null});
     const second = host.read().instanceId!;
+    diagnostic.phase='concurrent-restart-stop';
     await Promise.all([host.restart(second), host.stop(second)]);
     expect(host.read()).toMatchObject({ state: "ready", canStart: false, error: null });
     expect(host.read().instanceId).not.toBe(second);
     expect(events).toEqual([`start:${instance}`, `exit:${instance}`, `start:${second}`, `exit:${second}`, `start:${host.read().instanceId}`]);
-  } finally {
-    if (host.read().instanceId && !host.read().canStart) await host.stop(host.read().instanceId!);
-    rmSync(root, { recursive: true, force: true });
-  }
+  } catch(error) {failed=true;throw error;}
+  finally {await finishHostFixture(host,root,entry,diagnostic,failed);}
 }, 30000);
 
 test("wrong ready identity and oversized incomplete frames fail and cannot adopt another process", async () => {

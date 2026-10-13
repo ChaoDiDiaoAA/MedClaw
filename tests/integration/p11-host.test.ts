@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { stripVTControlCharacters } from 'node:util';
 import type { BrowserWindow } from 'electron';
 import { Database } from 'bun:sqlite';
 import { HostController } from '../../apps/desktop/src/main/host-controller';
@@ -28,7 +29,7 @@ function hostTest(name: string, body: () => Promise<void>, timeout: number) {
     const child = Bun.spawn([process.execPath, 'test', import.meta.path, '-t', '^' + name + '$'], { env: { ...process.env, MEDCLAW_P11_HOST_CHILD: '1' }, stdout: 'pipe', stderr: 'pipe' });
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     if (code !== 0) process.stderr.write(stdout + stderr);
-    expect(code).toBe(0); expect(stderr).toMatch(/\n\s*1 pass\n\s*1 filtered out\n\s*0 fail\b/);
+    expect(code).toBe(0); expect(stripVTControlCharacters(stderr).replaceAll('\r\n', '\n')).toMatch(/\n\s*1 pass\n\s*1 filtered out\n\s*0 fail\b/);
   }, timeout);
 }
 function unwrap<T>(result: Result<T>): T { if (!result.ok) throw result.error; return result.data; }

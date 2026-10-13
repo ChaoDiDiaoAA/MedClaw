@@ -1,5 +1,6 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, openSync, writeSync, closeSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { stripVTControlCharacters } from "node:util";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { createRequire } from "node:module";
 
@@ -14,6 +15,10 @@ export interface StageReport {
   fail: number;
   skip: number;
   exitCode: number;
+  countsSource: "junit" | "stderr" | "playwright" | "unavailable";
+  reportComplete: boolean;
+  reportErrors: string[];
+  reportDirectory: string | null;
 }
 const projectRoot = resolve(import.meta.dir, "..");
 const stagePrefixes = { P1: "p1", P2: "p2", P3: "p3", P4: "p4", P5: "p5", P6: "p6", P7: "p7", P8: "p8", P9: "p9", P10: "p10", P11: "p11", P12: "p12", P13: "p13", P14: "p14", P15: "p15" } as const;
@@ -61,14 +66,60 @@ function terminalIncomplete(cases:string[],files:string[]):boolean {
   return cases.some(item=>/<skipped\b/.test(item))||[...executed.values()].some(count=>count===0);
 }
 
+function readJUnit(xml:string) {
+  const document=/^\s*(?:<\?xml[^>]*>\s*)?<testsuites\b([^>]*)>[\s\S]*<\/testsuites>\s*$/.exec(xml);
+  const stack:string[]=[];
+  let end=0;
+  for(const token of xml.matchAll(/<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[\s\S]*?\?>|<\/?[\w:.-]+(?:[^<>"']|"[^"]*"|'[^']*')*>/g)){
+    if(xml.slice(end,token.index).includes('<'))throw new Error('junit_report_invalid');
+    const tag=token[0];end=token.index+tag.length;
+    if(tag.startsWith('<?')||tag.startsWith('<!'))continue;
+    const name=/^<\/?([\w:.-]+)/.exec(tag)![1];
+    if(tag.startsWith('</')){if(!/^<\/[\w:.-]+\s*>$/.test(tag)||stack.pop()!==name)throw new Error('junit_report_invalid');}
+    else if(!tag.endsWith('/>'))stack.push(name);
+  }
+  if(stack.length||xml.slice(end).includes('<'))throw new Error('junit_report_invalid');
+  const cases=xml.match(/<testcase\b[^>]*?(?:\/>|>[\s\S]*?<\/testcase>)/g)??[];
+  if(!document||(xml.match(/<testcase\b/g)?.length??0)!==cases.length)throw new Error('junit_report_invalid');
+  const fail=cases.filter(item=>/<(?:failure|error)\b/.test(item)).length;
+  const skip=cases.filter(item=>/<skipped\b/.test(item)).length;
+  for(const [attribute,count] of [['tests',cases.length],['failures',fail],['skipped',skip]] as const){
+    const value=new RegExp(`\\b${attribute}="([^"]+)"`).exec(document[1])?.[1];
+    if(value!==undefined&&(!/^\d+$/.test(value)||Number(value)!==count))throw new Error('junit_report_invalid');
+  }
+  return {cases,pass:cases.length-fail-skip,fail,skip};
+}
+
 export async function runStage(category: TestCategory, stage: string, options: { root?: string } = {}): Promise<StageReport> {
   const root = resolve(options.root ?? projectRoot);
   const files = discoverTests(category, stage, root);
-  const result: StageReport = { category, stage, discoveredFiles: files.length, discovered: 0, executed: 0, pass: 0, fail: 0, skip: 0, exitCode: 1 };
-  if (!files.length) return result;
-  const temporary = mkdtempSync(join(tmpdir(), "medclaw-test-report-"));
+  const result: StageReport = { category, stage, discoveredFiles: files.length, discovered: 0, executed: 0, pass: 0, fail: 0, skip: 0, exitCode: 1,
+    countsSource:'unavailable',reportComplete:false,reportErrors:[],reportDirectory:null };
+  const issue=(code:string)=>{if(!result.reportErrors.includes(code))result.reportErrors.push(code);result.reportComplete=false;result.exitCode ||= 1;};
+  const output=join(root,'test-results');
+  const saveLatest=()=>{if(category==='e2e'&&existsSync(output))try{writeFileSync(join(output,'e2e-results.json'),JSON.stringify(result,null,2));}catch{issue('report_write_failed');}};
+  if (!files.length) {
+    issue('no_tests_discovered');
+    if(category==='e2e')try{rmSync(join(output,'e2e-results.xml'),{force:true});}catch{issue('report_setup_failed');}
+    saveLatest();return result;
+  }
   const desktop=category==='desktop';
-  const report = join(temporary, desktop ? "results.json" : "results.xml");
+  const directory=join(output,'.runs',randomUUID());
+  const report = join(directory, desktop ? "results.json" : "results.xml");
+  const descriptors:number[]=[];
+  let childExit=1,stderr='',junit:ReturnType<typeof readJUnit>|undefined,desktopData:unknown;
+  try {
+    if(category==='e2e')rmSync(join(output,'e2e-results.xml'),{force:true});
+    mkdirSync(directory,{recursive:true});result.reportDirectory=directory;
+    descriptors.push(openSync(join(directory,'stdout.log'),'wx'));
+    descriptors.push(openSync(join(directory,'stderr.log'),'wx'));
+  }catch{
+    for(const descriptor of descriptors){try{closeSync(descriptor);}catch{}}
+    issue('report_setup_failed');
+    saveLatest();
+    if(result.reportDirectory){try{writeFileSync(join(directory,'result.json'),JSON.stringify(result,null,2));}catch{issue('report_write_failed');}}
+    return result;
+  }
   try {
     const cli = desktop
       // Desktop specs build the same ordinary dev output; serialize files so
@@ -78,57 +129,81 @@ export async function runStage(category: TestCategory, stage: string, options: {
     const child = Bun.spawn(cli, {
       cwd: root,
       env: { ...process.env, ...(desktop ? { PLAYWRIGHT_JSON_OUTPUT_FILE: report } : {}) },
-      stdout: "inherit", stderr: "pipe",
+      stdout: "pipe", stderr: "pipe",
     });
+    const forward=(stream:ReadableStream<Uint8Array>,descriptor:number,target:NodeJS.WriteStream)=>{
+      const decoder=new TextDecoder();
+      let pending='';
+      const print=(text:string)=>target.write(text
+        .replace(/^((?:\x1b\[[\d;]*m)*)(?:\(pass\)|✓)(?=\s|\x1b\[|$)/gm,'$1✅')
+        .replace(/^((?:\x1b\[[\d;]*m)*)(?:\(fail\)|✗)(?=\s|\x1b\[|$)/gm,'$1❌'));
+      return stream.pipeTo(new WritableStream<Uint8Array>({write(chunk){
+        try{if(writeSync(descriptor,chunk)!==chunk.length)issue('output_write_failed');}catch{issue('output_write_failed');}
+        try{
+          if(desktop||target===process.stdout)target.write(chunk);
+          else{
+            pending+=decoder.decode(chunk,{stream:true});
+            const end=pending.lastIndexOf('\n');
+            if(end!==-1){print(pending.slice(0,end+1));pending=pending.slice(end+1);}
+          }
+        }catch{issue('output_forward_failed');}
+      },close(){
+        if(!desktop&&target===process.stderr)try{print(pending+decoder.decode());}catch{issue('output_forward_failed');}
+      }})).catch(()=>{issue('output_read_failed');});
+    };
     const [display, recorded] = child.stderr.tee();
-    const [exitCode, stderr] = await Promise.all([
-      child.exited, new Response(recorded).text(),
-      display.pipeTo(new WritableStream({ write(chunk) { process.stderr.write(chunk); } })),
+    [childExit,stderr] = await Promise.all([
+      child.exited, new Response(recorded).text().catch(()=>{issue('output_read_failed');return ''; }),
+      forward(child.stdout,descriptors[0],process.stdout),forward(display,descriptors[1],process.stderr),
     ]);
-    let reportErrors = !existsSync(report), requiredSkipped = false;
+  }catch{issue('test_process_failed');}
+  finally{for(const descriptor of descriptors){try{closeSync(descriptor);}catch{issue('output_write_failed');}}}
+  try {
     if (existsSync(report)) {
       if (desktop) {
         const data = JSON.parse(readFileSync(report, "utf8")) as { stats: { expected: number; unexpected: number; flaky: number; skipped: number }; errors: unknown[]; suites:PlaywrightSuite[] };
+        if(!data.stats||![data.stats.expected,data.stats.unexpected,data.stats.flaky,data.stats.skipped].every(value=>Number.isSafeInteger(value)&&value>=0)||!Array.isArray(data.errors)||!Array.isArray(data.suites))throw new Error('invalid_report');
         result.pass = data.stats.expected + data.stats.flaky;
         result.fail = data.stats.unexpected;
         result.skip = data.stats.skipped;
-        reportErrors = data.errors.length > 0;
-        requiredSkipped = desktopIncomplete(data.suites,files);
-        mkdirSync(join(root,'test-results'),{recursive:true});
-        writeFileSync(join(root,'test-results/desktop-results.json'),JSON.stringify(data,null,2));
+        result.countsSource='playwright';desktopData=data;
+        if(data.errors.length)issue('playwright_report_errors');
+        if(desktopIncomplete(data.suites,files))issue('test_coverage_incomplete');
       } else {
-        const xml=readFileSync(report, "utf8");
-        const cases = xml.match(/<testcase\b[^>]*?(?:\/>|>[\s\S]*?<\/testcase>)/g) ?? [];
-        result.fail = cases.filter(test => /<(?:failure|error)\b/.test(test)).length;
-        result.skip = cases.filter(test => /<skipped\b/.test(test)).length;
-        result.pass = cases.length - result.fail - result.skip;
-        if(category==='e2e'){
-          requiredSkipped=terminalIncomplete(cases,files);
-          mkdirSync(join(root,'test-results'),{recursive:true});
-          writeFileSync(join(root,'test-results/e2e-results.xml'),xml);
-        }
+        junit=readJUnit(readFileSync(report,'utf8'));
+        result.pass=junit.pass;result.fail=junit.fail;result.skip=junit.skip;result.countsSource='junit';
+        if(category==='e2e'&&terminalIncomplete(junit.cases,files))issue('test_coverage_incomplete');
       }
+    }else issue(desktop?'playwright_report_missing':'junit_report_missing');
+  }catch{issue(desktop?'playwright_report_invalid':'junit_report_invalid');}
+  if (!desktop) {
+    // Bun omits module-loading errors from JUnit; its final summary includes them.
+    const plain=stripVTControlCharacters(stderr).replaceAll('\r\n','\n');
+    const summary = [...plain.matchAll(/(?:^|\n)\s*(\d+) pass\n(?:\s*(\d+) skip\n)?\s*(\d+) fail\b/g)].at(-1);
+    if (summary) {
+      result.pass = Number(summary[1]);
+      result.skip = Number(summary[2] ?? 0);
+      result.fail = Number(summary[3]);
+      result.countsSource='stderr';
+      if(junit&&(['pass','fail','skip'] as const).some(key=>junit[key]!==result[key]))issue('test_counts_inconsistent');
+      if(plain.slice(summary.index).includes('JUnitReportFailed:'))issue('junit_report_failed');
     }
-    if (!desktop) {
-      // Bun omits module-loading errors from JUnit; its final summary includes them.
-      const summary = [...stderr.replaceAll("\r\n", "\n").matchAll(/(?:^|\n)\s*(\d+) pass\n(?:\s*(\d+) skip\n)?\s*(\d+) fail\b/g)].at(-1);
-      if (summary) {
-        result.pass = Number(summary[1]);
-        result.skip = Number(summary[2] ?? 0);
-        result.fail = Number(summary[3]);
-      }
-    }
-    result.executed = result.pass + result.fail;
-    result.discovered = result.executed + result.skip;
-    result.exitCode = exitCode || (result.executed === 0 || result.fail > 0 || reportErrors || requiredSkipped || ['P12', 'P13', 'P14', 'P15'].includes(stage) && result.skip > 0 ? 1 : 0);
-    if(category==='e2e'){
-      mkdirSync(join(root,'test-results'),{recursive:true});
-      writeFileSync(join(root,'test-results/e2e-results.json'),JSON.stringify(result,null,2));
-    }
-    return result;
-  } finally {
-    rmSync(temporary, { recursive: true, force: true });
   }
+  if(result.countsSource==='unavailable')issue('test_counts_unavailable');
+  result.executed = result.pass + result.fail;
+  result.discovered = result.executed + result.skip;
+  if(result.executed===0)issue('test_execution_empty');
+  if(['P12','P13','P14','P15'].includes(stage)&&result.skip>0)issue('test_coverage_incomplete');
+  result.reportComplete=result.reportErrors.length===0;
+  result.exitCode=childExit||(result.fail>0||!result.reportComplete?1:0);
+  try{
+    if(category==='e2e'&&junit&&result.reportComplete)writeFileSync(join(output,'e2e-results.xml'),readFileSync(report));
+    if(desktop&&desktopData)writeFileSync(join(output,'desktop-results.json'),JSON.stringify(desktopData,null,2));
+  }catch{issue('report_write_failed');}
+  saveLatest();
+  try{writeFileSync(join(directory,'result.json'),JSON.stringify(result,null,2));}
+  catch{issue('report_write_failed');saveLatest();}
+  return result;
 }
 
 if (import.meta.main) {
@@ -144,6 +219,7 @@ if (import.meta.main) {
       console.log(JSON.stringify({category,stage,runner:desktop?'playwright':'bun',check:true,ready,discoveredFiles:files.length,files:files.map(file=>relative(projectRoot,file).replaceAll('\\','/'))}));process.exitCode=ready?0:1;
     }else{
       const report = await runStage(category, stage);
+      if(report.countsSource==='unavailable')console.error('Test counts are unavailable; inspect reportErrors and the retained logs.');
       console.log(JSON.stringify(report));process.exitCode = report.exitCode;
     }
   } catch (error) {
