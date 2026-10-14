@@ -53,6 +53,7 @@ export async function readReport(location:string):Promise<EvaluationReport> {
   const cases=dataset.cases.map(item=>({id:item.id,version:1,name:item.name,category:item.category,evalType:item.evalType,tags:item.tags}));
   if(!isDeepStrictEqual(cases,raw.cases))throw new Error('report_case_metadata_mismatch');
   if(!Array.isArray(raw.plan)||!Array.isArray(raw.trials)||!Array.isArray(raw.scores)||!Array.isArray(raw.evidenceManifest)||!Array.isArray(raw.judgeCalls)||!Number.isFinite(Date.parse(raw.createdAt)))throw new Error('report_contract_invalid');
+  if(snapshot.plan!==undefined&&!isDeepStrictEqual(snapshot.plan,raw.plan))throw new Error('snapshot_plan_mismatch');
   if(raw.trials.length!==raw.plan.length||new Set(raw.plan.map(item=>item.trialId)).size!==raw.plan.length||new Set(raw.trials.map(item=>item.trialId)).size!==raw.trials.length||raw.scores.some(score=>!raw.plan.some(item=>item.trialId===score.trialId&&item.caseId===score.caseId)))throw new Error('report_plan_identity_mismatch');
   const paths=new Set<string>();
   const journals=new Map<string,any[]>();
@@ -91,6 +92,10 @@ export async function readReport(location:string):Promise<EvaluationReport> {
     } else if(trial.status==='completed')throw new Error('completed_trial_missing_observation');
     const task=dataset.cases.find(item=>item.id===plan.caseId)!;
     const scores=raw.scores.filter(score=>score.trialId===plan.trialId);
+    if(snapshot.plan!==undefined) {
+      const events=journals.get('evidence/'+trial.trialId+'/events.jsonl')!,recorded=events.filter(event=>event.kind==='scoring.completed');
+      if(recorded.length!==1||recorded[0].value?.trialId!==trial.trialId||!isDeepStrictEqual(recorded[0].value.scores,scores))throw new Error('scoring_journal_binding_mismatch');
+    }
     if(scores.length!==task.expected.checks.length)throw new Error('report_check_coverage_mismatch');
     for(const check of task.expected.checks) {
       const score=scores.find(score=>score.checkId===check.id);if(!score)throw new Error('report_check_missing');

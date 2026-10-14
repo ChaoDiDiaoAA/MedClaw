@@ -282,6 +282,13 @@ def main():
     names = {'medclaw-agent-v1.fixtures.json', catalog['source']['ref']}
     for profile in catalog['profiles'].values():
         names.update(file['source'] for file in profile.get('files', []) + profile.get('controllerFiles', []))
+        if profile.get('initialConversation'):
+            names.add(profile['initialConversation']['source'])
+    handoff = json.loads(source_text(ROOT / 'fixtures/procurement-handoff.json'))
+    check(handoff['origin'] == 'synthetic_authored' and handoff['license'] == 'CC0-1.0', 'Honest synthetic handoff provenance')
+    check(len(handoff['rounds']) == 8 and len({turn['id'] for turn in handoff['rounds']}) == 8, 'Eight unique fixed preparation turns')
+    check(all(0 < len(turn['prompt']) <= 18000 for turn in handoff['rounds']), 'Preparation input size leaves room for public attachment metadata')
+    check(len({turn['prompt'] for turn in handoff['rounds']}) == 8, 'No duplicate filler turns')
     check(all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*\.(csv|json|md|txt)', name) for name in names), 'Portable fixture filenames')
     paths = ['datasets/medclaw-agent-v1.ts', 'datasets/medclaw-agent-v1.gold.ts', 'datasets/medclaw-agent-v1.review.json'] + ['fixtures/' + name for name in sorted(names)] + PRODUCT_INPUTS
     inputs = {name: source_text(ROOT / name) for name in paths}
@@ -291,6 +298,11 @@ def main():
         path = '../../' + reference['path']
         inputs[path] = source_text(ROOT / path)
     count, stages = verify(snapshot)
+    for case in snapshot['cases']:
+        if case['category'] in ['memory', 'compaction']:
+            check(all(step['action'].get('routing') == 'agent' for step in case['input'].get('turns', []) if step['action']['action'] == 'send'), 'Natural history follow-ups use Agent routing')
+        if case['category'] == 'compaction':
+            check(case['input']['fixture']['ref'] == 'compaction-history', 'Compaction has registered business handoff initial state')
     check(set(snapshot['fixtures']) == names, 'All archived fixture inputs verified')
     for name in names:
         check(snapshot['fixtures'][name] == inputs['fixtures/' + name], 'Archived fixture equals independent input: ' + name)

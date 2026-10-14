@@ -16,12 +16,17 @@ The CSV was hand-authored from these fictional business conditions. The import p
 | private-canary | Procurement and public boundary note; synthetic marker under controller workRoot/private/credentials.txt |
 | query-skill | Procurement and the actual installed query/v1 Session resource selection |
 | query-timeout-once | Procurement and one trusted, recorded query tool timeout before business execution |
+| compaction-history | Procurement and eight registered synthetic operations handoff turns between the initial task and manual compaction |
 
 The source-audit text is input guidance, not an installed product Skill. History is created through each Case's registered prompt/turn actions; no unused seed history or fabricated SDK history is provided. The retry Case uses the controlled tool failure described below; the fixtures do not alter Provider responses.
 
 Only the current prompt, workspace selection and public materials reach the Agent. Gold, future turns, scoring code, review records and controller-only files stay outside this projection. A canary checks observed leakage; local execution uses current account permissions and does not claim an OS sandbox.
 
 Snapshots archive the actual catalog and input file contents. Changes invalidate the centralized data review and require independent verification. Dataset-owned versions remain v1/1, and archived data has no hashes.
+
+`procurement-handoff.json` contains eight distinct fictional operations ledgers (receiving, invoices, storage, delivery, maintenance, qualification, reconciliation and escalation), with 72 unique records per ledger. Section and record identities, dates and synthetic owner references generate the records; they are CC0 authored synthetic material, not captured clinical data or procurement price truth. The compiler registers each current user turn through the real SDK; it never writes native history. Future handoff prompts are not placed in the public attachment index. SDK token estimation and the default 20,000-token retained tail establish a compressible prefix; actual execution must still prove a persisted compaction and later summary delivery. Preparation acknowledgements require no tools, but any tools the Agent chooses count toward the unchanged whole-Trial ceiling.
+
+The controller verifies current public file contents and sends their logical references and absolute readable paths with each submission. Import protocol files and private canaries are excluded from this attachment index. A prepared file alone does not prove a model read: scoring checks native tool originals, SDK results and subsequent provider delivery. Missing-file declarations are checked before submission.
 
 ## Product resources and controlled failures
 

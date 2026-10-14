@@ -1,4 +1,4 @@
-import { test, expect } from 'bun:test';
+import { test, expect, spyOn } from 'bun:test';
 import { executePlan, planTrials, runExperiment } from '../src/execution/runner.ts';
 import { reportFixture,runConfigFixture,saveReportFixture } from './report-fixture.ts';
 import { createDatasetFixture } from './datasets/fixture.ts';
@@ -6,6 +6,29 @@ import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { readReport } from '../src/reports/write.ts';
+import * as scoring from '../src/scoring/evaluate.ts';
+import * as files from 'node:fs/promises';
+
+test('a failed required Judge journal stops the pipeline even when the scorer returns an ERROR result',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'mc-judge-save-failure-'));
+  const append=files.appendFile;let scored=0;const events:string[]=[];
+  const save=spyOn(files,'appendFile').mockImplementation(async(path,data,options)=>{
+    if(String(data).includes('"kind":"judge.result"'))throw new Error('controlled_disk_failure');
+    return append(path,data,options);
+  });
+  const evaluator=spyOn(scoring,'evaluate').mockImplementation(async context=>{
+    scored++;
+    try{await context.onJudgeResult?.({status:'error',results:[],error:'controlled',metadata:{baseUrl:'http://127.0.0.1/',timeoutMs:30000,model:'controlled',startedAt:'2026-10-14T00:00:00.000Z',endedAt:'2026-10-14T00:00:00.000Z',durationMs:0,temperature:0.8,httpStatus:null,requestId:null,usage:{promptTokens:null,completionTokens:null}}});}catch{/* The real scorer also records this as a scoring error. */}
+    return [];
+  });
+  try {
+    const datasetRoot=join(root,'dataset');await createDatasetFixture(datasetRoot);
+    let failure:unknown;
+    try{await runExperiment({datasetRoot,runsRoot:join(root,'runs'),executionId:'save-failure',selection:'full',repeat:3,config:reportFixture().config,judgeMode:'off',onEvent:event=>events.push(event.kind)});}catch(error){failure=error;}
+    expect(scored).toBe(1);expect(failure).toBeInstanceOf(Error);expect(events).not.toContain('saved');
+    expect(await Bun.file(join(root,'runs/.active-execution.json')).exists()).toBe(true);
+  } finally {evaluator.mockRestore();save.mockRestore();await rm(root,{recursive:true,force:true});}
+});
 
 test('cancelled native Smoke startup archives ten trials and reads back without model calls',async()=>{
   const {JudgeClient,resolveRunConfig}=await import('../src/scoring/judges/client.ts');
@@ -36,6 +59,16 @@ test('plans every repetition before execution and does not lose trials on unsafe
   expect(result.slice(1).every(item => item.status === 'not_run' && item.reason === 'previous_trial_stop_or_save_unconfirmed')).toBe(true);
 });
 
+test('each Trial finishes asynchronous scoring and saving before the next execution',async()=>{
+  const order:string[]=[];
+  await executePlan(planTrials(['first','second'],1),async item=>{order.push('run:'+item.caseId);return {...item,status:'completed',instanceId:null,startedAt:null,endedAt:null,reason:null,stopped:true,closed:true,observation:null};},{onProgress:async trial=>{await Bun.sleep(5);order.push('saved:'+trial.caseId);}});
+  expect(order).toEqual(['run:first','saved:first','run:second','saved:second']);
+  let launched=0;
+  let failure:unknown;
+  try{await executePlan(planTrials(['first','second'],1),async item=>{launched++;return {...item,status:'completed',instanceId:null,startedAt:null,endedAt:null,reason:null,stopped:true,closed:true,observation:null};},{onProgress:async()=>{throw new Error('necessary_save_unconfirmed');}});}catch(error){failure=error;}
+  expect(failure).toBeInstanceOf(Error);expect(launched).toBe(1);
+});
+
 test('first Full records its complete plan and independent report even when data review is pending', async () => {
   const root = await mkdtemp(join(tmpdir(), 'medclaw-runner-'));
   try {
@@ -47,7 +80,9 @@ test('first Full records its complete plan and independent report even when data
     const path = join(root, 'runs', report.executionId, 'report.json');
     expect((await readReport(path)).snapshot).toEqual(report.snapshot);
     expect(await readFile(path, 'utf8')).toContain('dataset_review_pending');
-    expect(await readFile(join(root,'runs',report.executionId,'evidence',report.trials[0]!.trialId,'events.jsonl'),'utf8')).toBe('');
+    const events=(await readFile(join(root,'runs',report.executionId,'evidence',report.trials[0]!.trialId,'events.jsonl'),'utf8')).trim().split('\n').map(line=>JSON.parse(line));
+    expect(events).toHaveLength(1);expect(events[0]).toMatchObject({kind:'scoring.completed',value:{status:'NOT_RUN'}});
+    expect(report.snapshot.plan).toEqual(report.plan);
     await expect(runExperiment({ datasetRoot, runsRoot: join(root, 'runs'), executionId: 'controlled-admission', selection: 'smoke', repeat: 1, config: reportFixture().config, judgeMode: 'off' })).rejects.toThrow();
   } finally { await rm(root, { recursive: true, force: true }); }
 }, 30000);

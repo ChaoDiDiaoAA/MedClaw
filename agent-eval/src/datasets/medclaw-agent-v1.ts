@@ -723,7 +723,7 @@ export const cases: CaseDefinition[] = [
       workspaceContext: {"activeView":"data","region":"浙江"},
       fixture: {"ref":"procurement"},
       turns: [
-        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"What about September 29?","referenceDate":"2026-10-02","routing":"intent"},"timeoutMs":30000,"targetAlias":"turn-1"},
+        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"What about September 29?","referenceDate":"2026-10-02","routing":"agent"},"timeoutMs":30000,"targetAlias":"turn-1"},
       ],
     },
     expected: {
@@ -752,7 +752,7 @@ export const cases: CaseDefinition[] = [
       fixture: {"ref":"procurement"},
       turns: [
         {"id":"history-operation","trigger":"run_settled","action":{"action":"restore_session","sessionAlias":"main"},"timeoutMs":30000,"targetAlias":"turn-1"},
-        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"Continue with that device and check September 28.","referenceDate":"2026-10-02","routing":"intent"},"timeoutMs":30000,"targetAlias":"turn-1"},
+        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"Continue with that device and check September 28.","referenceDate":"2026-10-02","routing":"agent"},"timeoutMs":30000,"targetAlias":"turn-1"},
       ],
     },
     expected: {
@@ -780,7 +780,7 @@ export const cases: CaseDefinition[] = [
       workspaceContext: {"activeView":"data","region":"浙江"},
       fixture: {"ref":"procurement"},
       turns: [
-        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"I named the wrong device. Change it to Zhejiang B, still on October 2.","referenceDate":"2026-10-02","routing":"intent"},"timeoutMs":30000,"targetAlias":"turn-1"},
+        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"I named the wrong device. Change it to Zhejiang B, still on October 2.","referenceDate":"2026-10-02","routing":"agent"},"timeoutMs":30000,"targetAlias":"turn-1"},
       ],
     },
     expected: {
@@ -809,9 +809,9 @@ export const cases: CaseDefinition[] = [
       fixture: {"ref":"procurement"},
       turns: [
         {"id":"other-session","trigger":"run_settled","action":{"action":"new_session","alias":"other"},"timeoutMs":30000,"targetAlias":"turn-1"},
-        {"id":"other-turn","trigger":"ready","action":{"action":"send","sessionAlias":"other","alias":"other-turn","prompt":"Find the October 2 procurement price of Henan synthetic infusion pump A.","referenceDate":"2026-10-02","routing":"intent"},"timeoutMs":30000},
+        {"id":"other-turn","trigger":"ready","action":{"action":"send","sessionAlias":"other","alias":"other-turn","prompt":"Find the October 2 procurement price of Henan synthetic infusion pump A.","referenceDate":"2026-10-02","routing":"agent"},"timeoutMs":30000},
         {"id":"back-main","trigger":"run_settled","action":{"action":"select_session","sessionAlias":"main"},"timeoutMs":30000,"targetAlias":"other-turn"},
-        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"Back to the Zhejiang device from the original session: restate its price.","referenceDate":"2026-10-02","routing":"intent"},"timeoutMs":30000,"targetAlias":"turn-1"},
+        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"Back to the Zhejiang device from the original session: restate its price.","referenceDate":"2026-10-02","routing":"agent"},"timeoutMs":30000,"targetAlias":"turn-1"},
       ],
     },
     expected: {
@@ -838,10 +838,10 @@ export const cases: CaseDefinition[] = [
     input: {
       prompt: "Find the October 2 procurement price of Zhejiang synthetic infusion pump A. We will verify another date next.",
       workspaceContext: {"activeView":"data","region":"浙江"},
-      fixture: {"ref":"procurement"},
+      fixture: {"ref":"compaction-history"},
       turns: [
         {"id":"history-operation","trigger":"run_settled","action":{"action":"compact","sessionAlias":"main"},"timeoutMs":30000,"targetAlias":"turn-1"},
-        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"What about September 29?","referenceDate":"2026-10-02","routing":"intent"},"timeoutMs":30000,"targetAlias":"turn-1"},
+        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"What about September 29?","referenceDate":"2026-10-02","routing":"agent"},"timeoutMs":30000,"targetAlias":"turn-1"},
       ],
     },
     expected: {
@@ -867,10 +867,10 @@ export const cases: CaseDefinition[] = [
     input: {
       prompt: "Verify Zhejiang A's October 2 price. Remember that the material is synthetic and all follow-up work is query-only.",
       workspaceContext: {"activeView":"data","region":"浙江"},
-      fixture: {"ref":"procurement"},
+      fixture: {"ref":"compaction-history"},
       turns: [
         {"id":"history-operation","trigger":"run_settled","action":{"action":"compact","sessionAlias":"main"},"timeoutMs":30000,"targetAlias":"turn-1"},
-        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"Continue by restating the price, source and usage limits.","referenceDate":"2026-10-02","routing":"intent"},"timeoutMs":30000,"targetAlias":"turn-1"},
+        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"Continue by restating the price, source and usage limits.","referenceDate":"2026-10-02","routing":"agent"},"timeoutMs":30000,"targetAlias":"turn-1"},
       ],
     },
     expected: {
@@ -896,10 +896,10 @@ export const cases: CaseDefinition[] = [
     input: {
       prompt: "First look up all Zhejiang devices on October 2. Next we will check missing prices.",
       workspaceContext: {"activeView":"data","region":"浙江"},
-      fixture: {"ref":"procurement"},
+      fixture: {"ref":"compaction-history"},
       turns: [
         {"id":"history-operation","trigger":"run_settled","action":{"action":"compact","sessionAlias":"main"},"timeoutMs":30000,"targetAlias":"turn-1"},
-        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"Continue by checking synthetic reagent C for a missing price.","referenceDate":"2026-10-02","routing":"intent"},"timeoutMs":30000,"targetAlias":"turn-1"},
+        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"Continue by checking synthetic reagent C for a missing price.","referenceDate":"2026-10-02","routing":"agent"},"timeoutMs":30000,"targetAlias":"turn-1"},
       ],
     },
     expected: {
@@ -925,10 +925,10 @@ export const cases: CaseDefinition[] = [
     input: {
       prompt: "Find Zhejiang A's procurement price on October 2.",
       workspaceContext: {"activeView":"data","region":"浙江"},
-      fixture: {"ref":"procurement"},
+      fixture: {"ref":"compaction-history"},
       turns: [
         {"id":"history-operation","trigger":"run_settled","action":{"action":"compact","sessionAlias":"main"},"timeoutMs":30000,"targetAlias":"turn-1"},
-        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"Change the device to Zhejiang B and keep the date.","referenceDate":"2026-10-02","routing":"intent"},"timeoutMs":30000,"targetAlias":"turn-1"},
+        {"id":"turn-2","trigger":"run_settled","action":{"action":"send","sessionAlias":"main","alias":"turn-2","prompt":"Change the device to Zhejiang B and keep the date.","referenceDate":"2026-10-02","routing":"agent"},"timeoutMs":30000,"targetAlias":"turn-1"},
       ],
     },
     expected: {

@@ -226,12 +226,12 @@ test('real Host deterministic form Query, all Query/Evidence pages, export and c
     expect(observation.missing.filter(item=>item.key.startsWith('artifact.'))).toEqual([]);
     const artifactFiles = observation.facts.artifactFiles as { relativePath: string }[]; expect(artifactFiles.some(file => file.relativePath === 'result.csv')).toBe(true); expect(artifactFiles.some(file => file.relativePath === 'metadata.json')).toBe(true);
     const checks: CheckSpec[] = ['query.conditions', 'query.set_exact', 'query.numeric', 'export.exact'].map(metricId => ({ id: metricId, metricId, version: 'v1', kind: 'deterministic', required: true, hardConstraint: true, unit: 'original facts', goldKey: `values.${metricId.replace('.', '_')}`, evidenceKey: metricId.replace('.', '_') }));
-    const values = { finalStageAlias: 'form', query_conditions: { region: null, regions: null, date: '2026-09-28', start: null, endExclusive: null, sourceDeviceId: null, manufacturer: null, category: null, status: null, snapshotMode: 'exact_date', threshold: null },
+    const values = { finalStageAlias: 'form', query_conditions: { region: '浙江', regions: null, date: '2026-09-28', start: null, endExclusive: null, sourceDeviceId: null, manufacturer: null, category: null, status: null, snapshotMode: 'exact_date', threshold: null },
       query_set_exact: ['A', 'B', 'C'].map(id => `SYN-ZJ-${id}@synthetic-zj-v1`),
       query_numeric: [['A', 10000], ['B', 0]].map(([id, value]) => ({ id: `SYN-ZJ-${id}@synthetic-zj-v1`, value, unit: 'CNY cents' })),
       export_exact: { rows: [['A', 10000], ['B', 0], ['C', null]].map(([id, price]) => ({ key: `SYN-ZJ-${id}|2026-09-28`, device: `SYN-ZJ-${id}`, price })),
         sets: ['A', 'B', 'C'].map(id => `SYN-ZJ-${id}@synthetic-zj-v1`), format: 'csv', sourceQueryAlias: 'form:query:1',
-        metadata: { requestedDate: '2026-09-28', actualDataDate: '2026-09-28', snapshotMode: 'exact_date', region: null, scopeKey: 'synthetic-zj-v1', isStale: false, quantityUnit: 'records', nullPriceDeviceIds: ['SYN-ZJ-C@synthetic-zj-v1'] } } };
+        metadata: { requestedDate: '2026-09-28', actualDataDate: '2026-09-28', snapshotMode: 'exact_date', region: '浙江', scopeKey: 'synthetic-zj-v1', isStale: false, quantityUnit: 'records', nullPriceDeviceIds: ['SYN-ZJ-C@synthetic-zj-v1'] } } };
     const scoring = { trialId: 'form', caseId: 'form', task: { checks }, gold: { values }, observation, trialStatus: 'completed' as const };
     expect((await evaluate(scoring)).map(score => ({ metricId: score.metricId, status: score.status, reason: score.status === 'PASS' ? null : score.reason }))).toEqual(checks.map(check => ({ metricId: check.metricId, status: 'PASS', reason: null })));
     const incorrect = { ...values, query_numeric: values.query_numeric.map((row, index) => index === 0 ? { ...row, value: 10001 } : row) };

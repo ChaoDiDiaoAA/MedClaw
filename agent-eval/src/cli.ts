@@ -6,6 +6,8 @@ import { ExecutionIdSchema } from './types.ts';
 import { loadDataset, datasetCoverage, auditLineage } from './datasets.ts';
 import { doctor } from './doctor.ts';
 import { runExperiment,planTrials } from './execution/runner.ts';
+import type {ProgressEvent} from './execution/progress.ts';
+import type {EvaluationReport} from './types.ts';
 import { readReport } from './reports/write.ts';
 import { compareReports } from './reports/compare.ts';
 import { exportReport, platformConfig } from './langfuse/export.ts';
@@ -86,7 +88,7 @@ export function parseCommand(input: string[]): { command: string; options: Recor
 const json = async (path: string) => JSON.parse(await readFile(resolve(path), 'utf8'));
 const datasetPath = (id: string) => id==='medclaw-agent-v1'?id:resolve(id);
 const reportPath = (id: string) => join(runsRoot, ExecutionIdSchema.parse(id), 'report.json');
-export async function main(args: string[], env:Record<string,string|undefined> = process.env): Promise<number> {
+export async function main(args: string[], env:Record<string,string|undefined> = process.env,presentation?:{onEvent:(event:ProgressEvent)=>void;report:(report:EvaluationReport,path:string)=>void}): Promise<number> {
   const { command, options } = parseCommand(args);
   const required = (key: string) => { const value = options[key]; if (!value) throw new Error(`missing_${key.replaceAll('-', '_')}`); return value; };
   const local = () => { if (required('backend') !== 'local') throw new Error('backend_must_be_local'); };
@@ -116,8 +118,8 @@ export async function main(args: string[], env:Record<string,string|undefined> =
     const judge = judgeConfig ? await JudgeClient.create(judgeConfig, { plannedTrials: count,trialIds:judged.map(trial=>trial.trialId) }) : undefined;
     const controller = new AbortController(), stop = (): void => { controller.abort(); }; processEvents.on('SIGINT', stop); processEvents.on('SIGTERM', stop);
     try {
-      const report = await runExperiment({ datasetRoot, runsRoot, executionId: required('execution-id'), selection, repeat, config, modelCredential, judgeMode, judge, signal: controller.signal, onProgress: trial => console.error(JSON.stringify({ trialId: trial.trialId, status: trial.status, reason: trial.reason })) });
-      print({ executionId: report.executionId, report: reportPath(report.executionId), totals: report.totals }); return report.totals.pass === report.totals.planned ? 0 : 2;
+      const report = await runExperiment({ datasetRoot, runsRoot, executionId: required('execution-id'), selection, repeat, config, modelCredential, judgeMode, judge, signal: controller.signal, onEvent:presentation?.onEvent,onProgress:presentation?undefined:trial => console.error(JSON.stringify({ trialId: trial.trialId, status: trial.status, reason: trial.reason })) });
+      if(presentation)presentation.report(report,reportPath(report.executionId));else print({ executionId: report.executionId, report: reportPath(report.executionId), totals: report.totals }); return report.totals.pass === report.totals.planned ? 0 : 2;
     } finally { processEvents.off('SIGINT', stop); processEvents.off('SIGTERM', stop); }
   }
   if (command === 'report') { print(await readReport(reportPath(required('execution-id')))); return 0; }

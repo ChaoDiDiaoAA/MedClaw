@@ -211,3 +211,9 @@ Judge配置去重后的本批受控验证见[05附录B.8](../docs/evals/05_MedCl
 历史B.11已完成直接本地执行与完整E2E修复：类型检查退出0；完整unit/integration为1604通过/0失败（120文件），评测工程套件260通过/0失败（40文件、1,539项expect），当时`bun run test:e2e`执行桌面UI测试，为153执行/153通过/0失败/0跳过（24文件）；该覆盖现由`test:e2e:desktop`保留。截图用例两轮8项、P1/P7完整文件两轮56项均通过。Python普通与`-O`各67,494项核验通过并更新集中审核；50Case/62阶段真值/10Smoke/11Harness保持。精确Subagent补丁恢复后，干净`bun install --frozen-lockfile`安装143包并验证Pi0.87.1与managed接口。Smoke10×1、Full50×3及受控归档上传预检均退出0，不需要历史成绩或校准记录；上传检查不联网、不改变归档。实际配置仍被Git忽略，runs为空。完整命令、日志与历史失效证据说明见[05附录B.11](../docs/evals/05_MedClaw_Agent评测分阶段实施与操作手册_v1.md#local-eval-repair-v1)。真实模型评测、真实Judge校准和平台上传仍为NOT_RUN。
 
 本次终端入口调整见[05附录B.12](../docs/evals/05_MedClaw_Agent评测分阶段实施与操作手册_v1.md#terminal-e2e-v1)：`bun run test:e2e`实际执行18文件、200项全部通过，0失败、0跳过，475.88秒；进程采样未发现Electron。原24个桌面文件由`test:e2e:desktop`单独保留。类型检查退出0；完整单元及快捷入口检查为36文件、375通过/0失败。终端汇总/JUnit和桌面结果分开保存。本次使用本地受控服务，用户配置和数据集保持，真实质量及平台仍NOT_RUN。
+
+Smoke/Full 正常执行采用中文逐题阶段输出：准备公开输入→Host→Agent→停止与采证→评分→保存，每 60 秒显示等待心跳。✅ 表示对应阶段完成，最终五态及主要失败检查另行展示；--check 和底层 CLI 保留 JSON。只有评分事件落盘后才显示结果已保存。公开材料通过当前附件清单送达，压缩历史由固定真实 SDK 用户轮次建立；准备工具调用计入 Trial 总预算。Judge 使用判据所需去重证据，不增加 Token 上限。
+
+2026-10-14 本批实际工程验证：类型检查通过，评测工程套件 **304 通过／0 失败（46 文件）**；Python 普通及 `-O` 各 **67,544** 项通过；dataset validate/audit-lineage 和 Smoke/Full `--check` 均退出 0。受控本地服务验证了真实 SDK 的短历史 no_op、默认长历史压缩，以及逐题读取材料、一次 Judge、评分和保存流程。已有真实 Smoke 的 **0 PASS／7 FAIL／3 UNJUDGEABLE** 保持，当前修订未执行真实质量运行或上传。完整修改、命令和限制见 [05 附录 B.17](../docs/evals/05_MedClaw_Agent评测分阶段实施与操作手册_v1.md#b17-smoke-判分场景初态终端输出与归档修复2026-10-14)；终端样例见 [07 §4](../docs/evals/07_MedClaw_Agent本地评测执行操作手册_v1.md#4-本地-smoke-101)。
+
+保存结构继续为 snapshot.json、report.json、evidence/<trial-id>/{trial.json,observation.json,events.jsonl,artifacts/}，只有实际产物、反馈或平台导出才创建对应可选文件。临时导出位于所属临时工作区；旧运行不改写、不自动重评分。本次修复仅执行受控本地验证。

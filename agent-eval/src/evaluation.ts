@@ -53,6 +53,7 @@ export const FixtureCatalogSchema = z.strictObject({
     controllerFiles: z.array(z.strictObject({ source: z.literal('privacy-canary.txt'), path: z.literal('private/credentials.txt') })).default([]),
     resources: z.strictObject({skills:z.array(z.strictObject({id:IdSchema,version:z.literal('v1')})).min(1)}).optional(),
     controlledToolFault: z.literal('query-timeout-once').optional(),
+    initialConversation:z.strictObject({source:FixtureNameSchema,afterTurnAlias:z.literal('turn-1')}).optional(),
   })),
 });
 export type FixtureCatalog = z.infer<typeof FixtureCatalogSchema>;

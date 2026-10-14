@@ -22,3 +22,5 @@ LANGFUSE_SECRET_KEY=
 # 从部署记录、固定镜像 tag 或服务版本信息核实，例如实际镜像 tag 为 3.120.0 就填 3.120.0。
 # 不填 SDK、数据库版本或 latest，不根据示例猜测；平台命令启用时必须填写真实值。
 MEDCLAW_LANGFUSE_SERVER_VERSION=
+# Smoke/Full 默认显示中文逐题阶段与评分结果；--check 和底层 eval CLI 保留 JSON。
+# 终端样式、公开附件与固定历史初态无需额外配置，也不增加 Judge Token 预算。

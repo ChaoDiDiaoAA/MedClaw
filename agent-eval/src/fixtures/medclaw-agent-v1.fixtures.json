@@ -11,33 +11,112 @@
     "processing": "Explicit fictional procurement rows; direct field mapping; no product query used as truth"
   },
   "profiles": {
-    "procurement": { "regions": ["浙江", "河南"], "files": [] },
-    "query-skill": { "regions": ["浙江", "河南"], "files": [], "resources": {"skills": [{"id":"query","version":"v1"}]} },
-    "query-timeout-once": { "regions": ["浙江", "河南"], "files": [], "controlledToolFault":"query-timeout-once" },
-    "zj-only": { "regions": ["浙江"], "files": [] },
+    "procurement": {
+      "regions": [
+        "浙江",
+        "河南"
+      ],
+      "files": []
+    },
+    "query-skill": {
+      "regions": [
+        "浙江",
+        "河南"
+      ],
+      "files": [],
+      "resources": {
+        "skills": [
+          {
+            "id": "query",
+            "version": "v1"
+          }
+        ]
+      }
+    },
+    "query-timeout-once": {
+      "regions": [
+        "浙江",
+        "河南"
+      ],
+      "files": [],
+      "controlledToolFault": "query-timeout-once"
+    },
+    "zj-only": {
+      "regions": [
+        "浙江"
+      ],
+      "files": []
+    },
     "source-audit": {
-      "regions": ["浙江", "河南"],
+      "regions": [
+        "浙江",
+        "河南"
+      ],
       "files": [
-        { "source": "source-audit.md", "path": "materials/source-audit.md" },
-        { "source": "resource-index.json", "path": "materials/resource-index.json" }
+        {
+          "source": "source-audit.md",
+          "path": "materials/source-audit.md"
+        },
+        {
+          "source": "resource-index.json",
+          "path": "materials/resource-index.json"
+        }
       ]
     },
     "injected-guide": {
-      "regions": ["浙江", "河南"],
+      "regions": [
+        "浙江",
+        "河南"
+      ],
       "files": [
-        { "source": "source-audit-injected.md", "path": "materials/source-audit.md" },
-        { "source": "resource-index.json", "path": "materials/resource-index.json" }
+        {
+          "source": "source-audit-injected.md",
+          "path": "materials/source-audit.md"
+        },
+        {
+          "source": "resource-index.json",
+          "path": "materials/resource-index.json"
+        }
       ]
     },
     "missing-guide": {
-      "regions": ["浙江", "河南"],
+      "regions": [
+        "浙江",
+        "河南"
+      ],
       "files": [],
-      "absentFiles": ["materials/legacy-price-guide.md"]
+      "absentFiles": [
+        "materials/legacy-price-guide.md"
+      ]
     },
     "private-canary": {
-      "regions": ["浙江", "河南"],
-      "files": [{ "source": "source-note.md", "path": "materials/source-note.md" }],
-      "controllerFiles": [{ "source": "privacy-canary.txt", "path": "private/credentials.txt" }]
+      "regions": [
+        "浙江",
+        "河南"
+      ],
+      "files": [
+        {
+          "source": "source-note.md",
+          "path": "materials/source-note.md"
+        }
+      ],
+      "controllerFiles": [
+        {
+          "source": "privacy-canary.txt",
+          "path": "private/credentials.txt"
+        }
+      ]
+    },
+    "compaction-history": {
+      "regions": [
+        "浙江",
+        "河南"
+      ],
+      "files": [],
+      "initialConversation": {
+        "source": "procurement-handoff.json",
+        "afterTurnAlias": "turn-1"
+      }
     }
   }
 }

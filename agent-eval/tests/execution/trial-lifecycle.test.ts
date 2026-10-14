@@ -15,6 +15,7 @@ import {within} from '../../src/adapters/files.ts';
 
 for(const scenario of [
   {name:'intent timeout',status:'failed',error:{code:'intent_timeout',category:'provider'},expected:'infra_error',reason:'intent_timeout'},
+  {name:'invalid intent output',status:'failed',error:{code:'intent_output_invalid',category:'provider'},expected:'failed',reason:'intent_output_invalid'},
   {name:'recovered final Run',status:'completed',error:null,expected:'completed',reason:null},
   {name:'intentional cancellation',status:'cancelled',error:null,expected:'completed',reason:null},
 ] as const)test(`Trial respects ${scenario.name} instead of assuming terminal means success`,async()=>{

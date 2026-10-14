@@ -4,7 +4,7 @@ import {isDeepStrictEqual} from 'node:util';
 import { cases as builtInCases, datasetInfo, smokeIds } from './datasets/medclaw-agent-v1.ts';
 import { goldDefinitions, sourceReferences } from './datasets/medclaw-agent-v1.gold.ts';
 import type { GoldDefinition } from './evaluation.ts';
-import { fixtureMaterials, loadFixtureFiles, loadProductResources, parseFixtureCatalog } from './dataset-fixtures.ts';
+import { fixtureMaterials, loadFixtureFiles, loadProductResources, parseFixtureCatalog,fixtureConversation } from './dataset-fixtures.ts';
 import { assertNoDatasetHashes, importFiles } from './data-format.ts';
 import { compileCase } from './dataset-compiler.ts';
 import {CommonRequiredMetrics} from './dataset-compiler.ts';
@@ -58,7 +58,7 @@ export function loadSnapshot(raw:unknown,root='archived',archived?:CompiledDatas
       for(const metric of CommonRequiredMetrics){const checks=recorded.checks.filter(check=>check.metricId===metric);if(checks.length!==1||!checks[0]!.required||(metric!=='task.success'&&(!checks[0]!.hardConstraint||checks[0]!.kind!=='deterministic')))fail('archived_required_check_missing');}
       for(const metric of [...item.scorers,'tool.selection','efficiency.calls',...(item.expected.mustHaveEvidence?['evidence.present']:[])])if(recorded.checks.filter(check=>check.metricId===metric&&check.required).length!==1)fail('archived_authored_check_missing');
       compiled={compiled:{...item,version:1,dataset:common,requires:item.expected.requiredCapabilities??[],materialRefs:Object.keys(materials),lineageGroupIds:['synthetic-procurement-v1'],input:{...item.input,materials},setup:[],steps:[],expected:{...item.expected,success:[item.expected.expectedAnswerHint],failure:item.expected.forbiddenConditions,checks:recorded.checks}},gold:{schemaVersion:1,caseId:item.id,version:1,values:recorded.values,sources}};
-    }else compiled=compileCase(item,definition,materials,sources,common,catalog.profiles[item.input.fixture.ref],snapshot.productResources);
+    }else compiled=compileCase(item,definition,materials,sources,common,catalog.profiles[item.input.fixture.ref],snapshot.productResources,fixtureConversation(snapshot.fixtures,catalog.profiles[item.input.fixture.ref]?.initialConversation?.source));
     const review=snapshot.review.cases[item.id]??fail('review_missing:'+item.id);
     reviews[item.id]=ReviewSchema.parse({schemaVersion:1,caseId:item.id,caseVersion:1,goldVersion:1,authoredBy:'MedClaw evaluation authoring',...review});
     if(snapshot.info.id==='medclaw-agent-v1'){
@@ -113,6 +113,25 @@ export async function materializeInputs(item:EvalCase,directory:string) {
       await writeFile(target,file.content,{encoding:'utf8',flag:'wx'});
   }
   return root;
+}
+export interface PublicMaterial {ref:string;path:string;bytes:number}
+export async function preparePublicMaterials(item:EvalCase,directory:string,absentRefs:readonly string[]=[]):Promise<PublicMaterial[]> {
+  const root=await realpath(directory),files:PublicMaterial[]=[];
+  for(const ref of item.materialRefs) {
+    const material=item.input.materials[ref];
+    if(material?.kind!=='file')continue;
+    RelativePathSchema.parse(ref);
+    if(!ref.startsWith('materials/')||material.files.length!==1)fail('public_material_invalid');
+    const path=join(root,ref),file=material.files[0]!;
+    let current=root;for(const part of ref.split('/')){current=join(current,part);if((await lstat(current)).isSymbolicLink())fail('linked_public_material');}
+    if(await realpath(path)!==path||!(await lstat(path)).isFile()||await readFile(path,'utf8')!==file.content||Buffer.byteLength(file.content)!==file.bytes)fail('public_material_content_changed');
+    files.push({ref,path,bytes:file.bytes});
+  }
+  for(const ref of absentRefs) {
+    RelativePathSchema.parse(ref);if(!ref.startsWith('materials/'))fail('absent_material_invalid');
+    try{await lstat(join(root,ref));fail('declared_absent_fixture_exists');}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+  }
+  return files;
 }
 export function projectInput(dataset:LoadedDataset,caseId:string,stepId:string) {
   const item=dataset.cases.find(item=>item.id===caseId)??fail('unknown_case');

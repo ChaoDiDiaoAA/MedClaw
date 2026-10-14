@@ -9,7 +9,7 @@ import { verifyCopiedArtifact, type CopiedFile } from '../adapters/files.ts';
 import { equal, record } from './rules.ts';
 import type { CheckSpec, EvaluationContext } from './types.ts';
 import { projectIntent } from './project-intent.ts';
-import { projectHarness,verifiedOriginals,toolCollectionHasGaps } from './project-harness.ts';
+import { projectHarness,verifiedOriginals,completeToolOriginals,acceptedChildQuery,publicMaterialReads,toolDeliveryRequest } from './project-harness.ts';
 import { projectPublicEvidence } from '../data-format.ts';
 
 const PublicSnapshotSchema=SnapshotSchema.extend({sourceRefs:z.array(SourceRefSchema.omit({sha256:true}))});
@@ -69,7 +69,7 @@ function selectQueries(check: CheckSpec, context: EvaluationContext, all: Map<nu
   if (typeof alias !== 'string' || !aliases || !Array.isArray(aliases.runs)) return undefined;
   const bindings = aliases.runs.filter(x => record(x) && x.alias === alias && Number.isSafeInteger(x.runId));
   if (bindings.length !== 1) return undefined;
-  let selected = [...all.values()].filter(x => x.query.runId === bindings[0].runId).sort((a, b) => a.query.id - b.query.id);
+  let selected = [...all.values()].filter(x => x.query.runId === bindings[0].runId||acceptedChildQuery(facts,x.query,bindings[0].runId)).sort((a, b) => a.query.id - b.query.id);
   if (selection?.queryIndex !== undefined) {
     if (!Number.isSafeInteger(selection.queryIndex) || selection.queryIndex < 1 || selection.queryIndex > selected.length) return undefined;
     selected = [selected[selection.queryIndex - 1]!];
@@ -111,7 +111,7 @@ function parameters(query: CompleteQuery) {
   const original = query.query.params;
   return QueryParamsSchema.safeParse({ ...original, kind: query.query.kind, population: 'population' in original ? original.population : query.query.kind === 'changes' ? 'changes' : 'snapshot', snapshotMode: 'snapshotMode' in original ? original.snapshotMode : query.query.kind === 'changes' ? null : 'exact_date' });
 }
-export async function observedConditions(facts:Record<string,unknown>,raw:unknown) {
+export async function observedConditions(facts:Record<string,unknown>,raw:unknown,inferRegion=true) {
   const parsed=QueryParamsSchema.safeParse(raw);if(!parsed.success)return undefined;
   const p=parsed.data;
   let device:string|null=null;
@@ -121,7 +121,20 @@ export async function observedConditions(facts:Record<string,unknown>,raw:unknow
     device=identities.get(p.deviceIds[0]!)!;
   }
   const point=p.kind==='current'||p.kind==='aggregate'&&p.population==='snapshot';
-  return {region:p.region,regions:null,date:point?p.time?.start??null:null,start:point?null:p.time?.start??null,endExclusive:point?null:p.time?.endExclusive??null,sourceDeviceId:device,manufacturer:p.manufacturer,category:p.category,status:p.status,snapshotMode:p.snapshotMode,threshold:p.threshold?{operator:p.threshold.operator,percent:p.threshold.value*100}:null};
+  let region=p.region;
+  if(region===null&&inferRegion) {
+    const regions=new Set<string>();
+    if(!p.batchIds.length)return undefined;
+    for(const id of p.batchIds) {
+      const batches=list(facts.batches).filter(batch=>batch.id===id),batch=batches[0];
+      if(batches.length!==1||typeof batch.region!=='string'||!Number.isSafeInteger(batch.observedEntityCount))return undefined;
+      const scope=await sourceScope(facts,{batchIds:[id],deviceIds:null});
+      if(!scope||scope.length!==batch.observedEntityCount||!scope.length)return undefined;
+      regions.add(batch.region);
+    }
+    if(regions.size===1)region=[...regions][0]!;
+  }
+  return {region,regions:null,date:point?p.time?.start??null:null,start:point?null:p.time?.start??null,endExclusive:point?null:p.time?.endExclusive??null,sourceDeviceId:device,manufacturer:p.manufacturer,category:p.category,status:p.status,snapshotMode:p.snapshotMode,threshold:p.threshold?{operator:p.threshold.operator,percent:p.threshold.value*100}:null};
 }
 export async function sourceScope(facts:Record<string,unknown>,scope:{batchIds:number[];deviceIds:number[]|null}) {
   if(scope.deviceIds!==null) {
@@ -186,8 +199,8 @@ export async function projectObservation(check: CheckSpec, context: EvaluationCo
     return batches.length ? { actual: { region: expected.region, requestedDate: expected.requestedDate, complete: batches.some(batch => batch.snapshotDate === expected.requestedDate) }, evidenceRefs: evidence.refs } : gap('Requested region has no verified source coverage');
   }
   if(facts&&['tool.selection','efficiency.calls','evidence.present'].includes(check.metricId)&&!(check.metricId==='tool.selection'&&record((context.gold.values as any)?.[check.evidenceKey])&&Array.isArray((context.gold.values as any)[check.evidenceKey].opportunities))) {
-    const rawTools=list(facts.toolCalls),tools=[...new Map(rawTools.map(tool=>[tool.id,tool])).values()],originals=verifiedOriginals(facts,'toolOriginals'),queries=list(facts.queries),refs=[...tools.map(tool=>'tool:'+tool.id),...queries.map(query=>'query:'+query.id)];
-    const complete=!toolCollectionHasGaps(context)&&Array.isArray(facts.toolCalls)&&Array.isArray(facts.queries)&&rawTools.every(tool=>originals.some(original=>original.selector.toolCallId===tool.id&&equal(original.original,tool)))&&originals.every(original=>tools.some(tool=>tool.id===original.selector.toolCallId));
+    const verified=completeToolOriginals(context),tools=verified??list(facts.toolCalls),queries=list(facts.queries),refs=[...tools.map(tool=>'tool:'+tool.id),...queries.map(query=>'query:'+query.id)];
+    const complete=verified!==undefined&&Array.isArray(facts.queries);
     if(check.metricId==='tool.selection')return {actual:{capabilities:[...new Set([...tools.map(tool=>tool.name),...(tools.some(tool=>/^query_(?:current|changes|device_changes|aggregate|trend|intent_step)/.test(tool.name))?['query']:[]),...(tools.some(tool=>tool.name==='Agent')?['delegate']:[])])],coverageComplete:complete},evidenceRefs:refs};
     if(check.metricId==='efficiency.calls')return complete?{actual:{calls:tools.map(tool=>({id:String(tool.id),kind:tool.name}))},evidenceRefs:refs}:gap('Complete native tool call records, SDK attempt identities and child inventory required for budget');
     const expected=(context.gold.values as any)?.[check.evidenceKey],needsSources=record(expected)&&(expected.expectedSources?.length||expected.minSources!==undefined||expected.sourceKinds?.length);
@@ -224,42 +237,92 @@ export async function projectObservation(check: CheckSpec, context: EvaluationCo
     const all = completeQueries(facts); if (!all) return gap('Original Query records are malformed, crossed, or incompletely paginated');
     if (check.kind === 'llm-judge') {
       const authored=record(context.gold.values)?context.gold.values[check.evidenceKey]:undefined,aliases=record(facts.aliases)?facts.aliases:{};
+      const runId=check.scope?.kind==='run'?list(aliases.runs).find(binding=>binding.alias===check.scope!.ref)?.runId:undefined;
+      if(check.scope?.kind==='run'&&!Number.isSafeInteger(runId))return gap('Semantic answer scope is not bound to an actual run');
+      const supporting=check.metricId.startsWith('answer.')?context.task.checks.filter(item=>item.scope?.kind!=='run'||item.scope.ref===check.scope?.ref):[check];
+      const needs=(prefix:string)=>supporting.some(item=>item.metricId.startsWith(prefix));
+      const sourceExpectation=record(authored)&&(authored.sourceTurnAlias!==undefined||authored.sessionAlias!==undefined)?authored:
+        supporting.map(item=>record(context.gold.values)?context.gold.values[item.evidenceKey]:undefined).find(value=>record(value)&&(value.sourceTurnAlias!==undefined||value.sessionAlias!==undefined));
       let selectedSource:Record<string,unknown>|undefined;
-      if(record(authored)&&(authored.sourceTurnAlias!==undefined||authored.sessionAlias!==undefined)) {
-        const sessions=authored.sessionAlias===undefined?[]:list(aliases.sessions).filter(binding=>binding.alias===authored.sessionAlias);
-        if(authored.sessionAlias!==undefined&&sessions.length!==1)return gap('Authored Session alias has no unique actual identity');
-        const bindings=list(aliases.inputs).filter(binding=>binding.alias===authored.sourceTurnAlias),binding=bindings[0];
+      if(record(sourceExpectation)) {
+        const sessions=sourceExpectation.sessionAlias===undefined?[]:list(aliases.sessions).filter(binding=>binding.alias===sourceExpectation.sessionAlias);
+        if(sourceExpectation.sessionAlias!==undefined&&sessions.length!==1)return gap('Authored Session alias has no unique actual identity');
+        const bindings=list(aliases.inputs).filter(binding=>binding.alias===sourceExpectation.sourceTurnAlias),binding=bindings[0];
         const inputs=bindings.length===1?list(facts.inputs).filter(input=>input.id===binding.inputId&&input.sessionId===binding.sessionId):[];
         if(inputs.length!==1||inputs[0].status!=='consumed'||!inputs[0].nativeEntryId||inputs[0].textInfo?.truncated===true||sessions.length&&inputs[0].sessionId!==sessions[0].sessionId)return gap('Authored source turn is not a complete consumed input in the selected Session');
         const input=inputs[0],history=verifiedOriginals(facts,'nativeHistory').find(original=>original.selector.sessionId===input.sessionId);
-        const paths=list(facts.modelCalls).filter(call=>call.kind!=='intent'&&call.sessionId===input.sessionId).map(call=>{
+        const paths=list(facts.modelCalls).filter(call=>call.kind!=='intent'&&call.sessionId===input.sessionId&&(runId===undefined||call.runId===runId)).map(call=>{
           const entries=list(history?.original.entries),boundary=call.context?.nativeHistory,seen=new Set<string>(),path:string[]=[];let leaf=boundary?.leafId??boundary?.baseLeafId;
           while(typeof leaf==='string'&&!seen.has(leaf)){seen.add(leaf);const entry=entries.find(item=>item.id===leaf);if(!entry)break;path.push(entry.id);leaf=entry.parentId;}
-          return {callId:call.callId,runId:call.runId,leafId:boundary?.leafId??boundary?.baseLeafId,path,sourceOnBranch:path.includes(input.nativeEntryId)};
+          const requests=verifiedOriginals(facts,'providerRequests').flatMap(item=>list(item.original)).filter(request=>request.callId===call.callId&&request.runId===call.runId&&request.sessionId===input.sessionId);
+          return {callId:call.callId,runId:call.runId,leafId:boundary?.leafId??boundary?.baseLeafId,path,sourceOnBranch:path.includes(input.nativeEntryId),sourceInputDelivered:typeof input.text==='string'&&requests.some(request=>request.body.includes(JSON.stringify(input.text).slice(1,-1)))};
         });
-        if((check.metricId.startsWith('memory.')||check.metricId.startsWith('compaction.'))&&(!history||!list(history.original.entries).some(entry=>entry.id===input.nativeEntryId)))return gap('Native history does not contain the authored source input identity');
-        selectedSource={sourceTurnAlias:authored.sourceTurnAlias,sessionAlias:authored.sessionAlias,input,requestBranches:paths};
+        if((needs('memory.')||needs('compaction.'))&&(!history||!list(history.original.entries).some(entry=>entry.id===input.nativeEntryId)))return gap('Native history does not contain the authored source input identity');
+        selectedSource={sourceTurnAlias:sourceExpectation.sourceTurnAlias,sessionAlias:sourceExpectation.sessionAlias,input,requestBranches:paths};
       }
-      const needed=check.metricId.startsWith('memory.')?['nativeHistory']:check.metricId.startsWith('compaction.')?['nativeHistory','operations']:check.metricId.startsWith('subagent.')?['runOriginals','toolOriginals']:[];
+      const needed=[...needs('memory.')||needs('compaction.')?['nativeHistory']:[],...needs('compaction.')?['operations']:[],...needs('subagent.')?['runOriginals','toolOriginals']:[]];
       if(needed.some(key=>!list(facts[key]).length))return gap('Actual native history, compaction or child evidence missing for semantic assessment');
-      if(check.metricId.startsWith('compaction.')&&!list(facts.nativeHistory).some(item=>list(item.original?.entries).some(entry=>entry.type==='compaction')))return gap('No actual persisted compaction entry');
-      if(check.metricId.startsWith('subagent.')&&!list(facts.runs).some(run=>run.kind==='child'))return gap('No actual child execution');
-      const runId=check.scope?.kind==='run'?list(record(facts.aliases)?facts.aliases.runs:[]).find(binding=>binding.alias===check.scope!.ref)?.runId:undefined;
-      if(check.scope?.kind==='run'&&!Number.isSafeInteger(runId))return gap('Semantic answer scope is not bound to an actual run');
+      if(needs('compaction.')&&!list(facts.nativeHistory).some(item=>list(item.original?.entries).some(entry=>entry.type==='compaction')))return gap('No actual persisted compaction entry');
+      if(needs('subagent.')&&!list(facts.runs).some(run=>run.kind==='child'))return gap('No actual child execution');
       const answers = list(facts.answers).filter(answer=>runId===undefined||answer.runId===runId).map(a => AnswerRecordSchema.safeParse(a));
       if (!answers.length || answers.some(a => !a.success)) return gap('Original complete Answer records are unavailable');
       const originals = answers.flatMap(a => a.success ? [a.data] : []);
       const referenced = originals.flatMap(a => a.queryIds);
       if (referenced.some(id => !all.has(id))) return gap('Answer references a missing original Query');
-      const queries = [...new Set(referenced)].map(id => all.get(id)!);
+      const selected=selectQueries(check,context,all)??[];
+      const queries = [...new Map([...referenced.map(id=>all.get(id)!),...selected].map(query=>[query.query.id,query])).values()];
       if (!attachEvidence(facts, queries)) return gap('Answer source Evidence pages are incomplete');
       const coverage = checksCoverage ? await coverageEvidence(facts) : undefined;
       if (checksCoverage && !coverage) return gap('Answer coverage sources are incomplete');
-      const evidenceRefs = [...originals.map(a => `answer:${a.id}`), ...queries.flatMap(q => q.pages.map(p => `query:${q.query.id}:page:${p.page.page}`)), ...queries.flatMap(q => q.evidence.map(e => `evidence:${e.evidence.id}:page:${e.page}`))];
-      if (coverage) evidenceRefs.push(...coverage.refs);
-      if(selectedSource)evidenceRefs.push(`input:${(selectedSource.input as any).id}`);
+      const items:{ref:string;value:unknown}[]=[];
+      const add=(ref:string,value:unknown)=>items.push({ref,value});
+      for(const {text,...answer} of originals)add(`answer:${answer.id}`,answer);
+      for(const input of list(facts.inputs).filter(input=>originals.some(answer=>answer.inputId===input.id)&&input.status==='consumed'&&input.textInfo?.truncated!==true))add(`current-input:${input.id}`,input);
+      for(const query of queries) {
+        for(const page of query.pages)add(`query:${query.query.id}:page:${page.page.page}`,page);
+        for(const page of query.evidence)add(`evidence:${page.evidence.id}:page:${page.page}`,page);
+      }
+      if(coverage)add('coverage:verified',coverage);
+      if(selectedSource)add(`input:${(selectedSource.input as any).id}`,{selectedSource});
+      if(needs('memory.')||needs('compaction.')||needs('context.')) {
+        const inputId=(selectedSource?.input as any)?.nativeEntryId;
+        for(const history of verifiedOriginals(facts,'nativeHistory'))for(const entry of list(history.original.entries).filter(entry=>entry.id===inputId||needs('compaction.')&&entry.type==='compaction')) {
+          if(entry.type==='compaction') {
+            const deliveredCalls=verifiedOriginals(facts,'providerRequests').flatMap(item=>list(item.original)).filter(request=>request.sessionId===history.selector.sessionId&&(runId===undefined||request.runId===runId)&&typeof entry.summary==='string'&&request.body.includes(JSON.stringify(entry.summary).slice(1,-1))).map(request=>request.callId);
+            if(!deliveredCalls.length)return gap('Persisted compaction summary was not observed in the subsequent model request');
+            add(`history:${history.selector.sessionId}:entry:${entry.id}`,{...entry,deliveredCalls});
+          }else add(`history:${history.selector.sessionId}:entry:${entry.id}`,entry);
+        }
+        for(const view of list(facts.contexts).filter(view=>view.kind==='snapshot'))for(const delivery of list(view.deliveries)) {
+          if(list(facts.modelCalls).some(call=>call.callId===delivery.callId&&(runId===undefined||call.runId===runId))) {
+            const request=verifiedOriginals(facts,'providerRequests').flatMap(item=>list(item.original)).find(request=>request.callId===delivery.callId);
+            add(`context:${view.snapshot.id}:call:${delivery.callId}`,{projection:view.snapshot.renderedProjection,delivery,projectionDelivered:typeof view.snapshot.renderedProjection==='string'&&request?.body.includes(JSON.stringify(view.snapshot.renderedProjection).slice(1,-1))});
+          }
+        }
+      }
+      if(needs('subagent.'))for(const child of list(facts.runs).filter(child=>child.kind==='child'&&(runId===undefined||child.parentRunId===runId))) {
+        const tool=verifiedOriginals(facts,'toolOriginals').find(item=>item.selector.toolCallId===child.originToolCallId)?.original;
+        const delivery=tool&&toolDeliveryRequest(facts,tool);
+        add(`child:${child.id}`,{parentRunId:child.parentRunId,childRunId:child.id,childSessionId:child.sessionId,result:child.childResult,deliveredToParent:!!delivery,parentCallId:delivery?.callId});
+      }
+      if(needs('resource.')) {
+        const reads=publicMaterialReads(context).filter(read=>read.verified&&(runId===undefined||read.tool.runId===runId));
+        const required=list(record(context.gold.values)?context.gold.values.resource_progressive_read?.requiredRefs:undefined);
+        if(required.some(ref=>!reads.some(read=>read.ref===ref)))return gap('Required public resource content was not proved read and delivered');
+        for(const read of reads)add(`material-read:${read.tool.id}`,{ref:read.ref,bytes:read.bytes,content:list(read.tool.sdkDelivery.content).map(part=>part.text).join('\n'),deliveredCallId:read.request?.callId});
+        for(const resourceCheck of supporting.filter(item=>item.metricId==='resource.read')) {
+          const projection=await projectHarness(resourceCheck,context);
+          const installed=record(projection?.actual)?list(projection.actual.opportunities).flatMap(item=>list(item.actual?.reads)):[];
+          for(const read of installed)add(`resource-read:${read.id}:${read.nativeReadId}`,read);
+        }
+      }
+      if(needs('tool.')||needs('context.'))for(const item of verifiedOriginals(facts,'toolOriginals').filter(item=>runId===undefined||item.original.runId===runId)) {
+        const tool=item.original,delivery=toolDeliveryRequest(facts,tool);
+        add(`tool:${tool.id}`,{id:tool.id,name:tool.name,input:tool.input,status:tool.status,error:tool.error,sdkReturned:tool.sdkReturned,deliveredCallId:delivery?.callId});
+      }
+      const evidenceRefs=items.map(item=>item.ref);
       const resolved=record(authored)&&selectedSource&&authored.sessionAlias!==undefined?{...authored,sessionId:String((selectedSource.input as any).sessionId),leafId:(selectedSource.input as any).nativeEntryId}:undefined;
-      return { ...resolved?{expected:resolved}:{},actual: { answer: originals.map(a => `Answer #${a.id}, Run #${a.runId}:\n${a.text}`).join('\n\n'), evidenceRefs, evidence: { answers: originals, queries: queries.flatMap(q => q.pages), evidence: queries.flatMap(q => q.evidence), ...(coverage ? { coverage } : {}),...(selectedSource?{selectedSource}:{}), intents: facts.intents ?? [],nativeHistory:facts.nativeHistory??[],providerRequests:facts.providerRequests??[],toolOriginals:facts.toolOriginals??[],runOriginals:facts.runOriginals??[],operations:facts.operations??[] } }, evidenceRefs };
+      return { ...resolved?{expected:resolved}:{},actual: { answer: originals.map(a => `Answer #${a.id}, Run #${a.runId}:\n${a.text}`).join('\n\n'), evidenceRefs, evidence:{items} }, evidenceRefs };
     }
     const selected = selectQueries(check, context, all); if (!selected) return gap('Authored turn cannot be bound to original Query ownership');
     const evidenceRefs = selected.flatMap(q => q.pages.map(p => `query:${q.query.id}:page:${p.page.page}`));
@@ -283,11 +346,10 @@ export async function projectObservation(check: CheckSpec, context: EvaluationCo
       evidenceRefs.push(...selected.flatMap(q => q.evidence.map(e => `evidence:${e.evidence.id}:page:${e.page}`)));
     }
     if (check.metricId === 'query.conditions') {
-      const normalized = params.map((p, index) => {
-        if (p.deviceIds && (p.deviceIds.length !== 1 || !identities.has(p.deviceIds[0]!))) return undefined;
-        const point = p.kind === 'current' || p.kind === 'aggregate' && p.population === 'snapshot';
-        return { region: p.region, regions: null, date: point ? selected[index]!.query.interpretation?.requestedDate ?? p.time?.start ?? null : null, start: point ? null : p.time?.start ?? null, endExclusive: point ? null : p.time?.endExclusive ?? null, sourceDeviceId: p.deviceIds ? identities.get(p.deviceIds[0]!) : null, manufacturer: p.manufacturer, category: p.category, status: p.status, snapshotMode: p.snapshotMode, threshold: p.threshold ? { operator: p.threshold.operator, percent: p.threshold.value * 100 } : null };
-      });
+      const normalized = await Promise.all(params.map(async(p,index)=>{
+        const conditions=await observedConditions(facts,p);
+        return conditions?{...conditions,date:conditions.date===null?null:selected[index]!.query.interpretation?.requestedDate??conditions.date}:undefined;
+      }));
       if (normalized.some(p => !p)) return gap('Query Device filters are missing an independent source identity');
       const first = normalized[0]!;
       if (!normalized.every(p => equal({ ...p, region: null }, { ...first, region: null }))) return gap('Multiple Query parts have incompatible conditions');
@@ -301,7 +363,8 @@ export async function projectObservation(check: CheckSpec, context: EvaluationCo
       if(selected.length!==1||!selected[0]!.query.interpretation)return gap('One complete query interpretation required');
       const interpretation=selected[0]!.query.interpretation!,dates=interpretation.dataDates;
       const actualDate=dates.length===1?dates[0]:null;
-      return {actual:{requestedDate:interpretation.requestedDate,actualDataDate:actualDate,snapshotMode:interpretation.snapshotMode,region:params[0]!.region,scopeKey:list(facts.batches).find(batch=>batch.id===selected[0]!.query.batchIds[0])?.scopeKey??null,isStale:actualDate===null?null:actualDate!==interpretation.requestedDate,quantityUnit:interpretation.unit,nullPriceDeviceIds:rows.filter(row=>row.priceCents===null).map(id),ratioUnknown:[]},evidenceRefs};
+      const conditions=await observedConditions(facts,params[0]);if(!conditions)return gap('Query scope cannot be independently verified');
+      return {actual:{requestedDate:interpretation.requestedDate,actualDataDate:actualDate,snapshotMode:interpretation.snapshotMode,region:conditions.region,scopeKey:list(facts.batches).find(batch=>batch.id===selected[0]!.query.batchIds[0])?.scopeKey??null,isStale:actualDate===null?null:actualDate!==interpretation.requestedDate,quantityUnit:interpretation.unit,nullPriceDeviceIds:rows.filter(row=>row.priceCents===null).map(id),ratioUnknown:[]},evidenceRefs};
     }
     if (check.metricId.startsWith('query.set_')) return { actual: [...new Set(rows.map(id))].sort(), evidenceRefs };
     if (check.metricId === 'export.exact') {
@@ -339,7 +402,8 @@ export async function projectObservation(check: CheckSpec, context: EvaluationCo
       if (!interpretation) return gap('Export source Query interpretation is unavailable');
       const scopedBatches = list(facts.batches).filter(b => record(b) && q.query.batchIds.includes(b.id));
       const scopes = [...new Set(scopedBatches.map(b => b.scopeKey))];
-      const normalizedMetadata = { requestedDate: interpretation.requestedDate, actualDataDate: interpretation.dataDates.length === 1 ? interpretation.dataDates[0] : null, snapshotMode: interpretation.snapshotMode, region: params[0]!.region, scopeKey: scopes.length === 1 ? scopes[0] : null, isStale: interpretation.isStale, quantityUnit: interpretation.unit, nullPriceDeviceIds: rows.filter(r => r.priceCents === null).map(id).sort() };
+      const conditions=await observedConditions(facts,params[0]);if(!conditions)return gap('Export scope cannot be independently verified');
+      const normalizedMetadata = { requestedDate: interpretation.requestedDate, actualDataDate: interpretation.dataDates.length === 1 ? interpretation.dataDates[0] : null, snapshotMode: interpretation.snapshotMode, region: conditions.region, scopeKey: scopes.length === 1 ? scopes[0] : null, isStale: interpretation.isStale, quantityUnit: interpretation.unit, nullPriceDeviceIds: rows.filter(r => r.priceCents === null).map(id).sort() };
       const normalizedRows = rows.map(row => ({ key: `${identities.get(Number(row.deviceId))}|${row.date}`, device: identities.get(Number(row.deviceId)), name: row.deviceName, category: row.category, region: row.region, date: row.date, price: row.priceCents, status: row.status, manufacturer: row.manufacturer, distributor: row.distributor }));
       return { actual: { rows: normalizedRows, sets: [...new Set(rows.map(id))].sort(), format: operation.format, sourceQueryAlias: binding[0].alias, queryId: q.query.id, artifactId: artifact.id, columns, fileRows, queryRows, metadata: normalizedMetadata, fileMetadata: metadata }, evidenceRefs: [...evidenceRefs, ...copied.map(f => 'artifact:'+artifact.id+'/'+f.relativePath), `export:${operation.operationRef}`] };
     }

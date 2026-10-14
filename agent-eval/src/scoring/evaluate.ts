@@ -1,5 +1,5 @@
 import { registry } from './registry.ts';
-import { ratio, record, unknown } from './rules.ts';
+import { ratio, record, unknown,equal } from './rules.ts';
 import { projectObservation } from './project-observation.ts';
 import { judgeableCoverage } from './runtime.ts';
 import type { CheckSpec, EvaluationContext, EvaluationScore, RuleResult, ScoreStatus } from './types.ts';
@@ -82,10 +82,22 @@ export async function evaluate(context: EvaluationContext): Promise<EvaluationSc
   }
   if (semantic.length) {
     try {
+      const items:{ref:string;value:unknown}[]=[],answers:{ref:string;text:string}[]=[],answerRefs:{checkId:string;answerRef:string}[]=[];
+      for(const item of semantic) {
+        const entries=record(item.actual.evidence)&&Array.isArray(item.actual.evidence.items)?item.actual.evidence.items:[{ref:item.actual.evidenceRefs[0],value:item.actual.evidence}];
+        for(const entry of entries) {
+          const previous=items.find(value=>value.ref===entry.ref);
+          if(previous&&!equal(previous.value,entry.value))throw new Error('semantic_evidence_reference_conflict');
+          if(!previous)items.push(entry);
+        }
+        let answer=answers.find(answer=>answer.text===item.actual.answer);
+        if(!answer){answer={ref:'answer-'+(answers.length+1),text:item.actual.answer};answers.push(answer);}
+        answerRefs.push({checkId:item.check.id,answerRef:answer.ref});
+      }
       const request={ trialId: context.trialId,
         checks: semantic.map(x => ({ checkId: x.check.id, rubric: x.expected.rubric+'\nIndependent expectations: '+JSON.stringify({...x.expected,rubric:undefined}), evidenceRefs: x.actual.evidenceRefs })),
-        answer: JSON.stringify(semantic.map(x => ({ checkId: x.check.id, answer: x.actual.answer }))),
-        evidence: semantic.map(x => ({ checkId: x.check.id, evidence: x.actual.evidence })) };
+        answer: JSON.stringify({answers,checks:answerRefs}),
+        evidence: {items,checks:semantic.map(item=>({checkId:item.check.id,evidenceRefs:item.actual.evidenceRefs}))} };
       await context.onJudgeRequest?.(request);
       const result = await context.judge!.judge(request, context.signal);
       await context.onJudgeResult?.(result);

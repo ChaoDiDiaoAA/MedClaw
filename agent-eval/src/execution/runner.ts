@@ -13,6 +13,7 @@ import { sourceInventory,runBlockers } from '../doctor.ts';
 import { assertSafeExport } from '../langfuse/map.ts';
 import { projectPublicEvidence } from '../data-format.ts';
 import {assertJudgeMatches} from '../scoring/judges/client.ts';
+import {trialProgress,type ProgressEvent} from './progress.ts';
 
 const unsafeTrial=(trial:TrialResult)=>Boolean(trial.startedAt&&(trial.stopped!==true||trial.closed!==true))||['necessary_save_unconfirmed','trial_exception_stop_unknown','host_stop_unconfirmed'].includes(trial.reason??'');
 export function planTrials(caseIds:string[],repeat:number):TrialPlan[] {
@@ -20,14 +21,14 @@ export function planTrials(caseIds:string[],repeat:number):TrialPlan[] {
   caseIds.forEach(id=>ExecutionIdSchema.parse(id));
   return caseIds.flatMap(caseId=>Array.from({length:repeat},(_,i)=>({caseId,repetition:i+1,trialId:ExecutionIdSchema.parse(caseId+'-r'+(i+1))})));
 }
-export async function executePlan(plan:TrialPlan[],run:(item:TrialPlan)=>Promise<TrialResult>,options:{signal?:AbortSignal;blockers?:string[];onProgress?:(trial:TrialResult)=>void}={}) {
+export async function executePlan(plan:TrialPlan[],run:(item:TrialPlan)=>Promise<TrialResult>,options:{signal?:AbortSignal;blockers?:string[];onProgress?:(trial:TrialResult)=>void|Promise<void>}={}) {
   const trials:TrialResult[]=[];let unsafe=false;
   for(const item of plan) {
     const reason=unsafe?'previous_trial_stop_or_save_unconfirmed':options.signal?.aborted?'execution_cancelled_before_start':options.blockers?.length?options.blockers.join(';'):null;
     let trial:TrialResult;
     if(reason)trial={...item,status:'not_run',instanceId:null,startedAt:null,endedAt:null,reason,stopped:null,closed:null,observation:null};
     else {try{trial=await run(item);}catch{trial={...item,status:'infra_error',instanceId:null,startedAt:null,endedAt:new Date().toISOString(),reason:'trial_exception_stop_unknown',stopped:null,closed:null,observation:null};unsafe=true;}if(unsafeTrial(trial))unsafe=true;}
-    trials.push(trial);options.onProgress?.(trial);
+    trials.push(trial);await options.onProgress?.(trial);
   }
   return trials;
 }
@@ -35,6 +36,7 @@ export interface RunOptions {
   datasetRoot:string;runsRoot:string;executionId:string;selection:'smoke'|'full';repeat:number;
   config:ResolvedRunConfig;modelCredential?:AgentModelCredential;judgeMode:'required'|'off';judge?:Judge;signal?:AbortSignal;
   onProgress?:(trial:TrialResult)=>void;controlledFixture?:boolean;
+  onEvent?:(event:ProgressEvent)=>void;
 }
 export async function runExperiment(options:RunOptions):Promise<EvaluationReport> {
   ExecutionIdSchema.parse(options.executionId);const config=ResolvedRunConfigSchema.parse(options.config);assertSafeExport(config);
@@ -51,24 +53,37 @@ export async function runExperiment(options:RunOptions):Promise<EvaluationReport
     const executionRoot=join(root,options.executionId);await mkdir(executionRoot);
     const source=await sourceInventory();
     const criteria=scoringCriteria(dataset.cases.flatMap(item=>item.expected.checks.map(check=>check.metricId)));
-    const snapshot:ExecutionSnapshot={contract:'medclaw-execution-snapshot/v1',executionId:options.executionId,dataset:dataset.snapshot,compiled:snapshotCompiled(dataset),config,criteria,source};
+    const snapshot:ExecutionSnapshot={contract:'medclaw-execution-snapshot/v1',executionId:options.executionId,dataset:dataset.snapshot,compiled:snapshotCompiled(dataset),config,criteria,source,plan,preparationTurns:Object.fromEntries(dataset.cases.map(task=>[task.id,task.steps.filter(step=>step.action.action==='send'&&step.action.alias.startsWith('prepare-')).length]))};
     await writeJsonExclusive(join(executionRoot,'snapshot.json'),snapshot);
     const blockers=runBlockers(dataset,source,config,{required:options.judgeMode==='required'&&judged.length>0,configured:!!options.judge});
     keepLock=true;
-    const trials=await executePlan(plan,item=>runTrial({...item,executionId:options.executionId,case:dataset.cases.find(task=>task.id===item.caseId)!,datasetRoot:dataset.root,fixtureFiles:dataset.snapshot.fixtures,productResources:dataset.snapshot.productResources,config,controlledFixture:options.controlledFixture,modelCredential:options.modelCredential,trialRoot:join(executionRoot,'evidence',item.trialId),signal:options.signal}),{blockers,signal:options.signal,onProgress:options.onProgress});
     const scores:EvaluationScore[]=[],judgeCalls:{trialId:string;result:JudgeResult}[]=[];
     const evidenceFiles:{path:string;sensitivity:'private'}[]=[];
-    for(const trial of trials) {
+    const progress=new Map<string,ReturnType<typeof trialProgress>>();
+    const forTrial=(item:TrialPlan)=>{
+      let value=progress.get(item.trialId);
+      if(!value){value=trialProgress(item,plan.findIndex(trial=>trial.trialId===item.trialId)+1,plan.length,options.onEvent);progress.set(item.trialId,value);}return value;
+    };
+    let trials:TrialResult[];
+    try {trials=await executePlan(plan,item=>runTrial({...item,executionId:options.executionId,case:dataset.cases.find(task=>task.id===item.caseId)!,datasetRoot:dataset.root,fixtureFiles:dataset.snapshot.fixtures,productResources:dataset.snapshot.productResources,config,controlledFixture:options.controlledFixture,modelCredential:options.modelCredential,trialRoot:join(executionRoot,'evidence',item.trialId),signal:options.signal,onPhase:phase=>forTrial(item).phase(phase)}),{blockers,signal:options.signal,onProgress:async trial=>{
+      const current=forTrial(trial);current.emit({kind:'execution',executionStatus:trial.status,reason:trial.reason});current.phase('score');
       const task=dataset.cases.find(task=>task.id===trial.caseId)!;
       const directory=join(executionRoot,'evidence',trial.trialId);await mkdir(directory,{recursive:true});
       const events=await open(join(directory,'events.jsonl'),'a',0o600);await events.close();
-      const journal=async(kind:string,value:unknown)=>{const event=projectPublicEvidence({kind,at:new Date().toISOString(),value});await appendFile(join(directory,'events.jsonl'),JSON.stringify(event)+'\n',{mode:0o600});};
-      scores.push(...await evaluate({trialId:trial.trialId,caseId:trial.caseId,task:{checks:task.expected.checks},input:task,result:trial,gold:dataset.gold[trial.caseId]!,observation:trial.observation,trialStatus:trial.status,judge:options.judgeMode==='off'?undefined:options.judge,signal:options.signal,onJudgeRequest:request=>journal('judge.request',request),onJudgeResult:async result=>{await journal('judge.result',result);judgeCalls.push({trialId:trial.trialId,result});}}));
+      let journalFailed=false;
+      const journal=async(kind:string,value:unknown)=>{try{const event=projectPublicEvidence({kind,at:new Date().toISOString(),value});await appendFile(join(directory,'events.jsonl'),JSON.stringify(event)+'\n',{mode:0o600});}catch(error){journalFailed=true;throw error;}};
+      const trialScores=await evaluate({trialId:trial.trialId,caseId:trial.caseId,task:{checks:task.expected.checks},input:task,result:trial,gold:dataset.gold[trial.caseId]!,observation:trial.observation,trialStatus:trial.status,judge:options.judgeMode==='off'?undefined:options.judge,signal:options.signal,onJudgeRequest:request=>journal('judge.request',request),onJudgeResult:async result=>{await journal('judge.result',result);judgeCalls.push({trialId:trial.trialId,result});}});
+      if(journalFailed)throw new Error('necessary_save_unconfirmed');
+      scores.push(...trialScores);
+      const status=aggregate([trial],[trial],trialScores).trials[0]!.status;
+      current.emit({kind:'score',status,checks:trialScores});current.phase('save');
       try{await stat(join(directory,'trial.json'));}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;const {observation,...state}=trial;await writeJsonExclusive(join(directory,'trial.json'),{...state,observationRef:observation?'observation.json':null,lifecycle:{}});}
       if(trial.observation)try{await stat(join(directory,'observation.json'));}catch{await writeJsonExclusive(join(directory,'observation.json'),projectPublicEvidence(trial.observation));}
+      await journal('scoring.completed',{trialId:trial.trialId,status,scores:trialScores});
       const walk=async(dir:string)=>{for(const item of await readdir(dir,{withFileTypes:true})){const path=join(dir,item.name);if(item.isSymbolicLink())throw new Error('linked_trial_evidence');if(item.isDirectory()){if(item.name==='product'||item.name==='inputs'||item.name==='projection')continue;await walk(path);}else if(item.isFile())evidenceFiles.push({path:relative(executionRoot,path).replaceAll('\\','/'),sensitivity:'private'});}};
       await walk(directory);
-    }
+      current.emit({kind:'saved',status,evidenceRef:'evidence/'+trial.trialId+'/'});current.close();options.onProgress?.(trial);
+    }});}finally{for(const item of progress.values())item.close();}
     const cases=dataset.cases.map(item=>({id:item.id,version:1 as const,name:item.name,category:item.category,evalType:item.evalType,tags:item.tags}));
     const aggregation=aggregate(plan,trials,scores,cases);
     const archivedTrials=trials.map(({observation,...trial})=>({...trial,observationRef:observation?'evidence/'+trial.trialId+'/observation.json':null}));

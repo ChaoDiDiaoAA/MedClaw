@@ -7,12 +7,13 @@ import type { AgentModelCredential,ResolvedRunConfig, TrialResult } from '../typ
 import { ActionExecutor } from '../adapters/actions.ts';
 import { ProductAdapter, unwrap, type ShutdownProof } from '../adapters/product.ts';
 import { cleanupInstance, prepareInstance } from './instance.ts';
-import { materializeInputs } from '../datasets.ts';
+import { materializeInputs,preparePublicMaterials,type PublicMaterial } from '../datasets.ts';
 import { materializeControlFixtures, parseFixtureCatalog } from '../dataset-fixtures.ts';
 import { collectObservation } from './observe.ts';
 import { projectPublicEvidence } from '../data-format.ts';
+import type {TrialPhase} from './progress.ts';
 
-export interface RunTrialOptions { executionId: string; trialId: string; caseId: string; repetition: number; case: EvalCase; datasetRoot: string; fixtureFiles?: Record<string,string>; productResources?: readonly ProductResource[]; config: ResolvedRunConfig; modelCredential?:AgentModelCredential; trialRoot: string; signal?: AbortSignal; controlledFixture?: boolean }
+export interface RunTrialOptions { executionId: string; trialId: string; caseId: string; repetition: number; case: EvalCase; datasetRoot: string; fixtureFiles?: Record<string,string>; productResources?: readonly ProductResource[]; config: ResolvedRunConfig; modelCredential?:AgentModelCredential; trialRoot: string; signal?: AbortSignal; controlledFixture?: boolean;onPhase?:(phase:TrialPhase)=>void }
 export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
   const result: TrialResult = { trialId: options.trialId, caseId: options.caseId, repetition: options.repetition, status: 'preparing', instanceId: null, startedAt: null, endedAt: null, reason: null, stopped: null, closed: null, observation: null };
   const trialRoot = resolve(options.trialRoot); await mkdir(trialRoot, { recursive: true });
@@ -21,6 +22,7 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
   let cancellation: Promise<void> | undefined;
   let firstShutdown:ShutdownProof|undefined;
   let workRoot:string|undefined;
+  let publicMaterials:PublicMaterial[]=[];
   const onAbort = () => {
     if (!product) return;
     const current = product;
@@ -47,16 +49,21 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
     options.signal?.throwIfAborted();
     if (options.case.id !== options.caseId) throw new Error('case_identity_mismatch');
     result.startedAt = new Date().toISOString();
+    options.onPhase?.('prepare_input');
     workRoot=await mkdtemp(join(tmpdir(),'medclaw-eval-work-'));
     const inputRoot = await materializeInputs(options.case, join(workRoot, 'inputs'));
     const profile = options.fixtureFiles ? parseFixtureCatalog(options.fixtureFiles).profiles[options.case.input.fixture.ref] : undefined;
+    publicMaterials=await preparePublicMaterials(options.case,inputRoot,profile?.absentFiles);
     if(options.fixtureFiles) await materializeControlFixtures(options.case.input.fixture.ref, options.fixtureFiles, workRoot);
     else if(options.case.input.fixture.ref==='private-canary') throw new Error('controller_fixture_inputs_missing');
+    options.onPhase?.('prepare_host');
     product = await prepareInstance({ trialRoot,workRoot, config: options.config, modelCredential:options.modelCredential, controlledToolFault: profile?.controlledToolFault,
       owner: { executionId: options.executionId, trialId: options.trialId, caseId: options.caseId } }); result.instanceId = product.instanceId; result.status = 'running';
     options.signal?.addEventListener('abort', onAbort, { once: true }); options.signal?.throwIfAborted();
-    executor = new ActionExecutor(product, options.config, inputRoot, trialRoot, options.productResources);
+    executor = new ActionExecutor(product, options.config, inputRoot, trialRoot, options.productResources,publicMaterials,()=>preparePublicMaterials(options.case,inputRoot,profile?.absentFiles));
+    product.record('public_materials',{files:publicMaterials});
     for (const action of options.case.setup) { options.signal?.throwIfAborted(); await executor.execute(action); }
+    options.onPhase?.('execute');
     for (const step of options.case.steps) {
       options.signal?.throwIfAborted(); product.record('step_started', { stepId: step.id, action: step.action.action, trigger: step.trigger });
       product.deadlineAt = Date.now() + step.timeoutMs;
@@ -82,6 +89,7 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
     }
   } finally {
     options.signal?.removeEventListener('abort', onAbort); await cancellation;
+    options.onPhase?.('collect');
     if (product) {
       product.deadlineAt = null;
       let cleanup: { status: 'removed' | 'preserved'; reason: string | null } = { status: 'preserved', reason: options.config.retention === 'preserve_all' ? 'retention_policy' : 'trial_or_evidence_incomplete' };
@@ -90,8 +98,8 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
       const lastRunId=executor?.lastSendAlias?executor.aliases.runs.get(executor.lastSendAlias):undefined;
       const runs=result.observation?.facts.runs;
       const lastRun=Array.isArray(runs)&&lastRunId!==undefined?runs.find(run=>run.id===lastRunId):undefined;
-      if(result.status==='completed'&&lastRun?.status==='failed'&&['provider_request_failed','intent_timeout'].includes(lastRun.error?.code)) {
-        result.status='infra_error';result.reason=lastRun.error.code;
+      if(result.status==='completed'&&lastRun?.status==='failed') {
+        result.status=['provider_request_failed','intent_timeout'].includes(lastRun.error?.code)?'infra_error':'failed';result.reason=lastRun.error?.code??'native_run_failed';
       }
       if (result.observation?.identityChecks.some(check => !check.passed)) { result.status = 'infra_error'; result.reason = 'evidence_identity_mismatch'; }
       try { const latest = await product.stop();const proof=firstShutdown??latest;firstShutdown??=latest; result.stopped = proof.stopped; result.closed = proof.closed;
@@ -113,6 +121,7 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
       await writeFile(join(trialRoot, 'cleanup.json'), JSON.stringify({ contract: 'medclaw-eval-cleanup/v1', executionId: options.executionId, trialId: options.trialId,
         instanceId: product.instanceId, productRoot: product.paths.dataRoot, ...cleanup, observedAt: new Date().toISOString() }, null, 2));
       if(result.observation) {
+        result.observation.facts.publicMaterials=publicMaterials;
         let isolation:unknown;try{isolation=JSON.parse(await readFile(join(trialRoot,'isolation.json'),'utf8'));}catch{}
         result.observation.facts.lifecycle={shutdown:firstShutdown??null,cleanup,isolation,productRoot:product.paths.dataRoot};
         result.observation=projectPublicEvidence(result.observation);

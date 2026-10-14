@@ -46,6 +46,7 @@ export interface ExecutionSnapshot {
   contract:'medclaw-execution-snapshot/v1';executionId:string;dataset:DatasetSnapshot;
   config:ResolvedRunConfig;criteria:unknown;source:Record<string,unknown>;
   compiled:CompiledDataset;
+  plan?:TrialPlan[];preparationTurns?:Record<string,number>;
 }
 export interface EvaluationReport {
   contract:'medclaw-evaluation-report/v1';executionId:string;snapshotRef:'snapshot.json';

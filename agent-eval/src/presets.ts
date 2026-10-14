@@ -10,6 +10,7 @@ import {runBlockers,sourceInventory} from './doctor.ts';
 import {main,formatCliError} from './cli.ts';
 import {readReport} from './reports/write.ts';
 import {exportReport,inspectExport,platformConfig} from './langfuse/export.ts';
+import {terminalProgress,terminalSummary} from './terminal.ts';
 
 const projectRoot=resolve(import.meta.dir,'../..');
 const processEvents:NodeJS.EventEmitter=process;
@@ -50,17 +51,19 @@ export async function mainPreset(args:string[],root=projectRoot,print:(value:unk
     try{const result=await exportReport(path,'langfuse',config,controller.signal);print({executionId:report.executionId,...result});return result.state==='complete'?0:1;}
     finally{processEvents.off('SIGINT',stop);processEvents.off('SIGTERM',stop);}
   }
-  const dataset=await loadDataset('medclaw-agent-v1'),repeat=preset.mode==='smoke'?1:3;
+  const repeat=preset.mode==='smoke'?1:3;
+  if(!preset.check){console.log(`[评测] ${preset.mode==='smoke'?'Smoke':'Full'}：${preset.mode==='smoke'?10:50}题 × ${repeat}次，共${(preset.mode==='smoke'?10:50)*repeat}个Trial`);console.log('▶ [评测] 核对数据与模型配置');}
+  const dataset=await loadDataset('medclaw-agent-v1');
   const selected=preset.mode==='smoke'?dataset.manifest.smoke:dataset.manifest.members,plan=planTrials(selected,repeat);
   const judged=plan.filter(trial=>dataset.cases.find(task=>task.id===trial.caseId)!.expected.checks.some(check=>check.kind==='llm-judge'));
   const configPath=join(root,'agent-eval/configs/agent.json'),input=JSON.parse(await readFile(configPath,'utf8'));
   const {config,judgeConfig}=await resolveRunConfig(input,env,'required',judged.length>0);
   const blockers=runBlockers(dataset,await sourceInventory(),config,{required:judged.length>0,configured:!!judgeConfig});
-  print({contract:'medclaw-eval-preflight/v1',mode:preset.mode,check:preset.check,backend:'local',dataset:dataset.manifest.id,cases:selected.length,repeat,plannedTrials:plan.length,plannedJudgeCalls:judged.length,ready:blockers.length===0,blockers});
-  if(blockers.length)return 2;
-  if(preset.check)return 0;
+  if(preset.check){print({contract:'medclaw-eval-preflight/v1',mode:preset.mode,check:true,backend:'local',dataset:dataset.manifest.id,cases:selected.length,repeat,plannedTrials:plan.length,plannedJudgeCalls:judged.length,ready:blockers.length===0,blockers});return blockers.length?2:0;}
+  if(blockers.length){console.error('❌ [评测] 启动检查未通过：'+blockers.join('；'));return 2;}
   const executionId=ExecutionIdSchema.parse(`${preset.mode}-${new Date().toISOString().replace(/[-:.]/g,'')}-${randomUUID().slice(0,8)}`);
-  return main(['run','--dataset',dataset.manifest.id,'--selection',preset.mode,'--repeat',String(repeat),'--config',configPath,'--execution-id',executionId,'--judge','required','--backend','local'],env);
+  console.log('[执行] '+executionId);console.log('[结果目录] '+join(runsRoot,executionId));
+  return main(['run','--dataset',dataset.manifest.id,'--selection',preset.mode,'--repeat',String(repeat),'--config',configPath,'--execution-id',executionId,'--judge','required','--backend','local'],env,{onEvent:terminalProgress(),report:terminalSummary});
 }
 if(import.meta.main){
   try{process.exitCode=await mainPreset(Bun.argv.slice(2));}

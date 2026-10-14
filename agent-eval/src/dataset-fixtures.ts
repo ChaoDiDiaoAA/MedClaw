@@ -3,16 +3,18 @@ import { FixtureCatalogSchema, ProductResourceSchema, type ProductResource, type
 import {csvRows} from './data-format.ts';
 import { readFile, lstat, realpath, mkdir, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
+import {DEFAULT_COMPACTION_SETTINGS,estimateTokens,findCutPoint,type SessionEntry} from '@earendil-works/pi-coding-agent';
+import {z} from 'zod';
 
-export const fixtureIds = ['procurement','zj-only','source-audit','injected-guide','private-canary','missing-guide','query-skill','query-timeout-once'] as const;
+export const fixtureIds = ['procurement','zj-only','source-audit','injected-guide','private-canary','missing-guide','query-skill','query-timeout-once','compaction-history'] as const;
 export const FixtureCatalogFile = 'medclaw-agent-v1.fixtures.json';
 
 export function fixtureInventory(catalog: ReturnType<typeof FixtureCatalogSchema.parse>) {
-  return [...new Set([FixtureCatalogFile, catalog.source.ref, ...Object.values(catalog.profiles).flatMap(profile => [...profile.files, ...profile.controllerFiles].map(file => file.source))])].sort();
+  return [...new Set([FixtureCatalogFile, catalog.source.ref, ...Object.values(catalog.profiles).flatMap(profile => [...profile.files, ...profile.controllerFiles,...profile.initialConversation?[profile.initialConversation]:[]].map(file => file.source))])].sort();
 }
 export function parseFixtureCatalog(files: Record<string, string>) {
   const catalog = FixtureCatalogSchema.parse(JSON.parse(files[FixtureCatalogFile] ?? 'null'));
-  if (Object.keys(catalog.profiles).sort().join() !== [...fixtureIds].sort().join()) throw new Error('fixture_profiles_invalid');
+  if(fixtureIds.filter(id=>id!=='compaction-history').some(id=>!catalog.profiles[id])||Object.keys(catalog.profiles).some(id=>!fixtureIds.includes(id as typeof fixtureIds[number])))throw new Error('fixture_profiles_invalid');
   if (catalog.profiles['zj-only']!.regions.join() !== '浙江' || catalog.profiles['zj-only']!.files.length || catalog.profiles['private-canary']!.controllerFiles.length !== 1) throw new Error('fixture_scope_invalid');
   const expected = fixtureInventory(catalog);
   if (Object.keys(files).sort().join() !== expected.join()) throw new Error('fixture_inventory_invalid');
@@ -21,11 +23,25 @@ export function parseFixtureCatalog(files: Record<string, string>) {
     if (profile.controllerFiles.length && ref !== 'private-canary') throw new Error('controller_fixture_profile_invalid');
     if (profile.resources && (ref !== 'query-skill' || profile.resources.skills.length !== 1 || profile.resources.skills[0]?.id !== 'query')) throw new Error('fixture_resources_invalid');
     if (profile.controlledToolFault && ref !== 'query-timeout-once') throw new Error('fixture_fault_invalid');
+    if(profile.initialConversation&&(ref!=='compaction-history'||profile.initialConversation.source!=='procurement-handoff.json'))throw new Error('fixture_conversation_invalid');
     const paths = profile.files.map(file => file.path.toLowerCase());
     if (new Set(paths).size !== paths.length || paths.some(path => path === 'materials/procurement.csv' || /^materials\/(zj|hn)-snapshot(?:\/|$)/.test(path))) throw new Error('overlapping_fixture_files');
   }
   for (const name of expected) if (typeof files[name] !== 'string' || !files[name]!.trim()) throw new Error('fixture_file_missing:' + name);
   return catalog;
+}
+const HandoffSchema=z.strictObject({contract:z.literal('medclaw-procurement-handoff/v1'),origin:z.literal('synthetic_authored'),author:z.string().min(1),license:z.literal('CC0-1.0'),method:z.string().min(1),rounds:z.array(z.strictObject({id:z.string().min(1),prompt:z.string().min(1).max(18000)})).length(8)});
+export function fixtureConversation(files:Record<string,string>,source?:string):string[] {
+  if(!source)return [];
+  const handoff=HandoffSchema.parse(JSON.parse(files[source]??'null'));
+  if(new Set(handoff.rounds.map(turn=>turn.id)).size!==handoff.rounds.length||new Set(handoff.rounds.map(turn=>turn.prompt)).size!==handoff.rounds.length)throw new Error('duplicate_handoff_turn');
+  return handoff.rounds.map(turn=>turn.prompt);
+}
+export function compactionHistoryEligibility(prompts:readonly string[]) {
+  const entries:SessionEntry[]=prompts.map((content,index)=>({type:'message',id:'estimate-'+index,parentId:index?'estimate-'+(index-1):null,timestamp:new Date(0).toISOString(),message:{role:'user',content,timestamp:0}}));
+  const estimatedTokens=entries.reduce((total,entry)=>total+(entry.type==='message'?estimateTokens(entry.message):0),0),keepRecentTokens=DEFAULT_COMPACTION_SETTINGS.keepRecentTokens;
+  const cut=findCutPoint(entries,0,entries.length,keepRecentTokens);
+  return {estimatedTokens,keepRecentTokens,firstKeptEntryIndex:cut.firstKeptEntryIndex,sourceInPrefix:cut.firstKeptEntryIndex>0};
 }
 export async function loadFixtureFiles(directory = join(import.meta.dir, 'fixtures')) {
   const root = resolve(directory);

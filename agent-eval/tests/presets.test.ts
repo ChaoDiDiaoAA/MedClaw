@@ -36,7 +36,7 @@ Bun.spawn=()=>{throw new Error('unexpected_host_start');};
     const child=Bun.spawnSync([process.execPath,'--no-env-file','--preload',preload,resolve(import.meta.dir,'../src/presets.ts'),mode],{cwd:root,stdout:'pipe',stderr:'pipe'});
     const stdout=new TextDecoder().decode(child.stdout),stderr=new TextDecoder().decode(child.stderr);
     expect(child.exitCode).toBe(1);
-    expect(JSON.parse(stdout)).toMatchObject({mode,check:false,ready:true,plannedTrials:mode==='smoke'?10:150,blockers:[]});
+    expect(stdout).toContain(`[评测] ${mode==='smoke'?'Smoke':'Full'}`);expect(stdout).toContain(`共${mode==='smoke'?10:150}个Trial`);expect(stdout).toContain('▶ [评测] 核对数据与模型配置');expect(stdout).toContain('[执行] ');expect(stdout).toContain('[结果目录] ');
     expect(JSON.parse(stderr)).toMatchObject({error:'filesystem_error',reason:'EACCES',operation:'mkdir',location:expect.stringMatching(/^agent-eval\/src\/cli\.ts:\d+:\d+$/)});
     expect(stderr+stdout).not.toContain('local-private-key');expect(stderr+stdout).not.toContain(runConfigFixture().model.key);expect(stderr+stdout).not.toContain('local-judge-key');
   } finally {await rm(root,{recursive:true,force:true});}
