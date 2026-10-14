@@ -87,6 +87,12 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
       let cleanup: { status: 'removed' | 'preserved'; reason: string | null } = { status: 'preserved', reason: options.config.retention === 'preserve_all' ? 'retention_policy' : 'trial_or_evidence_incomplete' };
       if (executor) try { result.observation = await collectObservation({ executionId: options.executionId, trialId: options.trialId, product, aliases: executor.aliases, lastSendAlias: executor.lastSendAlias, trialRoot, observedFrom: result.startedAt! }); }
       catch (error) { result.status = 'infra_error'; result.reason = `observation_failed:${error instanceof Error ? error.message : 'unknown'}`; }
+      const lastRunId=executor?.lastSendAlias?executor.aliases.runs.get(executor.lastSendAlias):undefined;
+      const runs=result.observation?.facts.runs;
+      const lastRun=Array.isArray(runs)&&lastRunId!==undefined?runs.find(run=>run.id===lastRunId):undefined;
+      if(result.status==='completed'&&lastRun?.status==='failed'&&['provider_request_failed','intent_timeout'].includes(lastRun.error?.code)) {
+        result.status='infra_error';result.reason=lastRun.error.code;
+      }
       if (result.observation?.identityChecks.some(check => !check.passed)) { result.status = 'infra_error'; result.reason = 'evidence_identity_mismatch'; }
       try { const latest = await product.stop();const proof=firstShutdown??latest;firstShutdown??=latest; result.stopped = proof.stopped; result.closed = proof.closed;
         await writeFile(join(trialRoot, 'shutdown.json'), JSON.stringify(proof, null, 2));

@@ -64,7 +64,7 @@ export async function calibrateReferences(args:{referencesPath:string;executionI
   assessCalibration(empty,references.limits);
   const config=readJudgeConfig(args.env,'required',true)!;
   if(JSON.stringify(prepared).includes(config.apiKey))throw new Error('calibration_credential_boundary');
-  const client=new JudgeClient(config,{plannedTrials:prepared.length,trialIds:prepared.map(item=>item.sample.id)});
+  const client=await JudgeClient.create(config,{plannedTrials:prepared.length,trialIds:prepared.map(item=>item.sample.id)});
   const root=resolve(args.outputPath);await mkdir(root);
   const snapshot={contract:'medclaw-calibration-snapshot/v1',executionId:args.executionId,rubricVersion:references.rubricVersion,systemRubric:ANSWER_QUALITY_RUBRIC,judge:client.configuration,limits:references.limits,model:config.model,samples:prepared.map(item=>item.sample)};
   await writeJsonExclusive(join(root,'snapshot.json'),snapshot);

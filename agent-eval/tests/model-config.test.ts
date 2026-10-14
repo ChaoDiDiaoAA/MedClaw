@@ -13,6 +13,20 @@ import { HOST_PROTOCOL_VERSION } from '../../packages/contracts/src/protocol.ts'
 
 const agentInput=runConfigFixture;
 
+test('DeepSeek official Anthropic endpoint selects Messages without changing native model limits',async()=>{
+  const input=agentInput();input.model.model='deepseek-flash';input.model.url='https://api.deepseek.com';
+  const baseline=await resolveRunConfig(input,{},'off',false);
+  for(const url of ['https://api.deepseek.com/anthropic','https://api.deepseek.com/anthropic/']) {
+    const resolved=await resolveRunConfig({...input,model:{...input.model,url}}, {},'off',false);
+    expect(resolved.config.model.definition).toMatchObject({api:'anthropic-messages',baseUrl:url});
+    expect(resolved.config.model.definition!.models).toEqual(baseline.config.model.definition!.models);
+    expect(resolved.config.model.maxTokens).toBe(baseline.config.model.maxTokens);
+    expect(resolved.modelCredential).toEqual(baseline.modelCredential);
+  }
+  const other=await resolveRunConfig({...input,model:{...input.model,url:'https://proxy.example.invalid/anthropic'}},{},'off',false);
+  expect(other.config.model.definition!.api).toBe(baseline.config.model.definition!.api);
+});
+
 test('author model requires only url/key/model and rejects manual native limits',()=>{
   const input=agentInput();
   expect(RunConfigSchema.parse(input).model).toEqual(input.model);

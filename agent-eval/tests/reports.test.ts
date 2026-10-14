@@ -99,6 +99,13 @@ test('actual Judge journal and metadata must agree with the recorded public conf
       raw.judgeCalls=[{trialId:trial.trialId,result}];await writeFile(path,JSON.stringify(raw));
     };
     await persist();expect((await readReport(root)).judgeCalls).toHaveLength(1);
+    const nativeModel={catalogRef:'deepseek/deepseek-flash',api:'anthropic-messages',contextWindow:1000000,maxTokens:384000,sdkVersion:'0.87.1' as const};
+    report.config.judge.nativeModel=nativeModel;await writeFile(join(root,'snapshot.json'),JSON.stringify(report.snapshot));
+    await expect(readReport(root)).rejects.toThrow('judge_configuration_mismatch');
+    Object.assign(result.metadata,{nativeModel});await persist();
+    expect((await readReport(root)).judgeCalls[0]!.result.metadata.nativeModel).toEqual(nativeModel);
+    delete report.config.judge.nativeModel;Reflect.deleteProperty(result.metadata,'nativeModel');
+    await writeFile(join(root,'snapshot.json'),JSON.stringify(report.snapshot));await persist();
     report.config.judge.outputLimit=256;
     await writeFile(join(root,'snapshot.json'),JSON.stringify(report.snapshot));
     Object.assign(result.metadata,{outputLimit:256});await persist();

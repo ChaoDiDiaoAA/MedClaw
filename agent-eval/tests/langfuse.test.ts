@@ -68,9 +68,11 @@ test('multiple semantic scores reference one actual Judge generation', async () 
   const result: JudgeResult = { status: 'completed', results: checks.map(check => ({ checkId: check.id, value: 1, reason: 'supported', evidenceRefs: ['source'] })), error: null, metadata: { baseUrl:'http://127.0.0.1:1/',timeoutMs:30000,model: 'controlled-judge', startedAt: report.createdAt, endedAt: report.createdAt, durationMs: 0, temperature: .8, httpStatus: 200, requestId: 'controlled', usage: { promptTokens: null, completionTokens: null } } };
   const observation=observations(report)[trial.trialId]!;observation.facts.semantic = { answer: 'Synthetic answer', evidenceRefs: ['source'], evidence: { source: 'Synthetic source' } };
   report.scores = await evaluate({ trialId: trial.trialId, caseId: trial.caseId, task: { checks }, gold: { semantic: { rubric: 'Use only source' } }, observation, trialStatus: 'completed', judge: { judge: async () => result }, onJudgeResult: result => { report.judgeCalls.push({ trialId: trial.trialId, result }); } });
+  result.metadata.nativeModel={catalogRef:'deepseek/deepseek-flash',api:'anthropic-messages',contextWindow:1000000,maxTokens:384000,sdkVersion:'0.87.1'};
   const envelope = mapReport(report,{[trial.trialId]:observation}), spans = envelope.events.filter(event => event.kind === 'span').map(event => (event.payload.resourceSpans as any)[0].scopeSpans[0].spans[0]);
   const judge = spans.filter(span => span.name === 'judge/answer-quality');
   expect(judge).toHaveLength(1); expect(spans.filter(span => span.name === 'scoring/answer.faithful')).toHaveLength(2);
+  expect(JSON.parse(judge[0].attributes.find((attribute:any)=>attribute.key==='medclaw.nativeModel').value.stringValue)).toEqual(result.metadata.nativeModel);
   expect(envelope.events.filter(event => event.kind === 'score')).toHaveLength(2);
   for (const span of spans.filter(span => span.name === 'scoring/answer.faithful')) expect(span.attributes.find((attribute: any) => attribute.key === 'medclaw.judgeObservationId').value.stringValue).toBe(judge[0].spanId);
 });

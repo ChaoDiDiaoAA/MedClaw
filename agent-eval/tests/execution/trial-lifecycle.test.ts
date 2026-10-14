@@ -10,6 +10,35 @@ import { createDatasetFixture } from '../datasets/fixture.ts';
 import { loadDataset } from '../../src/datasets.ts';
 import { reportFixture } from '../report-fixture.ts';
 import { hashValue } from '../../src/adapters/product-checksums.ts';
+import {ActionExecutor} from '../../src/adapters/actions.ts';
+import {within} from '../../src/adapters/files.ts';
+
+for(const scenario of [
+  {name:'intent timeout',status:'failed',error:{code:'intent_timeout',category:'provider'},expected:'infra_error',reason:'intent_timeout'},
+  {name:'recovered final Run',status:'completed',error:null,expected:'completed',reason:null},
+  {name:'intentional cancellation',status:'cancelled',error:null,expected:'completed',reason:null},
+] as const)test(`Trial respects ${scenario.name} instead of assuming terminal means success`,async()=>{
+  const root=await mkdtemp(join(tmpdir(),'mc-terminal-provider-'));
+  const datasetRoot=join(root,'dataset'),trialRoot=join(root,'trial');await createDatasetFixture(datasetRoot);
+  const task=(await loadDataset(datasetRoot)).cases[0]!;task.setup=[{action:'read_control'}];task.steps=[];
+  const product=new ProductAdapter({dataRoot:join(root,'product'),tracePath:join(trialRoot,'events.jsonl')});
+  product.instanceId='controlled-instance';Object.assign(product,{paths:{dataRoot:product.options.dataRoot}});
+  const prepare=spyOn(instance,'prepareInstance').mockResolvedValue(product);
+  const execute=spyOn(ActionExecutor.prototype,'execute').mockImplementation(async function(this:ActionExecutor){this.lastSendAlias='final';this.aliases.runs.set('final',2);return null;});
+  const collect=spyOn(observe,'collectObservation').mockResolvedValue({executionId:'engineering',trialId:'terminal',instanceId:product.instanceId,observedFrom:'2026-10-14T00:00:00.000Z',observedUntil:'2026-10-14T00:00:00.000Z',identityChecks:[],missing:[],facts:{runs:[{id:1,status:'failed',error:{code:'provider_request_failed'}},{id:2,status:scenario.status,error:scenario.error}]}});
+  const stop=spyOn(product,'stop').mockResolvedValue({stopped:true,closed:true,processExited:true,residuals:[]});
+  let workRoot:string|undefined;
+  try {
+    const result=await runTrial({executionId:'engineering',trialId:'terminal',caseId:task.id,repetition:1,case:task,datasetRoot,config:reportFixture().config,trialRoot});
+    const saved=JSON.parse(await readFile(join(trialRoot,'trial.json'),'utf8'));workRoot=saved.lifecycle.workRoot;
+    expect({status:result.status,reason:result.reason}).toEqual({status:scenario.expected,reason:scenario.reason});
+    expect(saved.status).toBe(scenario.expected);
+  } finally {
+    prepare.mockRestore();execute.mockRestore();collect.mockRestore();stop.mockRestore();
+    if(workRoot){within(tmpdir(),workRoot);await rm(workRoot,{recursive:true,force:true});}
+    await rm(root,{recursive:true,force:true});
+  }
+});
 
 test('Trial retains an acknowledged shutdown with unconfirmed process exit as infrastructure failure', async () => {
   const root = await mkdtemp(join(tmpdir(), 'medclaw-trial-stop-proof-'));

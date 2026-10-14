@@ -83,6 +83,7 @@ export function mapReport(report: EvaluationReport, observations:Record<string,V
         'langfuse.observation.usage_details': { ...(metadata.usage.promptTokens !== null ? { input: metadata.usage.promptTokens } : {}), ...(metadata.usage.completionTokens !== null ? { output: metadata.usage.completionTokens } : {}) },
         'medclaw.status': call.result.status, 'medclaw.httpStatus': metadata.httpStatus,
         'medclaw.requestId': metadata.requestId,
+        ...metadata.nativeModel?{'medclaw.nativeModel':metadata.nativeModel}:{},
         ...metadata.outputLimit!==undefined?{'medclaw.outputLimit':metadata.outputLimit}:{},
         'medclaw.temperature': metadata.temperature, 'medclaw.usageSource': 'independent_judge_response', 'medclaw.costSource': 'unknown',
       });

@@ -1,4 +1,6 @@
 # Resource versions hash their actual bytes; keep checkout bytes stable.
 resources/** text eol=lf
+# Dataset review compares the actual fixture text across platforms.
+agent-eval/src/fixtures/** text eol=lf
 # Unified-diff context markers contain significant trailing spaces.
 patches/*.patch text eol=lf -whitespace

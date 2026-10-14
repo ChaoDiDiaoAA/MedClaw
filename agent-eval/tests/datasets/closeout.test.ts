@@ -1,5 +1,33 @@
 import {test,expect} from 'bun:test';
 import {loadDataset,loadSnapshot} from '../../src/datasets.ts';
+import {loadFixtureFiles} from '../../src/dataset-fixtures.ts';
+import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
+import {join,resolve} from 'node:path';
+import {tmpdir} from 'node:os';
+
+for(const autoCRLF of ['true','false'])test(`Git checkout keeps reviewed fixture bytes with core.autocrlf=${autoCRLF}`,async()=>{
+  const root=await mkdtemp(join(tmpdir(),'mc-fixture-checkout-'));
+  try {
+    const git=(...args:string[])=>{
+      const result=Bun.spawnSync(['git','-c',`core.autocrlf=${autoCRLF}`,'-c','core.safecrlf=false','-C',root,...args],{stdout:'pipe',stderr:'pipe'});
+      if(result.exitCode!==0)throw new Error(new TextDecoder().decode(result.stderr));
+    };
+    const review=JSON.parse(await readFile(join(import.meta.dir,'../../src/datasets/medclaw-agent-v1.review.json'),'utf8'));
+    const {compiled,criteria,authoring,...recorded}=review.verifiedData;
+    const fixtures=await loadFixtureFiles(),directory=join(root,'agent-eval/src/fixtures');
+    await mkdir(directory,{recursive:true});
+    await writeFile(join(root,'.gitattributes'),await readFile(resolve(import.meta.dir,'../../../.gitattributes')));
+    for(const name of Object.keys(fixtures))await writeFile(join(directory,name),await readFile(join(import.meta.dir,'../../src/fixtures',name)));
+    git('init','--quiet');git('add','--force','.gitattributes','agent-eval/src/fixtures');git('checkout-index','--force','--all');
+    const checkedOut=await loadFixtureFiles(directory);
+    for(const [name,content] of Object.entries(checkedOut)) {
+      expect(content).not.toContain('\r\n');
+      expect(content===recorded.fixtures[name]).toBe(true);
+    }
+    const dataset=loadSnapshot({contract:'medclaw-dataset-snapshot/v1',...recorded,fixtures:checkedOut,review});
+    expect(dataset.cases).toHaveLength(50);expect(dataset.manifest.smoke).toHaveLength(10);
+  } finally {await rm(root,{recursive:true,force:true});}
+},30000);
 
 test('verified review binds the time basis and Smoke selection as actual content',async()=>{
   const dataset=await loadDataset();

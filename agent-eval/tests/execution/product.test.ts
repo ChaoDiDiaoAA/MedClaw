@@ -73,6 +73,27 @@ test('explicit internal fixture mode does not grant model or native tool executi
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('provider HTTP failure uses the selected Anthropic route and is an infrastructure error',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'mc-anthropic-provider-error-')),requests:{path:string;key:string|null}[]=[];
+  const server=Bun.serve({hostname:'127.0.0.1',port:0,fetch(request){
+    requests.push({path:new URL(request.url).pathname,key:request.headers.get('x-api-key')});
+    return Response.json({error:{type:'not_found_error',message:'ENGINEERING controlled provider failure'}},{status:404});
+  }});
+  try {
+    const {resolveRunConfig}=await import('../../src/scoring/judges/client.ts');
+    const {config:selected,modelCredential}=await resolveRunConfig({...config(),model:{url:'https://api.deepseek.com/anthropic',key:'ENGINEERING-LOCAL-KEY',model:'deepseek-flash'}},{},'off',false);
+    selected.model.definition!.baseUrl=server.url.href+'anthropic';
+    const task=controlledCase();task.setup=[{action:'new_session',alias:'A'}];
+    task.steps=[{id:'send',trigger:'ready',action:{action:'send',sessionAlias:'A',alias:'first',prompt:'ENGINEERING provider error',referenceDate:'2026-10-12'},timeoutMs:15000},
+      {id:'settled',trigger:'run_settled',targetAlias:'first',action:{action:'read_messages',sessionAlias:'A'},timeoutMs:15000}];
+    const result=await runTrial({executionId:'engineering-provider',trialId:'provider-failed',caseId:task.id,repetition:1,case:task,datasetRoot:root,config:selected,modelCredential,trialRoot:join(root,'trial')});
+    expect({status:result.status,reason:result.reason,stopped:result.stopped,closed:result.closed}).toEqual({status:'infra_error',reason:'provider_request_failed',stopped:true,closed:true});
+    expect(requests).toEqual([{path:'/anthropic/v1/messages',key:'ENGINEERING-LOCAL-KEY'}]);
+    expect(result.observation?.facts.runs).toMatchObject([{status:'failed',error:{code:'provider_request_failed'}}]);
+    expect(JSON.parse(await readFile(join(root,'trial/trial.json'),'utf8'))).toMatchObject({status:'infra_error',reason:'provider_request_failed'});
+  } finally {server.stop(true);await rm(root,{recursive:true,force:true});}
+},30000);
+
 test('local Trial sends two real SDK turns and records a tool through a loopback model only', async () => {
   const root=await mkdtemp(join(tmpdir(),'medclaw-eval-sdk-turns-')),requests:unknown[]=[];
   const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){

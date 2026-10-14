@@ -4,7 +4,9 @@ import { record } from '../rules.ts';
 import { ANSWER_QUALITY_RUBRIC } from './answer-quality.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { JudgeConfigurationSchema,RunConfigSchema,type AgentModelCredential,type ResolvedRunConfig,type JudgeConfiguration } from '../../types.ts';
-import { resolveAgentModel } from '../../adapters/model.ts';
+import { resolveAgentModel,resolveEvaluationModel } from '../../adapters/model.ts';
+import { textOf,SDK_VERSION } from '../../../../packages/runtime-pi/src/model-runtime.ts';
+import { safeUsage } from '../../../../packages/contracts/src/run.ts';
 
 export function assertJudgeMatches(expected:JudgeConfiguration|undefined,actual:JudgeConfiguration|undefined) {
   if(!expected||!actual||!isDeepStrictEqual(JudgeConfigurationSchema.parse(expected),JudgeConfigurationSchema.parse(actual)))throw new Error('judge_configuration_mismatch');
@@ -12,6 +14,7 @@ export function assertJudgeMatches(expected:JudgeConfiguration|undefined,actual:
 
 export function assertJudgeCallMatches(expected:JudgeConfiguration|undefined,metadata:JudgeMetadata) {
   assertJudgeMatches(expected,expected&&{baseUrl:metadata.baseUrl,model:metadata.model,timeoutMs:metadata.timeoutMs,temperature:metadata.temperature,systemRubric:expected.systemRubric,
+    ...metadata.nativeModel?{nativeModel:metadata.nativeModel}:{},
     ...Object.hasOwn(metadata,'outputLimit')?{outputLimit:metadata.outputLimit}:{}});
 }
 
@@ -39,8 +42,23 @@ export async function resolveRunConfig(raw: unknown, env: Record<string, string 
   const input = RunConfigSchema.parse(raw);
   const judgeConfig = readJudgeConfig(env, mode, selected);
   const {model,modelCredential}=await resolveAgentModel(input.model);
-  const config = {...input,model,...judgeConfig?{judge:JudgeConfigurationSchema.parse({baseUrl:judgeConfig.baseUrl,model:judgeConfig.model,timeoutMs:judgeConfig.timeoutMs})}:{}};
+  const judge=judgeConfig?await resolveJudgeModel(judgeConfig):undefined;
+  const config = {...input,model,...judge?{judge:judge.configuration}:{}};
   return {config,modelCredential,judgeConfig};
+}
+async function resolveJudgeModel(config:JudgeConfig) {
+  const resolved=await resolveEvaluationModel({url:config.baseUrl,model:config.model}).catch(error=>{
+    if(error instanceof Error&&error.message==='agent_model_not_found_or_ambiguous')throw new Error('judge_model_not_found_or_ambiguous');
+    throw error;
+  });
+  const {model,catalogRef,runtime}=resolved;
+  runtime.native.registerProvider('medclaw-judge',{name:'Evaluation Judge',baseUrl:model.baseUrl,api:model.api,models:[{...model}]});
+  const refresh=await runtime.native.refresh({allowNetwork:false});
+  const registered=runtime.native.getModel('medclaw-judge',model.id);
+  if(refresh.aborted||refresh.errors.size||!registered)throw new Error('judge_provider_registration_failed');
+  const configuration=JudgeConfigurationSchema.parse({baseUrl:config.baseUrl,model:config.model,timeoutMs:config.timeoutMs,
+    nativeModel:{catalogRef,api:model.api,contextWindow:model.contextWindow,maxTokens:model.maxTokens,sdkVersion:SDK_VERSION}});
+  return {...resolved,model:registered,configuration};
 }
 const exactKeys = (x: Record<string, any>, keys: string[]) => Object.keys(x).length === keys.length && keys.every(k => Object.hasOwn(x, k));
 function parseResults(content: string, request: JudgeRequest): JudgeResult['results'] {
@@ -62,19 +80,22 @@ function parseResults(content: string, request: JudgeRequest): JudgeResult['resu
 export class JudgeClient implements Judge {
   readonly configuration:JudgeConfiguration;
   private readonly attempted = new Set<string>();
-  constructor(private readonly config: JudgeConfig, private readonly plan: { plannedTrials: number; trialIds?: string[] }) {
+  static async create(config:JudgeConfig,plan:{plannedTrials:number;trialIds?:string[]}) {
     if(!Number.isSafeInteger(plan.plannedTrials)||plan.plannedTrials<0)throw new Error('Invalid Judge request plan');
     if (!config.apiKey.trim() || !config.model.trim() || !Number.isFinite(config.timeoutMs) || config.timeoutMs <= 0 || config.timeoutMs > 30000) throw new Error('Invalid Judge configuration');
     validateUrl(config.baseUrl);
-    this.configuration=Object.freeze(JudgeConfigurationSchema.parse({baseUrl:config.baseUrl,model:config.model,timeoutMs:config.timeoutMs}));
     if (plan.trialIds && (plan.trialIds.length !== plan.plannedTrials || new Set(plan.trialIds).size !== plan.trialIds.length)) throw new Error('Judge plan identities must be unique and complete');
+    return new JudgeClient(config,plan,await resolveJudgeModel(config));
+  }
+  private constructor(private readonly config:JudgeConfig,private readonly plan:{plannedTrials:number;trialIds?:string[]},private readonly resolved:Awaited<ReturnType<typeof resolveJudgeModel>>) {
+    this.configuration=Object.freeze(resolved.configuration);
   }
   async judge(request: JudgeRequest, signal?: AbortSignal): Promise<JudgeResult> {
     if (this.attempted.has(request.trialId)) throw new Error('Judge already attempted for this trial');
     if (this.attempted.size >= this.plan.plannedTrials || this.plan.trialIds && !this.plan.trialIds.includes(request.trialId)) throw new Error('Judge request is outside planned trials');
     this.attempted.add(request.trialId);
     const started = performance.now(), controller = new AbortController();
-    const metadata: JudgeMetadata = { baseUrl:this.configuration.baseUrl,timeoutMs:this.configuration.timeoutMs,model: this.config.model, startedAt: new Date().toISOString(), endedAt: '', durationMs: 0, temperature: .8, httpStatus: null, requestId: null, usage: { promptTokens: null, completionTokens: null } };
+    const metadata: JudgeMetadata = { baseUrl:this.configuration.baseUrl,timeoutMs:this.configuration.timeoutMs,model: this.config.model,nativeModel:this.configuration.nativeModel, startedAt: new Date().toISOString(), endedAt: '', durationMs: 0, temperature: .8, httpStatus: null, requestId: null, usage: { promptTokens: null, completionTokens: null } };
     const cancel = () => controller.abort(new Error('Judge cancelled'));
     const timer = setTimeout(() => controller.abort(new Error('Judge timeout')), this.config.timeoutMs);
     signal?.addEventListener('abort', cancel, { once: true });
@@ -82,20 +103,26 @@ export class JudgeClient implements Judge {
     let results: JudgeResult['results'] = [], error: string | null = null;
     try {
       if (!request.checks.length || new Set(request.checks.map(x => x.checkId)).size !== request.checks.length || request.checks.some(x => !x.rubric.trim() || !x.evidenceRefs.length)) throw new Error('Judge request requires unique checks, recorded rubrics, and evidence');
-      const url = this.config.baseUrl.replace(/\/$/, '') + '/chat/completions';
-      const response = await fetch(url, { method: 'POST', redirect: 'error', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.config.apiKey}` }, body: JSON.stringify({ model: this.config.model, temperature: .8, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: ANSWER_QUALITY_RUBRIC }, { role: 'user', content: JSON.stringify(request) }] }), signal: controller.signal });
-      metadata.httpStatus = response.status;
-      const requestId = response.headers.get('x-request-id');
-      if (requestId?.includes(this.config.apiKey)) throw new Error('Judge response echoed protected credentials');
-      metadata.requestId = requestId?.slice(0, 256) ?? null;
-      if (!response.ok) throw new Error(`Judge HTTP ${response.status}`);
-      const responseText = await response.text();
-      if (responseText.length > 65536 || responseText.includes(this.config.apiKey)) throw new Error('Judge response exceeded limits or echoed protected credentials');
-      const body: unknown = JSON.parse(responseText);
-      if (!record(body) || !Array.isArray(body.choices) || body.choices.length !== 1 || body.choices[0]?.finish_reason !== 'stop' || typeof body.choices[0]?.message?.content !== 'string') throw new Error('Judge response is truncated or malformed');
-      const tokens = (x: unknown) => typeof x === 'number' && Number.isSafeInteger(x) && x >= 0 ? x : null;
-      metadata.usage = { promptTokens: tokens(body.usage?.prompt_tokens), completionTokens: tokens(body.usage?.completion_tokens) };
-      results = parseResults(body.choices[0].message.content, request);
+      controller.signal.throwIfAborted();
+      const message=await this.resolved.runtime.native.completeSimple(this.resolved.model,
+        {systemPrompt:ANSWER_QUALITY_RUBRIC,messages:[{role:'user',content:JSON.stringify(request),timestamp:Date.now()}]},
+        {apiKey:this.config.apiKey,temperature:.8,signal:controller.signal,timeoutMs:this.config.timeoutMs,maxRetries:0,
+          fetch:Object.assign(async (input:Parameters<typeof fetch>[0],init?:Parameters<typeof fetch>[1])=>{
+            const response=await fetch(input,{...init,redirect:'error'});
+            metadata.httpStatus=response.status;
+            const requestId=response.headers.get('x-request-id')??response.headers.get('request-id');
+            if(requestId?.includes(this.config.apiKey))throw new Error('Judge response echoed protected credentials');
+            metadata.requestId=requestId?.slice(0,256)??null;
+            return response;
+          },{preconnect:fetch.preconnect})});
+      if(JSON.stringify(message).includes(this.config.apiKey))throw new Error('Judge response echoed protected credentials');
+      if(metadata.httpStatus!==null&&(metadata.httpStatus<200||metadata.httpStatus>=300))throw new Error(`Judge HTTP ${metadata.httpStatus}`);
+      if(message.stopReason!=='stop'||message.content.some(part=>part.type==='toolCall'))throw new Error('Judge response is truncated or malformed');
+      const usage=safeUsage(message.usage,false);
+      metadata.usage={promptTokens:usage.inputTokens,completionTokens:usage.outputTokens};
+      const parsed=parseResults(textOf(message),request);
+      if(JSON.stringify(parsed).includes(this.config.apiKey))throw new Error('Judge response echoed protected credentials');
+      results=parsed;
     } catch (cause) {
       // Provider bodies and exception messages may contain credentials; retain only controlled categories.
       const message = cause instanceof Error ? cause.message : '';

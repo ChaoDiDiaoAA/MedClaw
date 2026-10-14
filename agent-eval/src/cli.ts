@@ -1,5 +1,7 @@
 import { readFile } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { resolve, join, relative } from 'node:path';
+import { ZodError } from 'zod';
 import { ExecutionIdSchema } from './types.ts';
 import { loadDataset, datasetCoverage, auditLineage } from './datasets.ts';
 import { doctor } from './doctor.ts';
@@ -13,6 +15,32 @@ import { JudgeClient, resolveRunConfig } from './scoring/judges/client.ts';
 
 const root = resolve(import.meta.dir, '../..'), runsRoot = join(root, 'agent-eval/runs');
 const processEvents: NodeJS.EventEmitter = process;
+export function formatCliError(error: unknown): {error:string;reason?:string;operation?:string;location?:string;issues?:{path:string;code:string}[]} {
+  const message=error instanceof Error?error.message:'';
+  if(message==='dataset_invalid:review_content_changed'||message==='dataset_invalid:review_criteria_changed') {
+    return {error:'dataset_invalid',reason:message.slice('dataset_invalid:'.length)};
+  }
+  if(/^[a-z][a-z0-9_]*$/.test(message))return {error:message};
+  const diagnostic:{location?:string}={};
+  // Only existing evaluation source frames are public; never print the raw stack or exception text.
+  for(const line of (error instanceof Error?error.stack??'':'').replaceAll('\\','/').split('\n').slice(1)) {
+    const frame=line.match(/((?:[A-Za-z]:)?\/[^()\r\n]+\.ts):(\d{1,7}):(\d{1,7})\)?$/);
+    if(!frame)continue;
+    const path=relative(root,frame[1]!).replaceAll('\\','/');
+    if(/^agent-eval\/src\/[A-Za-z0-9_/-]+\.ts$/.test(path)&&existsSync(resolve(root,path))) {
+      diagnostic.location=`${path}:${frame[2]}:${frame[3]}`;break;
+    }
+  }
+  if(error instanceof ZodError) {
+    const fields=new Set(['version','environment','model','url','key','provider','maxTokens','definition','models','id','intent','baseUrl','judge','timeoutMs','temperature','systemRubric','policy','retention','comparison','baselineExecutionId','factors']);
+    return {error:'validation_error',issues:error.issues.map(issue=>({path:issue.path.map(part=>typeof part==='number'||typeof part==='string'&&fields.has(part)?part:'[field]').join('.'),code:issue.code})),...diagnostic};
+  }
+  if(error instanceof Error&&'code' in error&&typeof error.code==='string'&&['ENOENT','EACCES','EPERM','EEXIST','ENOTDIR','EISDIR','EINVAL','ENAMETOOLONG','ENOSPC','EMFILE','EBUSY','EROFS'].includes(error.code)) {
+    const operation='syscall' in error&&typeof error.syscall==='string'&&['open','mkdir','read','write','unlink','stat','lstat','scandir','rename'].includes(error.syscall)?error.syscall:undefined;
+    return {error:'filesystem_error',reason:error.code,...operation?{operation}:{},...diagnostic};
+  }
+  return {error:'invalid_request_or_facility_error',...diagnostic};
+}
 const commands: Record<string, string[]> = {
   doctor: ['dataset'],
   'dataset validate': ['dataset'], 'dataset audit-lineage': ['dataset'],
@@ -85,7 +113,7 @@ export async function main(args: string[], env:Record<string,string|undefined> =
     const judged=planTrials(selected,repeat).filter(trial=>dataset.cases.find(task=>task.id===trial.caseId)!.expected.checks.some(check=>check.kind==='llm-judge'));
     const count = judged.length;
     const {config,modelCredential,judgeConfig} = await resolveRunConfig(input, env, judgeMode, count>0);
-    const judge = judgeConfig ? new JudgeClient(judgeConfig, { plannedTrials: count,trialIds:judged.map(trial=>trial.trialId) }) : undefined;
+    const judge = judgeConfig ? await JudgeClient.create(judgeConfig, { plannedTrials: count,trialIds:judged.map(trial=>trial.trialId) }) : undefined;
     const controller = new AbortController(), stop = (): void => { controller.abort(); }; processEvents.on('SIGINT', stop); processEvents.on('SIGTERM', stop);
     try {
       const report = await runExperiment({ datasetRoot, runsRoot, executionId: required('execution-id'), selection, repeat, config, modelCredential, judgeMode, judge, signal: controller.signal, onProgress: trial => console.error(JSON.stringify({ trialId: trial.trialId, status: trial.status, reason: trial.reason })) });
@@ -104,5 +132,5 @@ export async function main(args: string[], env:Record<string,string|undefined> =
 }
 if (import.meta.main) {
   try { process.exitCode = await main(Bun.argv.slice(2)); }
-  catch (error) { console.error(JSON.stringify({ error: error instanceof Error && /^[a-z][a-z0-9_]*$/.test(error.message) ? error.message : 'invalid_request_or_facility_error' })); process.exitCode = 1; }
+  catch (error) { console.error(JSON.stringify(formatCliError(error))); process.exitCode = 1; }
 }

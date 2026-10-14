@@ -7,6 +7,7 @@ import { CustomBaseUrlSchema,CustomProviderDefinitionSchema } from '../../packag
 export const JudgeConfigurationSchema=z.strictObject({
   baseUrl:z.url().refine(value=>{const url=new URL(value);return ['http:','https:'].includes(url.protocol)&&!url.username&&!url.password&&!url.search&&!url.hash&&(url.protocol==='https:'||['127.0.0.1','localhost','[::1]'].includes(url.hostname));}).transform(value=>new URL(value).href),
   model:z.string().trim().min(1),timeoutMs:z.number().int().positive().max(30000).default(30000),
+  nativeModel:z.strictObject({catalogRef:z.string().min(1),api:z.string().min(1),contextWindow:z.number().int().positive(),maxTokens:z.number().int().positive(),sdkVersion:z.literal('0.87.1')}).optional(),
   // Historical archives retain this field; new runtime configurations omit it.
   outputLimit:z.literal(256).optional(),temperature:z.literal(.8).default(.8),
   systemRubric:z.literal(ANSWER_QUALITY_RUBRIC).default(ANSWER_QUALITY_RUBRIC),

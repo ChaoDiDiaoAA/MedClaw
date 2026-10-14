@@ -1,6 +1,7 @@
 import {test,expect} from 'bun:test';
 import {mkdtemp,mkdir,writeFile,readFile,readdir,rm} from 'node:fs/promises';
-import {join} from 'node:path';
+import {join,resolve} from 'node:path';
+import {pathToFileURL} from 'node:url';
 import {tmpdir} from 'node:os';
 import {runConfigFixture,reportFixture,saveReportFixture} from './report-fixture.ts';
 
@@ -11,7 +12,35 @@ async function configuredRoot(environment:string) {
   await writeFile(join(root,'agent-eval/configs/environment'),environment);
   return root;
 }
-const judgeEnvironment='# 中文注释\nMEDCLAW_JUDGE_BASE_URL="https://judge.example.invalid/v1"\nMEDCLAW_JUDGE_MODEL="independent judge"\nMEDCLAW_JUDGE_API_KEY=local-judge-key\nMEDCLAW_EVAL_BACKEND=langfuse\n';
+const judgeEnvironment='# 中文注释\nMEDCLAW_JUDGE_BASE_URL="https://judge.example.invalid/v1"\nMEDCLAW_JUDGE_MODEL="deepseek/deepseek-flash"\nMEDCLAW_JUDGE_API_KEY=local-judge-key\nMEDCLAW_EVAL_BACKEND=langfuse\n';
+
+for(const mode of ['smoke','full'])test(`${mode} execution continuation reports a controlled startup error after a successful preflight`,async()=>{
+  const root=await mkdtemp(join(tmpdir(),'mc-preset-startup-'));
+  try {
+    const preload=join(root,'preload.ts'),runnerUrl=pathToFileURL(resolve(import.meta.dir,'../src/execution/runner.ts')).href;
+    await writeFile(preload,`
+import {mock} from 'bun:test';
+import * as fs from 'node:fs/promises';
+const readFile=fs.readFile;
+mock.module('node:fs/promises',()=>({...fs,readFile:(path,...args)=>{
+  const name=String(path).replaceAll('\\\\','/');
+  if(name.endsWith('/agent-eval/configs/environment'))return Promise.resolve(${JSON.stringify(judgeEnvironment)});
+  if(name.endsWith('/agent-eval/configs/agent.json'))return Promise.resolve(${JSON.stringify(JSON.stringify(runConfigFixture()))});
+  return readFile(path,...args);
+},mkdir:()=>{throw new Error('unexpected_archive_write');}}));
+const runner=await import(${JSON.stringify(runnerUrl)});
+mock.module(${JSON.stringify(runnerUrl)},()=>({...runner,runExperiment:async()=>{throw Object.assign(new Error('local-private-key from filesystem'),{code:'EACCES',syscall:'mkdir',path:'C:/private/local-private-key'});}}));
+globalThis.fetch=()=>{throw new Error('unexpected_network_call');};
+Bun.spawn=()=>{throw new Error('unexpected_host_start');};
+`);
+    const child=Bun.spawnSync([process.execPath,'--no-env-file','--preload',preload,resolve(import.meta.dir,'../src/presets.ts'),mode],{cwd:root,stdout:'pipe',stderr:'pipe'});
+    const stdout=new TextDecoder().decode(child.stdout),stderr=new TextDecoder().decode(child.stderr);
+    expect(child.exitCode).toBe(1);
+    expect(JSON.parse(stdout)).toMatchObject({mode,check:false,ready:true,plannedTrials:mode==='smoke'?10:150,blockers:[]});
+    expect(JSON.parse(stderr)).toMatchObject({error:'filesystem_error',reason:'EACCES',operation:'mkdir',location:expect.stringMatching(/^agent-eval\/src\/cli\.ts:\d+:\d+$/)});
+    expect(stderr+stdout).not.toContain('local-private-key');expect(stderr+stdout).not.toContain(runConfigFixture().model.key);expect(stderr+stdout).not.toContain('local-judge-key');
+  } finally {await rm(root,{recursive:true,force:true});}
+},30000);
 
 test('presets reject missing, duplicate and cross-mode arguments',async()=>{
   const {parsePreset}=await import('../src/presets.ts');
@@ -26,7 +55,7 @@ test('fixed environment parsing handles comments and quotes without Shell fallba
   const old=process.env.MEDCLAW_JUDGE_API_KEY;
   process.env.MEDCLAW_JUDGE_API_KEY='shell-must-not-win';
   try {
-    expect(await readPresetEnvironment(root)).toMatchObject({MEDCLAW_JUDGE_MODEL:'independent judge',MEDCLAW_JUDGE_API_KEY:'local-judge-key'});
+    expect(await readPresetEnvironment(root)).toMatchObject({MEDCLAW_JUDGE_MODEL:'deepseek/deepseek-flash',MEDCLAW_JUDGE_API_KEY:'local-judge-key'});
     expect(process.env.MEDCLAW_JUDGE_API_KEY).toBe('shell-must-not-win');
     await writeFile(join(root,'agent-eval/configs/environment'),judgeEnvironment.replace('MEDCLAW_JUDGE_API_KEY=local-judge-key',''));
     await expect(mainPreset(['smoke','--check'],root,()=>{})).rejects.toThrow('Partial');

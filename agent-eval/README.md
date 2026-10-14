@@ -1,5 +1,17 @@
 # MedClaw Agent 评测 v1
 
+只读预检与故障定位：`bun run eval:smoke -- --check` 和 `bun run eval:full -- --check` 检查当前文件、配置和计划。共享 fixtures 使用 UTF-8 文本，由 `.gitattributes` 固定 LF 换行，Windows 检出也必须保持一致。入口以 `error=dataset_invalid` 和固定 `reason` 区分 `review_content_changed`（实际材料或数据与核验记录不一致）及 `review_criteria_changed`（判据与核验记录不一致），均返回非零。先检查 `git ls-files --eol agent-eval/src/fixtures`；确认只是 CRLF/LF 差异时恢复文件换行，真实内容变化则重新独立核验。运行时保持原始内容核对，不自动改写文件或审核状态。本次修复与实际验证见 [05 附录 B.14](../docs/evals/05_MedClaw_Agent评测分阶段实施与操作手册_v1.md#eval-smoke-fixture-lf-v1)。
+
+B.14 换行修复验证：typecheck 通过，评测工程测试 268 通过、0 失败；Python 普通与 `-O` 各通过 67,494 项检查。Smoke/Full 只读预检及不同工作目录加载均退出 0，分别生成 10/150 个计划 Trial；没有执行真实评测或平台上传。
+
+`ready=true` 表示只读预检通过，执行阶段仍可能失败。启动异常会安全输出 `validation_error` 的字段路径及类型、`filesystem_error` 的固定错误码及操作，或 `location` 中现有评测源文件的位置；不输出配置值、私有文件路径、异常原文或完整堆栈。若预检后失败，请保留这条 JSON，按具体错误继续定位，不能将预检通过当作实际执行通过。
+
+2026-10-14 用户已执行真实 Smoke `smoke-20261013T165746254Z-209638e0`，原始结果为 0 PASS、4 FAIL、6 UNJUDGEABLE，Judge 实际调用 0 次。采证显示 9 次主模型 HTTP 404、3 次意图识别超时；原报告保留。已修正主模型协议及 Judge SDK 接入，当前修复仅用本地受控服务验证，尚未真实复测；下方各历史批次的 NOT_RUN 状态只适用于当时。
+
+本次 SDK 接入修复的最终工程验证为 283 通过、0 失败，类型检查、Python 普通/`-O`、数据引用与 Smoke/Full 只读预检均通过，实际结果见 05 附录 B.16。原报告独立读回及 352 个历史归档文件保持不变；3 次意图超时的根因未关闭。
+
+B.15 诊断补齐验证：typecheck 通过，完整评测工程测试 274 通过、0 失败；覆盖正常执行入口的受控启动失败，以及取消状态下原生 Runner 的 10 题归档与读回。该次用户实际启动异常尚未复现，待原窗口的新错误 JSON 确认根因。
+
 > 终端 E2E 修复结果见 [05 附录 B.13](../docs/evals/05_MedClaw_Agent评测分阶段实施与操作手册_v1.md#e2e-report-diagnostics-v1)：最终 18 个文件、200 项全部通过，0 失败、0 跳过，退出 0，报告完整。已修复带颜色汇总的解析、报告目录与保存、P11 子进程汇总误判，并补齐 Host 失败诊断。工程原始日志与汇总保存在 `test-results/.runs/<run-id>/`；最新汇总为 `test-results/e2e-results.json`。用户原 199／1、首次修复验证 198／2 和中断记录均保留，Host 原偶发故障根因仍未确认，生产状态机未改。
 
 > 2026-10-13 本次实施规则：本地 Smoke 为 10×1，Full 为 50×3；两者直接执行并保存当次快照，上传已有报告使用独立命令。配置不要求人工就绪声明或手填源码清单，源码由控制器自动记录。Judge 校准可独立执行，不是运行前提。本批只进行受控工程验证，真实 Agent/Judge、Smoke/Full 与平台上传仍为 NOT_RUN。数据与本地执行链交付见 05 附录 B.11；默认终端 E2E 入口及验证见 B.12。
@@ -16,6 +28,10 @@ bun run eval:upload -- --execution-id EXECUTION_ID
 快捷命令按入口文件位置显式读取 `agent-eval/configs/agent.json` 与 `configs/environment`，以 `node:util.parseEnv` 解析中文注释、引号和空行。受管理变量以文件为准，不由同名 Shell 值补齐/覆盖，不修改全局环境。主模型仍只填写 url/key/model，Judge 仅填写 BASE_URL/MODEL/API_KEY 三项；上传仅读取平台配置和指定归档。旧显式 CLI 保留，不增加任意 .env 自动加载；密钥不进入 Agent、快照或日志。
 
 Judge 不受确定性高低分触发。独立 MEDCLAW_JUDGE_*，初始温度 0.8、超时 30 秒；每个适用 Trial 最多一次，不自动重试、不切模型、不继承 Agent 密钥。不设置人为输出 Token 上限或整次输出预算，沿用服务端和模型限制。请求数和 Trial 身份仍按计划校验；Agent、意图、压缩、子执行和 Judge 的实际用量分别记录，未知值不填零，不能推算固定费用上界。Case.maxToolCalls、资源预算和采证分页限制继续保留。
+
+Judge 通过 Pi SDK 0.87.1 的独立 Provider 调用，和主模型共用离线原生模型解析；不再手工拼接 `/chat/completions`。URL 与模型原生协议匹配，官方 DeepSeek `/anthropic` 使用 Messages 协议。环境仍只有三项配置，不填写额外 provider 或 Token 限制。SDK 在协议需要时自动发送原生模型上限，应用不设置 `maxTokens`；这是原生能力，不是已删除的 256 Token 或总输出预算。`snapshot.config.judge.nativeModel` 与调用元数据记录目录引用、API、原生输入/输出能力和 SDK 版本，Key 仅传独立 Judge。旧归档不补填这些字段，新旧配置差异仍被比较识别。
+
+DeepSeek 官方仍接受旧名 `deepseek-v4-flash` 与 `deepseek-v4-flash-vision-exp`，实际由 Flash 服务。本项目仅对官方域名按这项已公布映射读取 `deepseek/deepseek-flash` 的原生能力，保留配置和请求中的旧名；不会对任意未知模型或第三方代理猜测映射。[官方模型说明](https://api-docs.deepseek.com/quick_start/pricing/)、[Anthropic 接口说明](https://api-docs.deepseek.com/guides/anthropic_api/)。
 
 Smoke 与 Full 直接从当前制作来源加载，并在执行前保存当次 snapshot.json；Full 首次即可运行，不要求历史 Smoke 成绩或 Judge 校准。Baseline 是用户选择的一次本地执行报告，失败和未运行成员也保留。配置、依赖、数据引用和实际协议继续检查；校准是可选独立工具。
 
@@ -100,7 +116,7 @@ agent-eval/
 
 snapshot 保存实际 Case、Gold、sourceReferences、fixtures、产品资源正文、审核、配置、编译checks/Gold/Rubric和源代码内容；report 合并计划、Trial 状态、分数和汇总，引用完整采证。Trial 文件合并所有权、隔离、启动、停止及清理证明。产物使用相对路径和实际内容核对，读取归档只读记录JSON，不执行TS，不由当前编译器重算或覆盖旧规则。校准采用同样的 snapshot/report/evidence 模式。可选校准使用相同归档模式。
 
-每个 Trial 都保存 `events.jsonl`，未启动时为空；读回拒绝缺少日志、无效记录或 Judge 调用与日志不一致的归档。Judge 只在 `configs/environment` 填写 `MEDCLAW_JUDGE_BASE_URL`、`MEDCLAW_JUDGE_MODEL` 和 `MEDCLAW_JUDGE_API_KEY`，快捷入口显式读取该文件并以文件值为准，不用同名Shell值补齐/覆盖；旧低层CLI仍显式接收调用环境。`agent.json`、示例及其他 `--config` 输入不含 `judge`，出现该字段会被拒绝。运行与记录从这三项环境变量自动生成 `snapshot.config.judge`，只保存端点、模型、超时、温度和系统 Rubric，不保存 API Key。校准、Smoke、记录、Full 和比较继续核对实际公开配置；读取旧归档使用归档中的配置，不依赖当前环境变量。
+每个 Trial 都保存 `events.jsonl`，未启动时为空；读回拒绝缺少日志、无效记录或 Judge 调用与日志不一致的归档。Judge 只在 `configs/environment` 填写 `MEDCLAW_JUDGE_BASE_URL`、`MEDCLAW_JUDGE_MODEL` 和 `MEDCLAW_JUDGE_API_KEY`，快捷入口显式读取该文件并以文件值为准，不用同名Shell值补齐/覆盖；旧低层CLI仍显式接收调用环境。`agent.json`、示例及其他 `--config` 输入不含 `judge`，出现该字段会被拒绝。运行与记录从这三项环境变量自动生成 `snapshot.config.judge`，保存端点、模型、超时、温度、系统 Rubric 和 SDK 原生能力 nativeModel，不保存 API Key。校准、Smoke、记录、Full 和比较继续核对实际公开配置；读取旧归档使用归档中的配置，不依赖当前环境变量。
 
 被测主模型独立配置在 `configs/agent.json`，`model` 只接受 `url`、`key`、`model` 三项。`url` 填与模型原生 API 协议兼容的服务地址；`model` 精确匹配 Pi SDK 0.87.1 的原生模型目录，支持唯一的模型 ID，有同名项时用 `provider/modelId` 消除歧义（例如 `openai/gpt-4o-mini`，实际请求仍使用 `gpt-4o-mini`）。输入 contextWindow 和输出 maxTokens 均由原生目录解析，不填写 provider、maxTokens 或 contextWindow，不另设评测输出上限；目录缺失或歧义在预检拒绝，不猜测能力。运行时通过产品已有自定义 Provider 入口装载公开端点和原生能力，通过私有凭据通道只提供对应 Provider 的 API Key。快照只保存解析后的公开配置和原生上限；`agent.json` 含密钥，已加入 Git 忽略，不复制到报告或 Trial 工作区。本地原生工具使用当前 Windows 账户权限。Runner 创建独立临时工作区，只向 Host 提供必要环境与公开材料，不把 Gold、Hint、未来输入、审核和 Judge/Langfuse 密钥作为 Agent 输入。独立目录不构成系统权限沙箱；采证核对实际泄漏、所有权、停止和保存，不生成 OS 隔离通过结论。
 

@@ -7,11 +7,12 @@ import {loadDataset} from './datasets.ts';
 import {resolveRunConfig} from './scoring/judges/client.ts';
 import {planTrials} from './execution/runner.ts';
 import {runBlockers,sourceInventory} from './doctor.ts';
-import {main} from './cli.ts';
+import {main,formatCliError} from './cli.ts';
 import {readReport} from './reports/write.ts';
 import {exportReport,inspectExport,platformConfig} from './langfuse/export.ts';
 
 const projectRoot=resolve(import.meta.dir,'../..');
+const processEvents:NodeJS.EventEmitter=process;
 type Preset={mode:'smoke'|'full'|'upload';check:boolean;executionId?:string};
 export function parsePreset(input:string[]):Preset {
   const args=input.filter(arg=>arg!=='--'),mode=args.shift();
@@ -45,9 +46,9 @@ export async function mainPreset(args:string[],root=projectRoot,print:(value:unk
       const {document}=await inspectExport(path);
       print({contract:'medclaw-eval-preflight/v1',mode:'upload',check:true,ready:true,executionId:report.executionId,events:document.envelope.events.length});return 0;
     }
-    const controller=new AbortController(),stop=()=>controller.abort();process.on('SIGINT',stop);process.on('SIGTERM',stop);
+    const controller=new AbortController(),stop=()=>controller.abort();processEvents.on('SIGINT',stop);processEvents.on('SIGTERM',stop);
     try{const result=await exportReport(path,'langfuse',config,controller.signal);print({executionId:report.executionId,...result});return result.state==='complete'?0:1;}
-    finally{process.off('SIGINT',stop);process.off('SIGTERM',stop);}
+    finally{processEvents.off('SIGINT',stop);processEvents.off('SIGTERM',stop);}
   }
   const dataset=await loadDataset('medclaw-agent-v1'),repeat=preset.mode==='smoke'?1:3;
   const selected=preset.mode==='smoke'?dataset.manifest.smoke:dataset.manifest.members,plan=planTrials(selected,repeat);
@@ -63,5 +64,5 @@ export async function mainPreset(args:string[],root=projectRoot,print:(value:unk
 }
 if(import.meta.main){
   try{process.exitCode=await mainPreset(Bun.argv.slice(2));}
-  catch(error){console.error(JSON.stringify({error:error instanceof Error&&/^[a-z][a-z0-9_]*$/.test(error.message)?error.message:'invalid_request_or_facility_error'}));process.exitCode=1;}
+  catch(error){console.error(JSON.stringify(formatCliError(error)));process.exitCode=1;}
 }

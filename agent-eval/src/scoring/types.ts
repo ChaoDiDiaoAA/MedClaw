@@ -49,6 +49,7 @@ export interface JudgeResult {
 }
 export interface JudgeMetadata {
   baseUrl:string;timeoutMs:number;model: string; startedAt: string; endedAt: string; durationMs: number;
+  nativeModel?:JudgeConfiguration['nativeModel'];
   outputLimit?: 256; temperature: 0.8; httpStatus: number | null; requestId: string | null;
   usage: { promptTokens: number | null; completionTokens: number | null };
 }

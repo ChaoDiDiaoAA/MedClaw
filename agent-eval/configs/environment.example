@@ -6,7 +6,8 @@ MEDCLAW_EVAL_ENVIRONMENT=development
 # 独立 Judge 只在这里配置以下三项，agent.json 不再填写 judge。
 # 不设置 Judge 输出 Token 上限或总输出预算；每个适用 Trial 最多一次，超时和取消仍有效。
 # 每次运行自动保存无密钥的实际配置；校准可独立执行，不是 Smoke/Full 的前提。
-# BASE_URL 为兼容接口地址（含 /v1）；MODEL 为独立裁判模型 ID，须替换占位值。
+# BASE_URL 与模型的 Pi SDK 原生 API 兼容；DeepSeek 官方 /anthropic 使用 Messages，无需手填协议。
+# MODEL 为原生目录中唯一的模型 ID，同名时使用 provider/modelId；原生输入/输出能力由 SDK 提供。
 MEDCLAW_JUDGE_BASE_URL=https://REPLACE_WITH_INDEPENDENT_JUDGE_ENDPOINT/v1
 MEDCLAW_JUDGE_MODEL=REPLACE_WITH_INDEPENDENT_JUDGE_MODEL
 # Judge API Key 仅供控制器读取，不能传给被测 Agent、写入快照或提交仓库。

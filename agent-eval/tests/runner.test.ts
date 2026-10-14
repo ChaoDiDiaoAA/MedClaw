@@ -7,6 +7,24 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { readReport } from '../src/reports/write.ts';
 
+test('cancelled native Smoke startup archives ten trials and reads back without model calls',async()=>{
+  const {JudgeClient,resolveRunConfig}=await import('../src/scoring/judges/client.ts');
+  const root=await mkdtemp(join(tmpdir(),'mc-native-smoke-startup-'));
+  let calls=0;const server=Bun.serve({hostname:'127.0.0.1',port:0,fetch(){calls++;return new Response('unexpected_call',{status:500});}});
+  try {
+    const input=runConfigFixture();input.model.url=server.url.href;input.intent.baseUrl=server.url.href;
+    const {config,modelCredential,judgeConfig}=await resolveRunConfig(input,{MEDCLAW_JUDGE_BASE_URL:server.url.href,MEDCLAW_JUDGE_MODEL:'deepseek/deepseek-flash',MEDCLAW_JUDGE_API_KEY:'private-judge-key'},'required',true);
+    const judge=await JudgeClient.create(judgeConfig!,{plannedTrials:10}),executionId='controlled-native-smoke-startup';
+    const report=await runExperiment({datasetRoot:'medclaw-agent-v1',runsRoot:root,executionId,selection:'smoke',repeat:1,config,modelCredential,judgeMode:'required',judge,signal:AbortSignal.abort()});
+    expect(report.trials).toHaveLength(10);expect(report.trials.every(trial=>trial.status==='not_run'&&trial.startedAt===null)).toBe(true);
+    expect(report.judgeCalls).toHaveLength(0);expect(calls).toBe(0);
+    const archived=await readReport(join(root,executionId,'report.json'));
+    expect(archived.plan).toHaveLength(10);expect(archived.totals.notRun).toBe(10);
+    const snapshot=await readFile(join(root,executionId,'snapshot.json'),'utf8');
+    expect(snapshot).not.toContain(modelCredential.key);expect(snapshot).not.toContain('private-judge-key');
+  } finally {server.stop(true);await rm(root,{recursive:true,force:true});}
+},30000);
+
 test('plans every repetition before execution and does not lose trials on unsafe stop', async () => {
   const plan = planTrials(['case-1', 'case-2'], 3);
   expect(plan).toHaveLength(6); let launched = 0;
@@ -49,8 +67,8 @@ test('env-derived Judge identity is archived without credentials or calls when a
   const server=Bun.serve({hostname:'127.0.0.1',port:0,fetch(){calls++;return new Response('must_not_call',{status:500});}});
   try{
     const datasetRoot=join(root,'dataset');await createDatasetFixture(datasetRoot);
-    const {config,modelCredential,judgeConfig}=await resolveRunConfig(runConfigFixture(),{MEDCLAW_JUDGE_BASE_URL:server.url.href,MEDCLAW_JUDGE_MODEL:'controlled-judge',MEDCLAW_JUDGE_API_KEY:'private-judge-key'},'required',true);
-    const judge=new JudgeClient(judgeConfig!,{plannedTrials:1});
+    const {config,modelCredential,judgeConfig}=await resolveRunConfig(runConfigFixture(),{MEDCLAW_JUDGE_BASE_URL:server.url.href,MEDCLAW_JUDGE_MODEL:'deepseek/deepseek-flash',MEDCLAW_JUDGE_API_KEY:'private-judge-key'},'required',true);
+    const judge=await JudgeClient.create(judgeConfig!,{plannedTrials:1});
     const report=await runExperiment({datasetRoot,runsRoot:join(root,'runs'),executionId:'env-judge-blocked',selection:'smoke',repeat:1,config,modelCredential,judge,judgeMode:'required'});
     expect(report.trials.every(trial=>trial.status==='not_run')).toBe(true);
     const path=join(root,'runs',report.executionId,'snapshot.json');
