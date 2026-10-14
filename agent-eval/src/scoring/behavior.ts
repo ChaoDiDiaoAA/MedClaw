@@ -13,8 +13,16 @@ export const behaviorRules: Record<string, OpportunityRule> = {
   'task.false_completion': (g, a) => typeof g.completed !== 'boolean' || typeof a.claimedComplete !== 'boolean' || typeof a.completed !== 'boolean' || !refs(a, ['claimRef', 'factRef']) ? null : a.claimedComplete && !a.completed,
   'task.clarify_decision': (g, a) => !strings(g.allowedActions) || !strings(g.forbiddenCalls) || !strings(a.callNames) || !refs(a, ['decisionRef', 'informationRef']) ? null :
     g.allowedActions.includes(a.action) && !a.callNames.some((x: string) => g.forbiddenCalls.includes(x)),
-  'tool.selection': (g, a) => Array.isArray(g.requiredCapabilities) ? (!strings(a.capabilities)||a.coverageComplete!==true?null:subset(g.requiredCapabilities,a.capabilities)&&!g.forbiddenCapabilities.some((capability:string)=>a.capabilities.includes(capability))) : !strings(g.allowedActions) || !strings(g.forbiddenCalls) || !strings(a.callNames) || !refs(a, ['decisionRef', 'informationRef', 'toolsRef']) ? null :
-    g.allowedActions.includes(a.action) && !a.callNames.some((x: string) => g.forbiddenCalls.includes(x)) && (g.requiredCall === undefined || (a.callNames.length > 0) === g.requiredCall),
+  'tool.selection': (g, a) => {
+    if(Array.isArray(g.requiredCapabilities)) {
+      if(!strings(a.capabilities)||!strings(g.forbiddenCapabilities))return null;
+      if(g.forbiddenCapabilities.some(capability=>a.capabilities.includes(capability)))return false;
+      if(a.coverageComplete!==true||a.opportunityComplete===false&&!subset(g.requiredCapabilities,a.capabilities))return null;
+      return subset(g.requiredCapabilities,a.capabilities);
+    }
+    if(!strings(g.allowedActions)||!strings(g.forbiddenCalls)||!strings(a.callNames)||!refs(a,['decisionRef','informationRef','toolsRef']))return null;
+    return g.allowedActions.includes(a.action)&&!a.callNames.some((x:string)=>g.forbiddenCalls.includes(x))&&(g.requiredCall===undefined||(a.callNames.length>0)===g.requiredCall);
+  },
   'tool.params': (g, a) => a.schemaValid===false?false:!record(g.parameters) || !record(a.originalParameters) || !record(a.finalParameters) || typeof a.schemaValid !== 'boolean' || !refs(a, ['requestRef', 'callId']) ? null :
     a.schemaValid && equal(g.parameters, a.originalParameters),
   'tool.adoption': (g, a) => !has(g, ['value', 'sourceId']) || !has(a, ['usedValue', 'sourceId']) || !refs(a, ['deliveryRef', 'useRef']) ? null : equal(g.value, a.usedValue) && g.sourceId === a.sourceId,
@@ -24,7 +32,7 @@ export const behaviorRules: Record<string, OpportunityRule> = {
   'resource.follow': (g, a) => Array.isArray(g.forbiddenActions)&&Array.isArray(a.actions)&&a.actions.some((action:unknown)=>g.forbiddenActions.includes(action))?false:a.behaviorComplete===false||!Array.isArray(g.requiredActions) || !Array.isArray(g.forbiddenActions) || !Array.isArray(a.actions) || !refs(a, ['ruleRef', 'behaviorRef']) ? null :
     subset(g.requiredActions, a.actions) && !a.actions.some((x: unknown) => g.forbiddenActions.some((y: unknown) => equal(x, y))),
   'resource.progressive_read': (g, a) => !strings(g.requiredRefs) || g.allowedRefs !== undefined && !strings(g.allowedRefs) || !Number.isFinite(g.maxBytes) || !strings(a.readRefs) || !Number.isFinite(a.bytes) || !refs(a, ['needRef', 'readObservationRef']) ? null :
-    subset(g.requiredRefs, a.readRefs) && (g.allowedRefs === undefined || subset(a.readRefs, g.allowedRefs)) && a.bytes >= 0 && a.bytes <= g.maxBytes,
+    (g.allowedRefs!==undefined&&!subset(a.readRefs,g.allowedRefs)||a.bytes<0||a.bytes>g.maxBytes)?false:a.opportunityComplete===false&&!subset(g.requiredRefs,a.readRefs)?null:subset(g.requiredRefs,a.readRefs),
   'context.necessary_coverage': (g, a) => !has(g, ['factId', 'value', 'sourceId']) || !Array.isArray(a.requestFacts) || !refs(a, ['requestRef', 'snapshotRef']) ? null :
     a.requestFacts.some((f: unknown) => record(f) && f.factId === g.factId && equal(f.value, g.value) && f.sourceId === g.sourceId),
   'context.delivery': (g, a) => !has(g, ['revision', 'snapshotContent', 'instanceId']) || !refs(a, ['snapshotRef', 'requestRef', 'callId', 'instanceId']) || !has(a, ['revision','snapshotContent','requestContext']) ? null :
@@ -53,7 +61,7 @@ export const behaviorRules: Record<string, OpportunityRule> = {
 export function behavior(id: string, expected: unknown, actual: unknown, check: CheckSpec): RuleResult {
   if(id==='tool.selection'&&record(expected)&&Array.isArray(expected.requiredCapabilities)&&record(actual)) {
     const result=behaviorRules[id]!(expected,actual);
-    return result===null?{status:'UNJUDGEABLE',value:null,numerator:null,denominator:1,reason:'Complete capability evidence required'}:{status:result?'PASS':'FAIL',value:Number(result),numerator:Number(result),denominator:1,reason:'Required and forbidden capabilities checked; other valid capabilities allowed'};
+    return result===null?{status:'UNJUDGEABLE',value:null,numerator:null,denominator:1,reason:actual.opportunityComplete===false?'Target Run did not complete; omitted capabilities cannot be established':'Complete capability evidence required'}:{status:result?'PASS':'FAIL',value:Number(result),numerator:Number(result),denominator:1,reason:'Required and forbidden capabilities checked; other valid capabilities allowed'};
   }
   return opportunities(expected, actual, check, behaviorRules[id]!, id === 'task.false_completion' || id === 'tool.redundancy');
 }

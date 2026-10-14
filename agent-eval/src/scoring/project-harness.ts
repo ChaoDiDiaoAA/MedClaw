@@ -8,9 +8,10 @@ import { childScopeWithin } from '../../../packages/contracts/src/subagent.ts';
 import { registry } from './registry.ts';
 import type { CheckSpec,EvaluationContext } from './types.ts';
 import {commandEffects} from './command-effects.ts';
+import {CONTEXT_MATERIAL_PREFIX} from '../../../packages/contracts/src/context.ts';
 
 const list=(value:unknown):any[]=>Array.isArray(value)?value:[];
-const parse=(value:unknown):any=>{if(typeof value!=='string')return value;try{return JSON.parse(value);}catch{return undefined;}};
+const parse=(value:unknown):any=>{if(typeof value!=='string')return value;try{return JSON.parse(value.startsWith(CONTEXT_MATERIAL_PREFIX)?value.slice(CONTEXT_MATERIAL_PREFIX.length):value);}catch{return undefined;}};
 const serialized=(value:unknown)=>JSON.stringify(value);
 async function projectedConditions(facts:Record<string,unknown>,snapshot:any) {
   const projection=parse(snapshot?.renderedProjection),adopted=projection?.adoptedQueryContext;
@@ -181,7 +182,7 @@ export async function projectHarness(check:CheckSpec,context:EvaluationContext):
       reads.push({id:logical,content:source.content,nativeReadId:use.nativeEntryId??request.callId});refs.push(request.evidenceRef,...(native?[native.evidenceRef]:[]));
     }
     const evidenceRefs=[...new Set([...requests.map(request=>request.evidenceRef),...refs])];
-    return {expected:{opportunities:[{id:'required-resource-delivery',expected:authored}]},actual:{opportunities:[{id:'required-resource-delivery',actual:{reads},evidenceRefs}]},evidenceRefs};
+    return {expected:{opportunities:[{id:'required-resource-delivery',expected:authored}]},actual:{opportunities:[{id:'required-resource-delivery',actual:{reads,opportunityComplete:scope(runs).length>0&&scope(runs).every(run=>run.status==='completed')},evidenceRefs}]},evidenceRefs};
   }
   if(metric.startsWith('security.')) {
     const inspected=[...requests.map(req=>({id:req.evidenceRef,text:req.body})),...tools.map(tool=>({id:tool.evidenceRef,text:serialized(tool)})),...answers.map(answer=>({id:`answer:${answer.id}`,text:answer.text}))],evidenceRefs=inspected.map(item=>item.id);
@@ -251,7 +252,7 @@ export async function projectHarness(check:CheckSpec,context:EvaluationContext):
       let value:any=metric==='tool.selection'?{action:names.length?'retrieve':'answer_without_tool',callNames:names,decisionRef:request.evidenceRef,informationRef:`run:${run.id}`,toolsRef:request.evidenceRef}:
         metric==='subagent.delegation'?{delegated:children.some(child=>child.parentRunId===run.id&&calls.some(tool=>tool.id===child.originToolCallId)),authority:explicit?'explicit':'autonomous',decisionRef:request.evidenceRef,informationRef:`run:${run.id}`,toolsRef:request.evidenceRef}:
         {selectedSkillId:skill?.resourceRef.id??null,indexRef:skill||list(resources).some(item=>item.kind==='skill_index')?request.evidenceRef:undefined,decisionRef:request.evidenceRef};
-      if((!decisionComplete||metric==='tool.selection'&&gold.requiredCall&&prior.length&&!fulfilled.length)&&!names.some(name=>list(gold.forbiddenCalls).includes(name)))value={};
+      if((!decisionComplete||metric==='tool.selection'&&(gold.requiredCall&&prior.length&&!fulfilled.length||run.status!=='completed'))&&!names.some(name=>list(gold.forbiddenCalls).includes(name)))value={};
       add(request.callId+':'+request.sequence,value,[request.evidenceRef],run.id,gold);
     }
     if(!requests.length&&runs.some(run=>run.kind==='intent'))return {actual:{opportunities:[]},expected:{opportunities:[]},evidenceRefs:[],reason:'Program intent execution is not an autonomous model decision'};
@@ -295,6 +296,21 @@ export async function projectHarness(check:CheckSpec,context:EvaluationContext):
         value={adoptedSlots:adopted,queryParameters:conditions,correctionRef:snapshot?.inputId?`input:${snapshot.inputId}`:undefined,decisionRef:decision?`intent:${request.runId}:decision:${decision.id}`:undefined,queryRef:conditions?`run:${request.runId}:queries`:undefined};
       }
       else if(metric==='context.necessary_coverage') {
+        if(Array.isArray(gold.facts)){
+          const projection=parse(snapshot?.renderedProjection),contains=typeof snapshot?.renderedProjection==='string'&&request.body.includes(JSON.stringify(snapshot.renderedProjection).slice(1,-1));
+          const selectedSnapshots=list(projection?.materials).filter(material=>material.ref?.kind==='snapshot'&&record(material.value?.fields)&&typeof material.value.fields.sourceRowRef==='string').map(material=>material.value.fields);
+          const workspace=projection?.workspaceContext,deviceIds=selectedSnapshots.length?[...new Set(selectedSnapshots.map(item=>item.deviceId))]:list(workspace?.deviceIds??projection?.materialScope?.deviceIds),batchIds=workspace?list(workspace.batchRefs).map(item=>item.id):list(projection?.materialScope?.batchIds);
+          const identities=gold.facts.some((fact:any)=>fact.factId==='selectedDevice')&&deviceIds.length?await sourceIdentities(facts,[...selectedSnapshots,...list(facts.evidencePages).flatMap(page=>list(page.items))]):undefined;
+          const batches=list(facts.batches).filter(batch=>batchIds.includes(batch.id)),regions=[...new Set(batches.map(batch=>batch.region))];
+          const selectedRegions=[...new Set(selectedSnapshots.map(item=>item.region))];
+          const observed:Record<string,unknown>={referenceDate:projection?.referenceDate,selectedDevice:deviceIds.length===0?null:deviceIds.length===1?identities?.get(deviceIds[0]):deviceIds.map(id=>identities?.get(id)),selectedRegion:selectedRegions.length===1?selectedRegions[0]:batchIds.length===0?null:batches.length===batchIds.length&&regions.length===1?regions[0]:undefined};
+          for(const fact of gold.facts){
+            const known=!!projection&&observed[fact.factId]!==undefined;
+            const requestFacts=contains&&known?[{factId:fact.factId,value:observed[fact.factId],sourceId:context.caseId+':context-contract'}]:contains&&!known?undefined:[];
+            add(request.callId+':'+request.sequence+':'+fact.factId,{requestFacts,requestRef:request.evidenceRef,snapshotRef:snapshot?`snapshot:${snapshot.id}`:undefined},[request.evidenceRef,...snapshot?[`snapshot:${snapshot.id}`]:[]],request.runId,fact);
+          }
+          continue;
+        }
         const actualConditions=await projectedConditions(facts,snapshot);
         const contains=typeof snapshot?.renderedProjection==='string'&&request.body.includes(JSON.stringify(snapshot.renderedProjection).slice(1,-1));
         value={requestFacts:contains&&actualConditions?[{factId:'effective_conditions',value:actualConditions,sourceId:`${context.caseId}:effective-user-turn`}]:[],requestRef:request.evidenceRef,snapshotRef:snapshot?`snapshot:${snapshot.id}`:undefined};
@@ -333,7 +349,7 @@ export async function projectHarness(check:CheckSpec,context:EvaluationContext):
       if(runTools.some(tool=>tool.input?.path?.split(/[\\/]/).includes('gold')))actions.push('read_gold');
       const behaviorComplete=complete&&instructionRead&&claim&&Object.keys(claim).every(key=>['sets','synthetic','nullIsUnknown','zeroIsKnown'].includes(key))&&runTools.every(tool=>['read','grep','find','ls','query_current_devices','query_device_changes','query_current','query_changes','query_aggregate','query_trend','read_query','read_evidence'].includes(tool.name));
       const readRefs=reads.map(tool=>readRef(tool)??tool.resourceRead?.file??tool.input?.path);
-      const value=metric==='resource.progressive_read'?{readRefs,bytes:reads.reduce((total,tool)=>total+list(tool.sdkDelivery?.content).reduce((size,item)=>size+(item.type==='text'?Buffer.byteLength(item.text):0),0),0),needRef:runRequests[0]?.evidenceRef,readObservationRef:complete&&reads.every(tool=>readRef(tool)!==undefined)?runRequests[0]?.evidenceRef:undefined,readCallIds:reads.map(tool=>tool.id)}:
+      const value=metric==='resource.progressive_read'?{readRefs,opportunityComplete:run.status==='completed',bytes:reads.reduce((total,tool)=>total+list(tool.sdkDelivery?.content).reduce((size,item)=>size+(item.type==='text'?Buffer.byteLength(item.text):0),0),0),needRef:runRequests[0]?.evidenceRef,readObservationRef:complete&&reads.every(tool=>readRef(tool)!==undefined)?runRequests[0]?.evidenceRef:undefined,readCallIds:reads.map(tool=>tool.id)}:
         {actions,behaviorComplete,ruleRef:instructionRead?reads[0]?.evidenceRef:undefined,behaviorRef:claim?`answer:${answers.find(answer=>answer.runId===run.id)?.id}`:undefined};
       add('run:'+run.id,value,[...runRequests.map(request=>request.evidenceRef),...reads.map(tool=>tool.evidenceRef)],run.id);
     }

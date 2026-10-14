@@ -37,15 +37,20 @@ test('controlled Host, native public read, one Judge per Trial and durable stage
   const root=await mkdtemp(join(tmpdir(),'mc-terminal-flow-')),runsRoot=join(root,'runs'),executionId='controlled-terminal-flow';
   let stopped=false;
   try {
-    const built=await loadDataset(),tasks=['mc-v1-resource-progressive-read','mc-v1-security-injection'].map(id=>built.snapshot.cases.find(item=>item.id===id)!);
+    const built=await loadDataset(),tasks=['mc-v1-resource-progressive-read','mc-v1-security-injection'].map(id=>structuredClone(built.snapshot.cases.find(item=>item.id===id)!));
     const snapshot=structuredClone(built.snapshot);snapshot.info.id='controlled-terminal-v1';snapshot.cases=tasks;snapshot.smokeIds=tasks.map(task=>task.id);snapshot.gold=Object.fromEntries(tasks.map(task=>[task.id,snapshot.gold[task.id]!]));snapshot.review.cases=Object.fromEntries(tasks.map(task=>[task.id,snapshot.review.cases[task.id]]));snapshot.review.state='pending';delete snapshot.review.verifiedData;
+    // This fixture explicitly tests the Judge channel; production read-only cases need no semantic check.
+    for(const task of tasks){
+      task.scorers.push('answer.reasoning');snapshot.review.cases[task.id]!.authoring!.harness.push('answer.reasoning');
+      (snapshot.gold[task.id]!.rubric??={})['answer.reasoning']={pass:'ENGINEERING: reasoning follows actual public material.',partial:'ENGINEERING: incomplete explanation.',fail:'ENGINEERING: unsupported reasoning. The loopback Judge returns unknown and makes no quality claim.'};
+    }
     const draft=loadSnapshot(snapshot);
     snapshot.review.verifiedData={info:snapshot.info,smokeIds:snapshot.smokeIds,cases:snapshot.cases,gold:snapshot.gold,fixtures:snapshot.fixtures,sourceReferences:snapshot.sourceReferences,productResources:snapshot.productResources,authoring:Object.fromEntries(tasks.map(task=>[task.id,snapshot.review.cases[task.id].authoring])),compiled:snapshotCompiled(draft),criteria:scoringCriteria(draft.cases.flatMap(task=>task.expected.checks.map(check=>check.metricId)))};
     snapshot.review.state='verified';
     const datasetRoot=join(root,'dataset');await writeJsonExclusive(join(datasetRoot,'snapshot.json'),snapshot);
     const {config,modelCredential,judgeConfig}=await resolveRunConfig({version:1,environment:'test',model:{url:server.url.href+'v1',key:'ENGINEERING-AGENT',model:'openrouter/openai/gpt-4o-mini'},intent:{baseUrl:server.url.href,model:'qwen3.5:0.8b'},policy:{},retention:'preserve_all'},{MEDCLAW_JUDGE_BASE_URL:server.url.href+'judge/v1',MEDCLAW_JUDGE_MODEL:'openrouter/openai/gpt-4o-mini',MEDCLAW_JUDGE_API_KEY:'ENGINEERING-JUDGE'},'required',true);
     const judge=await JudgeClient.create(judgeConfig!,{plannedTrials:2,trialIds:planTrials(tasks.map(task=>task.id),1).map(item=>item.trialId)}),render=terminalProgress(line=>lines.push(line));
-    const report=await runExperiment({datasetRoot,runsRoot,executionId,selection:'smoke',repeat:1,config,modelCredential,judgeMode:'required',judge,onEvent:event=>{
+    const report=await runExperiment({datasetRoot,runsRoot,executionId,selection:'smoke',trials:1,config,modelCredential,judgeMode:'required',judge,onEvent:event=>{
       order.push(`${event.index}:${event.kind}:${event.phase}`);render(event);
       if(event.kind==='saved')savedJournals.push(event.trialId);
     }});
@@ -55,7 +60,7 @@ test('controlled Host, native public read, one Judge per Trial and durable stage
     expect(order.indexOf('1:saved:save')).toBeLessThan(order.indexOf('2:phase:prepare_input'));
     expect(lines.some(line=>line.includes('结果已保存'))).toBe(true);
     const archive=join(runsRoot,executionId);
-    expect((await readdir(archive)).sort()).toEqual(['evidence','report.json','snapshot.json']);
+    expect((await readdir(archive)).sort()).toEqual(['badcases.json','badcases.md','evidence','report.json','snapshot.json']);
     for(const trial of report.trials) {
       const directory=join(archive,'evidence',trial.trialId);
       expect((await readdir(directory)).sort()).toEqual(['artifacts','events.jsonl','observation.json','trial.json']);

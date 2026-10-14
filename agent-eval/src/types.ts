@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import type { EvaluationScore, JudgeResult } from './scoring/types.ts';
 import type { DatasetSnapshot,CompiledDataset } from './datasets.ts';
+import type {QualityMetricDefinition,QualityMetricCatalogVersion} from './scoring/registry.ts';
+import type {ReportAnalysis} from './reports/analysis.ts';
 import { ANSWER_QUALITY_RUBRIC } from './scoring/judges/answer-quality.ts';
 import { CustomBaseUrlSchema,CustomProviderDefinitionSchema } from '../../packages/contracts/src/model.ts';
 
@@ -47,6 +49,8 @@ export interface ExecutionSnapshot {
   config:ResolvedRunConfig;criteria:unknown;source:Record<string,unknown>;
   compiled:CompiledDataset;
   plan?:TrialPlan[];preparationTurns?:Record<string,number>;
+  qualityMetricCatalog?:QualityMetricDefinition[];
+  qualityMetricCatalogVersion?:QualityMetricCatalogVersion;
 }
 export interface EvaluationReport {
   contract:'medclaw-evaluation-report/v1';executionId:string;snapshotRef:'snapshot.json';
@@ -57,6 +61,7 @@ export interface EvaluationReport {
   judgeCalls:{trialId:string;result:JudgeResult}[];evidenceManifest:EvidenceFile[];
   totals:{planned:number;pass:number;fail:number;unjudgeable:number;error:number;notRun:number};
   aggregation:unknown;createdAt:string;
+  analysis?:ReportAnalysis;
   reviewCandidates:{trialId:string;caseId:string;reasons:string[];checkIds:string[];evidenceRefs:string[]}[];
   /** Hydrated from snapshot.json, non-enumerable when read or written. */
   snapshot:ExecutionSnapshot;config:ResolvedRunConfig;

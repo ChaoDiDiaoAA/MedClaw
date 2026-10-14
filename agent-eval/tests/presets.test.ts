@@ -14,6 +14,30 @@ async function configuredRoot(environment:string) {
 }
 const judgeEnvironment='# 中文注释\nMEDCLAW_JUDGE_BASE_URL="https://judge.example.invalid/v1"\nMEDCLAW_JUDGE_MODEL="deepseek/deepseek-flash"\nMEDCLAW_JUDGE_API_KEY=local-judge-key\nMEDCLAW_EVAL_BACKEND=langfuse\n';
 
+test('Smoke and Full accept decimal trials with and without Bun separators and reject the removed repeat flag',async()=>{
+  const {parsePreset}=await import('../src/presets.ts');
+  for(const mode of ['smoke','full'])for(const separator of [[],['--']])
+    expect(parsePreset([mode,...separator,'--trials','5','--check'])).toMatchObject({mode,check:true,trials:5});
+  for(const value of ['0','-1','1.5','1e2','NaN','9007199254740992'])
+    expect(()=>parsePreset(['full','--trials',value])).toThrow();
+  expect(()=>parsePreset(['full','--trials'])).toThrow();
+  expect(()=>parsePreset(['full','--trials','5','--trials','2'])).toThrow();
+  expect(()=>parsePreset(['full','--repeat','5'])).toThrow('use_--trials');
+  expect(()=>parsePreset(['upload','--execution-id','existing','--trials','5'])).toThrow();
+});
+
+test('N=5 preflight reports 50 Smoke or 250 Full Trials without model calls or archive writes',async()=>{
+  const {mainPreset}=await import('../src/presets.ts');
+  const root=await configuredRoot(judgeEnvironment),summaries:any[]=[];
+  try {
+    for(const mode of ['smoke','full']){
+      expect(await mainPreset([mode,'--trials','5','--check'],root,value=>summaries.push(value))).toBe(0);
+      expect(summaries.at(-1)).toMatchObject({mode,trials:5,plannedTrials:mode==='smoke'?50:250});
+    }
+    expect(await readdir(join(root,'agent-eval'))).toEqual(['configs']);
+  } finally {await rm(root,{recursive:true,force:true});}
+});
+
 for(const mode of ['smoke','full'])test(`${mode} execution continuation reports a controlled startup error after a successful preflight`,async()=>{
   const root=await mkdtemp(join(tmpdir(),'mc-preset-startup-'));
   try {
@@ -29,7 +53,7 @@ mock.module('node:fs/promises',()=>({...fs,readFile:(path,...args)=>{
   return readFile(path,...args);
 },mkdir:()=>{throw new Error('unexpected_archive_write');}}));
 const runner=await import(${JSON.stringify(runnerUrl)});
-mock.module(${JSON.stringify(runnerUrl)},()=>({...runner,runExperiment:async()=>{throw Object.assign(new Error('local-private-key from filesystem'),{code:'EACCES',syscall:'mkdir',path:'C:/private/local-private-key'});}}));
+mock.module(${JSON.stringify(runnerUrl)},()=>({...runner,runExperiment:async options=>{if(!options.runsRoot.replaceAll('\\\\','/').endsWith('/agent-eval/runs/business'))throw new Error('business_run_root_missing');throw Object.assign(new Error('local-private-key from filesystem'),{code:'EACCES',syscall:'mkdir',path:'C:/private/local-private-key'});}}));
 globalThis.fetch=()=>{throw new Error('unexpected_network_call');};
 Bun.spawn=()=>{throw new Error('unexpected_host_start');};
 `);
@@ -37,6 +61,7 @@ Bun.spawn=()=>{throw new Error('unexpected_host_start');};
     const stdout=new TextDecoder().decode(child.stdout),stderr=new TextDecoder().decode(child.stderr);
     expect(child.exitCode).toBe(1);
     expect(stdout).toContain(`[评测] ${mode==='smoke'?'Smoke':'Full'}`);expect(stdout).toContain(`共${mode==='smoke'?10:150}个Trial`);expect(stdout).toContain('▶ [评测] 核对数据与模型配置');expect(stdout).toContain('[执行] ');expect(stdout).toContain('[结果目录] ');
+    expect(stdout.replaceAll('\\','/')).toContain('/agent-eval/runs/business/');
     expect(JSON.parse(stderr)).toMatchObject({error:'filesystem_error',reason:'EACCES',operation:'mkdir',location:expect.stringMatching(/^agent-eval\/src\/cli\.ts:\d+:\d+$/)});
     expect(stderr+stdout).not.toContain('local-private-key');expect(stderr+stdout).not.toContain(runConfigFixture().model.key);expect(stderr+stdout).not.toContain('local-judge-key');
   } finally {await rm(root,{recursive:true,force:true});}
@@ -73,9 +98,9 @@ test('local smoke/full checks build fixed plans and check first execution withou
       expect(await mainPreset([mode,'--check'],root,value=>summaries.push(value))).toBe(0);
       const summary=summaries.at(-1);
       expect(summary.blockers).toEqual([]);
-      expect(summary).toMatchObject({mode,check:true,backend:'local',cases:mode==='smoke'?10:50,repeat:mode==='smoke'?1:3,plannedTrials:mode==='smoke'?10:150,ready:true});
+      expect(summary).toMatchObject({mode,check:true,backend:'local',cases:mode==='smoke'?10:50,trials:mode==='smoke'?1:3,plannedTrials:mode==='smoke'?10:150,ready:true});
     }
-    expect(await Bun.file(join(root,'agent-eval/runs/.active-execution.json')).exists()).toBe(false);
+    expect(await Bun.file(join(root,'agent-eval/runs/business/.active-execution.json')).exists()).toBe(false);
     expect(await readdir(join(root,'agent-eval'))).toEqual(['configs']);
     expect(calls).toBe(0);
     const printed=JSON.stringify(summaries);expect(printed).not.toContain('local-judge-key');expect(printed).not.toContain(runConfigFixture().model.key);
@@ -83,7 +108,7 @@ test('local smoke/full checks build fixed plans and check first execution withou
   } finally {server.stop(true);await rm(root,{recursive:true,force:true});}
 });
 
-test('upload check uses only platform configuration and an explicit archived execution, with no writes',async()=>{
+for(const category of ['business','research'])test(`upload check finds ${category} archives using only platform configuration, with no writes`,async()=>{
   const {mainPreset}=await import('../src/presets.ts');
   let calls=0;const server=Bun.serve({hostname:'127.0.0.1',port:0,fetch(){calls++;return Response.json({});}});
   const root=await mkdtemp(join(tmpdir(),'mc-upload-preset-'));
@@ -93,7 +118,7 @@ test('upload check uses only platform configuration and an explicit archived exe
     const report=reportFixture(),trial=report.trials[0]!;
     trial.startedAt=report.createdAt;trial.endedAt=report.createdAt;trial.status='infra_error';trial.instanceId='controlled-host';trial.observationRef='evidence/'+trial.trialId+'/observation.json';
     const {aggregate}=await import('../src/scoring/aggregate.ts');report.aggregation=aggregate(report.plan,report.trials,report.scores,report.cases);report.totals=(report.aggregation as any).totals;
-    const archive=join(root,'agent-eval/runs',report.executionId);await saveReportFixture(archive,report);
+    const archive=join(root,'agent-eval/runs',category,report.executionId);await saveReportFixture(archive,report);
     const original=await readFile(join(archive,'report.json'),'utf8'),summaries:any[]=[];
     expect(await mainPreset(['upload','--execution-id',report.executionId,'--check'],root,value=>summaries.push(value))).toBe(0);
     expect(summaries[0]).toMatchObject({mode:'upload',check:true,ready:true,executionId:report.executionId});

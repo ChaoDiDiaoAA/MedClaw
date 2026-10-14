@@ -64,6 +64,8 @@ test('Skill source content needs actual expansion/read and provider delivery, no
  const request={instanceId:'host',sessionId:1,runId:1,callId:'p1',sequence:1,body,bytes:Buffer.byteLength(body)};
  facts.providerRequests=[{selector:{kind:'request',sessionId:1,runId:1,callId:'p1'},protocolValidated:true,original:[request],bytes:Buffer.byteLength(JSON.stringify([request]))}];
  facts.modelCalls=[{runId:1,kind:'main',callId:'p1'}];
+ expect(await score(c)).toMatchObject({status:'UNJUDGEABLE'});
+ facts.runs[0].status='completed';
  expect(await score(c)).toMatchObject({status:'FAIL'});
  facts.contexts[0].deliveries[0].observation.resources.verified=[{kind:'skill_expansion',coverage:'complete',resourceRef:{kind:'skill',id:'query',version:'v1'},file:null}];
  expect(await score(c)).toMatchObject({status:'PASS'});

@@ -1,10 +1,11 @@
 import type {TrialPlan,TrialResult} from '../types.ts';
 import type {EvaluationScore,ScoreStatus} from '../scoring/types.ts';
+import type {CaseAnalysis} from '../reports/analysis.ts';
 
 export type TrialPhase='prepare_input'|'prepare_host'|'execute'|'collect'|'score'|'save';
 export interface ProgressEvent extends TrialPlan {
-  index:number;total:number;kind:'phase'|'heartbeat'|'execution'|'score'|'saved';phase:TrialPhase;elapsedMs:number;phaseElapsedMs?:number;
-  executionStatus?:TrialResult['status'];reason?:string|null;status?:ScoreStatus;checks?:Pick<EvaluationScore,'metricId'|'status'|'actual'|'expected'>[];evidenceRef?:string;
+  index:number;total:number;trialsPerCase?:number;kind:'phase'|'heartbeat'|'execution'|'score'|'saved'|'case_summary';phase:TrialPhase;elapsedMs:number;phaseElapsedMs?:number;
+  executionStatus?:TrialResult['status'];reason?:string|null;status?:ScoreStatus;checks?:(Pick<EvaluationScore,'metricId'|'status'>&Partial<EvaluationScore>)[];evidenceRef?:string;caseSummary?:CaseAnalysis;
 }
 export function trialProgress(item:TrialPlan,index:number,total:number,notify?:(event:ProgressEvent)=>void) {
   const started=Date.now();let phase:TrialPhase='prepare_input',phaseStarted=started,timer:ReturnType<typeof setInterval>|undefined;

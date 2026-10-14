@@ -1,12 +1,17 @@
 import { describe, expect, spyOn, test } from 'bun:test';
-import { JudgeClient, readJudgeConfig } from '../../src/scoring/judges/client.ts';
+import { JudgeClient, readJudgeConfig,assertCountedJudgeResult } from '../../src/scoring/judges/client.ts';
 import { assessCalibration, calibrateReferences } from '../../src/scoring/judges/calibration.ts';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { hashBytes, hashValue } from '../../src/adapters/product-checksums.ts';
 import { judgeFacility } from '../../src/scoring/judges/facility.ts';
 import type { CheckSpec } from '../../src/scoring/types.ts';
+
+test('unknown counted evidence preserves a known independent denominator',()=>{
+  expect(()=>assertCountedJudgeResult({checkId:'c',value:null,numerator:null,denominator:2,reason:'Missing evidence',evidenceRefs:[]},{unit:'assertion',denominator:2})).not.toThrow();
+  for(const [numerator,denominator,value] of [[3,2,1],[1,2,.4],[0,0,0]])expect(()=>assertCountedJudgeResult({checkId:'c',value,numerator,denominator,reason:'Invalid',evidenceRefs:[]},{unit:'assertion'})).toThrow();
+});
 
 const reply = (content: string, finish_reason = 'stop'): {choices:{message:{content:string};finish_reason:string}[];usage?:{prompt_tokens:number;completion_tokens:number}} => ({ choices: [{ message: { content }, finish_reason }], usage: { prompt_tokens: 12, completion_tokens: 20 } });
 const streamReply = (body: ReturnType<typeof reply>, init?: ResponseInit) => new Response(`data: ${JSON.stringify({...body,choices:body.choices.map(({message,finish_reason})=>({index:0,delta:{role:'assistant',...message},finish_reason}))})}\n\ndata: [DONE]\n\n`,{...init,headers:{'content-type':'text/event-stream',...init?.headers}});
@@ -14,6 +19,17 @@ const valid = JSON.stringify({ results: [{ checkId: 'semantic', value: 1, reason
 const request = { trialId: 't1', checks: [{ checkId: 'semantic', rubric: 'Answer must remain supported by source.', evidenceRefs: ['source'] }], answer: 'Answer', evidence: { source: 'Source' } };
 
 describe('Judge controlled HTTP protocol', () => {
+  test('counted metrics retain real opportunity denominators in the same single Judge request',async()=>{
+    let calls=0;
+    const content=JSON.stringify({results:[{checkId:'semantic',value:2/3,numerator:2,denominator:3,reason:'Two of three required assertions are supported',evidenceRefs:['source']}]});
+    const server=Bun.serve({hostname:'127.0.0.1',port:0,fetch(){calls++;return streamReply(reply(content));}});
+    try{
+      const client=await JudgeClient.create({baseUrl:server.url.href,model:'deepseek/deepseek-flash',apiKey:'local-key',timeoutMs:30000},{plannedTrials:1});
+      const counted={...request,checks:[{...request.checks[0]!,counted:{unit:'assertion' as const,denominator:3}}]};
+      expect(await client.judge(counted)).toMatchObject({status:'completed',results:[{value:2/3,numerator:2,denominator:3}]});
+      await expect(client.judge(counted)).rejects.toThrow('already attempted');expect(calls).toBe(1);
+    }finally{server.stop(true);}
+  });
   test('SDK resolves the configured official Anthropic endpoint and legacy model offline',async()=>{
     const {resolveRunConfig}=await import('../../src/scoring/judges/client.ts');
     const {runConfigFixture}=await import('../report-fixture.ts');
@@ -265,6 +281,7 @@ describe('Judge controlled HTTP protocol', () => {
 
   test('controlled calibration archives actual sample contents, rejects changed review and cannot satisfy the real gate',async()=>{
     const root=mkdtempSync(join(tmpdir(),'mc-calibration-'));
+    const diagnostics:string[]=[],stderr=spyOn(console,'error').mockImplementation((line)=>{diagnostics.push(String(line));});
     const {createCalibrationFixture}=await import('../datasets/calibration-fixture.ts');
     const {path}=await createCalibrationFixture(join(root,'refs'));
     let calls=0;const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(req){
@@ -272,8 +289,13 @@ describe('Judge controlled HTTP protocol', () => {
       return streamReply(reply(JSON.stringify({results:[{checkId:id,value:/correct$|insufficient_evidence$/.test(id)?1:/omission$/.test(id)?.5:0,reason:'Controlled fixture comparison',evidenceRefs:[data.checks[0].evidenceRefs[0]]}]})));
     }});
     try {
-      const args={referencesPath:path,executionId:'controlled-calibration',outputPath:join(root,'run'),controlledFixture:true,env:{MEDCLAW_JUDGE_BASE_URL:server.url.href,MEDCLAW_JUDGE_MODEL:'deepseek/deepseek-flash',MEDCLAW_JUDGE_API_KEY:'fixture-key'}};
+      const args={referencesPath:path,executionId:'controlled-calibration',outputPath:join(root,'calibration','controlled-calibration'),controlledFixture:true,env:{MEDCLAW_JUDGE_BASE_URL:server.url.href,MEDCLAW_JUDGE_MODEL:'deepseek/deepseek-flash',MEDCLAW_JUDGE_API_KEY:'fixture-key'}};
       const report=await calibrateReferences(args);expect(report).toMatchObject({actualRun:false,controlledFixture:true,passed:true});expect(calls).toBe(12);
+      const {deriveBadcases}=await import('../../src/reports/badcases.ts'),index=await deriveBadcases(args.outputPath);
+      expect(index).toMatchObject({contract:'medclaw-badcase-index/v1',executionId:args.executionId,kind:'calibration',summary:{trials:0,cases:0}});
+      expect(index.candidates).toEqual([]);expect(index.gaps).toEqual([]);
+      expect(existsSync(join(args.outputPath,'badcases.json'))).toBe(false);expect(existsSync(join(args.outputPath,'badcases.md'))).toBe(false);
+      expect(diagnostics.join('\n')).toContain('无诊断文件需要保存');expect(diagnostics.join('\n')).not.toContain('诊断入口');
       const snapshot=JSON.parse(readFileSync(join(args.outputPath,'snapshot.json'),'utf8'));
       expect(snapshot.judge).toMatchObject({baseUrl:server.url.href,model:'deepseek/deepseek-flash',temperature:.8});
       expect(snapshot.judge).not.toHaveProperty('outputLimit');
@@ -285,6 +307,6 @@ describe('Judge controlled HTTP protocol', () => {
       await expect(calibrateReferences(args)).rejects.toThrow();
       const refs=JSON.parse(readFileSync(path,'utf8'));refs.samples[0].answer='Changed after review';writeFileSync(path,JSON.stringify(refs));
       await expect(calibrateReferences({...args,outputPath:join(root,'changed')})).rejects.toThrow('content_mismatch');expect(calls).toBe(12);
-    }finally{server.stop(true);rmSync(root,{recursive:true,force:true});}
+    }finally{stderr.mockRestore();server.stop(true);rmSync(root,{recursive:true,force:true});}
   });
 });

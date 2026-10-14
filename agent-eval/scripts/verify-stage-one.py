@@ -16,8 +16,14 @@ REPOSITORY = ROOT.parent.parent
 PRODUCT_INPUTS = ['../../resources/skills/query/v1/SKILL.md', '../../resources/skills/query/v1/references/facts-and-assumptions.md']
 CATEGORY_COUNTS = dict(zip('task tool skill resource context memory compaction subagent intent security export'.split(), [6, 6, 4, 4, 5, 4, 4, 4, 5, 5, 3]))
 COMMON_SCORERS = {'task.success', 'security.scope', 'security.gold', 'security.secret', 'security.side_effect', 'facility.isolation', 'facility.cleanup', 'host.shutdown', 'tool.selection', 'efficiency.calls'}
-SEMANTIC_SCORERS = {'task.clarify_decision', 'tool.adoption', 'context.current_use', 'memory.history_use', 'compaction.fact_retention', 'compaction.continue', 'subagent.success', 'subagent.utility', 'resource.follow', 'answer.faithful', 'answer.reasoning'}
+SEMANTIC_SCORERS = {'answer.partial_failure', 'task.clarify_decision', 'tool.adoption', 'context.current_use', 'memory.history_use', 'compaction.fact_retention', 'compaction.continue', 'subagent.success', 'subagent.utility', 'resource.follow', 'answer.faithful', 'answer.reasoning', 'task.verify_completion', 'task.false_completion', 'evidence.coverage', 'evidence.valid', 'answer.empty', 'answer.clarify', 'answer.refuse'}
 SPECIAL_FIELDS = {
+    'tool.recall': {'requiredCapabilities'}, 'tool.precision': {'allowedCapabilities'},
+    'tool.error_rate': {'maxRate'}, 'tool.argument_validity': set(),
+    'tool.recovery': {'maxRetries', 'allowedTools', 'allowStop', 'expectedFailureMode'},
+    'evidence.provenance': {'required'}, 'evidence.freshness': {'mode', 'date', 'maxLagDays', 'asOf', 'maxAgeMs'},
+    'efficiency.latency_budget': {'maxMs'}, 'answer.partial_failure': {'requireDisclosure', 'expectedFailureMode'},
+    'context.necessary_coverage': {'fields'}, 'context.delivery': {'required'}, 'evidence.coverage': {'factKeys'},
     'task.clarify_decision': {'allowedActions', 'forbiddenCalls'}, 'tool.params': {'sourceTurnAlias'},
     'tool.adoption': {'factKeys'}, 'tool.redundancy': {'allowedReasons'}, 'tool.failure_handling': {'maxRetries'},
     'skill.selection': {'allowedSkillIds'}, 'resource.read': {'requiredRefs'},
@@ -61,13 +67,15 @@ def safe_integer(value):
     return type(value) is int and 0 <= value <= 9007199254740991
 
 
-def verify_sources(snapshot):
+def verify_sources(snapshot, supplementary=False):
     references = snapshot['sourceReferences']
     check(isinstance(references, dict) and bool(references), 'Business source references exist')
     for identity, reference in references.items():
-        check(reference['kind'] == 'product-spec' and bool(reference['rationale']), 'Truthful hand-authored product reference: ' + identity)
+        issue = supplementary and reference['kind'] == 'historical-issue'
+        check((reference['kind'] == 'product-spec' or issue) and bool(reference['rationale']), 'Truthful hand-authored source reference: ' + identity)
         relative = Path(reference['path'])
-        check(not relative.is_absolute() and '..' not in relative.parts and reference['path'].startswith('docs/spec/'), 'Business reference stays in product specs')
+        prefix = 'agent-eval/records/' if issue else 'docs/spec/'
+        check(not relative.is_absolute() and '..' not in relative.parts and reference['path'].startswith(prefix), 'Source reference stays in its declared scope')
         path = REPOSITORY / relative
         check(path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(REPOSITORY.resolve()), 'Business reference file exists')
         check(reference['section'] in source_text(path), 'Business reference section exists: ' + identity)
@@ -163,14 +171,59 @@ def recompute(rows, target):
 
 
 def verify(snapshot):
+    return verify_cases(snapshot, 50, 62, True)
+
+
+def verify_compiled(snapshot, compiled):
+    """Check compiler outputs against authored contracts without importing compiler rules."""
+    check(set(compiled) == {case['id'] for case in snapshot['cases']}, 'Compiled cases have exact authored identities')
+    for case in snapshot['cases']:
+        case_id = case['id']
+        definition = case['expected'].get('expectedFacts') or snapshot['gold'][case_id]
+        authored = snapshot['gold'][case_id].get('scorerExpectations', {})
+        values, checks = compiled[case_id]['values'], compiled[case_id]['checks']
+        check(len({item['metricId'] for item in checks}) == len(checks), 'One compiled check per metric')
+        for metric in ['tool.recall', 'tool.precision', 'tool.error_rate', 'tool.argument_validity', 'tool.recovery', 'evidence.provenance', 'evidence.freshness', 'efficiency.latency_budget', 'answer.partial_failure']:
+            selected = [item for item in checks if item['metricId'] == metric]
+            check(bool(selected) == (metric in authored), 'New metric requires independently authored selection')
+            if not selected:
+                continue
+            spec = authored[metric]
+            expected = dict(spec)
+            if metric == 'tool.recall':
+                expected = {'requiredCapabilities': list(dict.fromkeys(case['expected'].get('requiredCapabilities', []) + spec['requiredCapabilities']))}
+            elif metric == 'tool.precision':
+                expected = {'allowedCapabilities': list(dict.fromkeys(case['expected'].get('requiredCapabilities', []) + case['expected'].get('optionalCapabilities', []) + spec['allowedCapabilities']))}
+            elif metric == 'evidence.freshness' and spec['mode'] == 'business_date':
+                expected['date'] = spec.get('date', definition['target']['date'])
+            elif metric in ['tool.recovery', 'answer.partial_failure']:
+                expected['expectedFailureMode'] = spec.get('expectedFailureMode', case['expected'].get('expectedFailureMode'))
+            key = metric.replace('.', '_')
+            actual = values[key]
+            if metric == 'answer.partial_failure':
+                check(isinstance(actual.get('rubric'), str) and bool(actual['rubric']), 'Partial failure has its independent semantic rubric')
+                actual = {key: actual[key] for key in expected}
+            check(actual == expected, 'Compiled expectation matches independent authored contract: ' + case_id + ':' + metric)
+            item = selected[0]
+            check(item['evidenceKey'] == key and item['goldKey'] == 'values.' + key, 'Compiled metric evidence binding')
+            diagnostic = metric == 'tool.error_rate' and 'maxRate' not in spec
+            check(item['required'] is (not diagnostic), 'Unbudgeted error rate remains diagnostic')
+            if metric == 'tool.error_rate':
+                check(item.get('threshold') == spec.get('maxRate'), 'No global error-rate budget is invented')
+            check(item['kind'] == ('llm-judge' if metric == 'answer.partial_failure' else 'deterministic'), 'Correct deterministic and semantic separation')
+
+
+def verify_cases(snapshot, case_count, stage_count, primary):
     clean(snapshot)
-    verify_sources(snapshot)
+    verify_sources(snapshot, supplementary=not primary)
     cases, gold = snapshot['cases'], snapshot['gold']
     check(snapshot['info']['version'] == 1 and snapshot['info']['scoringVersion'] == 'v1', 'Fixed v1')
-    check(len(cases) == len({item['id'] for item in cases}) == 50, '50 unique cases')
-    check(dict(Counter(item['category'] for item in cases)) == CATEGORY_COUNTS, 'Exact 11 Harness category counts')
-    check(list(dict.fromkeys(item['category'] for item in cases)) == list(CATEGORY_COUNTS), 'Harness groups retain their declared order')
-    check(len(snapshot['smokeIds']) == len(set(snapshot['smokeIds'])) == 10 and set(snapshot['smokeIds']) <= {item['id'] for item in cases}, '10 valid Smoke refs')
+    check(len(cases) == len({item['id'] for item in cases}) == case_count, 'Expected unique Case count')
+    if primary:
+        check(bool(snapshot['review'].get('coverageGaps', {}).get('efficiency.latency_budget')), 'Absent independently authored SLO is an explicit coverage gap')
+        check(dict(Counter(item['category'] for item in cases)) == CATEGORY_COUNTS, 'Exact 11 Harness category counts')
+        check(list(dict.fromkeys(item['category'] for item in cases)) == list(CATEGORY_COUNTS), 'Harness groups retain their declared order')
+    check(len(snapshot['smokeIds']) == len(set(snapshot['smokeIds'])) == (10 if primary else 0) and set(snapshot['smokeIds']) <= {item['id'] for item in cases}, 'Declared Smoke refs')
     fixture_catalog = json.loads(snapshot['fixtures']['medclaw-agent-v1.fixtures.json'])
     check(fixture_catalog['version'] == 1, 'Fixture version stays 1')
     rows = list(csv.DictReader(io.StringIO(snapshot['fixtures'][fixture_catalog['source']['ref']])))
@@ -191,15 +244,16 @@ def verify(snapshot):
         check(1 <= len(expected['forbiddenConditions']) <= 3 and len(set(expected['forbiddenConditions'])) == len(expected['forbiddenConditions']), 'One to three specific failure conditions')
         check(bool(expected.get('expectedFacts')) != bool(expected.get('goldRef')), 'Truth defined once')
         check(case['input']['fixture']['ref'] in fixture_catalog['profiles'], 'Fixture reference resolves')
-        for description in [case['name'], expected['expectedAnswerHint'], *expected['forbiddenConditions']]:
-            check(not re.search(r'[\u3400-\u9fff]', description), 'English case descriptions: ' + case['id'])
-        prompts = [case['input']['prompt']] + [step['action']['prompt'] for step in case['input'].get('turns', []) if step['action']['action'] == 'send']
-        for prompt in prompts:
-            for row in rows:
-                for field in ['name', 'manufacturer', 'category', 'region', 'distributor', 'applicant']:
-                    if row[field]:
-                        prompt = prompt.replace(row[field], '')
-            check(not re.search(r'[\u3400-\u9fff]', prompt), 'English user input except source business literals: ' + case['id'])
+        if primary:
+            for description in [case['name'], expected['expectedAnswerHint'], *expected['forbiddenConditions']]:
+                check(not re.search(r'[\u3400-\u9fff]', description), 'English case descriptions: ' + case['id'])
+            prompts = [case['input']['prompt']] + [step['action']['prompt'] for step in case['input'].get('turns', []) if step['action']['action'] == 'send']
+            for prompt in prompts:
+                for row in rows:
+                    for field in ['name', 'manufacturer', 'category', 'region', 'distributor', 'applicant']:
+                        if row[field]:
+                            prompt = prompt.replace(row[field], '')
+                check(not re.search(r'[\u3400-\u9fff]', prompt), 'English user input except source business literals: ' + case['id'])
         definition = expected.get('expectedFacts') or gold[expected['goldRef']]
         metadata = gold[case['id']]
         applicable = set(case['scorers']) | COMMON_SCORERS
@@ -217,8 +271,46 @@ def verify(snapshot):
         check(set(authoring['harness']) <= applicable and set(case['scorers']) <= set(authoring['harness']), 'Reviewed functional checks are consumed')
         special = metadata.get('scorerExpectations', {})
         check(set(special) <= applicable and set(special) <= set(SPECIAL_FIELDS), 'No unused or unknown functional expectation')
-        check(all(set(payload) <= SPECIAL_FIELDS[scorer] and bool(payload) for scorer, payload in special.items()), 'Only typed scorer fields are authored')
+        check(all(set(payload) <= SPECIAL_FIELDS[scorer] and (bool(payload) or scorer in {'tool.argument_validity', 'tool.error_rate'}) for scorer, payload in special.items()), 'Only typed scorer fields are authored')
         check(set(case['scorers']) & set(SPECIAL_FIELDS) <= set(special), 'Selected functional scorers have authored expectations')
+        if 'context.necessary_coverage' in special:
+            fields = special['context.necessary_coverage']['fields']
+            check(bool(fields) and len(set(fields)) == len(fields) and set(fields) <= {'referenceDate', 'selectedDevice', 'selectedRegion'}, 'Known independently authored necessary Context fields')
+            check('selectedDevice' not in fields or bool(case['input']['workspaceContext'].get('device')), 'Selected Device is independently specified')
+            check('selectedRegion' not in fields or bool(case['input']['workspaceContext'].get('region')), 'Selected region is independently specified')
+        if 'context.delivery' in special:
+            check(special['context.delivery']['required'] is True, 'Actual request and delivery identity chain is required')
+        if 'evidence.coverage' in special:
+            keys = special['evidence.coverage']['factKeys']
+            check(bool(keys) and len(set(keys)) == len(keys) and set(keys) <= set(definition['facts']), 'Evidence coverage uses independent Gold facts, not an Agent response')
+        for scorer in ['tool.recall', 'tool.precision']:
+            if scorer in special:
+                key = 'requiredCapabilities' if scorer == 'tool.recall' else 'allowedCapabilities'
+                check(set(special[scorer]) == {key} and isinstance(special[scorer][key], list) and len(set(special[scorer][key])) == len(special[scorer][key]), 'Explicit unique tool capabilities')
+                check(not set(special[scorer][key]) & set(expected.get('forbiddenCapabilities', [])), 'Expected tools do not bypass forbidden capabilities')
+        if 'tool.error_rate' in special and 'maxRate' in special['tool.error_rate']:
+            value = special['tool.error_rate']['maxRate']
+            check(type(value) in [int, float] and 0 <= value <= 1, 'Explicit optional error-rate budget')
+        if 'tool.argument_validity' in special:
+            check(special['tool.argument_validity'] == {}, 'Argument validity uses actual schema proofs without expected argument facts')
+        if 'evidence.provenance' in special:
+            check(special['evidence.provenance'] == {'required': True}, 'Actual provenance is required')
+        if 'evidence.freshness' in special:
+            spec = special['evidence.freshness']
+            check(spec['mode'] in ['business_date', 'age'], 'Explicit freshness mode')
+            if spec['mode'] == 'business_date':
+                check(set(spec) <= {'mode', 'date', 'maxLagDays'} and safe_integer(spec['maxLagDays']), 'Business date tolerance is independently authored')
+                check(date.fromisoformat(spec.get('date', definition['target']['date'])).isoformat() == spec.get('date', definition['target']['date']), 'Freshness refers to an explicit target business date')
+            else:
+                check(set(spec) == {'mode', 'asOf', 'maxAgeMs'} and safe_integer(spec['maxAgeMs']) and datetime.fromisoformat(spec['asOf'].replace('Z', '+00:00')).tzinfo is not None, 'Age freshness has explicit reference instant and budget')
+        if 'efficiency.latency_budget' in special:
+            check(set(special['efficiency.latency_budget']) == {'maxMs'} and safe_integer(special['efficiency.latency_budget']['maxMs']) and special['efficiency.latency_budget']['maxMs'] > 0, 'Explicit independently authored latency budget')
+        if 'tool.recovery' in special:
+            spec = special['tool.recovery']
+            check(safe_integer(spec['maxRetries']) and bool(spec['allowedTools']) and type(spec['allowStop']) is bool and spec.get('expectedFailureMode') == expected.get('expectedFailureMode') == 'tool_timeout', 'Recovery matches controlled failure and authored retry allowance')
+        if 'answer.partial_failure' in special:
+            check(type(special['answer.partial_failure']['requireDisclosure']) is bool and expected.get('expectedFailureMode') == 'tool_timeout', 'Partial failure semantic check has actual controlled failure evidence')
+            check(not special['answer.partial_failure']['requireDisclosure'] or 'Briefly identify the failure' in case['input']['prompt'], 'Recovered disclosure is explicitly requested by the authored task')
         rubric = metadata.get('rubric', {})
         check(set(rubric) == set(case['scorers']) & SEMANTIC_SCORERS, 'Every applicable semantic scorer has its own rubric')
         for scorer, criteria in rubric.items():
@@ -269,13 +361,100 @@ def verify(snapshot):
     check(next(row['price'] for row in rows if row['key'] == 'ZJ-B|2026-09-28') == 0, 'Zero stays zero')
     check(next(row['price'] for row in rows if row['key'] == 'ZJ-C|2026-10-02') is None, 'Missing stays null')
     check(not any(row['date'] == '2026-09-30' for row in rows), 'Missing date stays absent')
-    check(stages == 62, '62 independently checked truth stages')
+    check(stages == stage_count, 'Expected independently checked truth stages')
     check(snapshot['review']['qualityRuns'] == 'NOT_RUN' and snapshot['review']['exposure'] == 'developer_visible', 'No fabricated quality run or blind holdout')
     return len(rows), stages
 
 
+def confined_source(relative, required=True):
+    parts = Path(relative)
+    check(not parts.is_absolute() and ':' not in relative and '..' not in parts.parts, 'Portable source path')
+    current = REPOSITORY
+    for part in parts.parts:
+        current = current / part
+        check(not current.is_symlink(), 'No linked source component')
+    check(current.resolve().is_relative_to(REPOSITORY.resolve()), 'Confined source path')
+    if required:
+        check(current.is_file(), 'Source file exists')
+    return current
+
+
+def verify_origins(snapshot):
+    counts = dict(frozen=0, original=0)
+    for case_id, origin in snapshot['caseOrigins'].items():
+        issue = confined_source('agent-eval/records/' + origin['batchId'] + '/issues.md')
+        check(origin['issueId'] in source_text(issue), 'Original Issue exists')
+        packet_ref = 'agent-eval/records/' + origin['batchId'] + '/admission-evidence.json'
+        check(origin['evidencePacketRef'] == packet_ref, 'Frozen packet belongs to the source batch')
+        packet = json.loads(source_text(confined_source(packet_ref)))
+        check(packet['batchId'] == origin['batchId'] and bool(packet['capturedBy']) and datetime.fromisoformat(packet['capturedAt'].replace('Z', '+00:00')).tzinfo is not None, 'Actual capture identity and time')
+        sources = [source for source in packet['sources'] if source['caseId'] == case_id]
+        check(len(sources) == 1 and sources[0] == dict(caseId=case_id, sourceExecutionId=origin['sourceExecutionId'], sourceCaseId=origin['sourceCaseId'], sourceTrialId=origin['sourceTrialId'], evidenceRefs=origin['evidenceRefs']), 'Frozen source association and excerpts match')
+        roots = [f"agent-eval/runs/business/{origin['sourceExecutionId']}/evidence/{origin['sourceTrialId']}/",
+                 f"agent-eval/records/{origin['batchId']}/reproductions/{origin['sourceExecutionId']}/evidence/{origin['sourceTrialId']}/"]
+        check(bool(origin['evidenceRefs']), 'Minimal original evidence exists')
+        for ref in origin['evidenceRefs']:
+            check(ref['path'] in [root + name for root in roots for name in ['observation.json', 'trial.json']], 'Evidence belongs to original execution and Trial')
+            check(ref['pointer'].startswith('/') and not re.search(r'~(?![01])', ref['pointer']), 'Valid JSON pointer')
+            check(type(ref['value']) in [str, int, float, bool, type(None)] and (not isinstance(ref['value'], str) or len(ref['value']) <= 2000), 'Only minimal scalar excerpts')
+            counts['frozen'] += 1
+            path = confined_source(ref['path'], required=False)
+            if not path.exists():
+                continue
+            check(path.is_file(), 'Original source is a file')
+            value = json.loads(source_text(path))
+            for token in ref['pointer'][1:].split('/'):
+                key = token.replace('~1', '/').replace('~0', '~')
+                value = value[int(key)] if isinstance(value, list) else value[key]
+            check(type(value) is type(ref['value']) and value == ref['value'], 'Frozen fact matches available original evidence')
+            trial = json.loads(source_text(confined_source(str(Path(ref['path']).parent / 'trial.json').replace('\\', '/'))))
+            observation = json.loads(source_text(confined_source(str(Path(ref['path']).parent / 'observation.json').replace('\\', '/'))))
+            check(trial['caseId'] == origin['sourceCaseId'] and trial['trialId'] == origin['sourceTrialId'] and observation['executionId'] == origin['sourceExecutionId'], 'Original Case/Trial/Execution identity')
+            counts['original'] += 1
+    return counts
+
+
+def verify_badcase(snapshot, original):
+    # Admission retains its historical authored parent while the primary dataset evolves.
+    original = snapshot['review'].get('verifiedData') or original
+    count, stages = verify_cases(snapshot, 3, 3, False)
+    members = ['mc-bc-intent-zh-name', 'mc-v1-intent-resolve', 'mc-v1-intent-clarify-region']
+    check(snapshot['info']['id'] == 'medclaw-badcase-v1' and [case['id'] for case in snapshot['cases']] == members, 'First supplementary membership')
+    parents = {case['id']: case for case in original['cases']}
+    for case in snapshot['cases'][1:]:
+        check(case == parents[case['id']] and snapshot['gold'][case['id']] == original['gold'][case['id']], 'Reused Case and Gold remain unchanged')
+    chinese = snapshot['cases'][0]
+    check(chinese['input']['prompt'] == '查询浙江“合成输注泵 A”在 2026-10-02 的采购价格，并给出数据日期和来源。', 'Canonical Chinese condition')
+    check(bool(re.search(r'[\u3400-\u9fff]', chinese['name'])) and chinese['evalType'] == 'capability', 'Chinese name and capability purpose')
+    check(snapshot['gold'][chinese['id']] == original['gold']['mc-v1-intent-resolve'], 'Same independently recomputed business truth')
+    expected_chinese = json.loads(json.dumps(parents['mc-v1-intent-resolve']))
+    expected_chinese.update(id='mc-bc-intent-zh-name', name='中文名称唯一实体的意图查询', evalType='capability', sourceRef='badcase-intent-expression')
+    expected_chinese['input']['prompt'] = chinese['input']['prompt']
+    expected_chinese['expected']['goldRef'] = chinese['id']
+    check(chinese == expected_chinese, 'Only declared Chinese derivation changes')
+    for case in snapshot['cases']:
+        check(not re.search(r'8100|\b81(?:\.0+)?\b', case['input']['prompt']), 'No reference price in model input')
+    origins = snapshot['caseOrigins']
+    check(set(origins) == set(members), 'Complete origin identities')
+    for case_id, parent, purpose, changes in [
+        (members[0], members[1], 'capability', ['id', 'name', 'evalType', 'input.prompt', 'expected.goldRef', 'sourceRef']),
+        (members[1], members[1], 'challenge', []),
+        (members[2], members[2], 'control', []),
+    ]:
+        origin = origins[case_id]
+        check(origin['issueId'] == 'MC-BC-004' and origin['sourceCaseId'] == parent and origin['derivedFromCaseId'] == parent, 'Actual Issue and parent Case association')
+        check(origin['purpose'] == purpose and origin['changes'] == changes, 'Reviewed purpose and derivation declaration')
+    verify_origins(snapshot)
+    groups = snapshot['lineage']['groups']
+    check(len(groups) == 1 and groups[0]['id'] == 'synthetic-procurement-v1' and groups[0]['caseIds'] == members, 'One shared source family')
+    check(groups[0]['partition'] == 'developer_visible' and groups[0]['exposure'] == 'developer_visible' and groups[0]['origin'] == 'synthetic_authored' and not groups[0]['parentGroupIds'], 'Honest exposed synthetic provenance')
+    check(groups[0]['sourceRefs'] == ['fixtures/procurement.csv'], 'Shared original material')
+    return count, stages
+
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('dataset', nargs='?', choices=['medclaw-agent-v1', 'medclaw-badcase-v1'], default='medclaw-agent-v1')
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     catalog = json.loads(source_text(ROOT / 'fixtures/medclaw-agent-v1.fixtures.json'))
@@ -290,14 +469,26 @@ def main():
     check(all(0 < len(turn['prompt']) <= 18000 for turn in handoff['rounds']), 'Preparation input size leaves room for public attachment metadata')
     check(len({turn['prompt'] for turn in handoff['rounds']}) == 8, 'No duplicate filler turns')
     check(all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*\.(csv|json|md|txt)', name) for name in names), 'Portable fixture filenames')
-    paths = ['datasets/medclaw-agent-v1.ts', 'datasets/medclaw-agent-v1.gold.ts', 'datasets/medclaw-agent-v1.review.json'] + ['fixtures/' + name for name in sorted(names)] + PRODUCT_INPUTS
+    ids = ['medclaw-agent-v1', 'medclaw-badcase-v1'] if args.dataset == 'medclaw-badcase-v1' else ['medclaw-agent-v1']
+    paths = [f'datasets/{identity}{suffix}' for identity in ids for suffix in ['.ts', '.gold.ts', '.review.json']] + ['fixtures/' + name for name in sorted(names)] + PRODUCT_INPUTS
+    paths += ['evaluation.ts', 'dataset-compiler.ts', 'datasets.ts', 'scoring/registry.ts', 'scoring/general.ts', 'scoring/project-general.ts', 'scoring/project-observation.ts', 'scoring/project-harness.ts', 'scoring/evaluate.ts', '../../packages/contracts/src/business-tools.ts', '../scripts/verify-stage-one.py', '../scripts/export-data.ts', '../scripts/record-data-checks.ts']
     inputs = {name: source_text(ROOT / name) for name in paths}
-    exported = subprocess.run(['bun', '--no-env-file', str(SCRIPTS / 'export-data.ts')], check=True, capture_output=True, text=True, encoding='utf-8')
-    snapshot = json.loads(exported.stdout)
+    exported = subprocess.run(['bun', '--no-env-file', str(SCRIPTS / 'export-data.ts'), args.dataset, '--compiled'], check=True, capture_output=True, text=True, encoding='utf-8')
+    payload = json.loads(exported.stdout)
+    snapshot = payload['dataset']
+    verify_compiled(snapshot, payload['compiled'])
     for reference in snapshot['sourceReferences'].values():
         path = '../../' + reference['path']
         inputs[path] = source_text(ROOT / path)
-    count, stages = verify(snapshot)
+    if args.dataset == 'medclaw-badcase-v1':
+        original = subprocess.run(['bun', '--no-env-file', str(SCRIPTS / 'export-data.ts')], check=True, capture_output=True, text=True, encoding='utf-8')
+        for origin in snapshot['caseOrigins'].values():
+            paths = ['../../agent-eval/records/' + origin['batchId'] + '/issues.md', '../../' + origin['evidencePacketRef']]
+            for path in paths:
+                inputs[path] = source_text(ROOT / path)
+        count, stages = verify_badcase(snapshot, json.loads(original.stdout))
+    else:
+        count, stages = verify(snapshot)
     for case in snapshot['cases']:
         if case['category'] in ['memory', 'compaction']:
             check(all(step['action'].get('routing') == 'agent' for step in case['input'].get('turns', []) if step['action']['action'] == 'send'), 'Natural history follow-ups use Agent routing')
@@ -308,7 +499,10 @@ def main():
         check(snapshot['fixtures'][name] == inputs['fixtures/' + name], 'Archived fixture equals independent input: ' + name)
     for name, content in inputs.items():
         check(source_text(ROOT / name) == content, 'Inputs changed during verification')
-    result = dict(contract='medclaw-data-check-results/v1', status='passed', checker='independent-python-csv-decimal-v1', checkedAt=datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), assertions=assertions, cases=50, stages=stages, sourceRows=count, methods=['independent CSV parsing', 'Decimal boundary and integer-cent recomputation', 'source and six-field audit', 'per-case budget, evidence, functional expectation and rubric mapping', 'actual query/v1 content and business reference sections', 'fixed-v1 and digest-free validation'], inputs=inputs, qualityRuns='NOT_RUN', exposure='developer_visible', unresolvedDataChecks=[])
+    result = dict(contract='medclaw-data-check-results/v1', status='passed', checker='independent-python-csv-decimal-v1', checkedAt=datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), assertions=assertions, cases=len(snapshot['cases']), stages=stages, sourceRows=count, methods=['typed scorer contract and independently checked compiled expectation bindings (not complete prose failure semantics)', 'independent CSV parsing', 'Decimal boundary and integer-cent recomputation', 'source and six-field audit', 'per-case budget, evidence, functional expectation and rubric mapping', 'actual query/v1 content and business reference sections', 'fixed-v1 and digest-free validation'], inputs=inputs, qualityRuns='NOT_RUN', exposure='developer_visible', unresolvedDataChecks=[])
+    if args.dataset == 'medclaw-badcase-v1':
+        result['datasetId'] = args.dataset
+        result['methods'] += ['frozen scalar source packet; original archive crosscheck when available', 'same-source language/control pairing', 'unchanged reused Case and Gold identities']
     if args.output:
         args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
     print(json.dumps({key: value for key, value in result.items() if key != 'inputs'}, ensure_ascii=False))

@@ -36,15 +36,17 @@ export interface RuleResult {
 export interface EvaluatorDefinition {
   id: string; name: string; version: string; kind: EvaluatorKind; behavior: boolean;
   layer: string; formula: string;
+  appliesTo?: (expected: unknown, context: EvaluationContext) => {applicable:boolean;reason:string};
   evaluate(expected: unknown, actual: unknown, check: CheckSpec, context: EvaluationContext): RuleResult | Promise<RuleResult>;
 }
 export interface JudgeRequest {
-  trialId: string; checks: { checkId: string; rubric: string; evidenceRefs: string[] }[];
+  trialId: string; checks: { checkId: string; rubric: string; evidenceRefs: string[];counted?:CountedJudgeCriterion }[];
   answer: string; evidence: unknown;
 }
+export interface CountedJudgeCriterion {unit:'assertion'|'citation'|'completion-claim';denominator?:number}
 export interface JudgeResult {
   status: 'completed' | 'error';
-  results: { checkId: string; value: number | null; reason: string; evidenceRefs: string[] }[];
+  results: { checkId: string; value: number | null; reason: string; evidenceRefs: string[];numerator?:number|null;denominator?:number|null }[];
   error: string | null; metadata: JudgeMetadata;
 }
 export interface JudgeMetadata {

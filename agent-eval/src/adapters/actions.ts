@@ -4,7 +4,7 @@ import { mkdir, realpath,readFile } from 'node:fs/promises';
 import { join, resolve,dirname } from 'node:path';
 import type { ProductResource, RegisteredAction, RegisteredStep } from '../evaluation.ts';
 import type { ResolvedRunConfig } from '../types.ts';
-import type { SessionCheckpoint, SessionCheckpointPage, SessionInputPage } from '../../../packages/contracts/src/session.ts';
+import type { SessionCheckpoint, SessionCheckpointPage, SessionInputPage,CompactionOperationView } from '../../../packages/contracts/src/session.ts';
 import type { SessionMessagePage } from '../../../packages/contracts/src/messages.ts';
 import type { RunView } from '../../../packages/contracts/src/run.ts';
 import { ProductAdapter, unwrap } from './product.ts';
@@ -14,6 +14,8 @@ import {parseAuthoredSource} from '../independent-gold.ts';
 import type {Snapshot} from '../../../packages/contracts/src/query.ts';
 import type {WorkspaceSelection} from '../../../packages/contracts/src/workspace.ts';
 import type {PublicMaterial} from '../datasets.ts';
+import {safeError} from '../../../packages/contracts/src/error.ts';
+import {TOOL_READ_RULES} from '../../../packages/contracts/src/tool.ts';
 
 export interface AliasState {
   sessions: Map<string, { id: number; nativeSessionId: string }>;
@@ -80,7 +82,7 @@ export class ActionExecutor {
         } else if (trigger === 'tool_result_saved') {
           const runId = identity(this.aliases.runs, alias); let page = 1;
           for (;;) {
-            const result = unwrap(await this.product.request('tool.read', { runId, page, pageSize: 100 }));
+            const result = unwrap(await this.product.request('tool.read', { runId, page, pageSize: TOOL_READ_RULES.maxPageSize }));
             if (result.items.some(item => ['succeeded', 'failed', 'cancelled'].includes(item.status))) return;
             if (page * result.pageSize >= result.totalRows) break; page++;
           }
@@ -90,7 +92,8 @@ export class ActionExecutor {
       await Bun.sleep(Math.min(25, Math.max(1, deadline - Date.now())));
     }
   }
-  async execute(action: RegisteredAction): Promise<unknown> {
+  async execute(action: RegisteredAction, signal?:AbortSignal): Promise<unknown> {
+    signal?.throwIfAborted();
     const product = this.product, operationRef = randomUUID();
     switch (action.action) {
       case 'new_session': {
@@ -170,10 +173,19 @@ export class ActionExecutor {
           expectedBatchIds: workspace.batchRefs.map(batch => batch.id), expectedQueryId: workspace.queryId, model: await this.model(), referenceDate: action.referenceDate, timezone: 'Asia/Shanghai' as const };
         const payload = mode === 'send' ? { ...common, mode, ...(action.routing === 'intent' ? { routing: { mode: 'intent' as const, originRunId: null } } : {}) }
           : { ...common, mode, targetRunId: identity(this.aliases.runs, action.targetRunAlias ?? this.lastSendAlias ?? '') };
+        signal?.throwIfAborted();
         const result = unwrap(await product.request('session.submit', payload, operationRef));
-        if (result.sessionId !== sessionId || result.clientSequence !== common.clientSequence) throw new Error('submission_identity_mismatch');
+        if (result.sessionId !== sessionId || result.clientSequence !== common.clientSequence
+          || payload.mode === 'send' && result.runId === null
+          || payload.mode !== 'send' && (result.inputId === null || result.runId !== null && result.runId !== payload.targetRunId)) throw new Error('submission_identity_mismatch');
+        if(payload.mode!=='send') {
+          const input=unwrap(await product.request('session.readInput',{sessionId,clientSequence:common.clientSequence}));
+          if(!input||input.id!==result.inputId||input.sessionId!==sessionId||input.clientSequence!==common.clientSequence||input.mode!==payload.mode
+            ||input.targetRunId!==payload.targetRunId||input.runId!==null&&input.runId!==payload.targetRunId)throw new Error('submission_identity_mismatch');
+        }
         bind(this.aliases.inputs, action.alias, { sessionId, clientSequence: result.clientSequence, inputId: result.inputId });
-        if (result.runId !== null) bind(this.aliases.runs, action.alias, result.runId);
+        const runId=payload.mode==='send'?result.runId:payload.targetRunId;
+        if (runId !== null) bind(this.aliases.runs, action.alias, runId);
         this.lastSendAlias = action.alias; return result;
       }
       case 'import': {
@@ -199,9 +211,22 @@ export class ActionExecutor {
       case 'restart': { const ready = await product.restart(); await verifyPublishedConfiguration(product, this.config); return ready; }
       case 'compact': {
         const sessionId = this.session(action.sessionAlias), detail = unwrap(await product.request('session.read', { sessionId })); if (!detail) throw new Error('session_not_found');
+        const model=await this.model();signal?.throwIfAborted();
         bind(this.aliases.operations, `compaction:${operationRef}`, { kind: 'compaction', operationRef, sessionId });
-        const result = unwrap(await product.request('session.compact', { sessionId, expectedStorageVersion: detail.session.storageVersion, model: await this.model() }, operationRef));
-        return result;
+        let result:CompactionOperationView|null = unwrap(await product.request('session.compact', { sessionId, expectedStorageVersion: detail.session.storageVersion, model }, operationRef));
+        const deadline=product.deadlineAt??Date.now()+30000;
+        for(;;) {
+          signal?.throwIfAborted();
+          if(!result||result.sessionId!==sessionId||result.operationRef!==operationRef)throw new Error('compaction_identity_mismatch');
+          if(result.error||['failed','cancelled','interrupted','unconfirmed'].includes(result.status)) {
+            const provider=result.calls.find(call=>call.error?.code==='provider_request_failed')?.error;
+            return unwrap({ok:false,error:provider??result.error??safeError('compaction_failed')});
+          }
+          if(result.receipt&&['completed','no_op'].includes(result.status)&&result.canContinue)return result;
+          if(Date.now()>=deadline)throw new Error('compaction_wait_timeout');
+          await Bun.sleep(Math.min(25,Math.max(1,deadline-Date.now())));
+          result=unwrap(await product.request('session.compaction.read',{sessionId,operationRef}));
+        }
       }
       case 'read_checkpoints': return this.checkpoints(action.sessionAlias);
       case 'restore_checkpoint': {

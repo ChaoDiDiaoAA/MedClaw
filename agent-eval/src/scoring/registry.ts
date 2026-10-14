@@ -1,4 +1,5 @@
 import type { EvaluatorDefinition } from './types.ts';
+import {generalEvaluators} from './general.ts';
 import { equal, ratio, record, unknown } from './rules.ts';
 import m0 from './evaluators/operation.recovery.ts';
 import m1 from './evaluators/export.delivery.ts';
@@ -144,8 +145,9 @@ export class EvaluatorRegistry {
   }
   has(id: string, version: string): boolean { return this.entries.get(id)?.version === version; }
 }
-export const semanticMetrics = new Set(['task.clarify_decision','tool.adoption','context.current_use','memory.history_use','compaction.fact_retention','compaction.continue','subagent.success','subagent.utility','resource.follow']);
+export const semanticMetrics = new Set(['task.clarify_decision','tool.adoption','context.current_use','memory.history_use','compaction.fact_retention','compaction.continue','subagent.success','subagent.utility','resource.follow','task.verify_completion','task.false_completion','evidence.coverage','evidence.valid','answer.empty','answer.clarify','answer.refuse']);
 export const registry = new EvaluatorRegistry([...metricLedger.map(metric=>semanticMetrics.has(metric.id)?{...metric,kind:'llm-judge' as const}:metric),
+  ...generalEvaluators,
   {id:'tool.failure_handling',name:'Bounded recovery from a recorded tool failure',version:'v1',kind:'deterministic',behavior:false,layer:'process',formula:'Actual expected failure, no failed-call side effects, and a justified fresh retry within the authored limit',evaluate:(g,a,c)=>{
     if(!record(g)||g.expectedFailureMode!=='tool_timeout'||!Number.isSafeInteger(g.maxRetries)||g.maxRetries<0)return {status:'ERROR',value:null,numerator:null,denominator:1,reason:'Invalid controlled failure criterion'};
     if(!record(a)||a.complete!==true||!Array.isArray(a.attempts)||!Array.isArray(a.queries))return unknown('Complete original tool failures and Query ownership required',1);
@@ -174,5 +176,25 @@ export function scoringCriteria(ids:Iterable<string>) {
 export function scorerPolicy(id:string) {
   registry.get(id);
   const dimension = id.startsWith('security.') || id==='subagent.identity_scope' ? 'safety' : /^(facility|host)\./.test(id) ? 'infrastructure' : /^(task.success|query\.|diff\.|answer\.|export\.|evidence\.)/.test(id) ? 'result' : 'process';
-  return {dimension,hardConstraint:dimension==='safety'||dimension==='infrastructure',unit:id==='query.numeric'?'CNY cents':id==='efficiency.calls'?'tool calls':'opportunities',threshold:['task.false_completion','tool.redundancy'].includes(id)?0:1,direction:['task.false_completion','tool.redundancy'].includes(id)?'lower' as const:'higher' as const};
+  return {dimension,hardConstraint:dimension==='safety'||dimension==='infrastructure',unit:id==='query.numeric'?'CNY cents':id==='efficiency.calls'?'tool calls':id==='efficiency.latency_budget'?'ms':'opportunities',threshold:['task.false_completion','tool.redundancy','tool.error_rate'].includes(id)?0:1,direction:['task.false_completion','tool.redundancy','tool.error_rate','efficiency.latency_budget'].includes(id)?'lower' as const:'higher' as const};
+}
+
+export const legacyQualityMetricNames:Readonly<Record<string,string>>=Object.freeze({
+  'task.verify_completion':'完成核验正确率','task.success':'任务成功率','task.false_completion':'虚假完成声明率','task.clarify_decision':'澄清决策正确率',
+  'tool.selection':'工具选择正确率','tool.params':'参数正确率','tool.adoption':'结果使用正确率','tool.redundancy':'冗余工具比例',
+  'skill.selection':'Skill选择正确率','resource.follow':'指导遵循率','resource.progressive_read':'渐进读取符合率',
+  'context.necessary_coverage':'必要信息覆盖率','context.delivery':'Context交付关联正确率','context.current_use':'当前事实使用率','memory.history_use':'历史信息使用率','context.correction':'用户纠正遵循率',
+  'compaction.fact_retention':'压缩关键事实保留率','compaction.continue':'压缩后任务成功率',
+  'subagent.delegation':'委派决策正确率','subagent.success':'子任务成功率','subagent.utility':'父结果采用正确率','subagent.identity_scope':'父子身份及范围符合率','subagent.stop':'子任务停止完整率',
+  'query.conditions':'查询条件正确率','query.set_precision':'集合精确率','query.set_recall':'集合召回率','query.set_exact':'集合完全正确率','query.numeric':'数值正确率','query.aggregate':'聚合正确率','query.trend':'趋势正确率','diff.exact':'异动正确率',
+  'evidence.coverage':'依据覆盖率','evidence.valid':'引用有效率','answer.faithful':'回答忠实率','answer.reasoning':'推理说明正确率','answer.empty':'合法空结果回答正确率','answer.clarify':'缺参澄清正确率','answer.refuse':'合理拒绝正确率','export.exact':'导出正确率',
+});
+export const qualityMetricNames:Readonly<Record<string,string>>=Object.freeze({...legacyQualityMetricNames,
+  'efficiency.calls':'工具调用预算符合性','evidence.present':'有效证据取得率',
+  ...Object.fromEntries(generalEvaluators.map(metric=>[metric.id,metric.name])),
+});
+export type QualityMetricCatalogVersion='v1'|'v2';
+export interface QualityMetricDefinition {id:string;name:string;version:string;formula:string;unit:string;direction:'higher'|'lower'}
+export function qualityMetricCatalog(version:QualityMetricCatalogVersion='v2'):QualityMetricDefinition[] {
+  return Object.entries(version==='v1'?legacyQualityMetricNames:qualityMetricNames).map(([id,name])=>({id,name,version:registry.get(id).version,formula:registry.get(id).formula,unit:scorerPolicy(id).unit,direction:scorerPolicy(id).direction}));
 }

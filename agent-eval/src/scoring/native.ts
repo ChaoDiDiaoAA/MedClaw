@@ -55,7 +55,10 @@ export const nativeRules: Record<string, OpportunityRule> = {
   'memory.branch': rule('leafId:s slots:v', 'leafId:s slots:v oldBranchRetained:b', (g, a) => a.leafId === g.leafId && equal(a.slots, g.slots) && a.oldBranchRetained),
   'compaction.native': rule('leafId:s entryContent:s', 'engine:s entryType:s leafId:s entryContent:s persisted:b', (g, a) => a.engine === 'pi' && a.entryType === 'compaction' && a.leafId === g.leafId && a.entryContent === g.entryContent && a.persisted),
   'resource.discovery': rule('resources:a', 'resources:a conflictsAccepted:n', (g, a) => records(g.resources, 'id:s content:s') && records(a.resources, 'id:s content:s') && a.conflictsAccepted === 0 && sameSet(a.resources, g.resources)),
-  'resource.read': rule('required:a', 'reads:a', (g, a) => records(g.required, 'id:s content:s') && records(a.reads, 'id:s content:s nativeReadId:s') && g.required.every((item: any) => a.reads.some((read: any) => read.id === item.id && read.content === item.content))),
+  'resource.read': (g,a)=>{
+    if(a.opportunityComplete===false&&Array.isArray(g.required)&&Array.isArray(a.reads)&&!g.required.every((item:any)=>a.reads.some((read:any)=>read.id===item.id&&read.content===item.content)))return null;
+    return rule('required:a','reads:a',(g,a)=>records(g.required,'id:s content:s')&&records(a.reads,'id:s content:s nativeReadId:s')&&g.required.every((item:any)=>a.reads.some((read:any)=>read.id===item.id&&read.content===item.content)))(g,a);
+  },
   'extension.revalidate': rule('allowedIds:i schemaValid:b', 'finalScopeIds:i finalSchemaValid:b executeCount:n', (g, a) => a.finalSchemaValid === g.schemaValid && subset(a.finalScopeIds, g.allowedIds) && (a.finalSchemaValid ? a.executeCount === 1 : a.executeCount === 0)),
   'extension.lifecycle': rule('mandatoryFailure:b', 'mandatoryFailure:b disposed:b modelCalls:n', (g, a) => a.mandatoryFailure === g.mandatoryFailure && a.disposed && (!g.mandatoryFailure || a.modelCalls === 0)),
   'subagent.identity': rule('parentCallId:s childRunId:s childSessionId:s', 'parentCallId:s childRunId:s childSessionId:s boundAt:n firstRequestAt:n', (g, a) => a.parentCallId === g.parentCallId && a.childRunId === g.childRunId && a.childSessionId === g.childSessionId && a.boundAt < a.firstRequestAt),

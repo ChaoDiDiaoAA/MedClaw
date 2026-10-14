@@ -15,6 +15,98 @@ function context(metric:string,expected:any):EvaluationContext {
     observation:{trialId:'trial',instanceId:'host',identityChecks:[],missing:[],facts:{aliases:{runs:[{alias:'turn-1',runId:1}],sessions:[{alias:'main',sessionId:1}]},runs:[{id:1,kind:'agent',instanceId:'host',sessionId:1,status:'completed',cleanup:{stopConfirmed:true,requiredPersistenceComplete:true},stoppedAt:at}],providerRequests:[],toolOriginals:[],nativeHistory:[],modelCalls:[],toolCalls:[],answers:[],contexts:[]}}};
 }
 const score=async(c:EvaluationContext)=>(await evaluate(c))[0]!;
+
+test('necessary selected entities bind actual Context material fields to independently imported source rows',async()=>{
+  const {mkdtemp,mkdir,writeFile,rm}=await import('node:fs/promises'),{join}=await import('node:path'),{tmpdir}=await import('node:os');
+  const {CONTEXT_MATERIAL_PREFIX}=await import('../../../packages/contracts/src/context.ts');
+  const root=await mkdtemp(join(tmpdir(),'mc-context-selection-'));
+  try {
+    const name='zhejiang_2026-10-02.csv',path='input/'+name,content='device_id,device_name,snapshot_date,region,currency,unit,price_cents,source_refs_json\nSYN-ZJ-A,合成器械A,2026-10-02,浙江,CNY,台,8100,[]\n';
+    const manifest=JSON.stringify({artifactId:1,operationRef:'import',files:[{path,bytes:Buffer.byteLength(content)}]});
+    await mkdir(join(root,'input'));await writeFile(join(root,path),content);await writeFile(join(root,'manifest.json'),manifest);
+    const goldFacts=[['referenceDate','2026-10-02'],['selectedDevice','SYN-ZJ-A'],['selectedRegion','浙江']].map(([factId,value])=>({factId,value,sourceId:'MC-025:context-contract'}));
+    const c=context('context.necessary_coverage',{facts:goldFacts}),facts=c.observation!.facts as any;
+    const fields={deviceId:7,batchId:1,deviceName:'合成器械A',sourceRowRef:name+':2',region:'浙江',currency:'CNY',unit:'台',priceCents:8100,sourceRefs:[]};
+    const projection=CONTEXT_MATERIAL_PREFIX+JSON.stringify({referenceDate:'2026-10-02',materialScope:{deviceIds:[7],batchIds:[1]},materials:[{ref:{kind:'snapshot'},value:{fields}}]});
+    Object.assign(facts,{batches:[{id:1,region:'浙江',snapshotDate:'2026-10-02',sourceBundleId:'s'}],operations:[{kind:'import',artifactId:1,result:{batchIds:[1],sourceBundleId:'s'}}],artifacts:[{id:1,operationRef:'import',protocolValidated:true,status:'ready'}],artifactFiles:[{artifactId:1,relativePath:path,evidencePath:join(root,path),content,bytes:Buffer.byteLength(content)},{artifactId:1,relativePath:'manifest.json',evidencePath:join(root,'manifest.json'),content:manifest,bytes:Buffer.byteLength(manifest)}],contexts:[{kind:'snapshot',snapshot:{id:1,renderedProjection:projection},deliveries:[{callId:'one'}]}],providerRequests:[request('one',{messages:[{content:projection}]})],modelCalls:[{callId:'one',runId:1,sessionId:1,kind:'main'}]});
+    expect(await score(c)).toMatchObject({status:'PASS',numerator:3,denominator:3});
+    goldFacts[2]!.value='河南';expect(await score(c)).toMatchObject({status:'FAIL',numerator:2,denominator:3});
+    facts.artifactFiles=[];expect(await score(c)).toMatchObject({status:'ERROR'});
+  }finally{await rm(root,{recursive:true,force:true});}
+});
+
+test('semantic empty, clarification and refusal checks enforce real Query and route boundaries before Judge',async()=>{
+  const {projectObservation}=await import('../../src/scoring/project-observation.ts');
+  for(const metric of ['answer.empty','answer.clarify','answer.refuse']){
+    const c=context(metric,{}),facts=c.observation!.facts as any,criterion=c.task.checks[0]!;
+    criterion.kind='llm-judge';criterion.scope={kind:'run',ref:'turn-1'};
+    const answer={id:1,runId:1,sessionId:1,inputId:1,kind:metric==='answer.empty'?'result':metric==='answer.clarify'?'clarification':'out_of_scope',text:'Plain natural language answer',queryIds:[] as number[],missingSlots:metric==='answer.clarify'?['region']:[],nativeLeafId:'a',createdAt:at,resultSource:'agent'};
+    facts.answers=[answer];facts.queryPages=[];facts.queries=[];facts.evidencePages=[];facts.collectionCompleteness={queries:true,tools:true,children:true};
+    const expected=metric==='answer.empty'?{rubric:'Report a legal empty result',queryParameters:conditions}:{rubric:'Respect required business boundary',allowedRoutes:[metric==='answer.clarify'?'clarify':'reject'],allowedKinds:[answer.kind],missingSlots:answer.missingSlots,status:'OUT_OF_SCOPE'};
+    c.gold.values={expected};
+    facts.intents=[{runId:1,decision:{route:metric==='answer.clarify'?'clarify':'reject',status:'OUT_OF_SCOPE',missingSlots:answer.missingSlots}}];
+    if(metric==='answer.empty'){queryFacts(facts);answer.queryIds=[11];}
+    const positive=await projectObservation(criterion,c);
+    expect(positive?.reason,metric).toBeUndefined();expect(positive?.actual,metric).toBeDefined();
+    if(metric==='answer.empty'){facts.queryPages[0].query.totalRows=1;Object.assign(facts.queryPages[0].page,{totalRows:1,rows:[{value:1}],rowKeys:[null]});}
+    else facts.queries=[{id:99,runId:1}];
+    expect((await projectObservation(criterion,c))?.constraint?.status,metric).toBe('FAIL');
+    facts.queryPages=[];facts.queries=[];
+    if(metric==='answer.empty')answer.queryIds=[];else facts.intents=[];
+    expect((await projectObservation(criterion,c))?.reason,metric).toBeDefined();
+  }
+});
+
+test('necessary Context facts use independent expectations and the actual prefixed request projection',async()=>{
+  const {CONTEXT_MATERIAL_PREFIX}=await import('../../../packages/contracts/src/context.ts');
+  const c=context('context.necessary_coverage',{facts:[{factId:'referenceDate',value:'2026-10-02',sourceId:'MC-025:context-contract'}]}),facts=c.observation!.facts as any;
+  const text=CONTEXT_MATERIAL_PREFIX+JSON.stringify({referenceDate:'2026-10-02',workspaceContext:{deviceIds:[],batchRefs:[]}});
+  facts.contexts=[{kind:'snapshot',snapshot:{id:1,workspaceContext:{revision:1},renderedProjection:text},deliveries:[{callId:'one'}]}];
+  facts.providerRequests=[request('one',{messages:[{role:'system',content:text}]})];facts.modelCalls=[{callId:'one',runId:1,sessionId:1,kind:'main'}];
+  expect(await score(c)).toMatchObject({status:'PASS',denominator:1});
+  facts.providerRequests=[request('one',{messages:[{role:'system',content:'Projection was omitted'}]})];
+  expect(await score(c)).toMatchObject({status:'FAIL'});
+});
+
+test('autonomous delegation has positive and negative controls and explicit delegation is not scored as autonomous',async()=>{
+  const c=context('subagent.delegation',{delegate:false}),facts=c.observation!.facts as any;
+  facts.providerRequests=[request('one',{messages:[{role:'user',content:'Read-only query'}]})];
+  expect(await score(c)).toMatchObject({status:'PASS'});
+  const tool={id:3,runId:1,sessionId:1,modelCallId:'one',name:'Agent',nativeToolCallId:'agent-one'};
+  facts.toolCalls=[tool];facts.toolOriginals=[original({kind:'tool',runId:1,sessionId:1,toolCallId:3},tool)];facts.runs.push({id:2,kind:'child',sessionId:2,parentRunId:1,originToolCallId:3});
+  expect(await score(c)).toMatchObject({status:'FAIL'});
+  (c.gold.values as any).expected.opportunities[0].expected.delegate=true;
+  expect(await score(c)).toMatchObject({status:'PASS'});
+  c.input={tags:['explicit_delegate']};expect(await score(c)).toMatchObject({status:'UNJUDGEABLE',applicable:false,denominator:0});
+});
+
+test('failed or unfinished Runs do not prove omitted resource reads or required capabilities',async()=>{
+  for(const metric of ['resource.read','resource.progressive_read','tool.selection']) {
+    const expected=metric==='resource.read'?{required:[{id:'skill:guide@v1/SKILL.md',content:'guide'}]}:metric==='resource.progressive_read'?{requiredRefs:['materials/guide.md'],allowedRefs:['materials/guide.md'],maxBytes:100}:{requiredCapabilities:['delegate'],forbiddenCapabilities:['write']};
+    const c=context(metric,expected),facts=c.observation!.facts as Record<string,any>;
+    c.gold.values={expected};c.trialStatus='infra_error';
+    facts.providerRequests=[request('one',{})];facts.modelCalls=[{callId:'one',runId:1,kind:'main',state:'failed'}];facts.queries=[];
+    for(const state of ['failed','cancelled','created','running']) {
+      facts.runs[0].status=state;facts.runs[0].error=state==='failed'?{code:'provider_request_failed'}:null;
+      expect(await score(c),metric+':'+state).toMatchObject({status:'UNJUDGEABLE'});
+    }
+    facts.runs[0].status='completed';c.trialStatus='completed';
+    expect(await score(c)).toMatchObject({status:'FAIL'});
+  }
+});
+
+test('partial Run still fails a proven forbidden capability and a completed scoped follow-up is judgeable',async()=>{
+  const c=context('tool.selection',{}),facts=c.observation!.facts as Record<string,any>;
+  c.gold.values={expected:{requiredCapabilities:['delegate'],forbiddenCapabilities:['write']}};
+  facts.queries=[];c.trialStatus='infra_error';
+  const tool={id:8,runId:1,sessionId:1,name:'write',status:'succeeded'};
+  facts.toolCalls=[tool];facts.toolOriginals=[original({kind:'tool',runId:1,sessionId:1,toolCallId:8},tool)];
+  for(const state of ['failed','cancelled','created','running']){facts.runs[0].status=state;expect(await score(c),state).toMatchObject({status:'FAIL'});}
+  facts.toolCalls=[];facts.toolOriginals=[];
+  facts.runs.push({id:2,status:'completed',kind:'agent',sessionId:1,instanceId:'host'});
+  facts.aliases.runs.push({alias:'turn-2',runId:2});c.task.checks[0]!.scope={kind:'run',ref:'turn-2'};
+  expect(await score(c)).toMatchObject({status:'FAIL'});
+});
 function queryFacts(facts:Record<string,any>,region='浙江') {
   const params=QueryParamsSchema.parse({kind:'current',population:'snapshot',snapshotMode:'exact_date',batchIds:[1],region,time:{start:'2026-10-02',endExclusive:'2026-10-03'}});
   const query={id:11,sessionId:1,runId:1,callRef:'1:native-one',kind:'current',params,batchIds:[1],scopeDeviceIds:null,warnings:[],calculationVersion:'v1',resultHash:'result',createdAt:at,totalRows:0};

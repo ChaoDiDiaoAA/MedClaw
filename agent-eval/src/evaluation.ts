@@ -103,15 +103,35 @@ export const ReviewSchema = z.strictObject({schemaVersion:Version,caseId:IdSchem
 export const DatasetLineageSchema = z.strictObject({contract:z.literal('medclaw-eval-lineage/v1'),version:Version,
   groups:z.array(z.strictObject({id:IdSchema,sourceRefs:z.array(RelativePathSchema),caseIds:UniqueIds,partition:z.enum(['developer_visible','blind_holdout']),exposure:z.enum(['developer_visible','unexposed']),origin:z.enum(['synthetic_authored','public','licensed']),parentGroupIds:UniqueIds,notes:z.string()}))});
 export type DatasetLineage = z.infer<typeof DatasetLineageSchema>;
+export const CaseOriginsSchema=z.record(IdSchema,z.strictObject({batchId:IdSchema,issueId:IdSchema,evidencePacketRef:RelativePathSchema,sourceExecutionId:IdSchema,sourceCaseId:IdSchema,sourceTrialId:IdSchema,
+  derivedFromCaseId:IdSchema,purpose:z.enum(['capability','challenge','control','regression']),changes:z.array(z.string().min(1)),
+  evidenceRefs:z.array(z.strictObject({path:RelativePathSchema,pointer:z.string().startsWith('/').refine(value=>!/~(?![01])/.test(value),'Invalid JSON pointer'),
+    value:z.union([z.string().max(2000),z.number().finite(),z.boolean(),z.null()])})).min(1)}));
+export type CaseOrigins=z.infer<typeof CaseOriginsSchema>;
 export const DatasetManifestSchema = z.strictObject({contract:z.literal('medclaw-agent-dataset/v1'),id:IdSchema,version:Version,name:z.string(),description:z.string(),createdAt:z.iso.datetime(),readiness:z.enum(['draft','reviewed']),members:UniqueIds,smoke:UniqueIds,referenceDate:z.iso.date(),timezone:z.literal('Asia/Shanghai'),scoringVersion:z.literal('v1')});
 export type DatasetManifest = z.infer<typeof DatasetManifestSchema>;
-export const DataCheckResultsSchema = z.strictObject({contract:z.literal('medclaw-data-check-results/v1'),status:z.literal('passed'),checker:z.string(),checkedAt:z.iso.datetime(),assertions:z.number().int().positive(),cases:z.number().int().positive(),stages:z.number().int().positive(),sourceRows:z.number().int().positive(),methods:z.array(z.string()),inputs:z.record(z.string(),z.string()),qualityRuns:z.literal('NOT_RUN'),exposure:z.literal('developer_visible'),unresolvedDataChecks:z.array(z.string()).length(0)});
+export const DataCheckResultsSchema = z.strictObject({contract:z.literal('medclaw-data-check-results/v1'),datasetId:IdSchema.optional(),status:z.literal('passed'),checker:z.string(),checkedAt:z.iso.datetime(),assertions:z.number().int().positive(),cases:z.number().int().positive(),stages:z.number().int().positive(),sourceRows:z.number().int().positive(),methods:z.array(z.string()),inputs:z.record(z.string(),z.string()),qualityRuns:z.literal('NOT_RUN'),exposure:z.literal('developer_visible'),unresolvedDataChecks:z.array(z.string()).length(0)});
 
 const Strings = z.array(z.string().min(1));
 const Regions = z.array(z.enum(['浙江','河南'])).min(1);
 const FactKeys = z.strictObject({factKeys:Strings.min(1)});
 const SourceTurn = z.strictObject({sourceTurnAlias:Alias});
 export const ScorerExpectationsSchema = z.strictObject({
+  'tool.recall':z.strictObject({requiredCapabilities:Capabilities.min(1)}),
+  'tool.precision':z.strictObject({allowedCapabilities:Capabilities}),
+  'tool.error_rate':z.strictObject({maxRate:z.number().min(0).max(1).optional()}),
+  'tool.argument_validity':z.strictObject({}),
+  'tool.recovery':z.strictObject({maxRetries:z.number().int().nonnegative().max(8),allowedTools:Capabilities.min(1),allowStop:z.boolean(),expectedFailureMode:z.enum(['tool_timeout','resource_unavailable']).optional()}),
+  'evidence.provenance':z.strictObject({required:z.literal(true)}),
+  'evidence.freshness':z.discriminatedUnion('mode',[
+    z.strictObject({mode:z.literal('business_date'),date:z.iso.date().optional(),maxLagDays:z.number().int().nonnegative()}),
+    z.strictObject({mode:z.literal('age'),asOf:z.iso.datetime(),maxAgeMs:z.number().int().nonnegative()}),
+  ]),
+  'efficiency.latency_budget':z.strictObject({maxMs:z.number().int().positive()}),
+  'answer.partial_failure':z.strictObject({requireDisclosure:z.boolean(),expectedFailureMode:z.enum(['tool_timeout','resource_unavailable']).optional()}),
+  'context.necessary_coverage':z.strictObject({fields:z.array(z.enum(['referenceDate','selectedDevice','selectedRegion'])).min(1)}),
+  'context.delivery':z.strictObject({required:z.literal(true)}),
+  'evidence.coverage':FactKeys,
   'task.clarify_decision':z.strictObject({allowedActions:Strings.min(1),forbiddenCalls:Strings}),
   'tool.params':z.strictObject({sourceTurnAlias:Alias.optional()}),
   'tool.adoption':FactKeys,
@@ -139,7 +159,7 @@ export const ScorerExpectationsSchema = z.strictObject({
 }).partial();
 export type ScorerExpectations = z.infer<typeof ScorerExpectationsSchema>;
 const Rubric = z.strictObject({pass:z.string().min(1),partial:z.string().min(1),fail:z.string().min(1)});
-const SemanticIds = ['tool.params','task.clarify_decision','tool.adoption','context.current_use','memory.history_use','compaction.fact_retention','compaction.continue','subagent.success','subagent.utility','resource.follow','answer.faithful','answer.reasoning'] as const;
+const SemanticIds = ['answer.partial_failure','tool.params','task.clarify_decision','tool.adoption','context.current_use','memory.history_use','compaction.fact_retention','compaction.continue','subagent.success','subagent.utility','resource.follow','answer.faithful','answer.reasoning','task.verify_completion','task.false_completion','evidence.coverage','evidence.valid','answer.empty','answer.clarify','answer.refuse'] as const;
 export const SourceReferenceSchema=z.strictObject({kind:z.enum(['product-spec','historical-issue','real-trace','provider-fixture']),path:RelativePathSchema,section:z.string().min(1),rationale:z.string().min(1)});
 export const ProductResourceSchema=z.strictObject({kind:z.enum(['skill','prompt']),id:IdSchema,version:z.literal('v1'),files:z.array(EmbeddedFileSchema).min(1)});
 export type ProductResource=z.infer<typeof ProductResourceSchema>;

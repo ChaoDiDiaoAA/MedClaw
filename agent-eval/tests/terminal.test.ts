@@ -2,6 +2,12 @@ import {expect,test,spyOn} from 'bun:test';
 import {trialProgress} from '../src/execution/progress.ts';
 import {terminalProgress,terminalSummary} from '../src/terminal.ts';
 
+test('infrastructure blocked score is distinguished from a scorer error',()=>{
+  const lines:string[]=[],render=terminalProgress(line=>lines.push(line));
+  render({caseId:'case',trialId:'case-r1',repetition:1,index:1,total:1,kind:'score',phase:'score',elapsedMs:1,status:'ERROR',executionStatus:'infra_error'});
+  expect(lines[0]).toContain('执行阻断');expect(lines[0]).not.toContain('必要评分出错');
+});
+
 test('terminal separates execution completion, quality result and durable save, with exact evidence paths',()=>{
   const lines:string[]=[],render=terminalProgress(line=>lines.push(line)),item={caseId:'mc-v1-task-current-price',trialId:'mc-v1-task-current-price-r1',repetition:1,index:1,total:10};
   render({...item,kind:'phase',phase:'prepare_input',elapsedMs:0});
@@ -28,4 +34,14 @@ test('phase heartbeat repeats at sixty seconds and is cleared on phase changes a
     progress.phase('collect');expect(clear).toHaveBeenCalledTimes(1);
     progress.close();expect(clear).toHaveBeenCalledTimes(2);
   }finally{interval.mockRestore();clear.mockRestore();}
+});
+
+test('terminal prints every Case check including PASS and does not expand the 39-metric catalog',()=>{
+  const lines:string[]=[],render=terminalProgress(line=>lines.push(line));
+  render({caseId:'case-query',trialId:'case-query-r2',repetition:2,index:7,total:250,trialsPerCase:5,kind:'score',phase:'score',elapsedMs:1,status:'PASS',checks:
+    ['query.conditions','query.numeric','evidence.valid','answer.faithful'].map((metricId,index)=>({metricId,checkId:'check-'+index,name:metricId,status:'PASS' as const,value:1,numerator:1,denominator:1,unit:'opportunities',applicable:true,reason:'verified',missing:[],evidenceRefs:['query:1']}))});
+  const output=lines.join('\n');
+  expect(output).toContain('Trial 2/5');expect(output).toContain('case-query-r2');
+  for(const id of ['query.conditions','query.numeric','evidence.valid','answer.faithful'])expect(output).toContain(id);
+  expect(output).toContain('1/1');expect(output).not.toContain('compaction.fact_retention');
 });

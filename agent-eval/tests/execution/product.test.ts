@@ -16,6 +16,7 @@ import type { EvalCase } from '../../src/evaluation.ts';
 import { canonicalRequest } from '../../../packages/contracts/src/run.ts';
 import { QueryParamsSchema } from '../../../packages/contracts/src/query.ts';
 import { evaluate } from '../../src/scoring/evaluate.ts';
+import {observedConditions} from '../../src/scoring/project-observation.ts';
 import type { CheckSpec } from '../../src/scoring/types.ts';
 
 const intentPaths: string[] = [], intentDigest = `sha256:${'a'.repeat(64)}`;
@@ -234,6 +235,14 @@ test('real Host deterministic form Query, all Query/Evidence pages, export and c
         metadata: { requestedDate: '2026-09-28', actualDataDate: '2026-09-28', snapshotMode: 'exact_date', region: '浙江', scopeKey: 'synthetic-zj-v1', isStale: false, quantityUnit: 'records', nullPriceDeviceIds: ['SYN-ZJ-C@synthetic-zj-v1'] } } };
     const scoring = { trialId: 'form', caseId: 'form', task: { checks }, gold: { values }, observation, trialStatus: 'completed' as const };
     expect((await evaluate(scoring)).map(score => ({ metricId: score.metricId, status: score.status, reason: score.status === 'PASS' ? null : score.reason }))).toEqual(checks.map(check => ({ metricId: check.metricId, status: 'PASS', reason: null })));
+    const completeDeviceIds=[...new Set((observation.facts.evidencePages as any[]).flatMap(page=>page.items.map((item:any)=>item.deviceId)))];
+    expect(completeDeviceIds).toHaveLength(3);
+    const explicitFullScope={...params,deviceIds:completeDeviceIds};
+    expect(await observedConditions(observation.facts,explicitFullScope)).toMatchObject({sourceDeviceId:null,region:'浙江',date:'2026-09-28'});
+    expect(await observedConditions(observation.facts,{...explicitFullScope,deviceIds:[...completeDeviceIds,completeDeviceIds[0]]})).toMatchObject({sourceDeviceId:null});
+    expect(await observedConditions(observation.facts,{...explicitFullScope,deviceIds:completeDeviceIds.slice(0,2)})).toBeUndefined();
+    expect(await observedConditions(observation.facts,{...explicitFullScope,deviceIds:[...completeDeviceIds,999999]})).toBeUndefined();
+    expect(await observedConditions({...observation.facts,operations:[]},explicitFullScope)).toBeUndefined();
     const incorrect = { ...values, query_numeric: values.query_numeric.map((row, index) => index === 0 ? { ...row, value: 10001 } : row) };
     expect((await evaluate({ ...scoring, gold: { values: incorrect } }))[2]?.status).toBe('FAIL');
     const incorrectExport = { ...values, export_exact: { ...values.export_exact, rows: values.export_exact.rows.map((row, index) => index === 0 ? { ...row, price: 10001 } : row) } };

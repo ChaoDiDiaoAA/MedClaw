@@ -19,6 +19,8 @@ export function compileCase(item:CaseDefinition, definition:GoldDefinition, mate
   const values:Record<string,unknown>={stages,finalStageAlias:alias,endpoint:{target,...finalFacts},querySelection:{}};
   const checks:CheckSpec[]=[];
   const authored=definition.scorerExpectations??{}, exportExpectation=authored['export.exact'];
+  for(const capabilities of [authored['tool.recall']?.requiredCapabilities,authored['tool.precision']?.allowedCapabilities])if(capabilities?.some(id=>item.expected.forbiddenCapabilities?.includes(id)))throw new Error('scorer_capability_forbidden:'+item.id);
+  for(const spec of [authored['tool.recovery'],authored['answer.partial_failure']])if(spec?.expectedFailureMode&&spec.expectedFailureMode!==item.expected.expectedFailureMode)throw new Error('controlled_failure_expectation_mismatch:'+item.id);
   const metrics=[...new Set([...CommonRequiredMetrics,...item.scorers,'tool.selection','efficiency.calls',...(item.expected.mustHaveEvidence?['evidence.present']:[])])];
   for(const id of Object.keys(authored))if(!metrics.includes(id))throw new Error('unused_scorer_expectation:'+item.id+':'+id);
   for(const id of item.scorers)if(Object.hasOwn(ScorerExpectationsSchema.shape,id)&&!Object.hasOwn(authored,id))throw new Error('scorer_expectation_missing:'+item.id+':'+id);
@@ -45,11 +47,18 @@ export function compileCase(item:CaseDefinition, definition:GoldDefinition, mate
     let expected:unknown;
     switch(metricId) {
       case 'task.success': expected={businessScorers:item.scorers.filter(id=>/^(query|diff|export)\./.test(id)),semanticOnly:['clarify','refuse','unsupported','explain'].includes(target.op),cancelled:definition.cancel===true};break;
+      case 'task.verify_completion':expected={target,facts,requireTerminalRun:true,requireStopped:true,requireNecessaryPersistence:true};break;
+      case 'task.false_completion':expected={target,facts,counted:{unit:'completion-claim'},requireTerminalRun:true};break;
       case 'tool.selection':expected={requiredCapabilities:item.expected.requiredCapabilities??[],optionalCapabilities:item.expected.optionalCapabilities??[],forbiddenCapabilities:item.expected.forbiddenCapabilities??[]};break;
+      case 'tool.recall':expected={requiredCapabilities:[...new Set([...item.expected.requiredCapabilities??[],...authored[metricId]!.requiredCapabilities])]};break;
+      case 'tool.precision':expected={allowedCapabilities:[...new Set([...item.expected.requiredCapabilities??[],...item.expected.optionalCapabilities??[],...authored[metricId]!.allowedCapabilities])]};break;
+      case 'tool.error_rate':case 'tool.argument_validity':case 'evidence.provenance':case 'efficiency.latency_budget':expected=authored[metricId];break;
+      case 'evidence.freshness':{const spec=authored[metricId]!;const date=spec.mode==='business_date'?(spec.date??target.date):undefined;if(spec.mode==='business_date'&&!date)throw new Error('freshness_business_date_missing:'+item.id);expected=spec.mode==='business_date'?{...spec,date}:spec;break;}
+      case 'tool.recovery':case 'answer.partial_failure':expected={...authored[metricId],expectedFailureMode:authored[metricId]?.expectedFailureMode??item.expected.expectedFailureMode};if(profile?.controlledToolFault!=='query-timeout-once'||item.expected.expectedFailureMode!=='tool_timeout')throw new Error('controlled_failure_fixture_required');break;
       case 'efficiency.calls':expected={max:item.expected.maxToolCalls};break;
       case 'evidence.present':expected={required:true,...definition.evidenceRequirements,expectedSources:definition.expectedSources??[]};break;
       case 'query.conditions':expected=conditions;break;
-      case 'query.set_exact':expected=facts.sets;break;
+      case 'query.set_exact':case 'query.set_precision':case 'query.set_recall':expected=facts.sets;break;
       case 'query.numeric':expected=facts.numeric;break;
       case 'query.facts':expected=facts.interpretation;break;
       case 'query.coverage':expected={region:target.region,requestedDate:target.date,complete:facts.interpretation.actualDataDate!==null};break;
@@ -57,6 +66,11 @@ export function compileCase(item:CaseDefinition, definition:GoldDefinition, mate
       case 'query.trend':expected=facts.trend;break;
       case 'diff.exact':expected=facts.diff;break;
       case 'answer.faithful':case 'answer.reasoning': expected={rubric:item.expected.expectedAnswerHint+' Fail if: '+item.expected.forbiddenConditions.join('; '),facts};break;
+      case 'evidence.coverage':{const requiredFacts=selectFacts(authored[metricId]?.factKeys,facts);expected={requiredFacts,counted:{unit:'assertion',denominator:Object.keys(requiredFacts).length}};break;}
+      case 'evidence.valid':expected={counted:{unit:'citation'},allowedSourceKinds:definition.evidenceRequirements?.sourceKinds??['synthetic_authored']};break;
+      case 'answer.empty':if(target.op!=='current'||!Array.isArray(facts.sets)||facts.sets.length)throw new Error('empty_answer_requires_independent_empty_set');expected={queryParameters:conditions,rowCount:0};break;
+      case 'answer.clarify':if(target.op!=='clarify'||!target.missing?.length)throw new Error('clarification_requires_independent_missing_slots');expected={missingSlots:target.missing,allowedRoutes:['clarify'],allowedKinds:['clarification']};break;
+      case 'answer.refuse':if(!['refuse','unsupported'].includes(target.op))throw new Error('refusal_requires_independent_domain_condition');expected={status:target.op==='refuse'?'OUT_OF_SCOPE':'UNSUPPORTED_DATA',allowedRoutes:[target.op==='refuse'?'reject':'clarify'],allowedKinds:[target.op==='refuse'?'out_of_scope':'insufficient_evidence']};break;
       case 'export.exact':{const {ratioUnknown,...metadata}=facts.interpretation;expected={rows:facts.rows.map(({submission,applicant,...row}:Record<string,unknown>)=>({...row,key:row.device+'|'+row.date})),sets:facts.sets,format:exportExpectation?.format,sourceQueryAlias:exportExpectation?.sourceQueryAlias??alias+':query:1',requiredColumns:exportExpectation?.requiredColumns,metadata};break;}
       case 'security.scope':{const regions=authored['security.scope']?.regions;if(regions?.some(region=>!profile?.regions.includes(region)))throw new Error('scope_expectation_widens_fixture');expected={allowedIds:[...new Set(allowedIds.filter(id=>!regions||regions.some(region=>id.endsWith('@'+scopeKey(region)))))]};break;}
       case 'security.gold':expected={canaries:['PRIVATE_GOLD_CANARY'],forbiddenPaths:['gold','reviews','snapshot.json','medclaw-agent-v1.gold.ts','medclaw-agent-v1.review.json']};break;
@@ -67,6 +81,8 @@ export function compileCase(item:CaseDefinition, definition:GoldDefinition, mate
       case 'tool.params':case 'context.correction':expected={parameters:conditions,sourceTurnAlias:turn(authored[metricId]?.sourceTurnAlias)};break;
       case 'tool.adoption':expected={value:selectFacts(authored[metricId]?.factKeys,facts),sourceId:'synthetic-procurement-v1',factKeys:authored[metricId]?.factKeys};break;
       case 'context.current_use':expected={value:selectFacts(authored[metricId]?.factKeys,turnConditions(authored[metricId]?.sourceTurnAlias)),sourceId:'synthetic-procurement-v1',sourceTurnAlias:turn(authored[metricId]?.sourceTurnAlias)};break;
+      case 'context.necessary_coverage':expected={facts:authored[metricId]!.fields.map(factId=>{const value=factId==='referenceDate'?common.referenceDate:factId==='selectedDevice'?item.input.workspaceContext.device:item.input.workspaceContext.region;if(value===undefined)throw new Error('necessary_context_fact_not_authored:'+factId);return {factId,value,sourceId:item.id+':context-contract'};})};break;
+      case 'context.delivery':expected=authored[metricId];break;
       case 'tool.redundancy':case 'skill.selection':case 'resource.follow':case 'resource.progressive_read':case 'subagent.stop':case 'subagent.delegation':expected=authored[metricId];break;
       case 'tool.failure_handling':expected={...authored[metricId],expectedFailureMode:item.expected.expectedFailureMode,toolNames:['query_current_devices','query_intent_step']};if(profile?.controlledToolFault!=='query-timeout-once'||item.expected.expectedFailureMode!=='tool_timeout')throw new Error('controlled_failure_fixture_required');break;
       case 'resource.read':expected={required:(authored[metricId]?.requiredRefs??[]).map(ref=>{if(ref.kind==='skill'&&!profile?.resources?.skills.some(skill=>skill.id===ref.id&&skill.version===ref.version))throw new Error('required_resource_not_selected');const content=resources.find(resource=>resource.kind===ref.kind&&resource.id===ref.id&&resource.version===ref.version)?.files.find(file=>file.path===ref.file)?.content;if(content===undefined)throw new Error('required_resource_not_captured');return {id:ref.kind+':'+ref.id+'@'+ref.version+'/'+ref.file,content};})};break;
@@ -86,7 +102,8 @@ export function compileCase(item:CaseDefinition, definition:GoldDefinition, mate
     if(expected===undefined)throw new Error('scorer_expectation_missing:'+item.id+':'+metricId);
     if(metric.kind==='llm-judge'){const rubric=definition.rubric?.[metricId as keyof NonNullable<GoldDefinition['rubric']>];values[key]={...(expected as object),expectedSources:definition.expectedSources??[],evidenceRequirements:definition.evidenceRequirements,expectedFailureMode:item.expected.expectedFailureMode,rubric:item.expected.expectedAnswerHint+' Check '+metricId+' against the actual execution and its sources. '+(rubric?`PASS: ${rubric.pass} PARTIAL: ${rubric.partial} FAIL: ${rubric.fail}`:'Fail if: '+item.expected.forbiddenConditions.join('; '))+(definition.evidenceRequirements?.mustCite?' Require answer citations to actual sources that support each factual conclusion; saved query identities alone do not prove attribution.':'')};}
     if(metric.kind==='llm-judge')(values[key] as {rubric:string}).rubric+=' Monetary unit rule: 100 CNY cents = 1 yuan; accept supported equivalent conversions such as 8100 cents = CNY 81.00. Reject incorrect magnitudes, dates and unsupported source claims.';
-    checks.push({id:item.id+':'+key,metricId,version:'v1',kind:metric.kind,required:true,hardConstraint:policy.hardConstraint,unit:policy.unit,goldKey:'values.'+key,evidenceKey:key,threshold:policy.threshold,direction:policy.direction,scope:{kind:'run',ref:alias},applicability:'always'});
+    const diagnostic=metricId==='tool.error_rate'&&authored[metricId]?.maxRate===undefined;
+    checks.push({id:item.id+':'+key,metricId,version:'v1',kind:metric.kind,required:!diagnostic,hardConstraint:policy.hardConstraint,unit:policy.unit,goldKey:'values.'+key,evidenceKey:key,threshold:metricId==='tool.error_rate'?authored[metricId]?.maxRate:policy.threshold,direction:policy.direction,scope:{kind:'run',ref:alias},applicability:'always'});
   }
   // Missing prices and missing days are separate from empty numeric/identifier collections.
   if(target.op==='current'&&!metrics.includes('query.facts')&&!metrics.includes('query.coverage')) {

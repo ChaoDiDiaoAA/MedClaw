@@ -22,6 +22,9 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
   let cancellation: Promise<void> | undefined;
   let firstShutdown:ShutdownProof|undefined;
   let workRoot:string|undefined;
+  let waitingForController=false;
+  let executionStart:number|undefined,executionStop:number|undefined;
+  let executionStopConfirmed=false;
   let publicMaterials:PublicMaterial[]=[];
   const onAbort = () => {
     if (!product) return;
@@ -62,14 +65,19 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
     options.signal?.addEventListener('abort', onAbort, { once: true }); options.signal?.throwIfAborted();
     executor = new ActionExecutor(product, options.config, inputRoot, trialRoot, options.productResources,publicMaterials,()=>preparePublicMaterials(options.case,inputRoot,profile?.absentFiles));
     product.record('public_materials',{files:publicMaterials});
-    for (const action of options.case.setup) { options.signal?.throwIfAborted(); await executor.execute(action); }
+    for (const action of options.case.setup) { options.signal?.throwIfAborted(); await executor.execute(action,options.signal); }
     options.onPhase?.('execute');
     for (const step of options.case.steps) {
       options.signal?.throwIfAborted(); product.record('step_started', { stepId: step.id, action: step.action.action, trigger: step.trigger });
       product.deadlineAt = Date.now() + step.timeoutMs;
-      await executor.wait(step.trigger, step.targetAlias, step.timeoutMs, options.signal);
+      waitingForController=true;await executor.wait(step.trigger, step.targetAlias, step.timeoutMs, options.signal);waitingForController=false;
+      if(step.trigger==='run_settled'&&!step.expectedFailure&&['send','compact'].includes(step.action.action)) {
+        const dependency=await executor.runView(step.targetAlias??executor.lastSendAlias!);
+        if(dependency.status==='failed'&&dependency.error?.code==='provider_request_failed')unwrap({ok:false,error:dependency.error});
+      }
       let failure: unknown;
-      try { await executor.execute(step.action); } catch (error) { failure = error; }
+      if(step.action.action==='send')executionStart??=performance.now();
+      try { await executor.execute(step.action,options.signal); } catch (error) { failure = error; }
       if (step.expectedFailure) {
         const appError = failure && typeof failure === 'object' && 'appError' in failure ? failure.appError as { code?: string; reason?: string } : null;
         if (!appError || appError.code !== step.expectedFailure.code || step.expectedFailure.reason && appError.reason !== step.expectedFailure.reason) throw new Error('expected_failure_not_observed');
@@ -77,10 +85,15 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
       product.record('step_completed', { stepId: step.id, expectedFailure: step.expectedFailure ?? null });
       product.deadlineAt = null;
     }
+    try{
+      const runs=await Promise.all([...executor.aliases.runs.keys()].map(alias=>executor!.runView(alias)));
+      executionStopConfirmed=runs.length>0&&runs.every(run=>['completed','failed','cancelled'].includes(run.status)&&run.cleanup?.stopConfirmed===true&&run.cleanup.requiredPersistenceComplete===true);
+    }catch{/* A later collection cannot confirm an earlier timing boundary. */}
+    executionStop=performance.now();
     result.status = 'completed';
   } catch (error) {
     const appError = error && typeof error === 'object' && 'appError' in error ? error.appError as { code?: string } : null;
-    result.status = options.signal?.aborted ? 'cancelled' : appError && !['operation_result_unknown', 'host_interrupted', 'host_protocol_mismatch'].includes(appError.code ?? '') ? 'failed' : 'infra_error'; result.reason = error instanceof Error ? error.message : 'trial_failed';
+    result.status = options.signal?.aborted ? 'cancelled' : !waitingForController&&appError && !['operation_result_unknown', 'host_interrupted', 'host_protocol_mismatch','provider_request_failed','intent_timeout'].includes(appError.code ?? '') ? 'failed' : 'infra_error'; result.reason = error instanceof Error ? error.message : 'trial_failed';
     if (error && typeof error === 'object' && 'shutdownProof' in error) {
       const proof = error.shutdownProof as ShutdownProof; result.stopped = proof.stopped; result.closed = proof.closed;
       firstShutdown=proof;
@@ -88,6 +101,7 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
       if (proof.stopped !== true || proof.closed !== true || !proof.processExited || proof.residuals.length) result.reason = 'host_stop_unconfirmed';
     }
   } finally {
+    if(executionStart!==undefined&&executionStop===undefined)executionStop=performance.now();
     options.signal?.removeEventListener('abort', onAbort); await cancellation;
     options.onPhase?.('collect');
     if (product) {
@@ -121,6 +135,13 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
       await writeFile(join(trialRoot, 'cleanup.json'), JSON.stringify({ contract: 'medclaw-eval-cleanup/v1', executionId: options.executionId, trialId: options.trialId,
         instanceId: product.instanceId, productRoot: product.paths.dataRoot, ...cleanup, observedAt: new Date().toISOString() }, null, 2));
       if(result.observation) {
+        if(executionStart!==undefined&&executionStop!==undefined){
+          const runs=result.observation.facts.runs;
+          const stopConfirmed=executionStopConfirmed&&Array.isArray(runs)&&runs.length>0&&runs.every(run=>['completed','failed','cancelled'].includes(run.status)&&run.cleanup?.stopConfirmed===true&&run.cleanup.requiredPersistenceComplete===true);
+          const executionTiming={trialId:options.trialId,startedMonoMs:executionStart,stoppedMonoMs:executionStop,stopConfirmed};
+          result.observation.facts.executionTiming=executionTiming;
+          product.record('execution_timing',executionTiming);
+        }
         result.observation.facts.publicMaterials=publicMaterials;
         let isolation:unknown;try{isolation=JSON.parse(await readFile(join(trialRoot,'isolation.json'),'utf8'));}catch{}
         result.observation.facts.lifecycle={shutdown:firstShutdown??null,cleanup,isolation,productRoot:product.paths.dataRoot};

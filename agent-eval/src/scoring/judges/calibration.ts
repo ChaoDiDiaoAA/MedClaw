@@ -65,7 +65,7 @@ export async function calibrateReferences(args:{referencesPath:string;executionI
   const config=readJudgeConfig(args.env,'required',true)!;
   if(JSON.stringify(prepared).includes(config.apiKey))throw new Error('calibration_credential_boundary');
   const client=await JudgeClient.create(config,{plannedTrials:prepared.length,trialIds:prepared.map(item=>item.sample.id)});
-  const root=resolve(args.outputPath);await mkdir(root);
+  const root=resolve(args.outputPath);await mkdir(dirname(root),{recursive:true});await mkdir(root);
   const snapshot={contract:'medclaw-calibration-snapshot/v1',executionId:args.executionId,rubricVersion:references.rubricVersion,systemRubric:ANSWER_QUALITY_RUBRIC,judge:client.configuration,limits:references.limits,model:config.model,samples:prepared.map(item=>item.sample)};
   await writeJsonExclusive(join(root,'snapshot.json'),snapshot);
   const samples=[];
@@ -81,5 +81,12 @@ export async function calibrateReferences(args:{referencesPath:string;executionI
     samples.push({id:item.sample.id,sourceId:item.sample.sourceId,partition:item.sample.partition,reference:item.reference,judgeValue:judged?.value??null,judgeEvidenceRefs:judged?.evidenceRefs??[]});
   }
   const assessment=assessCalibration(samples,references.limits),report={contract:'medclaw-judge-calibration/v1',executionId:args.executionId,actualRun:args.controlledFixture!==true,controlledFixture:args.controlledFixture===true,createdAt:new Date().toISOString(),model:config.model,assessment,passed:assessment.passed};
-  await writeJsonExclusive(join(root,'report.json'),report);return report;
+  await writeJsonExclusive(join(root,'report.json'),report);
+  try{
+    const {writeBadcases}=await import('../../reports/badcases.ts'),index=await writeBadcases(join(root,'report.json'));
+    console.error(`[诊断] 校准候选 ${index.summary.candidates}；sample ${index.summary.samples}；诊断缺口 ${index.gaps.length}；需核验后确认根因`);
+    if(!index.candidates.length&&!index.commonEvents.length&&!index.gaps.length)console.error('[诊断] 候选、共同事件和诊断缺口均为空；无诊断文件需要保存');
+    else console.error(`[诊断入口] ${join(root,'badcases.json')}\n[诊断入口] ${join(root,'badcases.md')}`);
+  }catch{console.error('[诊断] 分析文件保存失败；原校准报告已保留');throw new Error('badcase_artifacts_failed');}
+  return report;
 }

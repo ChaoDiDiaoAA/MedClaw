@@ -1,13 +1,64 @@
 import { test, expect } from 'bun:test';
 import { parseCommand,formatCliError } from '../src/cli.ts';
-import { mkdtemp,readFile,writeFile,rm } from 'node:fs/promises';
+import { mkdtemp,readFile,writeFile,rm,readdir } from 'node:fs/promises';
 import { join,resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createDatasetFixture } from './datasets/fixture.ts';
-import { runConfigFixture } from './report-fixture.ts';
+import { runConfigFixture,saveReportFixture } from './report-fixture.ts';
 import {pathToFileURL} from 'node:url';
 import {loadDataset} from '../src/datasets.ts';
 import {RunConfigSchema} from '../src/types.ts';
+
+test('removed repeat option tells users the replacement through the safe error formatter',()=>{
+  expect(formatCliError(new Error('repeat_removed_use_--trials'))).toEqual({error:'repeat_removed',reason:'use --trials N'});
+});
+
+test('registered supplementary dataset IDs work through the CLI from another working directory',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'mc-cli-suite-id-'));
+  try {
+    for(const command of ['validate','audit-lineage']) {
+      const child=Bun.spawnSync([process.execPath,'--no-env-file',resolve(import.meta.dir,'../src/cli.ts'),'dataset',command,'--dataset','medclaw-badcase-v1'],{cwd:root,stdout:'pipe',stderr:'pipe'});
+      expect(child.exitCode,new TextDecoder().decode(child.stderr)).toBe(0);
+      const result=JSON.parse(new TextDecoder().decode(child.stdout));
+      if(command==='validate')expect(result).toMatchObject({id:'medclaw-badcase-v1',readiness:'draft',members:3,smoke:0});
+      else expect(result).toMatchObject({groups:1,developerVisibleCases:3,blindHoldoutCases:0});
+    }
+  } finally{await rm(root,{recursive:true,force:true});}
+});
+
+test('report re-derives badcase summary on stderr without changing stdout or writing analysis files',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'mc-cli-badcases-'));
+  try {
+    await saveReportFixture(root);const original=await readFile(join(root,'report.json'),'utf8');
+    const moduleUrl=pathToFileURL(resolve(import.meta.dir,'../src/reports/write.ts')).href,preload=join(root,'preload.ts');
+    await writeFile(preload,`import {mock} from 'bun:test';const reports=await import(${JSON.stringify(moduleUrl)});mock.module(${JSON.stringify(moduleUrl)},()=>({...reports,executionReportPath:async()=>${JSON.stringify(join(root,'report.json'))}}));globalThis.fetch=()=>{throw new Error('unexpected_network_call');};`);
+    const before=await readdir(root);
+    const child=Bun.spawnSync([process.execPath,'--no-env-file','--preload',preload,resolve(import.meta.dir,'../src/cli.ts'),'report','--execution-id','controlled-fixture'],{cwd:root,stdout:'pipe',stderr:'pipe'});
+    expect(child.exitCode,new TextDecoder().decode(child.stderr)).toBe(0);
+    expect(JSON.parse(new TextDecoder().decode(child.stdout))).toEqual(JSON.parse(original));
+    expect(new TextDecoder().decode(child.stderr)).toContain('[诊断]');
+    expect(new TextDecoder().decode(child.stderr)).toContain('只读派生');
+    expect(new TextDecoder().decode(child.stderr)).toContain('无诊断文件需要保存');
+    expect(new TextDecoder().decode(child.stderr)).not.toContain('诊断入口');
+    expect(new TextDecoder().decode(child.stderr)).not.toContain('尚未保存');
+    expect(await readdir(root)).toEqual(before);expect(await readFile(join(root,'report.json'),'utf8')).toBe(original);
+  } finally {await rm(root,{recursive:true,force:true});}
+});
+
+test('Judge calibration defaults to its own archive category and still honors an explicit output',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'mc-calibration-location-'));
+  try {
+    const preload=join(root,'preload.ts'),calibrationUrl=pathToFileURL(resolve(import.meta.dir,'../src/scoring/judges/calibration.ts')).href;
+    await writeFile(preload,`import {mock} from 'bun:test';const calibration=await import(${JSON.stringify(calibrationUrl)});mock.module(${JSON.stringify(calibrationUrl)},()=>({...calibration,calibrateReferences:async options=>{console.log(JSON.stringify({passed:true,outputPath:options.outputPath}));return {passed:true};}}));globalThis.fetch=()=>{throw new Error('unexpected_network_call');};Bun.spawn=()=>{throw new Error('unexpected_host_start');};`);
+    for(const output of [undefined,join(root,'explicit')]) {
+      const child=Bun.spawnSync([process.execPath,'--no-env-file','--preload',preload,resolve(import.meta.dir,'../src/cli.ts'),'judge','calibrate','--references',join(root,'references.json'),'--execution-id','controlled-calibration','--backend','local',...output?['--output',output]:[]],{cwd:root,stdout:'pipe',stderr:'pipe'});
+      expect(child.exitCode,new TextDecoder().decode(child.stderr)).toBe(0);
+      const line=new TextDecoder().decode(child.stdout).split('\n').find(line=>line.includes('outputPath'))!;
+      const actual=JSON.parse(line).outputPath;
+      if(output)expect(actual).toBe(output);else expect(actual.replaceAll('\\','/')).toBe(resolve(import.meta.dir,'../runs/calibration/controlled-calibration').replaceAll('\\','/'));
+    }
+  } finally {await rm(root,{recursive:true,force:true});}
+});
 
 test('CLI exposes filesystem codes and operations without private paths or exception messages',()=>{
   const error=Object.assign(new Error('local-private-key in private response'),{code:'EACCES',syscall:'mkdir',path:'C:/private/local-private-key'});
@@ -77,7 +128,7 @@ test('CLI rejects unknown native model capabilities before any run and never pri
     const dataset=join(root,'dataset');await createDatasetFixture(dataset);
     const input=runConfigFixture();input.model.model='missing-native-model-v1';
     const configPath=join(root,'config.json');await writeFile(configPath,JSON.stringify(input));
-    const child=Bun.spawnSync([process.execPath,'--no-env-file',resolve(import.meta.dir,'../src/cli.ts'),'run','--dataset',dataset,'--selection','smoke','--repeat','1','--config',configPath,'--execution-id','rejected-native-model','--judge','off','--backend','local'],
+    const child=Bun.spawnSync([process.execPath,'--no-env-file',resolve(import.meta.dir,'../src/cli.ts'),'run','--dataset',dataset,'--selection','smoke','--trials','1','--config',configPath,'--execution-id','rejected-native-model','--judge','off','--backend','local'],
       {env:{...process.env,MEDCLAW_JUDGE_BASE_URL:'',MEDCLAW_JUDGE_MODEL:'',MEDCLAW_JUDGE_API_KEY:''},stdout:'pipe',stderr:'pipe'});
     const stderr=new TextDecoder().decode(child.stderr);
     expect(child.exitCode).toBe(1);

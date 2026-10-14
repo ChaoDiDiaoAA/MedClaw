@@ -2,7 +2,8 @@ import { registry } from './registry.ts';
 import { ratio, record, unknown,equal } from './rules.ts';
 import { projectObservation } from './project-observation.ts';
 import { judgeableCoverage } from './runtime.ts';
-import type { CheckSpec, EvaluationContext, EvaluationScore, RuleResult, ScoreStatus } from './types.ts';
+import type { CheckSpec, EvaluationContext, EvaluationScore, RuleResult, ScoreStatus,CountedJudgeCriterion } from './types.ts';
+import {assertCountedJudgeResult} from './judges/client.ts';
 
 export function readPath(value: unknown, path: string): unknown {
   if (!path) return undefined;
@@ -50,6 +51,12 @@ export async function evaluate(context: EvaluationContext): Promise<EvaluationSc
     let definition;
     try { definition = registry.get(check.metricId); } catch { add(state('ERROR', `Unknown metric: ${check.metricId}`)); continue; }
     if (definition.version !== check.version) { add(unknown('Requested historical scorer version is unavailable; original identity/version preserved')); continue; }
+    if(definition.appliesTo){
+      let applicability;
+      try{applicability=definition.appliesTo(expected,context);}catch{add(state('ERROR','Scorer applicability failed'));continue;}
+      if(typeof applicability?.applicable!=='boolean'||typeof applicability.reason!=='string'||!applicability.reason.trim()){add(unknown('Scorer applicability requires explicit reason'));continue;}
+      if(!applicability.applicable){add({...state('UNJUDGEABLE',applicability.reason),applicable:false,denominator:0});continue;}
+    }
     const applicability = typeof check.applicability === 'string' && check.applicability !== 'always' ? readPath(context.gold, check.applicability) : typeof check.applicability === 'object' ? check.applicability : undefined;
     if (check.applicability !== undefined && check.applicability !== 'always') {
       if (!record(applicability) || typeof applicability.applicable !== 'boolean' || typeof applicability.reason !== 'string' || !applicability.reason.trim()) { add(unknown('Applicability requires independent explicit applicability and reason')); continue; }
@@ -61,10 +68,13 @@ export async function evaluate(context: EvaluationContext): Promise<EvaluationSc
     if (['task.success', 'task.end_to_end'].includes(check.metricId)) { deferred.push(check); continue; }
     if (check.metricId === 'coverage.judgeable') { coverage.push(check); continue; }
     if (check.metricId === 'execution.completed') { add(ratio(Number(context.trialStatus === 'completed'), 1, check)); continue; }
-    if (actual === undefined && context.observation) {
+    const requiresNativeProjection=['tool.recall','tool.precision','tool.error_rate','tool.argument_validity','tool.recovery','evidence.provenance','evidence.freshness','efficiency.latency_budget','answer.partial_failure'].includes(check.metricId);
+    if ((actual === undefined || requiresNativeProjection) && context.observation) {
+      if(requiresNativeProjection)actual=undefined;
       try {projection = await projectObservation(check, context); if (projection?.actual !== undefined) actual = projection.actual; if(projection?.expected!==undefined)expected=projection.expected;}
       catch {add(state('ERROR','Original evidence projection failed'));continue;}
     }
+    if(projection?.constraint){add(projection.constraint);continue;}
     if (check.kind === 'llm-judge') {
       if (context.trialStatus !== 'completed') { add(state('NOT_RUN', 'Judge requires completed trial')); continue; }
       if (!context.judge) { add(state('NOT_RUN', 'Independent Judge is disabled or not configured')); continue; }
@@ -95,7 +105,7 @@ export async function evaluate(context: EvaluationContext): Promise<EvaluationSc
         answerRefs.push({checkId:item.check.id,answerRef:answer.ref});
       }
       const request={ trialId: context.trialId,
-        checks: semantic.map(x => ({ checkId: x.check.id, rubric: x.expected.rubric+'\nIndependent expectations: '+JSON.stringify({...x.expected,rubric:undefined}), evidenceRefs: x.actual.evidenceRefs })),
+        checks: semantic.map(x => ({ checkId: x.check.id, rubric: x.expected.rubric+'\nIndependent expectations: '+JSON.stringify({...x.expected,rubric:undefined}), evidenceRefs: x.actual.evidenceRefs,...record(x.expected.counted)?{counted:x.expected.counted as CountedJudgeCriterion}:{} })),
         answer: JSON.stringify({answers,checks:answerRefs}),
         evidence: {items,checks:semantic.map(item=>({checkId:item.check.id,evidenceRefs:item.actual.evidenceRefs}))} };
       await context.onJudgeRequest?.(request);
@@ -103,7 +113,11 @@ export async function evaluate(context: EvaluationContext): Promise<EvaluationSc
       await context.onJudgeResult?.(result);
       for (const item of semantic) {
         const judged = result.results.find(x => x.checkId === item.check.id);
-        const outcome: RuleResult = result.status === 'error' ? state('ERROR', result.error ?? 'Judge protocol error') : !judged || judged.value === null ? unknown(judged?.reason ?? 'Judge returned no check result') : {
+        const counted=request.checks.find(check=>check.checkId===item.check.id)?.counted;
+        if(result.status==='completed'&&judged&&counted)assertCountedJudgeResult(judged,counted);
+        const outcome: RuleResult = result.status === 'error' ? state('ERROR', result.error ?? 'Judge protocol error') : judged&&counted&&judged.numerator!==null&&judged.denominator!==null ? {
+          ...ratio(judged.numerator!,judged.denominator!,item.check),reason:judged.reason,evidenceRefs:judged.evidenceRefs,
+        } : !judged || judged.value === null ? unknown(judged?.reason ?? 'Judge returned no check result',judged?.denominator??counted?.denominator??null) : {
           ...ratio(judged.value, 1, item.check), reason: judged.reason, evidenceRefs: judged.evidenceRefs,
         };
         scores.push(wrap(context, item.check, outcome, item.expected, item.actual));
@@ -119,7 +133,7 @@ export async function evaluate(context: EvaluationContext): Promise<EvaluationSc
   }
   for (const check of deferred) {
     const expected=readPath(context.gold,check.goldKey);
-    const business=scores.filter(score=>/^(query|diff|export|answer)\./.test(score.metricId)||score.metricId==='evidence.present'||record(expected)&&expected.cancelled===true&&score.metricId==='subagent.stop');
+    const business=scores.filter(score=>/^(query|diff|export|answer|evidence)\./.test(score.metricId)||record(expected)&&expected.cancelled===true&&score.metricId==='subagent.stop');
     const outcome=requiredOutcome(business);
     const status = context.trialStatus === 'failed' ? 'FAIL' : context.trialStatus === 'infra_error' ? outcome==='FAIL'?'FAIL':'ERROR' : context.trialStatus === 'cancelled' && !(record(expected)&&expected.cancelled===true) ? 'NOT_RUN' : outcome;
     const result: RuleResult = status === 'PASS' || status === 'FAIL' ? ratio(Number(status === 'PASS'), 1, check) : { ...state(status, 'Task cannot be confirmed while required checks are incomplete'), denominator: 1 };

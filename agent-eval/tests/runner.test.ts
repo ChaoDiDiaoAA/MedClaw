@@ -8,6 +8,40 @@ import { tmpdir } from 'node:os';
 import { readReport } from '../src/reports/write.ts';
 import * as scoring from '../src/scoring/evaluate.ts';
 import * as files from 'node:fs/promises';
+import * as diagnostics from '../src/reports/badcases.ts';
+
+test('plans arbitrary per-Case Trials in numeric order while preserving archived identities',()=>{
+  const plan=planTrials(['case-a','case-b'],10);
+  expect(plan).toHaveLength(20);
+  expect(plan[9]).toEqual({caseId:'case-a',repetition:10,trialId:'case-a-r10'});
+  expect(plan[10]).toEqual({caseId:'case-b',repetition:1,trialId:'case-b-r1'});
+  for(const count of [0,-1,1.5,NaN,Number.MAX_SAFE_INTEGER])expect(()=>planTrials(['case'],count)).toThrow();
+});
+
+test('Case summary follows all five saved Trials exactly once without a model request',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'mc-case-summary-')),events:any[]=[];
+  try{
+    const datasetRoot=join(root,'dataset');await createDatasetFixture(datasetRoot);
+    const report=await runExperiment({datasetRoot,runsRoot:join(root,'runs'),executionId:'controlled-case-summary',selection:'full',trials:5,config:reportFixture().config,judgeMode:'off',onEvent:event=>events.push(event)});
+    expect(report.plan).toHaveLength(5);expect(report.analysis?.cases).toHaveLength(1);
+    const groups=events.filter(event=>event.kind==='case_summary');expect(groups).toHaveLength(1);
+    expect(groups[0].caseSummary.planned).toBe(5);expect(groups[0].caseSummary.notRun).toBe(5);
+    expect(events.indexOf(groups[0])).toBeGreaterThan(events.findLastIndex(event=>event.kind==='saved'));
+    expect(events.filter(event=>event.kind==='saved').every(event=>event.trialsPerCase===5)).toBe(true);
+  }finally{await rm(root,{recursive:true,force:true});}
+});
+
+test('derived analysis failure preserves a readable report and releases a safely stopped execution lock',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'mc-diagnostic-save-failure-'));
+  const writer=spyOn(diagnostics,'writeBadcases').mockRejectedValue(new Error('controlled_disk_failure'));
+  try {
+    const datasetRoot=join(root,'dataset');await createDatasetFixture(datasetRoot);
+    await expect(runExperiment({datasetRoot,runsRoot:join(root,'runs'),executionId:'diagnostic-save-failure',selection:'full',trials:3,config:reportFixture().config,judgeMode:'off'})).rejects.toThrow('badcase_artifacts_failed');
+    const report=await readReport(join(root,'runs/diagnostic-save-failure/report.json'));
+    expect(report.totals.notRun).toBe(report.plan.length);
+    expect(await Bun.file(join(root,'runs/.active-execution.json')).exists()).toBe(false);
+  } finally {writer.mockRestore();await rm(root,{recursive:true,force:true});}
+});
 
 test('a failed required Judge journal stops the pipeline even when the scorer returns an ERROR result',async()=>{
   const root=await mkdtemp(join(tmpdir(),'mc-judge-save-failure-'));
@@ -24,7 +58,7 @@ test('a failed required Judge journal stops the pipeline even when the scorer re
   try {
     const datasetRoot=join(root,'dataset');await createDatasetFixture(datasetRoot);
     let failure:unknown;
-    try{await runExperiment({datasetRoot,runsRoot:join(root,'runs'),executionId:'save-failure',selection:'full',repeat:3,config:reportFixture().config,judgeMode:'off',onEvent:event=>events.push(event.kind)});}catch(error){failure=error;}
+    try{await runExperiment({datasetRoot,runsRoot:join(root,'runs'),executionId:'save-failure',selection:'full',trials:3,config:reportFixture().config,judgeMode:'off',onEvent:event=>events.push(event.kind)});}catch(error){failure=error;}
     expect(scored).toBe(1);expect(failure).toBeInstanceOf(Error);expect(events).not.toContain('saved');
     expect(await Bun.file(join(root,'runs/.active-execution.json')).exists()).toBe(true);
   } finally {evaluator.mockRestore();save.mockRestore();await rm(root,{recursive:true,force:true});}
@@ -38,7 +72,7 @@ test('cancelled native Smoke startup archives ten trials and reads back without 
     const input=runConfigFixture();input.model.url=server.url.href;input.intent.baseUrl=server.url.href;
     const {config,modelCredential,judgeConfig}=await resolveRunConfig(input,{MEDCLAW_JUDGE_BASE_URL:server.url.href,MEDCLAW_JUDGE_MODEL:'deepseek/deepseek-flash',MEDCLAW_JUDGE_API_KEY:'private-judge-key'},'required',true);
     const judge=await JudgeClient.create(judgeConfig!,{plannedTrials:10}),executionId='controlled-native-smoke-startup';
-    const report=await runExperiment({datasetRoot:'medclaw-agent-v1',runsRoot:root,executionId,selection:'smoke',repeat:1,config,modelCredential,judgeMode:'required',judge,signal:AbortSignal.abort()});
+    const report=await runExperiment({datasetRoot:'medclaw-agent-v1',runsRoot:root,executionId,selection:'smoke',trials:1,config,modelCredential,judgeMode:'required',judge,signal:AbortSignal.abort()});
     expect(report.trials).toHaveLength(10);expect(report.trials.every(trial=>trial.status==='not_run'&&trial.startedAt===null)).toBe(true);
     expect(report.judgeCalls).toHaveLength(0);expect(calls).toBe(0);
     const archived=await readReport(join(root,executionId,'report.json'));
@@ -73,7 +107,7 @@ test('first Full records its complete plan and independent report even when data
   const root = await mkdtemp(join(tmpdir(), 'medclaw-runner-'));
   try {
     const datasetRoot = join(root, 'dataset'); await createDatasetFixture(datasetRoot);
-    const report = await runExperiment({ datasetRoot, runsRoot: join(root, 'runs'), executionId: 'controlled-admission', selection: 'full', repeat: 3, config: reportFixture().config, judgeMode: 'off' });
+    const report = await runExperiment({ datasetRoot, runsRoot: join(root, 'runs'), executionId: 'controlled-admission', selection: 'full', trials: 3, config: reportFixture().config, judgeMode: 'off' });
     expect(report.plan).toHaveLength(3);
     expect(report.trials.every(trial => trial.status === 'not_run' && trial.startedAt === null)).toBe(true);
     expect(report.totals.notRun).toBe(report.plan.length);
@@ -83,7 +117,14 @@ test('first Full records its complete plan and independent report even when data
     const events=(await readFile(join(root,'runs',report.executionId,'evidence',report.trials[0]!.trialId,'events.jsonl'),'utf8')).trim().split('\n').map(line=>JSON.parse(line));
     expect(events).toHaveLength(1);expect(events[0]).toMatchObject({kind:'scoring.completed',value:{status:'NOT_RUN'}});
     expect(report.snapshot.plan).toEqual(report.plan);
-    await expect(runExperiment({ datasetRoot, runsRoot: join(root, 'runs'), executionId: 'controlled-admission', selection: 'smoke', repeat: 1, config: reportFixture().config, judgeMode: 'off' })).rejects.toThrow();
+    expect(report.snapshot.qualityMetricCatalogVersion).toBe('v2');
+    expect(report.snapshot.qualityMetricCatalog).toHaveLength(50);
+    const index=await diagnostics.deriveBadcases(path);
+    expect(index.contract).toBe('medclaw-badcase-index/v1');expect(index.executionId).toBe(report.executionId);
+    expect(index.candidates).toEqual([]);
+    expect(await Bun.file(join(root,'runs',report.executionId,'badcases.json')).exists()).toBe(false);
+    expect(await Bun.file(join(root,'runs',report.executionId,'badcases.md')).exists()).toBe(false);
+    await expect(runExperiment({ datasetRoot, runsRoot: join(root, 'runs'), executionId: 'controlled-admission', selection: 'smoke', trials: 1, config: reportFixture().config, judgeMode: 'off' })).rejects.toThrow();
   } finally { await rm(root, { recursive: true, force: true }); }
 }, 30000);
 test('cancellation and preflight blockers preserve all planned NOT_RUN outcomes', async () => {
@@ -104,7 +145,7 @@ test('env-derived Judge identity is archived without credentials or calls when a
     const datasetRoot=join(root,'dataset');await createDatasetFixture(datasetRoot);
     const {config,modelCredential,judgeConfig}=await resolveRunConfig(runConfigFixture(),{MEDCLAW_JUDGE_BASE_URL:server.url.href,MEDCLAW_JUDGE_MODEL:'deepseek/deepseek-flash',MEDCLAW_JUDGE_API_KEY:'private-judge-key'},'required',true);
     const judge=await JudgeClient.create(judgeConfig!,{plannedTrials:1});
-    const report=await runExperiment({datasetRoot,runsRoot:join(root,'runs'),executionId:'env-judge-blocked',selection:'smoke',repeat:1,config,modelCredential,judge,judgeMode:'required'});
+    const report=await runExperiment({datasetRoot,runsRoot:join(root,'runs'),executionId:'env-judge-blocked',selection:'smoke',trials:1,config,modelCredential,judge,judgeMode:'required'});
     expect(report.trials.every(trial=>trial.status==='not_run')).toBe(true);
     const path=join(root,'runs',report.executionId,'snapshot.json');
     const archived=await readFile(path,'utf8');
@@ -120,7 +161,7 @@ test('an execution archive is readable but cannot become an executable dataset',
   const root=await mkdtemp(join(tmpdir(),'mc-archive-readonly-'));
   try{
     await saveReportFixture(root);
-    await expect(runExperiment({datasetRoot:root,runsRoot:join(root,'runs'),executionId:'must-not-launch',selection:'smoke',repeat:1,config:reportFixture().config,judgeMode:'off'})).rejects.toThrow('execution_archive_read_only');
+    await expect(runExperiment({datasetRoot:root,runsRoot:join(root,'runs'),executionId:'must-not-launch',selection:'smoke',trials:1,config:reportFixture().config,judgeMode:'off'})).rejects.toThrow('execution_archive_read_only');
     expect(await Bun.file(join(root,'runs/.active-execution.json')).exists()).toBe(false);
   }finally{await rm(root,{recursive:true,force:true});}
 });

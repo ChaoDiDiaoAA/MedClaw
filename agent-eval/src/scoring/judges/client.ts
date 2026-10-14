@@ -1,5 +1,5 @@
 import { performance } from 'node:perf_hooks';
-import type { Judge, JudgeMetadata, JudgeRequest, JudgeResult } from '../types.ts';
+import type { Judge, JudgeMetadata, JudgeRequest, JudgeResult,CountedJudgeCriterion } from '../types.ts';
 import { record } from '../rules.ts';
 import { ANSWER_QUALITY_RUBRIC } from './answer-quality.ts';
 import { isDeepStrictEqual } from 'node:util';
@@ -61,16 +61,25 @@ async function resolveJudgeModel(config:JudgeConfig) {
   return {...resolved,model:registered,configuration};
 }
 const exactKeys = (x: Record<string, any>, keys: string[]) => Object.keys(x).length === keys.length && keys.every(k => Object.hasOwn(x, k));
+export function assertCountedJudgeResult(result:JudgeResult['results'][number],criterion:CountedJudgeCriterion) {
+  if(!['assertion','citation','completion-claim'].includes(criterion.unit)||criterion.denominator!==undefined&&(!Number.isSafeInteger(criterion.denominator)||criterion.denominator<0))throw new Error('Invalid counted Judge criterion');
+  const n=result.numerator,d=result.denominator;
+  if(n===null&&result.value===null&&(d===null||criterion.denominator!==undefined&&d===criterion.denominator))return;
+  if(!Number.isSafeInteger(n)||!Number.isSafeInteger(d)||n! < 0||d! < 0||n! > d!||criterion.denominator!==undefined&&d!==criterion.denominator||
+    (d===0?result.value!==null||n!==0:result.value===null||!Number.isFinite(result.value)||Math.abs(result.value-n!/d!)>1e-12))throw new Error('Invalid counted Judge opportunities');
+}
 function parseResults(content: string, request: JudgeRequest): JudgeResult['results'] {
   const parsed: unknown = JSON.parse(content);
   if (!record(parsed) || !exactKeys(parsed, ['results']) || !Array.isArray(parsed.results) || parsed.results.length !== request.checks.length) throw new Error('Invalid Judge response schema');
   const seen = new Set<string>();
   for (const result of parsed.results) {
-    if (!record(result) || !exactKeys(result, ['checkId', 'value', 'reason', 'evidenceRefs'])) throw new Error('Invalid Judge result keys');
+    if (!record(result))throw new Error('Invalid Judge result keys');
     const check = request.checks.find(x => x.checkId === result.checkId);
     if (!check || seen.has(result.checkId)) throw new Error('Unknown or duplicate Judge check');
+    if(!exactKeys(result,['checkId','value','reason','evidenceRefs',...check.counted?['numerator','denominator']:[]]))throw new Error('Invalid Judge result keys');
     seen.add(result.checkId);
-    if (result.value !== null && (![0, .5, 1].includes(result.value) || !Number.isFinite(result.value))) throw new Error('Judge value is out of fixed rubric range');
+    if(check.counted){assertCountedJudgeResult(result as JudgeResult['results'][number],check.counted);if(result.denominator>0&&result.numerator!==null)result.value=result.numerator/result.denominator;}
+    else if (result.value !== null && (![0, .5, 1].includes(result.value) || !Number.isFinite(result.value))) throw new Error('Judge value is out of fixed rubric range');
     if (typeof result.reason !== 'string' || !result.reason.trim() || result.reason.length > 2000) throw new Error('Judge reason is empty or too long');
     if (!Array.isArray(result.evidenceRefs) || !result.evidenceRefs.every((ref: unknown) => typeof ref === 'string' && check.evidenceRefs.includes(ref)) || new Set(result.evidenceRefs).size !== result.evidenceRefs.length || (result.value !== null && result.evidenceRefs.length === 0)) throw new Error('Judge references unsupported evidence');
   }

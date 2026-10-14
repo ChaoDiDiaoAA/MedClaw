@@ -1,10 +1,67 @@
 import {test,expect} from 'bun:test';
-import {mkdtemp,rm,readFile,writeFile} from 'node:fs/promises';
+import {mkdtemp,mkdir,rm,readFile,writeFile,symlink} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {reportFixture,saveReportFixture} from './report-fixture.ts';
+import {reportFixture,saveReportFixture,datasetFixture} from './report-fixture.ts';
 import {readReport} from '../src/reports/write.ts';
 import {compareReports} from '../src/reports/compare.ts';
+
+test('actual semantic boundary FAIL saves and reads without inventing a Judge call; forged constraints are rejected',async()=>{
+  const {cases}=await import('../src/datasets/medclaw-agent-v1.ts'),{goldDefinitions}=await import('../src/datasets/medclaw-agent-v1.gold.ts');
+  const {loadSnapshot,snapshotCompiled}=await import('../src/datasets.ts'),{scoringCriteria,registry}=await import('../src/scoring/registry.ts');
+  const {evaluate}=await import('../src/scoring/evaluate.ts'),{aggregate}=await import('../src/scoring/aggregate.ts'),{reviewCandidates}=await import('../src/review/candidates.ts');
+  const {QueryParamsSchema}=await import('../../packages/contracts/src/query.ts');
+  const item=cases.find(item=>item.id==='mc-v1-task-empty-result')!,definition=datasetFixture();
+  definition.cases=[structuredClone(item)];definition.smokeIds=[item.id];definition.gold={[item.id]:structuredClone(goldDefinitions[item.id]!)};
+  definition.review.cases={[item.id]:Object.values(definition.review.cases)[0]!};
+  const dataset=loadSnapshot(definition),task=dataset.cases[0]!,report=reportFixture(),trialId=item.id+'-r1',root=await mkdtemp(join(tmpdir(),'mc-boundary-archive-'));
+  const params=QueryParamsSchema.parse({kind:'current',population:'snapshot',snapshotMode:'exact_date',batchIds:[1],region:'浙江',time:{start:'2026-10-02',endExclusive:'2026-10-03'}});
+  const query={id:11,sessionId:1,runId:1,callRef:'one',kind:'current',params,batchIds:[1],scopeDeviceIds:null,warnings:[],calculationVersion:'v1',createdAt:report.createdAt,totalRows:1};
+  const trial={...report.trials[0]!,trialId,caseId:item.id,status:'completed' as const,instanceId:'host',startedAt:report.createdAt,endedAt:report.createdAt,stopped:true,closed:true,observationRef:'evidence/'+trialId+'/observation.json'};
+  const observation={executionId:report.executionId,trialId,instanceId:'host',identityChecks:[],missing:[],facts:{aliases:{runs:[{alias:'turn-1',runId:1}],lastSendAlias:'turn-1'},answers:[{id:1,runId:1,sessionId:1,inputId:1,kind:'result',text:'No results.',queryIds:[11],missingSlots:[],nativeLeafId:'answer',createdAt:report.createdAt,resultSource:'agent'}],queryPages:[{query,page:{queryId:11,rows:[{value:1}],totalRows:1,page:1,pageSize:20,warnings:[],calculationVersion:'v1',evidenceIds:[],rowKeys:[null]},evidence:[]}],evidencePages:[]}};
+  const criterion=task.expected.checks.find(check=>check.metricId==='answer.empty')!;
+  const [failed]=await evaluate({trialId,caseId:item.id,trialStatus:'completed',task:{checks:[criterion]},gold:dataset.gold[item.id]!,observation});
+  expect(failed).toMatchObject({status:'FAIL',value:0});
+  report.snapshot.dataset=dataset.snapshot;report.snapshot.compiled=snapshotCompiled(dataset);report.snapshot.criteria=scoringCriteria(task.expected.checks.map(check=>check.metricId));
+  report.cases=[{id:task.id,version:1,name:task.name,category:task.category,evalType:task.evalType,tags:task.tags}];report.modules=dataset.modules;
+  report.plan=[{trialId,caseId:item.id,repetition:1}];report.trials=[trial];
+  report.scores=task.expected.checks.map(check=>({...report.scores[0]!,trialId,caseId:item.id,checkId:check.id,metricId:check.metricId,name:registry.get(check.metricId).name,method:check.kind,unit:check.unit,required:check.required,hardConstraint:check.hardConstraint,scope:check.scope?.kind==='run'?{kind:'run',ref:check.scope.ref}:{kind:'trial',ref:trialId},expected:dataset.gold[item.id]!.values[check.evidenceKey]}));
+  report.scores[task.expected.checks.indexOf(criterion)]=failed!;
+  const aggregation=aggregate(report.plan,report.trials,report.scores,report.cases,scoringCriteria(task.expected.checks.map(check=>check.metricId)));report.aggregation=aggregation;report.totals=aggregation.totals;
+  report.reviewCandidates=reviewCandidates(dataset.snapshot.info.reviewPolicy,[{trialId,caseId:item.id,risks:task.risks,scores:report.scores}]);
+  try{
+    await saveReportFixture(root,report,{[trialId]:observation});
+    expect((await readReport(root)).judgeCalls).toHaveLength(0);
+    const path=join(root,'report.json'),raw=JSON.parse(await readFile(path,'utf8'));
+    delete raw.scores.find((score:any)=>score.metricId==='answer.empty').details;await writeFile(path,JSON.stringify(raw));
+    await expect(readReport(root)).rejects.toThrow('judge_score_binding_missing');
+    raw.scores.find((score:any)=>score.metricId==='answer.empty').details=failed!.details;await writeFile(path,JSON.stringify(raw));
+    observation.facts.answers[0]!.queryIds=[];observation.facts.queryPages=[];await writeFile(join(root,trial.observationRef!),JSON.stringify(observation));
+    raw.evidenceManifest.find((file:any)=>file.path===trial.observationRef).bytes=Buffer.byteLength(JSON.stringify(observation));await writeFile(path,JSON.stringify(raw));
+    await expect(readReport(root)).rejects.toThrow('semantic_constraint_binding_mismatch');
+  }finally{await rm(root,{recursive:true,force:true});}
+});
+
+test('execution lookup searches business and research, rejects duplicate IDs and never accepts traversal or linked archives',async()=>{
+  const {executionReportPath}=await import('../src/reports/write.ts');
+  const root=await mkdtemp(join(tmpdir(),'mc-domain-reports-'));
+  try {
+    const business=join(root,'business','sample'),research=join(root,'research','sample');
+    await mkdir(business,{recursive:true});await writeFile(join(business,'report.json'),'{}');
+    expect(await executionReportPath(root,'sample')).toBe(join(business,'report.json'));
+    await mkdir(research,{recursive:true});await writeFile(join(research,'report.json'),'{}');
+    await expect(executionReportPath(root,'sample')).rejects.toThrow('execution_id_ambiguous');
+    await rm(business,{recursive:true});
+    expect(await executionReportPath(root,'sample')).toBe(join(research,'report.json'));
+    await rm(join(research,'report.json'));
+    const calibration=join(root,'calibration','sample');await mkdir(calibration,{recursive:true});await writeFile(join(calibration,'report.json'),'{}');
+    await expect(executionReportPath(root,'sample')).rejects.toThrow('execution_report_not_found');
+    await expect(executionReportPath(root,'missing')).rejects.toThrow('execution_report_not_found');
+    await expect(executionReportPath(root,'../sample')).rejects.toThrow();
+    await symlink(research,join(root,'business','linked'),'junction');
+    await expect(executionReportPath(root,'linked')).rejects.toThrow('linked_execution_archive');
+  } finally {await rm(root,{recursive:true,force:true});}
+});
 test('v1 archives read independently, bind metadata and recompute every planned check',async()=>{
   const root=await mkdtemp(join(tmpdir(),'mc-report-'));
   try {
@@ -73,6 +130,25 @@ test('observation identities and archived trial state are checked on read',async
     await expect(readReport(root)).rejects.toThrow('observation_identity');
   }finally{await rm(root,{recursive:true,force:true});}
 });
+test('saved analysis is checked against the archive and the frozen catalog against its criteria',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'mc-analysis-')),report=reportFixture();
+  const {qualityMetricCatalog}=await import('../src/scoring/registry.ts');
+  report.snapshot.qualityMetricCatalog=qualityMetricCatalog('v1');
+  try {
+    await saveReportFixture(root,report);
+    const path=join(root,'report.json'),raw=JSON.parse(await readFile(path,'utf8'));
+    expect(raw.analysis.qualityMetrics).toHaveLength(39);
+    raw.analysis.cases[0].confirmedPassRate=1;await writeFile(path,JSON.stringify(raw));
+    await expect(readReport(root)).rejects.toThrow('report_analysis_mismatch');
+    raw.analysis=report.analysis;await writeFile(path,JSON.stringify(raw));
+    delete raw.analysis;await writeFile(path,JSON.stringify(raw));
+    expect((await readReport(root)).analysis).toBeUndefined();
+    report.snapshot.qualityMetricCatalog.find(row=>row.id===report.scores[0]!.metricId)!.formula='A conflicting formula';
+    await writeFile(join(root,'snapshot.json'),JSON.stringify(report.snapshot));
+    await expect(readReport(root)).rejects.toThrow('quality_metric_catalog_criteria_mismatch');
+  } finally {await rm(root,{recursive:true,force:true});}
+});
+
 test('an archive cannot discard the whole event journal and its manifest entry',async()=>{
   const root=await mkdtemp(join(tmpdir(),'mc-journal-'));
   try {
