@@ -29,7 +29,9 @@ const dataRoot = explicitRoot ?? app.getPath("userData");
 mkdirSync(join(dataRoot, "data"), { recursive: true }); mkdirSync(join(dataRoot, "runtime"), { recursive: true });
 const credentials = new MainCredentials(join(dataRoot, "data", "credentials.enc.json"), safeStorage);
 const fileTokens = new FileTokens();
-const destinations = new DestinationTokens(dataRoot);
+const destinations = new DestinationTokens(dataRoot, Date.now, async (instanceId, input) => {
+  unwrap(await host.request('export.copy.verify', input, input.operationRef, undefined, instanceId));
+});
 const notify = (notice: DesktopNotice) => {
   if ((notice.type === 'event.available' || notice.type === 'event.stream') && !ipc?.acceptEventNotice(notice, host.read().instanceId)) return;
   const frame = { ...notice, instanceId: host.read().instanceId };

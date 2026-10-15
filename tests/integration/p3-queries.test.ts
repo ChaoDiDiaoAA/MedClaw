@@ -41,17 +41,17 @@ function fixture(includeOtherRegion = false) {
     config_json,scope_json,workspace_json,reference_date,timezone,created_at)
     VALUES(1,1,'agent','host','submit',1,'{"sessionId":1,"clientSequence":1}','running','query','Query',
       '{"agent":{"nativeSessionId":"native"}}',?,'{}','2026-01-02','Asia/Shanghai',?)`).run(JSON.stringify(context.scope), time);
-  db.query(`INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_hash,preview_request_json,created_at,updated_at)
-    VALUES(1,'import','host','imported','hash','{}',?,?)`).run(time, time);
+  db.query(`INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_json,created_at,updated_at)
+    VALUES(1,'import','host','imported','{}',?,?)`).run(time, time);
   db.query('UPDATE catalog_state SET revision=1,updated_at=?').run(time);
   for (const id of [1, 2]) {
-    db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,
+    db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,coverage,
       expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at)
-      VALUES(?,1,'scope',?,'浙江','material/v1','bundle','lock',?,'full','cohort',3,3,'[]','{}',?,?,1,?)`)
-      .run(id, `2026-01-0${id}`, `content-${id}`, id === 1 ? 1 : 0, id === 1 ? null : 1, time);
+      VALUES(?,1,'scope',?,'浙江','material/v1','bundle','full',3,3,'[]','{}',?,?,1,?)`)
+      .run(id, `2026-01-0${id}`, id === 1 ? 1 : 0, id === 1 ? null : 1, time);
   }
   const prices = [[10000, 0, null], [8000, 50, 10]];
-  const sources = JSON.stringify([{ sourceId: 'fda', file: 'missing-original.csv', recordId: 'source-row', row: 1, sha256: 'a'.repeat(64) }]);
+  const sources = JSON.stringify([{ sourceId: 'fda', file: 'missing-original.csv', recordId: 'source-row', row: 1 }]);
   for (const deviceId of [1, 2, 3]) {
     db.query("INSERT INTO devices(id,source_device_id,source_bundle_id,source_submission_id,source_refs_json,created_at) VALUES(?,?,'bundle','same-submission',?,?)")
       .run(deviceId, `device-${deviceId}`, sources, time);
@@ -64,9 +64,9 @@ function fixture(includeOtherRegion = false) {
       .run(deviceId, `event-${deviceId}`, deviceId, JSON.stringify(prices[0]![deviceId - 1]), JSON.stringify(prices[1]![deviceId - 1]), time);
   }
   if (includeOtherRegion) {
-    db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,
+    db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,coverage,
       expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at)
-      VALUES(3,1,'other-scope','2026-01-01','上海','material/v1','bundle','lock','other-content','full','cohort',3,3,'[]','{}',1,NULL,1,?)`).run(time);
+      VALUES(3,1,'other-scope','2026-01-01','上海','material/v1','bundle','full',3,3,'[]','{}',1,NULL,1,?)`).run(time);
     db.exec(`INSERT INTO snapshots SELECT id+6,3,device_id,device_name,category,'上海',price_cents,currency,unit,status,manufacturer,distributor,source_row_ref,source_refs_json,field_origins_json
       FROM snapshots WHERE batch_id=1`);
   }
@@ -216,14 +216,14 @@ test('saved query interpretation and current page reject valid-schema date or id
   expect(() => queries.page({ queryId: result.queryId, page: 1, pageSize: 1 }, context)).toThrow('tool_output_inconsistent');
 });
 
-test('evidence reads reject mismatched saved query hash, source version and page row references', () => {
+test('evidence reads reject mismatched calculation version, source version and page row references', () => {
   const { db, context, queries, evidence } = fixture();
   const result = queries.current(CurrentQuerySchema.parse({ batchIds: [1, 2] }), context);
   const evidenceId = result.evidenceIds[0]!;
   db.exec('DROP TRIGGER query_evidence_update_immutable');
-  db.query("UPDATE query_evidence SET result_hash='other-result' WHERE id=?").run(evidenceId);
+  db.query("UPDATE query_evidence SET calculation_version='other-version' WHERE id=?").run(evidenceId);
   expect(() => evidence.list({ queryId: result.queryId, page: 1, pageSize: 50 }, context)).toThrow('tool_output_inconsistent');
-  db.query("UPDATE query_evidence SET result_hash=(SELECT result_hash FROM queries WHERE id=?),material_version='other-version' WHERE id=?").run(result.queryId, evidenceId);
+  db.query("UPDATE query_evidence SET calculation_version='medclaw.query/v1',material_version='other-version' WHERE id=?").run(evidenceId);
   expect(() => evidence.read(evidenceId, context)).toThrow('tool_output_inconsistent');
   db.query("UPDATE query_evidence SET material_version='material/v1',source_row_refs_json='[\"unrelated-row\"]' WHERE id=?").run(evidenceId);
   expect(() => evidence.rows({ evidenceId, page: 1, pageSize: 1 }, context)).toThrow('tool_output_inconsistent');

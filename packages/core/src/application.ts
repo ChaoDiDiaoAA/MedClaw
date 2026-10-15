@@ -58,7 +58,7 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
     const result=this.repositories.read({runId:input.runId});
     if(result.kind!=='one'||!result.run||result.run.kind!=='agent')throw safeError('run_not_found');
     const run=result.run, frozen=this.repositories.readRunExtensions?.(run.id)??null;
-    const summary=frozen?{...frozen,source:frozen.source?{manifest:frozen.source.manifest,files:frozen.source.files.map(({file,bytes,sha256})=>({file,bytes,sha256}))}:null}:null;
+    const summary=frozen?{...frozen,source:frozen.source?{manifest:frozen.source.manifest,files:frozen.source.files.map(({file,bytes})=>({file,bytes}))}:null}:null;
     return ExtensionsReadResultSchema.parse({source:'run',runId:run.id,sessionId:run.sessionId,evidence:frozen?'recorded':'not_recorded',frozen:summary,
       assembly:this.agent?.readExtensionCleanup?.(run.id)??run.cleanup?.extensions??null,cleanup:run.cleanup});
   }
@@ -118,7 +118,6 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
       if(candidate.intentModel?.enabled&&(changedIntent||candidate.rollbackFromVersion!==null)){
         const inspection=await this.inspectIntentModel(candidate.intentModel);
         if(!inspection.available)throw inspection.error??safeError('intent_model_unavailable');
-        if(inspection.actualDigest!==candidate.intentModel.modelDigest)throw safeError('intent_model_identity_mismatch');
       }
       if(changedExtensionSessions.length&&!this.agent?.validateExtensions)throw safeError('extension_unavailable');
       for(const id of changedExtensionSessions){this.extensionSession(Number(id));await this.agent!.validateExtensions!(Number(id),candidate);}

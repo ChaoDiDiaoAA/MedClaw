@@ -39,7 +39,7 @@ test('p9 saved-turn pages discard prior Session, prior leaf version and older re
 });
 
 test('p9 keyboard confirmation keeps focus and freezes both original versions; failed reads are not empty history',async({page})=>{
-  await start(page);const button=page.getByRole('button',{name:'Resume from here · Run 1',exact:true});await button.focus();await page.keyboard.press('Enter');await expect(page.getByRole('dialog').getByRole('button',{name:'Cancel',exact:true})).toBeFocused();await page.keyboard.press('Escape');await expect(button).toBeFocused();
+  await start(page);const button=page.getByRole('button',{name:'Resume from here · Run 1',exact:true});await button.press('Enter');await expect(page.getByRole('dialog').getByRole('button',{name:'Cancel',exact:true})).toBeFocused();await page.keyboard.press('Escape');await expect(button).toBeFocused();
   await resume(page);expect((await requests(page,'session.restoreCheckpoint'))[0]!.input).toEqual({sessionId:1,targetLeafId:'saved-1',expectedStorageVersion:1,expectedWorkspaceRevision:7});
   await reply(page,'session.restoreCheckpoint',{ok:false,error:{code:'storage_write_failed',category:'storage',message:'Save failed',retryable:false}});await expect(page.getByTestId('session-checkpoints')).toContainText('Run facts have not been confirmed saved.');
   await page.getByRole('button',{name:'Refresh saved turns'}).click();await reply(page,'session.checkpoints.read',{ok:false,error:{code:'storage_read_failed',category:'storage',message:'Read failed',retryable:false}},1);await expect(page.getByTestId('session-checkpoints')).toContainText('Saved turns could not be read.');await expect(button).toBeVisible();await expect(page.getByText('No completed saved turns.')).toHaveCount(0);

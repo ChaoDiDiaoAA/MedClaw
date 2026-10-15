@@ -17,16 +17,19 @@ import { ToolRecorder } from '../../packages/core/src/tools/recorder';
 import { acceptContextInput } from '../fixtures/p8-context';
 import { DefaultResourceLoader, SettingsManager } from '@earendil-works/pi-coding-agent';
 
+const retiredBusinessColumns=new Set(["preview_request_hash", "commit_request_hash", "fingerprint", "source_lock_hash", "content_hash", "cohort_hash", "params_hash", "result_hash", "scope_batch_hashes_json", "request_hash", "published_hash", "sha256"]);
+const retainedFields=(row:Record<string,unknown>)=>Object.fromEntries(Object.entries(row).filter(([key])=>!retiredBusinessColumns.has(key)));
+
 function writeAuthor(root: string, snapshots: ResourceSnapshot[]) {
   mkdirSync(root, { recursive: true });
   for (const snapshot of snapshots) for (const file of snapshot.files) { const path = join(root, dirname(snapshot.entry), file.file); mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, file.content); }
   writeFileSync(join(root, 'catalog.json'), JSON.stringify({ contract: 'medclaw.resource-catalog/v1', sdkVersion: '0.87.1', definitions: snapshots.map(s => ({ ...s.ref, entry: s.entry, files: s.files.map(f => f.file), keywords: s.keywords, requiredTools: s.requiredTools, requiredExtensions: s.requiredExtensions })) }));
 }
 function promptSnapshot(): ResourceSnapshot {
-  const content = '---\ndescription: ENGINEERING Prompt\n---\nFacts $ARGUMENTS\n', sha256 = createHash('sha256').update(content).digest('hex');
-  const metadata = { kind: 'prompt', id: 'query', version: 'v1', entry: 'prompts/query/v1/query.md', keywords: [], requiredTools: [], requiredExtensions: [], files: [{ path: 'query.md', bytes: Buffer.byteLength(content), sha256 }] };
-  return ResourceSnapshotSchema.parse({ ref: { kind: 'prompt', id: 'query', version: 'v1', treeHash: createHash('sha256').update(canonicalRequest(metadata)).digest('hex') }, name: 'query', description: 'ENGINEERING Prompt', disableModelInvocation: false,
-    keywords: [], requiredTools: [], requiredExtensions: [], entry: metadata.entry, files: [{ file: 'query.md', content, bytes: Buffer.byteLength(content), sha256 }] });
+  const content = '---\ndescription: ENGINEERING Prompt\n---\nFacts $ARGUMENTS\n';
+  const metadata = { kind: 'prompt', id: 'query', version: 'v1', entry: 'prompts/query/v1/query.md', keywords: [], requiredTools: [], requiredExtensions: [], files: [{ path: 'query.md', bytes: Buffer.byteLength(content) }] };
+  return ResourceSnapshotSchema.parse({ ref: { kind: 'prompt', id: 'query', version: 'v1'}, name: 'query', description: 'ENGINEERING Prompt', disableModelInvocation: false,
+    keywords: [], requiredTools: [], requiredExtensions: [], entry: metadata.entry, files: [{ file: 'query.md', content, bytes: Buffer.byteLength(content) }] });
 }
 
 test('p11 one resource service binds selection reads, frozen input planning and SQL history without a Run or model side effect', async () => {
@@ -52,8 +55,8 @@ test('p11 one resource service binds selection reads, frozen input planning and 
     expect(() => service.planInput(frozen, { ...request, text: '/skill:unselected' })).toThrow();
     expect(() => service.planInput(frozen, { ...request, text: '\ud800' })).toThrow();
     expect(db.query('SELECT * FROM runs').all()).toHaveLength(0); expect(db.query('SELECT * FROM model_calls').all()).toHaveLength(0);
-    const plan = { ...seed, content: { ...seed.content, scope: { ...seed.content.scope, allowedToolNames: ['read'], allowedResourceRefs: frozen.available.map(s => `${s.ref.kind}:${s.ref.id}@${s.ref.version}#${s.ref.treeHash}`) }, resourceInputPlan: service.planInput(frozen, seed.originalSubmitInput) },
-      execution: { ...seed.execution, run: { ...seed.execution.run, resources: frozen, scope: { ...seed.content.scope, allowedToolNames: ['read'], allowedResourceRefs: frozen.available.map(s => `${s.ref.kind}:${s.ref.id}@${s.ref.version}#${s.ref.treeHash}`) } } } };
+    const plan = { ...seed, content: { ...seed.content, scope: { ...seed.content.scope, allowedToolNames: ['read'], allowedResourceRefs: frozen.available.map(s => `${s.ref.kind}:${s.ref.id}@${s.ref.version}`) }, resourceInputPlan: service.planInput(frozen, seed.originalSubmitInput) },
+      execution: { ...seed.execution, run: { ...seed.execution.run, resources: frozen, scope: { ...seed.content.scope, allowedToolNames: ['read'], allowedResourceRefs: frozen.available.map(s => `${s.ref.kind}:${s.ref.id}@${s.ref.version}`) } } } };
     const accepted = repos.acceptInput(plan), work = join(root, 'runtime', String(accepted.runId), 'work', 'scratch'); mkdirSync(work, { recursive: true });
     const paths = await materializeRunResources(accepted.runId!, work, frozen); await verifyRunResourceFiles(work, frozen);
     expect(paths.skillPaths).toEqual([join(work, 'resources', skill.entry)]); expect(paths.promptPaths).toEqual([join(work, 'resources', prompt.entry)]);
@@ -61,7 +64,7 @@ test('p11 one resource service binds selection reads, frozen input planning and 
       noSkills: true, noPromptTemplates: true, noExtensions: true, noThemes: true, noContextFiles: true, additionalSkillPaths: paths.skillPaths, additionalPromptTemplatePaths: paths.promptPaths });
     await loader.reload(); expect(loader.getSkills().skills.map(s => s.filePath)).toEqual(paths.skillPaths); expect(loader.getPrompts().prompts[0]?.content).toBe('Facts $ARGUMENTS');
     const nextWork = join(root, 'runtime', '2', 'work', 'scratch'); mkdirSync(nextWork, { recursive: true });
-    expect((await materializeRunResources(2, nextWork, frozen)).signature).not.toBe(paths.signature);
+    expect((await materializeRunResources(2, nextWork, frozen)).skillPaths).toEqual([join(nextWork,'resources',skill.entry)]);
     writeFileSync(paths.skillPaths[0]!, 'changed copy'); await expect(verifyRunResourceFiles(work, frozen)).rejects.toMatchObject({ reason: 'resource_snapshot_invalid' });
     await expect(materializeRunResources(accepted.runId!, work, frozen)).rejects.toMatchObject({ reason: 'resource_snapshot_invalid' });
     rmSync(author, { recursive: true }); settings = { ...settings, configVersion: '2', resources: { bySession: {} } };
@@ -80,7 +83,7 @@ test('p11 optional resource failures preserve selection and only block inputs th
       resources: { bySession: { '1': { prompt: null, skills: [skill.ref] } } } });
     const { ResourceService } = await import('../../packages/core/src/resources/resource-service'), { createResourceSource } = await import('../../packages/runtime-pi/src/resource-loader');
     const service = new ResourceService(() => settings, repos, createResourceSource(author), () => ['read']);
-    await expect(service.validateSelection(1, { prompt: null, skills: [{ ...skill.ref, treeHash: 'a'.repeat(64) }] }, ['read'])).rejects.toMatchObject({ reason: 'resource_changed' });
+    await expect(service.validateSelection(1, { prompt: null, skills: [{ ...skill.ref,version:'v2'}] }, ['read'])).rejects.toMatchObject({ code:'resource_unavailable' });
     const dependent = await service.freeze(1, settings, seed.content.scope);
     expect(dependent.omitted).toContainEqual(expect.objectContaining({ resourceRef: skill.ref, reason: 'resource_dependency_missing' }));
     expect(service.planInput(dependent, { ...seed.originalSubmitInput, text: 'unrelated question' })).toMatchObject({ kind: 'plain' });
@@ -102,15 +105,15 @@ test('p11 optional resource failures preserve selection and only block inputs th
 });
 
 function skillSnapshot(): ResourceSnapshot {
-  const content = '---\nname: query\ndescription: ENGINEERING query\n---\nUse known facts.\n', sha256 = createHash('sha256').update(content).digest('hex');
-  const metadata = { kind: 'skill', id: 'query', version: 'v1', entry: 'skills/query/v1/SKILL.md', keywords: [], requiredTools: ['read'], requiredExtensions: [], files: [{ path: 'SKILL.md', bytes: Buffer.byteLength(content), sha256 }] };
-  return ResourceSnapshotSchema.parse({ ref: { kind: 'skill', id: 'query', version: 'v1', treeHash: createHash('sha256').update(canonicalRequest(metadata)).digest('hex') },
-    name: 'query', description: 'ENGINEERING query', keywords: [], disableModelInvocation: false, entry: metadata.entry, requiredTools: ['read'], requiredExtensions: [], files: [{ file: 'SKILL.md', content, bytes: Buffer.byteLength(content), sha256 }] });
+  const content = '---\nname: query\ndescription: ENGINEERING query\n---\nUse known facts.\n';
+  const metadata = { kind: 'skill', id: 'query', version: 'v1', entry: 'skills/query/v1/SKILL.md', keywords: [], requiredTools: ['read'], requiredExtensions: [], files: [{ path: 'SKILL.md', bytes: Buffer.byteLength(content) }] };
+  return ResourceSnapshotSchema.parse({ ref: { kind: 'skill', id: 'query', version: 'v1'},
+    name: 'query', description: 'ENGINEERING query', keywords: [], disableModelInvocation: false, entry: metadata.entry, requiredTools: ['read'], requiredExtensions: [], files: [{ file: 'SKILL.md', content, bytes: Buffer.byteLength(content) }] });
 }
 function plannedInput(repos: Repositories, snapshot?: ResourceSnapshot) {
   repos.createSession({ expectedWorkspaceRevision: 0 }, 'create', 'native', contextAt);
   const workspace = repos.readWorkspace(), context = toWorkspaceContext(workspace), scope = repos.freezeAgentScope(workspace, snapshot ? ['read'] : []);
-  if (snapshot) scope.allowedResourceRefs = [`skill:query@v1#${snapshot.ref.treeHash}`];
+  if (snapshot) scope.allowedResourceRefs = ['skill:query@v1'];
   const model = { provider: 'fixture', modelId: 'fixture', api: 'openai-completions', endpointRef: null, credentialRef: null, configVersion: '1', maxOutputTokens: 100, capabilitySource: 'user_declared' as const, sdkVersion: '0.87.1' as const };
   const request = { sessionId: context.sessionId, clientSequence: 1, text: '/query raw', mode: 'send' as const, expectedRevision: context.revision, expectedBatchIds: [], expectedQueryId: null,
     model: { provider: model.provider, modelId: model.modelId, expectedConfigVersion: '1' }, referenceDate: '2026-10-06', timezone: 'Asia/Shanghai' };
@@ -138,8 +141,8 @@ test('p11 consumption stores actual expanded text atomically and preserves the o
     const f = { repos, input: { inputId: accepted.inputId!, sessionId: accepted.sessionId, runId: accepted.runId!, nativeEntryId: 'native-input' } };
     f.repos.beginInputDelivery(f.input.inputId, 'host', contextAt);
     expect(() => f.repos.recordInputConsumption(f.input.inputId, { ...f.input, at: contextAt })).toThrow();
-    const nativeInput = { text: 'Expanded raw', sha256: createHash('sha256').update('Expanded raw').digest('hex') };
-    expect(() => f.repos.recordInputConsumption(f.input.inputId, { ...f.input, at: contextAt, nativeInput: { ...nativeInput, sha256: '0'.repeat(64) } })).toThrow();
+    const nativeInput = { text: 'Expanded raw'};
+    expect(() => f.repos.recordInputConsumption(f.input.inputId, { ...f.input, at: contextAt, nativeInput: { ...nativeInput,text:'\ud800'} })).toThrow();
     expect(f.repos.readInput({ inputId: f.input.inputId })?.status).toBe('queued');
     f.repos.recordInputConsumption(f.input.inputId, { ...f.input, at: contextAt, nativeInput });
     let c = JSON.parse(db.query<{ content_json: string }, [number]>('SELECT content_json FROM session_inputs WHERE id=?').get(f.input.inputId)!.content_json);
@@ -147,7 +150,7 @@ test('p11 consumption stores actual expanded text atomically and preserves the o
     for (const changed of [{ ...c, text: 'tampered' }, { ...c, nativeInput: { ...nativeInput, text: 'tampered' } }, { ...c, nativeInput: undefined }])
       expect(() => db.query('UPDATE session_inputs SET content_json=? WHERE id=?').run(canonicalRequest(changed), f.input.inputId)).toThrow('input_identity_immutable');
     f.repos.recordInputConsumption(f.input.inputId, { ...f.input, at: contextAt, nativeInput });
-    expect(() => f.repos.recordInputConsumption(f.input.inputId, { ...f.input, at: contextAt, nativeInput: { text: 'changed', sha256: createHash('sha256').update('changed').digest('hex') } })).toThrow('state_conflict');
+    expect(() => f.repos.recordInputConsumption(f.input.inputId, { ...f.input, at: contextAt, nativeInput: { text: 'changed'} })).toThrow('state_conflict');
     expect(() => f.repos.recordInputConsumption(f.input.inputId, { ...f.input, sessionId: 2, at: contextAt, nativeInput })).toThrow('state_conflict');
     db.close(); db = openDatabase(path);
     expect(new Repositories(db).readInput({ inputId: f.input.inputId })).toMatchObject({ text: '/query raw', status: 'consumed', nativeEntryId: f.input.nativeEntryId });
@@ -163,7 +166,7 @@ test('p11 consumption failure rolls back receipt, owner state and original nativ
     const plan = plannedInput(repos), accepted = repos.acceptInput(plan), inputId = accepted.inputId!, runId = accepted.runId!;
     repos.beginInputDelivery(inputId, 'host', contextAt);
     const before = db.query('SELECT * FROM session_inputs').all(), events = db.query('SELECT * FROM runtime_events').all();
-    const fact = { sessionId: accepted.sessionId, runId, nativeEntryId: 'input', at: contextAt, nativeInput: { text: '/query raw', sha256: createHash('sha256').update('/query raw').digest('hex') } };
+    const fact = { sessionId: accepted.sessionId, runId, nativeEntryId: 'input', at: contextAt, nativeInput: { text: '/query raw'} };
     fail = true; expect(() => repos.recordInputConsumption(inputId, fact)).toThrow('ENGINEERING commit failure');
     expect(db.query('SELECT * FROM session_inputs').all()).toEqual(before); expect(db.query('SELECT * FROM runtime_events').all()).toEqual(events);
     fail = false; repos.recordInputConsumption(inputId, fact); repos.recordInputConsumption(inputId, fact);
@@ -184,23 +187,25 @@ test('p11 schema10 migration preserves original facts through the current schema
     db.exec('PRAGMA foreign_keys=ON'); const f = acceptContextInput(db);
     const names = db.query<{ name: string }, []>("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(r => r.name);
     const before = new Map(names.map(n => [n, db.query<Record<string, unknown>, []>(`SELECT * FROM ${n}`).all()]));
+    const schema = db.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all();
     const trigger = db.query<{ sql: string }, []>("SELECT sql FROM sqlite_schema WHERE name='session_inputs_identity_immutable'").get()!.sql;
     db.close();
     expect(() => openDatabase(path, phase => { if (phase === 'p11_receipt_marker') throw new Error('ENGINEERING migration failure'); })).toThrow('storage_migration_failed');
     db = new Database(path, { strict: true });
     expect(db.query("SELECT sql FROM sqlite_schema WHERE name='session_inputs_identity_immutable'").get()).toEqual({ sql: trigger });
     for (const n of names) expect(db.query(`SELECT * FROM ${n}`).all()).toEqual(before.get(n)!);
+    expect(db.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all()).toEqual(schema);
     db.close(); db = openDatabase(path);
     const p14Tables=['intent_calls','route_decisions','query_contexts','exports'];
     expect(db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(r => (r as { name: string }).name)).toEqual([...names,...p14Tables].sort());
     for(const table of p14Tables)expect(db.query(`SELECT * FROM ${table}`).all()).toEqual([]);
     for (const n of names.filter(n => n !== 'schema_migrations')) {
       const rows = db.query<Record<string, unknown>, []>(`SELECT * FROM ${n}`).all();
-      expect(rows.map((row, i) => Object.fromEntries(Object.keys(before.get(n)![i]!).map(key => [key, row[key]])))).toEqual(before.get(n)!);
+      expect(rows.map((row, i) => Object.fromEntries(Object.keys(retainedFields(before.get(n)![i]!)).map(key => [key, row[key]])))).toEqual(before.get(n)!.map(retainedFields));
     }
     expect(db.query<Record<string, unknown>, []>('SELECT parent_run_id,origin_tool_call_id,child_result_json FROM runs').all().every(row => Object.values(row).every(value => value === null))).toBe(true);
     expect(db.query('SELECT * FROM schema_migrations ORDER BY version').all().slice(0, 10)).toEqual(before.get('schema_migrations')!);
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(15);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(16);
     expect(new Repositories(db).readInput({ inputId: f.input.inputId })).toMatchObject({ text: 'Why did this decline?', status: 'consumed' });
     expect(new Repositories(db).readRunResources(f.input.runId)).toBeNull();
   } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
@@ -211,14 +216,14 @@ test('p11 P8 native reference checks rendered receipt text rather than raw comma
   try {
     const repos = new Repositories(db), plan = plannedInput(repos), accepted = repos.acceptInput(plan), runId = accepted.runId!, inputId = accepted.inputId!;
     repos.beginInputDelivery(inputId, 'host', contextAt);
-    const nativeInput = { text: 'Expanded raw', sha256: createHash('sha256').update('Expanded raw').digest('hex') };
+    const nativeInput = { text: 'Expanded raw'};
     repos.recordInputConsumption(inputId, { sessionId: accepted.sessionId, runId, nativeEntryId: 'input', at: contextAt, nativeInput });
     const context = new SqliteContextStore(db), input = { runId, inputId, sessionId: accepted.sessionId, nativeEntryId: 'input', scope: plan.content.scope,
-      workspaceContext: plan.content.workspaceContext, runtimeFeedback: '', nativeRefs: [{ kind: 'input' as const, id: inputId, nativeEntryId: 'input', contentHash: nativeInput.sha256, nativeToolCallId: null, originSnapshotId: null }], createdAt: contextAt };
+      workspaceContext: plan.content.workspaceContext, runtimeFeedback: '', nativeRefs: [{ kind: 'input' as const, id: inputId, nativeEntryId: 'input',  nativeToolCallId: null, originSnapshotId: null }], createdAt: contextAt };
     const snapshot = context.save(context.select(input));
-    expect(snapshot.nativeRefs[0]!.contentHash).toBe(nativeInput.sha256);
+    expect(snapshot.nativeRefs[0]).toMatchObject({kind:'input',id:inputId,nativeEntryId:'input'});
     expect(snapshot.renderedProjection).not.toContain('Expanded raw');
-    expect(() => context.select({ ...input, nativeRefs: [{ ...input.nativeRefs[0]!, contentHash: createHash('sha256').update('/query raw').digest('hex') }] })).toThrow('access_denied');
+    expect(() => context.select({ ...input, nativeRefs: [{ ...input.nativeRefs[0]!,nativeEntryId:'other'}] })).toThrow('access_denied');
   } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -227,19 +232,19 @@ test('p11 context delivery binds resource payload to its original saved expected
   try {
     const repos = new Repositories(db), resource = skillSnapshot(), plan = plannedInput(repos, resource), accepted = repos.acceptInput(plan), runId = accepted.runId!, inputId = accepted.inputId!;
     repos.beginInputDelivery(inputId, 'host', contextAt);
-    repos.recordInputConsumption(inputId, { sessionId: accepted.sessionId, runId, nativeEntryId: 'input', at: contextAt, nativeInput: { text: '/query raw', sha256: createHash('sha256').update('/query raw').digest('hex') } });
+    repos.recordInputConsumption(inputId, { sessionId: accepted.sessionId, runId, nativeEntryId: 'input', at: contextAt, nativeInput: { text: '/query raw'} });
     const store = new SqliteContextStore(db), snapshot = store.save(store.select({ runId, inputId, sessionId: accepted.sessionId, nativeEntryId: 'input', scope: plan.content.scope,
       workspaceContext: plan.content.workspaceContext, runtimeFeedback: '', nativeRefs: [], createdAt: contextAt }));
-    const index = { resourceRef: resource.ref, originRunId: runId, file: null, kind: 'skill_index' as const, inputId: null, nativeEntryId: null, toolCallId: null, contentHash: 'a'.repeat(64), coverage: 'index' as const };
+    const index = { resourceRef: resource.ref, originRunId: runId, file: null, kind: 'skill_index' as const, inputId: null, nativeEntryId: null, toolCallId: null,  coverage: 'index' as const };
     repos.startCall(runId, 'call', 'main', contextAt, { snapshotId: snapshot.id, inputId, resources: { expected: [index], payload: null } });
-    const resourcePayload = { payloadHash: 'b'.repeat(64), verified: [index] }, observation = { contract: 'medclaw.context-observation/v1' as const, api: 'openai-completions' as const, transport: 'sse' as const, observedAt: contextAt,
-      httpStatus: 200, projectionHash: snapshot.projectionHash, feedbackHash: snapshot.feedbackHash, verifiedNativeRefs: [], resources: resourcePayload };
+    const resourcePayload = {  verified: [index] }, observation = { contract: 'medclaw.context-observation/v1' as const, api: 'openai-completions' as const, transport: 'sse' as const, observedAt: contextAt,
+      httpStatus: 200,   verifiedNativeRefs: [], resources: resourcePayload };
     const delivery = { runId, inputId, sessionId: accepted.sessionId, callId: 'call', snapshotId: snapshot.id, observation };
     expect(() => store.recordDelivery({ ...delivery, observation: { ...observation, resources: { ...resourcePayload, verified: [] } } })).toThrow();
     expect(db.query('SELECT * FROM context_deliveries').all()).toHaveLength(0);
     store.recordDelivery(delivery); store.recordDelivery(delivery);
-    expect(repos.readResourceEvidence(runId, 1, 50)).toMatchObject({ totalRows: 1, items: [{ kind: 'provider_delivery', modelCallId: 'call', resourceRef: resource.ref, originRunId: runId, coverage: 'index', payloadHash: resourcePayload.payloadHash }] });
-    expect(() => store.recordDelivery({ ...delivery, observation: { ...observation, resources: { ...resourcePayload, payloadHash: 'c'.repeat(64) } } })).toThrow('state_conflict');
+    expect(repos.readResourceEvidence(runId, 1, 50)).toMatchObject({ totalRows: 1, items: [{ kind: 'provider_delivery', modelCallId: 'call', resourceRef: resource.ref, originRunId: runId, coverage: 'index'}] });
+    expect(() => store.recordDelivery({ ...delivery, observation: { ...observation, resources: { ...resourcePayload,verified:[{...index,originRunId:runId+1}]} } })).toThrow();
   } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -254,10 +259,10 @@ test('p11 native read annotation verifies returned content and preserves pending
     store.transition(call.id, 'requested', 'running'); store.transition(call.id, 'running', 'succeeded', { status: 'succeeded', data: { ENGINEERING: true } });
     const delivery = { role: 'toolResult' as const, toolCallId: context.nativeToolCallId, toolName: 'read', content: [{ type: 'text', text: snapshot.files[0]!.content }], isError: false, timestamp: 1 };
     store.recordDelivery(context, 'read-entry', delivery);
-    const fact = { resourceRef: snapshot.ref, file: 'SKILL.md', fileHash: snapshot.files[0]!.sha256, returnedContentHash: createHash('sha256').update(canonicalRequest(delivery.content)).digest('hex'),
+    const fact = { resourceRef: snapshot.ref, file: 'SKILL.md',
       coverage: 'complete' as const, observedAt: contextAt };
     expect(Reflect.get(store, 'recordResourceRead')).toBeFunction();
-    expect(() => Reflect.get(store, 'recordResourceRead').call(store, context, { ...fact, returnedContentHash: '0'.repeat(64) })).toThrow();
+    expect(() => Reflect.get(store, 'recordResourceRead').call(store, context, { ...fact,file:'not-listed.md'})).toThrow();
     const recorder = new ToolRecorder(store);
     expect(Reflect.get(recorder, 'recordResourceRead')).toBeFunction();
     let fail = true; const save = store.recordResourceRead.bind(store);
@@ -268,9 +273,9 @@ test('p11 native read annotation verifies returned content and preserves pending
     expect(store.readCall(context)).toMatchObject({ sdkDelivery: delivery, resourceRead: fact });
     expect(recorder.blocked(context)?.code).toBe('storage_write_failed');
     store.recordResourceRead(context, fact);
-    expect(() => store.recordResourceRead(context, { ...fact, fileHash: '0'.repeat(64) })).toThrow();
+    expect(() => store.recordResourceRead(context, { ...fact,coverage:'partial' as const})).toThrow();
     const evidence = repos.readResourceEvidence(runId, 1, 1);
-    expect(evidence.totalRows).toBe(1); expect(evidence.items[0]).toMatchObject({ kind: 'native_read', originRunId: runId, toolCallId: call.id, contentHash: fact.returnedContentHash });
+    expect(evidence.totalRows).toBe(1); expect(evidence.items[0]).toMatchObject({ kind: 'native_read', originRunId: runId, toolCallId: call.id});
     expect(repos.readResourceEvidence(runId, 2, 1)).toEqual({ items: [], totalRows: 1 });
     expect(() => repos.readResourceEvidence(runId, Number.MAX_SAFE_INTEGER, 100)).toThrow('invalid_argument');
   } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
@@ -292,6 +297,6 @@ test('p11 run snapshot and input plan commit together and reject invalid owner',
     const accepted = repos.acceptInput(acceptance);
     expect(Reflect.get(repos, 'readRunResources')).toBeFunction();
     expect(repos.readRunResources(accepted.runId!)).toEqual(resources);
-    expect(db.query<{ n: number }, []>('SELECT MAX(version) n FROM schema_migrations').get()!.n).toBe(15);
+    expect(db.query<{ n: number }, []>('SELECT MAX(version) n FROM schema_migrations').get()!.n).toBe(16);
   } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
 });

@@ -1,5 +1,4 @@
 import type { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import { AppErrorSchema, PositiveIdSchema, safeError, type AppError } from "../../contracts/src/error";
@@ -18,6 +17,7 @@ import { ModelCallContextSchema, ContextSnapshotBodySchema } from '../../contrac
 import { FrozenRunResourcesSchema, ResourceReadFactSchema, resourceRefKey, type ResourceReadFact } from '../../contracts/src/resources';
 import { readFrozenChild, canReadRelatedQuery } from './child-identity';
 import { IntentItemsSchema, IntentQueryPlanSchema } from '../../contracts/src/intent';
+import {legacyBusinessToolOutput,legacyToolDelivery,legacyRunScope,legacyInputContent,legacyWorkspaceContext,legacyContextBody,legacyModelCallContext,legacyRunResources,omitLegacyFields} from './legacy-business-fields';
 
 const knownErrors = new Set(["invalid_argument", "access_denied", "state_conflict", "operation_not_found", "runtime_interrupted", "storage_read_failed", "storage_write_failed"]);
 function fail(code: string): never { throw new Error(code); }
@@ -76,10 +76,10 @@ type CallRow = { id: number; run_id: number; session_id: number; native_tool_cal
   effect: string; execution_mode: string; args_json: string; status: ToolCallRecord["status"]; result_json: string | null;
   error_json: string | null; delivery_json: string | null; ended_at:string|null };
 type QueryRow = { input_id?:number|null; id: number; session_id: number; run_id: number; call_ref: string; kind: QueryRecord["kind"];
-  params_json: string; params_hash: string; batch_ids_json: string; result_json: string; result_hash: string; created_at: string;
+  params_json: string; batch_ids_json: string; result_json: string; created_at: string;
   source?: QueryRecord['source']; catalog_revision?: number; material_version?: string; based_on_query_id?: number | null };
 type EvidenceRow = { id: number; query_id: number; batch_ids_json: string; snapshot_ids_json: string; event_ids_json: string;
-  source_row_refs_json: string; calculation_version: string; material_version: string; source_bundle_id: string; source_lock_hash: string; result_hash: string;
+  source_row_refs_json: string; calculation_version: string; material_version: string; source_bundle_id: string;
   filters_json?: string; provenance?: string };
 
 export class SqliteToolStore implements ToolCallStore, QueryStore {
@@ -120,7 +120,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       "SELECT * FROM runs WHERE id=?").get(context.runId);
     if (!run || run.session_id !== context.sessionId || run.reference_date !== context.referenceDate || run.timezone !== context.timezone) fail("access_denied");
     if('inputId' in context && context.inputId !== (run.input_id ?? null)) fail('access_denied');
-    const scope = RunScopeSchema.safeParse(decode(run.scope_json));
+    const scope = RunScopeSchema.safeParse(legacyRunScope(decode(run.scope_json)));
     if (!scope.success || !isDeepStrictEqual(scope.data, context.scope)) fail("access_denied");
     if(run.kind==='child') {
       const frozen=readFrozenChild(this.db,context.runId);
@@ -134,12 +134,12 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       const owner=this.db.query<{snapshot_json:string;input_id:number|null;model_json:string},[number,string,number,number]>(`SELECT s.snapshot_json,s.input_id,c.model_json FROM context_snapshots s JOIN model_calls c ON c.run_id=s.run_id AND c.session_id=s.session_id
         WHERE s.id=? AND c.call_id=? AND s.run_id=? AND s.session_id=? AND c.input_id IS NULL`).get(context.contextSnapshotId,context.modelCallId,context.runId,context.sessionId);
       if(!owner)fail('access_denied');
-      const body=ContextSnapshotBodySchema.safeParse(decode(owner.snapshot_json)),model=decode(owner.model_json) as {context?:unknown},marker=ModelCallContextSchema.safeParse(model.context);
+      const body=ContextSnapshotBodySchema.safeParse(legacyContextBody(decode(owner.snapshot_json))),model=decode(owner.model_json) as {context?:unknown},marker=ModelCallContextSchema.safeParse(legacyModelCallContext(model.context));
       if(!body.success||!marker.success)fail('storage_read_failed');
       if(owner.input_id!==null||marker.data.inputId!==null||marker.data.snapshotId!==context.contextSnapshotId||body.data.workspaceContext!==null
         ||!isDeepStrictEqual(body.data.delegationSource,context.delegationSource)||!isDeepStrictEqual(marker.data.delegationSource,context.delegationSource)
         ||context.delegationSource.parentRunId!==frozen.parentRunId||context.delegationSource.originToolCallId!==frozen.originToolCallId
-        ||context.delegationSource.parentSnapshotId!==frozen.originSnapshotId||context.delegationSource.promptHash!==frozen.promptHash)fail('access_denied');
+        ||context.delegationSource.parentSnapshotId!==frozen.originSnapshotId)fail('access_denied');
       if(active&&run.status!=='running')fail('state_conflict');
       return;
     }
@@ -149,7 +149,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       if (context.contextSnapshotId == null || !context.modelCallId || !context.workspaceContext || context.workspaceInputId == null) fail('state_conflict');
       const owner = this.db.query<{snapshot_json:string;input_id:number;model_json:string},[number,string,number,number]>(`SELECT s.snapshot_json,s.input_id,c.model_json FROM context_snapshots s JOIN model_calls c ON c.run_id=s.run_id AND c.session_id=s.session_id WHERE s.id=? AND c.call_id=? AND s.run_id=? AND s.session_id=?`).get(context.contextSnapshotId,context.modelCallId,context.runId,context.sessionId);
       if (!owner) fail('access_denied');
-      const body = ContextSnapshotBodySchema.safeParse(decode(owner.snapshot_json)), model = decode(owner.model_json) as {context?:unknown}, marker = ModelCallContextSchema.safeParse(model.context);
+      const body = ContextSnapshotBodySchema.safeParse(legacyContextBody(decode(owner.snapshot_json))), model = decode(owner.model_json) as {context?:unknown}, marker = ModelCallContextSchema.safeParse(legacyModelCallContext(model.context));
       if (!body.success || !marker.success) fail('storage_read_failed');
       if (marker.data.snapshotId !== context.contextSnapshotId || marker.data.inputId !== context.workspaceInputId || owner.input_id !== context.workspaceInputId || !isDeepStrictEqual(body.data.workspaceContext,context.workspaceContext)) fail('access_denied');
     } else if ('nativeToolCallId' in context && context.contextSnapshotId != null) fail('state_conflict');
@@ -159,14 +159,14 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
           native_entry_id: string | null; content_json: string }, [number]>('SELECT * FROM session_inputs WHERE id=?').get(context.workspaceInputId);
         if (!input || input.session_id !== context.sessionId || input.target_run_id !== context.runId || input.run_id !== context.runId
           || input.status !== 'consumed' || !input.native_entry_id) fail('state_conflict');
-        const content = InputContentSchema.safeParse(decode(input.content_json));
+        const content = InputContentSchema.safeParse(legacyInputContent(decode(input.content_json)));
         if (!content.success) fail('storage_read_failed');
         if (!isDeepStrictEqual(content.data.workspaceContext, context.workspaceContext)
           || !p8 && !isDeepStrictEqual(content.data.scope, context.scope) || content.data.referenceDate !== context.referenceDate
           || content.data.timezone !== context.timezone) fail('access_denied');
       } else {
         if (run.input_id != null || run.workspace_json == null) fail('state_conflict');
-        const workspace = WorkspaceContextSchema.safeParse(decode(run.workspace_json));
+        const workspace = WorkspaceContextSchema.safeParse(legacyWorkspaceContext(decode(run.workspace_json)));
         if (!workspace.success || !isDeepStrictEqual(workspace.data, context.workspaceContext)) fail('access_denied');
       }
     }
@@ -181,7 +181,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
        JOIN route_decisions d ON d.run_id=r.id AND d.input_id=i.id AND d.session_id=r.session_id WHERE r.id=? AND r.kind='agent' AND r.parent_run_id IS NULL`).get(runId);
     if(!row||row.input_id===null||row.content_json===null||row.cancel_requested_at!==null||row.decision_source!=='user_form'
       ||row.route!=='simple'||row.business_status!=='RESOLVED')fail('access_denied');
-    const parsed=InputContentSchema.safeParse(decode(row.content_json));if(!parsed.success)fail('storage_read_failed');
+    const parsed=InputContentSchema.safeParse(legacyInputContent(decode(row.content_json)));if(!parsed.success)fail('storage_read_failed');
     const request=parsed.data.originalSubmitInput;
     if(request.mode!=='send'||request.routing?.mode!=='user_form'||parsed.data.intentAdmission
       ||request.text!=='Query form: '+canonicalRequest(request.routing.params)||row.query_params_json===null
@@ -192,7 +192,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       cancelled(context);this.identity(context,true);this.assertFormRoute(context.runId,params);
       if(context.inputId===null||context.callRef!==`form:${context.runId}:${context.inputId}`)fail('access_denied');
       const row=this.db.query<{content_json:string},[number]>('SELECT content_json FROM session_inputs WHERE id=?').get(context.inputId);
-      const request=InputContentSchema.parse(decode(row!.content_json)).originalSubmitInput;
+      const request=InputContentSchema.parse(legacyInputContent(decode(row!.content_json))).originalSubmitInput;
       if((context.basedOnQueryId??null)!==request.expectedQueryId||context.workspaceRevision!==request.expectedRevision)fail('access_denied');
     },'storage_read_failed');
     if (!('source' in context) || context.source !== 'intent') return;
@@ -220,13 +220,13 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   assertReadContext(context: QueryContext): void { protect(() => this.identity(context, false), "storage_read_failed"); }
 
   private call(row: CallRow): ToolCallRecord {
-    const delivery = row.delivery_json === null ? null : decode(row.delivery_json);
+    const delivery = row.delivery_json === null ? null : legacyToolDelivery(decode(row.delivery_json));
     if (delivery !== null && (typeof delivery !== "object" || !Object.hasOwn(delivery, "sdkReturned") || !Object.hasOwn(delivery, "nativeEntryId"))) fail("storage_read_failed");
     const receipt = delivery as { sdkReturned: boolean; nativeEntryId: string | null; message?: ToolSdkDelivery; nextModelCallId?: string | null; consumedAt?: string | null; consumptionEvidence?: unknown; control?: ToolControlObservation; resourceRead?: ResourceReadFact } | null;
     const model = row.model_call_id ? this.db.query<{ call_id: string }, [number]>("SELECT call_id FROM model_calls WHERE id=?").get(row.model_call_id) : null;
     const parsed = ToolCallRecordSchema.safeParse({ id: row.id, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id,
       name: row.tool_name, version: row.tool_version, executionMode: row.execution_mode, input: decode(row.args_json), status: row.status,
-      data: row.result_json === null ? null : decode(row.result_json), error: row.error_json === null ? null : decode(row.error_json),
+      data: row.result_json === null ? null : legacyBusinessToolOutput(row.tool_name,decode(row.result_json)), error: row.error_json === null ? null : decode(row.error_json),
       sdkReturned: receipt?.sdkReturned ?? false, nativeEntryId: receipt?.nativeEntryId ?? null,
       contextSnapshotId: row.context_snapshot_id ?? null,
       ...(receipt?.message ? { sdkDelivery: receipt.message } : {}), ...(model ? { modelCallId: model.call_id } : {}),
@@ -284,7 +284,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   }
   private delivery(row: CallRow): Record<string, unknown> {
     if (row.delivery_json !== null) {
-      const value = decode(row.delivery_json);
+      const value = legacyToolDelivery(decode(row.delivery_json));
       if (!value || typeof value !== 'object' || Array.isArray(value)) fail('storage_read_failed');
       return value as Record<string, unknown>;
     }
@@ -379,11 +379,12 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       if (record.name !== 'read' || record.status !== 'succeeded' || !record.sdkReturned || !record.nativeEntryId || !record.sdkDelivery || record.sdkDelivery.isError) fail('state_conflict');
       const config = this.db.query<{ config_json: string }, [number, number]>('SELECT config_json FROM runs WHERE id=? AND session_id=?').get(context.runId, context.sessionId);
       const child=context.delegationSource?readFrozenChild(this.db,context.runId):null;
-      const frozen = FrozenRunResourcesSchema.safeParse(child?.resources??(config ? decode(config.config_json) as { agent?: { resources?: unknown } } : null)?.agent?.resources);
+      const frozen = FrozenRunResourcesSchema.safeParse(legacyRunResources(child?.resources??(config ? decode(config.config_json) as { agent?: { resources?: unknown } } : null)?.agent?.resources));
       if (!frozen.success || frozen.data.sessionId !== (child?.parentSessionId??context.sessionId)) fail('state_conflict');
       const snapshot = frozen.data.available.find(s => resourceRefKey(s.ref) === resourceRefKey(fact.resourceRef)), file = snapshot?.files.find(f => f.file === fact.file);
-      if (!file || file.sha256 !== fact.fileHash || createHash('sha256').update(file.content).digest('hex') !== file.sha256
-        || createHash('sha256').update(canonicalRequest(record.sdkDelivery.content)).digest('hex') !== fact.returnedContentHash) fail('state_conflict');
+      const blocks=record.sdkDelivery.content.map(block=>block&&typeof block==='object'&&!Array.isArray(block)&&('type' in block?block.type==='text'||block.type==='input_text':true)&&'text'in block&&typeof block.text==='string'?block.text:null);
+      const text=blocks.every(block=>block!==null)?blocks.join('\n'):null;
+      if (!file || Buffer.byteLength(file.content)!==file.bytes || fact.coverage==='complete'&&text!==file.content) fail('state_conflict');
       this.db.query('UPDATE tool_calls SET delivery_json=? WHERE id=?').run(json({ ...this.delivery(row), resourceRead: fact }), row.id);
     }), 'storage_write_failed');
   }
@@ -449,14 +450,13 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   }
 
   private query(row: QueryRow): QueryRecord {
-    const result = decode(row.result_json);
+    const result = omitLegacyFields(decode(row.result_json),['resultHash']);
     if (typeof result !== "object" || result === null) fail("storage_read_failed");
     const params = decode(row.params_json);
     const batches = decode(row.batch_ids_json);
     const schema = params && typeof params === 'object' && 'kind' in params ? QueryParamsSchema : row.kind === 'current' ? CurrentQuerySchema : ChangesQuerySchema;
     const prepared = schema.safeParse(params);
-    if (!prepared.success || 'kind' in prepared.data && prepared.data.kind !== row.kind
-      || row.params_hash !== createHash('sha256').update(canonicalRequest(prepared.data)).digest('hex')) throw safeError('tool_output_inconsistent');
+    if (!prepared.success || 'kind' in prepared.data && prepared.data.kind !== row.kind) throw safeError('tool_output_inconsistent');
     const headers: Record<string, unknown> = {
       id: row.id,
       sessionId: row.session_id,
@@ -465,14 +465,13 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       kind: row.kind,
       params: prepared.data,
       batchIds: batches,
-      resultHash: row.result_hash,
       createdAt: row.created_at,
     };
     for (const [key, value] of Object.entries(headers)) {
       if (Object.hasOwn(result, key) && !isDeepStrictEqual((result as Record<string, unknown>)[key], value)) throw safeError('tool_output_inconsistent');
     }
     const parsed = QueryRecordSchema.safeParse({ ...result, id: row.id, sessionId: row.session_id, runId: row.run_id, inputId: row.input_id ?? null, callRef: row.call_ref,
-      kind: row.kind, params: prepared.data, batchIds: batches, resultHash: row.result_hash, createdAt: row.created_at });
+      kind: row.kind, params: prepared.data, batchIds: batches, createdAt: row.created_at });
     return parsed.success ? parsed.data : fail("storage_read_failed");
   }
   findQuery(callRef: string): QueryRecord | null {
@@ -489,7 +488,7 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
   private evidence(row: EvidenceRow): Evidence {
     const parsed = EvidenceSchema.safeParse({ id: row.id, queryId: row.query_id, batchIds: decode(row.batch_ids_json), snapshotIds: decode(row.snapshot_ids_json),
       eventIds: decode(row.event_ids_json), sourceRowRefs: decode(row.source_row_refs_json), calculationVersion: row.calculation_version,
-      materialVersion: row.material_version, sourceBundleId: row.source_bundle_id, sourceLockHash: row.source_lock_hash, resultHash: row.result_hash,
+      materialVersion: row.material_version, sourceBundleId: row.source_bundle_id,
       ...(row.filters_json ? { filters: decode(row.filters_json) } : {}), ...(row.provenance ? { provenance: row.provenance } : {}) });
     return parsed.success ? parsed.data : fail("storage_read_failed");
   }
@@ -529,7 +528,12 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
       if (prior) {
         if (prior.sessionId !== input.sessionId || prior.runId !== input.runId || prior.kind !== input.kind || (prior.source ?? 'agent_tool') !== source
           || json(prior.params) !== json(params.data) || json(prior.batchIds) !== json(input.batchIds)
-          || json(prior.scopeDeviceIds) !== json(input.scopeDeviceIds)) fail('state_conflict');
+          || json(prior.scopeDeviceIds) !== json(input.scopeDeviceIds)
+          || !isDeepStrictEqual(prior.rows,input.rows) || !isDeepStrictEqual(prior.snapshotIds,input.snapshotIds)
+          || !isDeepStrictEqual(prior.eventIds,input.eventIds) || !isDeepStrictEqual(prior.warnings,input.warnings)
+          || prior.calculationVersion!==input.calculationVersion || !isDeepStrictEqual(prior.interpretation,input.interpretation)
+          || prior.materialVersion!==input.materialVersion || prior.catalogRevision!==input.catalogRevision
+          || (prior.basedOnQueryId??null)!==(input.basedOnQueryId??null)) fail('state_conflict');
         return prior;
       }
       // Validate the saved snapshot without reactivating removed business settings.
@@ -547,8 +551,8 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
         : input.kind === 'current' ? policySchemas.CurrentQuerySchema : policySchemas.ChangesQuerySchema;
       if (!policySchema.safeParse(params.data).success) fail('invalid_argument');
       if (input.rows.length > BUSINESS_RULES.maxSavedRows) throw safeError('query_result_too_large');
-      const references = this.p3 ? this.db.query<{ id: number; material_version: string; source_bundle_id: string; source_lock_hash: string }, [string]>(
-        'SELECT id,material_version,source_bundle_id,source_lock_hash FROM batches WHERE id IN (SELECT value FROM json_each(?))').all(json(input.batchIds)) : [];
+      const references = this.p3 ? this.db.query<{ id: number; material_version: string; source_bundle_id: string }, [string]>(
+        'SELECT id,material_version,source_bundle_id FROM batches WHERE id IN (SELECT value FROM json_each(?))').all(json(input.batchIds)) : [];
       if (this.p3) {
         const revision = this.db.query<{ revision: number }, []>('SELECT revision FROM catalog_state WHERE id=1').get()!.revision;
         if (references.length !== input.batchIds.length || input.catalogRevision !== undefined && input.catalogRevision !== revision
@@ -565,11 +569,11 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
         const checked = EvidenceSchema.omit({ id: true, queryId: true }).safeParse(value);
         if (!checked.success || checked.data.batchIds.some(batch => !input.batchIds.includes(batch))
           || checked.data.snapshotIds.some(snapshot => !input.snapshotIds.includes(snapshot)) || checked.data.eventIds.some(event => !input.eventIds.includes(event))
-          || checked.data.resultHash !== input.resultHash || checked.data.calculationVersion !== input.calculationVersion) fail("invalid_argument");
+          || checked.data.calculationVersion !== input.calculationVersion) fail("invalid_argument");
         if (checked.data.filters !== undefined && json(checked.data.filters) !== json(params.data)) fail('invalid_argument');
         if (this.p3 && checked.data.batchIds.some(batchId => {
           const batch = references.find(row => row.id === batchId)!;
-          return batch.material_version !== checked.data.materialVersion || batch.source_bundle_id !== checked.data.sourceBundleId || batch.source_lock_hash !== checked.data.sourceLockHash;
+          return batch.material_version !== checked.data.materialVersion || batch.source_bundle_id !== checked.data.sourceBundleId;
         })) fail('invalid_argument');
         json(value); return checked.data;
       });
@@ -579,23 +583,23 @@ export class SqliteToolStore implements ToolCallStore, QueryStore {
         ...(input.materialVersion === undefined ? {} : { materialVersion: input.materialVersion }), ...(input.basedOnQueryId === undefined ? {} : { basedOnQueryId: input.basedOnQueryId }) };
       const extraColumns = this.p3 ? ",source,catalog_revision,material_version,based_on_query_id,input_id" : "";
       const extraValues = this.p3 ? ",?,?,?,?,?" : "";
-      const inserted = this.db.query(`INSERT INTO queries(session_id,run_id,call_ref,kind,params_hash,params_json,batch_ids_json,result_json,result_hash,created_at${extraColumns})
-        VALUES(?,?,?,?,?,?,?,?,?,?${extraValues})`).run(input.sessionId, input.runId, input.callRef, input.kind,
-        createHash("sha256").update(json(params.data)).digest("hex"), json(params.data), json(input.batchIds), json(result), input.resultHash, input.createdAt,
+      const inserted = this.db.query(`INSERT INTO queries(session_id,run_id,call_ref,kind,params_json,batch_ids_json,result_json,created_at${extraColumns})
+        VALUES(?,?,?,?,?,?,?,?${extraValues})`).run(input.sessionId, input.runId, input.callRef, input.kind,
+        json(params.data), json(input.batchIds), json(result), input.createdAt,
         ...(this.p3 ? [source, input.catalogRevision ?? this.db.query<{ revision: number }, []>("SELECT revision FROM catalog_state WHERE id=1").get()!.revision,
           input.materialVersion ?? inputEvidence.map(item => item.materialVersion).join(","), input.basedOnQueryId ?? null, rootInput] : []));
       const queryId = Number(inserted.lastInsertRowid);
       for (const item of evidence) this.db.query(`INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,
-        calculation_version,material_version,source_bundle_id,source_lock_hash,result_hash${this.p3 ? ",filters_json,provenance" : ""}) VALUES(?,?,?,?,?,?,?,?,?,?${this.p3 ? ",?,?" : ""})`).run(queryId, json(item.batchIds),
-        json(item.snapshotIds), json(item.eventIds), json(item.sourceRowRefs), item.calculationVersion, item.materialVersion, item.sourceBundleId, item.sourceLockHash, item.resultHash,
+        calculation_version,material_version,source_bundle_id${this.p3 ? ",filters_json,provenance" : ""}) VALUES(?,?,?,?,?,?,?,?${this.p3 ? ",?,?" : ""})`).run(queryId, json(item.batchIds),
+        json(item.snapshotIds), json(item.eventIds), json(item.sourceRowRefs), item.calculationVersion, item.materialVersion, item.sourceBundleId,
         ...(this.p3 ? [json(item.filters ?? params.data), item.provenance ?? "synthetic-derived"] : []));
       if (this.p3) this.db.query("INSERT INTO business_events(operation_ref,type,actor,session_id,run_id,query_id,details_json,occurred_at) VALUES(?,'query_committed',?,?,?,?,?,?)")
         .run(input.callRef, source === "user_form" ? "user" : source === 'intent' ? 'system' : "agent", input.sessionId, input.runId, queryId,
-          json({ queryId, kind: input.kind, resultHash: input.resultHash, source, rowCount: input.rows.length,
+          json({ queryId, kind: input.kind, source, rowCount: input.rows.length,
             ...('workspaceRevision' in context ? { workspaceRevision: context.workspaceRevision } : {}) }), input.createdAt);
       cancelled(context); this.identity(context, true);
       this.assertQueryAdmission(input.params, context);
-      this.events?.appendInTransaction({type:'query_completed',payload:{contract:'medclaw.event/v1',queryId,resultHash:input.resultHash,batchIds:input.batchIds},runId:input.runId,sessionId:input.sessionId,source:source==='agent_tool'?'tool':'application',sourceConnection:null,sourceSequence:null,toolCallId:'nativeToolCallId'in context?this.callRow(context)?.id??null:null,occurredAt:input.createdAt,receivedAt:input.createdAt});
+      this.events?.appendInTransaction({type:'query_completed',payload:{contract:'medclaw.event/v1',queryId,batchIds:input.batchIds},runId:input.runId,sessionId:input.sessionId,source:source==='agent_tool'?'tool':'application',sourceConnection:null,sourceSequence:null,toolCallId:'nativeToolCallId'in context?this.callRow(context)?.id??null:null,occurredAt:input.createdAt,receivedAt:input.createdAt});
       return this.readQuery(queryId)!;
     }), "storage_write_failed");
   }

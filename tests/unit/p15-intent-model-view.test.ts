@@ -22,13 +22,13 @@ test('p15 model receives one business input while its complete audit stage verif
 test('p15 semantic review exposes its parsed prediction once and retains raw output only in the audit source', () => {
   const first = current(), prediction = resolvedIntent();
   const stage = IntentStageInputSchema.parse({ ...first, stage: 'verify', review: { mode: 'semantic_correction',
-    previousCallId: 'first-call', prediction, rawHash: 'a'.repeat(64), rawPreview: 'UNIQUE_RAW_OUTPUT_MARKER',
+    previousCallId: 'first-call', prediction, rawPreview: 'UNIQUE_RAW_OUTPUT_MARKER',
     issues: [{ code: 'explicit_condition_conflict', intentId: 's1', slot: 'l2', severity: 'invalid',
       message: '原文明确要求两日期比较', candidates: [], sourceSpan: { start: 0, end: 2 } }], candidates: [] } });
   const rendered = renderIntentContext(stage), view = JSON.parse(rendered.slice(CONTEXT_MATERIAL_PREFIX.length));
   expect(view.review).toEqual({ mode: 'semantic_correction', prediction, issues: stage.review!.issues, candidates: [] });
   expect(rendered).not.toContain('UNIQUE_RAW_OUTPUT_MARKER');
-  expect(rendered).not.toContain('rawHash'); expect(rendered).not.toContain('previousCallId');
+  expect(rendered).not.toContain('rawPreview'); expect(rendered).not.toContain('previousCallId');
   expect(readIntentContext(rendered, stage).review?.rawPreview).toBe('UNIQUE_RAW_OUTPUT_MARKER');
 });
 

@@ -34,10 +34,10 @@ test('p14 query contexts retain the unique adopted task and strict branch/source
   const schema = Reflect.get(schemas, 'QueryContextRecordSchema');
   const context = { sessionId: 1, nativeLeafId: 'leaf-1', version: 1, sourceInputId: 2, sourceRunId: 3,
     taskIntents: [productIntent()], contextIntentId: 's1', adoptedSlots: emptyIntentSlots(),
-    scopeBatchHashes: ['a'.repeat(64)], queryIds: [4], pendingClarification: null };
+     queryIds: [4], pendingClarification: null };
   expect(Boolean(schema?.safeParse(context).success)).toBe(true);
   for (const patch of [{ nativeLeafId: null }, { sourceRunId: 0 }, { contextIntentId: 's2' }, { taskIntents: [] },
-    { scopeBatchHashes: ['a'.repeat(64), 'a'.repeat(64)] }, { queryIds: [4, 4] }, { adoptedSlots: {} }]) {
+    { sourceRunId:0 }, { queryIds: [4, 4] }, { adoptedSlots: {} }]) {
     expect(schema.safeParse({ ...context, ...patch }).success).toBe(false);
   }
 });
@@ -52,7 +52,7 @@ test('p14 validation, execution mapping and HTTP facts remain distinct from mode
   expect(validationSchema.safeParse({ ...validation, finalStatus: null }).success).toBe(false);
   expect(validationSchema.safeParse({ ...validation, rawOutputTruncated: true, reviewRequired: true }).success).toBe(false);
   const execution = { contract: 'medclaw.intent-execution/v1', decisionId: 1, taskIntents: [productIntent()],
-    stepResults: [{ stepId: 's1', queryRefs: [{ queryId: 2, resultHash: 'b'.repeat(64) }] }] };
+    stepResults: [{ stepId: 's1', queryRefs: [{ queryId: 2}] }] };
   expect(executionSchema.safeParse(execution).success).toBe(true);
   expect(executionSchema.safeParse({ ...execution, stepResults: [{ ...execution.stepResults[0], stepId: 's2' }] }).success).toBe(false);
 });
@@ -175,12 +175,12 @@ test('p14 allows only numeric HTTP loopback Ollama URLs with no redirecting URL 
   }
 });
 
-test('p14 enables only the stock tag with an immutable digest and protocol evidence', () => {
+test('p14 enables only the stock tag with protocol evidence', () => {
   const enabled = { ...disabledIntentModel(), enabled: true };
   expect(schemas?.IntentModelConfigurationSchema.safeParse(enabled).success).toBe(false);
-  const valid = { ...enabled, modelDigest: 'sha256:' + 'a'.repeat(64), verifiedEvidenceRef: 'p14.official-protocol' };
+  const valid = { ...enabled,  verifiedEvidenceRef: 'p14.official-protocol' };
   expect(schemas?.IntentModelConfigurationSchema.safeParse(valid).success).toBe(true);
-  for (const patch of [{ modelTag: 'qwen3.5:2b' }, { modelDigest: 'a'.repeat(64) }, { timeoutMs: 999 },
+  for (const patch of [{ modelTag: 'qwen3.5:2b' }, { verifiedEvidenceRef:null }, { timeoutMs: 999 },
     { timeoutMs: 60001 }, { adapter: 'sft' }, { sourceUrl: 'https://example.com' }]) {
     expect(schemas?.IntentModelConfigurationSchema.safeParse({ ...valid, ...patch }).success).toBe(false);
   }
@@ -194,7 +194,7 @@ test('p14 exports JSON Schema from the same Zod output contract', () => {
 
 test('p14 registration binds the admitted input, stage and immutable enabled model selection', () => {
   const input = { input: intentInput(), stage: 'classify', review: null };
-  const model = { ...disabledIntentModel(), enabled: true, modelDigest: 'sha256:' + 'a'.repeat(64), verifiedEvidenceRef: 'protocol-1',
+  const model = { ...disabledIntentModel(), enabled: true,  verifiedEvidenceRef: 'protocol-1',
     configVersion: '1', api: 'ollama-chat', ...schemas.INTENT_VERSIONS };
   const value = { callId: 'classify-1', runId: 3, sessionId: 1, inputId: 2, snapshotId: 4,
     selection: model, input, stage: 'classify', previousCallId: null, createdAt: '2026-10-10T03:00:00.000Z' };

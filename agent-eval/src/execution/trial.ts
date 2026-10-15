@@ -10,7 +10,6 @@ import { cleanupInstance, prepareInstance } from './instance.ts';
 import { materializeInputs,preparePublicMaterials,type PublicMaterial } from '../datasets.ts';
 import { materializeControlFixtures, parseFixtureCatalog } from '../dataset-fixtures.ts';
 import { collectObservation } from './observe.ts';
-import { projectPublicEvidence } from '../data-format.ts';
 import type {TrialPhase} from './progress.ts';
 
 export interface RunTrialOptions { executionId: string; trialId: string; caseId: string; repetition: number; case: EvalCase; datasetRoot: string; fixtureFiles?: Record<string,string>; productResources?: readonly ProductResource[]; config: ResolvedRunConfig; modelCredential?:AgentModelCredential; trialRoot: string; signal?: AbortSignal; controlledFixture?: boolean;onPhase?:(phase:TrialPhase)=>void }
@@ -145,7 +144,6 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
         result.observation.facts.publicMaterials=publicMaterials;
         let isolation:unknown;try{isolation=JSON.parse(await readFile(join(trialRoot,'isolation.json'),'utf8'));}catch{}
         result.observation.facts.lifecycle={shutdown:firstShutdown??null,cleanup,isolation,productRoot:product.paths.dataRoot};
-        result.observation=projectPublicEvidence(result.observation);
         Object.defineProperty(result.observation.facts,'evidenceRoot',{value:trialRoot,enumerable:false});
         await writeFile(join(trialRoot,'observation.json'),JSON.stringify(result.observation,null,2),{mode:0o600});
       }
@@ -155,7 +153,7 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
     if(workRoot)lifecycle.workRoot=workRoot;
     for(const name of ['isolation','ownership','shutdown','startup-shutdown','cleanup','cleanup-shutdown'])try{lifecycle[name]=JSON.parse(await readFile(join(trialRoot,name+'.json'),'utf8'));await import('node:fs/promises').then(fs=>fs.unlink(join(trialRoot,name+'.json')));}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
     const {observation,...state}=result;
-    await writeFile(join(trialRoot, 'trial.json'), JSON.stringify(projectPublicEvidence({...state,observationRef:observation?'observation.json':null,lifecycle}), null, 2), { mode: 0o600 });
+    await writeFile(join(trialRoot, 'trial.json'), JSON.stringify({...state,observationRef:observation?'observation.json':null,lifecycle}, null, 2), { mode: 0o600 });
     if(workRoot&&options.config.retention==='preserve_on_failure'&&result.status==='completed'&&result.stopped===true&&result.closed===true&&result.observation?.missing.length===0) {
       within(tmpdir(),workRoot);if((await lstat(workRoot)).isSymbolicLink()||await realpath(workRoot)!==workRoot)throw new Error('work_root_ownership_changed');await rm(workRoot,{recursive:true});
     }

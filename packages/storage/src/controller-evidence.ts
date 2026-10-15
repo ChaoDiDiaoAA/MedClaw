@@ -1,11 +1,11 @@
 import type { Database } from 'bun:sqlite';
-import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { ControllerEvidenceInputSchema,ControllerEvidenceOutputSchema,ProviderRequestOriginalSchema,QueryInventoryOriginalSchema,type ControllerEvidenceInput } from '../../contracts/src/controller-evidence';
 import type { SqliteMemoryStore } from './memory-store';
 import type { SqliteToolStore } from './tool-store';
 import { readFrozenChild } from './child-identity';
 import { RunScopeSchema } from '../../contracts/src/run';
+import {omitLegacyFields,legacyRunScope} from './legacy-business-fields';
 
 /** Host-owned, identity-scoped original reads. There is deliberately no pathname input. */
 export class ControllerEvidenceReader {
@@ -20,13 +20,13 @@ export class ControllerEvidenceReader {
       if(owner.kind==='request') {
         const row=this.db.query<{model_json:string},[string,number|null,number|null]>('SELECT model_json FROM model_calls WHERE call_id=? AND run_id IS ? AND session_id IS ?').get(owner.callId,owner.runId,owner.sessionId);
         if(!row)throw new Error('evidence_not_found');
-        const originals=ProviderRequestOriginalSchema.array().parse(JSON.parse(row.model_json).requestOriginals??[]);
+        const originals=ProviderRequestOriginalSchema.array().parse((JSON.parse(row.model_json).requestOriginals??[]).map((item:unknown)=>omitLegacyFields(item,['sha256'])));
         if(!originals.length)throw new Error('evidence_not_found');
-        originals.forEach((item,index)=>{if(item.instanceId!==input.ownerInstanceId||item.callId!==owner.callId||item.sessionId!==owner.sessionId||item.runId!==owner.runId||item.sequence!==index+1||Buffer.byteLength(item.body)!==item.bytes||createHash('sha256').update(item.body).digest('hex')!==item.sha256)throw new Error('evidence_integrity_failed');});
+        originals.forEach((item,index)=>{if(item.instanceId!==input.ownerInstanceId||item.callId!==owner.callId||item.sessionId!==owner.sessionId||item.runId!==owner.runId||item.sequence!==index+1||Buffer.byteLength(item.body)!==item.bytes)throw new Error('evidence_integrity_failed');});
         original=originals;
       } else if(owner.kind==='run') {
         const row=this.db.query<{kind:string;scope_json:string;child_result_json:string|null},[number]>('SELECT kind,scope_json,child_result_json FROM runs WHERE id=?').get(owner.runId)!;
-        original={instanceId:input.ownerInstanceId,runId:owner.runId,sessionId:owner.sessionId,scope:RunScopeSchema.parse(JSON.parse(row.scope_json)),child:row.kind==='child'?readFrozenChild(this.db,owner.runId):null};
+        original={instanceId:input.ownerInstanceId,runId:owner.runId,sessionId:owner.sessionId,scope:RunScopeSchema.parse(legacyRunScope(JSON.parse(row.scope_json))),child:row.kind==='child'?readFrozenChild(this.db,owner.runId):null};
       } else if(owner.kind==='history') {
         original=this.memory.loadInTransaction(owner.sessionId);
       } else if(owner.kind==='queries') {
@@ -36,7 +36,7 @@ export class ControllerEvidenceReader {
       const bytes=Buffer.from(JSON.stringify(original),'utf8');
       if(input.offset>bytes.length)throw new Error('invalid_argument');
       const end=Math.min(bytes.length,input.offset+input.limit);
-      const result=ControllerEvidenceOutputSchema.parse({instanceId:this.instanceId,ownerInstanceId:input.ownerInstanceId,selector:owner,sha256:createHash('sha256').update(bytes).digest('hex'),bytes:bytes.length,offset:input.offset,nextOffset:end<bytes.length?end:null,encoding:'base64',data:bytes.subarray(input.offset,end).toString('base64')});
+      const result=ControllerEvidenceOutputSchema.parse({instanceId:this.instanceId,ownerInstanceId:input.ownerInstanceId,selector:owner,bytes:bytes.length,offset:input.offset,nextOffset:end<bytes.length?end:null,encoding:'base64',data:bytes.subarray(input.offset,end).toString('base64')});
       if(!isDeepStrictEqual(result.selector,owner))throw new Error('access_denied');return result;
     }).deferred();
   }

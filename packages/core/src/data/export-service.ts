@@ -1,24 +1,24 @@
-import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { AppErrorSchema, OpaqueIdSchema, safeError, serviceResult, type AppError, type Result } from '../../../contracts/src/error';
 import { canonicalRequest } from '../../../contracts/src/run';
-import { EXPORT_VERSION, ExportCopyReceiptSchema, ExportOperationSchema, ExportRequestSchema, type ExportDestinationSchema,
+import { ExportCopyReceiptSchema, ExportOperationSchema, ExportRequestSchema, type ExportDestinationSchema,
   type ExportDestinationCopySchema, type ExportListInputSchema, type ExportOperation, type ExportRequest, type ExportServicePort,
   type ExportStore, type FrozenExportSource, type PublishedExport, type StoredExport, type ExportCopyReceipt, type ExportCopyState } from '../../../contracts/src/export';
 import type { ArtifactStore } from '../../../storage/src/artifact-store';
+import { ExportCopyVerificationSchema } from '../../../contracts/src/protocol';
+import type { ExportCopyVerification } from '../../../contracts/src/export';
 
 type Destination = {
-  describe(input: z.infer<typeof ExportDestinationSchema>): Promise<{ destinationIdentity: string }>;
+  describe(input: z.infer<typeof ExportDestinationSchema>): Promise<{valid:true}>;
   copy(input: z.infer<typeof ExportDestinationCopySchema>): Promise<ExportCopyReceipt>;
   cancel(operationRef: string): Promise<{ stopped: boolean }>;
   settlePrevious(): Promise<{ stopped: true }>;
 };
-type Active = { operationRef: string; requestHash: string; controller: AbortController; accepted: Promise<Result<ExportOperation>>;
+type Active = { operationRef: string; request: ExportRequest; controller: AbortController; accepted: Promise<Result<ExportOperation>>;
   task: Promise<void> | null; copying: boolean; stopped: boolean; saving: boolean; receipt?: ExportCopyReceipt;
   pendingFailure?: { state: 'failed' | 'cancelled'; error: AppError | null; copyState: ExportCopyState } };
 const terminal = (state: string) => ['completed', 'failed', 'cancelled', 'interrupted'].includes(state);
 const publicView = (record: StoredExport) => ExportOperationSchema.parse(Object.fromEntries(Object.keys(ExportOperationSchema.shape).map(key => [key, record[key as keyof StoredExport]])));
-const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 
 export class ExportService implements ExportServicePort {
   private active: Active | null = null;
@@ -27,32 +27,37 @@ export class ExportService implements ExportServicePort {
     store: ExportStore; artifacts: Pick<ArtifactStore, 'publishExport' | 'verifyExport'>; destination: Destination; assertWritable(): void;
   }) {}
   get busy() { return this.active !== null; }
-  private required(operationRef: string) { const record = this.dependencies.store.find(operationRef); if (!record) throw new Error('operation_not_found'); return record; }
-  private requestHash(request: ExportRequest, source: FrozenExportSource) {
-    return sha(canonicalRequest({ queryId: request.queryId, resultHash: source.query.resultHash, answerId: request.answerId,
-      answerTextHash: source.answer ? sha(source.answer.text) : null, format: request.format, exportVersion: EXPORT_VERSION,
-      priorOperationRef: request.priorOperationRef ?? null, destinationIdentity: request.destinationIdentity }));
+  async verifyCopy(value: ExportCopyVerification): Promise<{ verified: true }> {
+    const input = ExportCopyVerificationSchema.parse(value), active = this.active, record = this.required(input.operationRef);
+    if (!active || active.operationRef !== input.operationRef || !active.copying || active.stopped
+      || record.instanceId !== this.instanceId || record.id !== input.exportId || record.reservedArtifactId !== input.artifactId
+      || record.state !== 'copying') throw new Error('state_conflict');
+    active.controller.signal.throwIfAborted();
+    await this.dependencies.artifacts.verifyExport(input.artifactId, input.temporaryPath, active.controller.signal);
+    active.controller.signal.throwIfAborted();
+    return { verified: true };
   }
+  private required(operationRef: string) { const record = this.dependencies.store.find(operationRef); if (!record) throw new Error('operation_not_found'); return record; }
   export(value: ExportRequest): Promise<Result<ExportOperation>> {
     return serviceResult(async () => {
-      const request = ExportRequestSchema.parse(value), source = this.dependencies.store.readSource(request.queryId, request.answerId), requestHash = this.requestHash(request, source);
+      const request = ExportRequestSchema.parse(value), source = this.dependencies.store.readSource(request.queryId, request.answerId);
       const old = this.dependencies.store.find(request.operationRef);
-      if (old) { if (old.requestHash !== requestHash) throw new Error('state_conflict'); return publicView(old); }
+      if (old) { if (old.request===null || canonicalRequest(old.request)!==canonicalRequest(request)) throw new Error('state_conflict'); return publicView(old); }
       if (this.active?.operationRef === request.operationRef) {
-        if (this.active.requestHash !== requestHash) throw new Error('state_conflict');
+        if (canonicalRequest(this.active.request)!==canonicalRequest(request)) throw new Error('state_conflict');
         const result = await this.active.accepted; if (!result.ok) throw result.error; return result.data;
       }
       if (this.closing || this.busy) throw new Error('runtime_busy'); this.dependencies.assertWritable();
       let resolve!: (result: Result<ExportOperation>) => void;
-      const active: Active = { operationRef: request.operationRef, requestHash, controller: new AbortController(),
+      const active: Active = { operationRef: request.operationRef, request, controller: new AbortController(),
         accepted: new Promise(done => { resolve = done; }), task: null, copying: false, stopped: true, saving: false };
       this.active = active; // Reserve before the first asynchronous permission or artifact check.
       const acceptance = await serviceResult(async () => {
         const destination = await this.dependencies.destination.describe(this.destination(request));
-        if (destination.destinationIdentity !== request.destinationIdentity) throw new Error('export_destination_invalid');
+        if (destination.valid !== true) throw new Error('export_destination_invalid');
         active.controller.signal.throwIfAborted();
         const prior = request.priorOperationRef ? this.required(request.priorOperationRef) : null;
-        if (prior && (!terminal(prior.state) || prior.sessionId !== source.query.sessionId)) throw new Error('state_conflict');
+        if (prior && (prior.request===null || !terminal(prior.state) || prior.sessionId !== source.query.sessionId)) throw new Error('state_conflict');
         let reuse: PublishedExport | null = null;
         if (prior?.artifact && prior.queryId === request.queryId && prior.answerId === request.answerId && prior.format === request.format) {
           try { reuse = await this.dependencies.artifacts.verifyExport(prior.artifact.id); }
@@ -64,7 +69,7 @@ export class ExportService implements ExportServicePort {
           if (priorOperationRefs.length === 100 || previous.sessionId !== source.query.sessionId) throw new Error('state_conflict');
           priorOperationRefs.push(previous.operationRef);
         }
-        const record = this.dependencies.store.accept({ operationRef: request.operationRef, requestHash, instanceId: this.instanceId, sessionId: source.query.sessionId,
+        const record = this.dependencies.store.accept({ operationRef: request.operationRef, request, instanceId: this.instanceId, sessionId: source.query.sessionId,
           queryId: request.queryId, answerId: request.answerId, format: request.format, priorExportId: prior?.id ?? null, reuseArtifactId: reuse?.artifactId ?? null, createdAt: new Date().toISOString() });
         const accepted = publicView(record);
         active.task = this.execute(active, request, source, record, reuse, priorOperationRefs);
@@ -74,8 +79,8 @@ export class ExportService implements ExportServicePort {
     }, 'storage_write_failed');
   }
   private destination(request: ExportRequest) {
-    const { operationRef, queryId, answerId, format, destinationToken, destinationIdentity } = request;
-    return { operationRef, queryId, answerId, format, destinationToken, destinationIdentity };
+    const { operationRef, queryId, answerId, format, destinationToken } = request;
+    return { operationRef, queryId, answerId, format, destinationToken };
   }
   private async execute(active: Active, request: ExportRequest, source: FrozenExportSource, record: StoredExport, reuse: PublishedExport | null, priorOperationRefs: string[]) {
     let stage: 'generation' | 'registration' | 'copy' = 'generation';
@@ -86,8 +91,9 @@ export class ExportService implements ExportServicePort {
       this.dependencies.store.register(request.operationRef, proof);
       active.controller.signal.throwIfAborted();
       stage = 'copy'; this.dependencies.store.beginCopy(request.operationRef); active.copying = true; active.stopped = false;
-      const receipt = ExportCopyReceiptSchema.parse(await this.dependencies.destination.copy({ ...this.destination(request), artifactId: proof.artifactId, manifest: proof.manifest, priorOperationRefs }));
+      const receipt = ExportCopyReceiptSchema.parse(await this.dependencies.destination.copy({ ...this.destination(request), exportId:record.id, artifactId: proof.artifactId, manifest: proof.manifest, priorOperationRefs }));
       active.stopped = true; active.receipt = receipt;
+      await this.dependencies.artifacts.verifyExport(proof.artifactId);
       try { this.dependencies.store.complete(request.operationRef, receipt); }
       catch (error) { if (!this.completed(active)) throw error; }
     } catch (error) {
@@ -150,9 +156,9 @@ export class ExportService implements ExportServicePort {
       }
       const record = this.required(operationRef); this.dependencies.store.readSource(record.queryId, record.answerId);
       if (this.closing || this.busy) throw new Error('runtime_busy'); this.dependencies.assertWritable();
-      if (!terminal(record.state) || record.reservedArtifactId === null) throw new Error('state_conflict');
+      if (!terminal(record.state) || record.reservedArtifactId === null || record.request === null) throw new Error('state_conflict');
       const artifactId = record.reservedArtifactId;
-      const active: Active = { operationRef, requestHash: record.requestHash, controller: new AbortController(), accepted: Promise.resolve({ ok: true, data: publicView(record) }),
+      const active: Active = { operationRef, request: record.request!, controller: new AbortController(), accepted: Promise.resolve({ ok: true, data: publicView(record) }),
         task: null, copying: false, stopped: false, saving: false };
       this.active = active;
       const work = (async () => {

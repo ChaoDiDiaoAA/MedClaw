@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { PositiveIdSchema } from '../../contracts/src/error';
 import { DataCatalogSchema } from '../../contracts/src/data';
 import { BatchSchema, ChangeSchema, DeviceSchema, IntentSnapshotSchema, QueryRowSchema, SnapshotSchema, type Batch, type CatalogFilters, type CatalogStore, type CatalogSummary, type Change, type Device, type QueryParams, type Snapshot, type SnapshotReference } from '../../contracts/src/query';
+import {legacySourceRef,legacyFieldOrigins} from './legacy-business-fields';
 
 type Row = Record<string, unknown>;
 type Binding = string | number | null;
@@ -54,9 +55,6 @@ export class SqliteCatalogStore implements CatalogStore {
       previousBatchId: row.previous_batch_id,
       materialVersion: row.material_version,
       sourceBundleId: row.source_bundle_id,
-      sourceLockHash: row.source_lock_hash,
-      contentHash: row.content_hash,
-      cohortHash: row.cohort_hash,
       catalogRevision: row.catalog_revision,
       expectedEntityCount: row.expected_entity_count,
       observedEntityCount: row.observed_entity_count,
@@ -70,7 +68,7 @@ export class SqliteCatalogStore implements CatalogStore {
       sourceBundleId: row.source_bundle_id,
       sourceSubmissionId: row.source_submission_id,
       sourceApplicant: row.source_applicant,
-      sourceRefs: decode(row.source_refs_json),
+      sourceRefs: z.array(z.unknown()).parse(decode(row.source_refs_json)).map(legacySourceRef),
     })));
   }
   private snapshot(row: Row): Snapshot {
@@ -88,8 +86,8 @@ export class SqliteCatalogStore implements CatalogStore {
       manufacturer: row.manufacturer,
       distributor: row.distributor,
       sourceRowRef: row.source_row_ref,
-      sourceRefs: decode(row.source_refs_json),
-      fieldOrigins: decode(row.field_origins_json),
+      sourceRefs: z.array(z.unknown()).parse(decode(row.source_refs_json)).map(legacySourceRef),
+      fieldOrigins: legacyFieldOrigins(decode(row.field_origins_json)),
     });
   }
   private filters(filters: CatalogFilters, expression: (column: string) => string, clauses: string[], params: Binding[]) {

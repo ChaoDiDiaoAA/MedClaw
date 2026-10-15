@@ -24,14 +24,14 @@ function IntentModelSettings({ host, configVersion, onChanged }: { host: HostVie
         if (!result.ok) { setError(errorMessage(result.error)); return; }
         const value = result.data.intentModel ?? { ...DEFAULT_INTENT_MODEL };
         setDraft(value); setVersion(result.data.configVersion);
-        setVerified(old => old?.baseUrl === value.baseUrl && old.inspection.actualDigest === value.modelDigest ? old : null);
+        setVerified(old => old?.baseUrl === value.baseUrl ? old : null);
       } catch { if (ticket === generation.current) setError('The intent configuration could not be read. Reload the published directory.'); }
       finally { if (ticket === generation.current) setBusy(false); }
     })();
     return () => { generation.current++; };
   }, [host.state, host.instanceId, configVersion]);
   const blocked = host.state !== 'ready' || busy || version === null;
-  const verifiedNow = verified?.instanceId === host.instanceId && verified.baseUrl === draft.baseUrl && verified.inspection.available && verified.inspection.actualDigest === draft.modelDigest;
+  const verifiedNow = verified?.instanceId === host.instanceId && verified.baseUrl === draft.baseUrl && verified.inspection.available;
   async function inspect() {
     const ticket = generation.current; setBusy(true); setError(null); setMessage(null); setVerified(null);
     try {
@@ -39,8 +39,8 @@ function IntentModelSettings({ host, configVersion, onChanged }: { host: HostVie
       if (ticket !== generation.current) return;
       if (!result.ok) { setError(errorMessage(result.error)); return; }
       setVerified({ instanceId: host.instanceId, baseUrl: draft.baseUrl, inspection: result.data });
-      if (!result.data.available || !result.data.actualDigest) { setError(result.data.error ? errorMessage(result.data.error) : 'The local intent model is unavailable.'); return; }
-      setDraft(old => ({ ...old, modelDigest: result.data.actualDigest })); setMessage('Local model identity verified.');
+      if (!result.data.available) { setError(result.data.error ? errorMessage(result.data.error) : 'The local intent model is unavailable.'); return; }
+      setMessage('Local model tag and protocol metadata verified.');
     } catch { if (ticket === generation.current) setError('The local intent model could not be verified.'); }
     finally { if (ticket === generation.current) setBusy(false); }
   }
@@ -68,7 +68,7 @@ function IntentModelSettings({ host, configVersion, onChanged }: { host: HostVie
       <fieldset disabled={blocked}>
         <legend>Local model configuration</legend>
         <div className="form-grid">
-          <label>Ollama URL<input value={draft.baseUrl} onChange={event => { setDraft(old => ({ ...old, baseUrl: event.target.value, modelDigest: null })); setVerified(null); }} /></label>
+          <label>Ollama URL<input value={draft.baseUrl} onChange={event => { setDraft(old => ({ ...old, baseUrl: event.target.value })); setVerified(null); }} /></label>
           <label>Model tag<input value={draft.modelTag} readOnly /></label>
           <label>Intent timeout (ms)<input type="number" min={1000} max={60000} step={1} value={draft.timeoutMs} onChange={event => setDraft(old => ({ ...old, timeoutMs: event.target.valueAsNumber }))} /></label>
           <label>Verification record<input maxLength={256} value={draft.verifiedEvidenceRef ?? ''} onChange={event => setDraft(old => ({ ...old, verifiedEvidenceRef: event.target.value || null }))} placeholder="Official source, identity and protocol evidence reference" /></label>
@@ -78,8 +78,8 @@ function IntentModelSettings({ host, configVersion, onChanged }: { host: HostVie
         <div className="actions"><button type="button" onClick={() => void inspect()}>Verify local model</button><button type="submit" className="primary">Apply configuration</button></div>
       </fieldset>
     </form>
-    <p>Selected identity: {draft.modelDigest ? <code>{draft.modelDigest}</code> : 'Not verified'}</p>
-    {verified && <p>Actual identity: <code>{verified.inspection.actualDigest ?? 'Unavailable'}</code> · {verified.inspection.checkedAt}</p>}
+    <p>Selected model: <code>{draft.modelTag}</code></p>
+    {verified && <p>Observed model: {verified.inspection.available ? draft.modelTag : 'Unavailable'} · {verified.inspection.checkedAt}</p>}
     {metadata && <p className="muted">Ollama {metadata.serviceVersion ?? 'Unknown'} · {metadata.family ?? 'Unknown family'} · {metadata.parameterSize ?? 'Unknown size'} · {metadata.quantization ?? 'Unknown quantization'}</p>}
     {busy && <p role="status">Reading or applying intent configuration…</p>}
     {message && <p role="status">{message}</p>}

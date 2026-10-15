@@ -129,21 +129,29 @@ function legacy() {
   db.query(`INSERT INTO context_snapshots(run_id,session_id,input_id,sequence,snapshot_json,created_at) VALUES(10,1,1,1,'{ "contract": "medclaw.context/v1", "raw": "工程😀" }',?)`).run(memoryAt);
   const names = db.query<{name:string},[]>("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(row => row.name);
   const before = Object.fromEntries(names.map(name => [name, db.query<Record<string,unknown>,[]>(`SELECT * FROM ${name} ORDER BY id`).all()]));
-  return { root, path, db, names, before };
+  const schema = db.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all();
+  return { root, path, db, names, before, schema };
 }
 function preserved(db: Database, f: ReturnType<typeof legacy>) {
+  const current=db.query<{version:number},[]>('SELECT max(version) version FROM schema_migrations').get()!.version>=16;
+  const retiredBusinessColumns=new Set(["preview_request_hash", "commit_request_hash", "fingerprint", "source_lock_hash", "content_hash", "cohort_hash", "params_hash", "result_hash", "scope_batch_hashes_json", "request_hash", "published_hash", "sha256"]);
+  const retainedFields=(row:Record<string,unknown>)=>Object.fromEntries(Object.entries(row).filter(([key])=>!retiredBusinessColumns.has(key)));
+
+
+  if (!current) expect(db.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all()).toEqual(f.schema);
   for (const name of f.names) {
-    const expected = f.before[name]!;
-    const after = db.query<Record<string,unknown>,[]>(`SELECT * FROM ${name} ORDER BY id`).all().slice(0, expected.length);
-    expect(after.map((row,i) => Object.fromEntries(Object.keys(expected[i]!).map(key => [key,row[key]])))).toEqual(expected);
+    const expected = current?f.before[name]!.map(retainedFields):f.before[name]!;
+    const after = db.query<Record<string,unknown>,[]>(`SELECT * FROM ${name} ORDER BY id`).all();
+    if (current) expect(after.slice(0, expected.length).map((row,i) => Object.fromEntries(Object.keys(expected[i]!).map(key => [key,row[key]])))).toEqual(expected);
+    else expect(after).toEqual(expected);
   }
 }
 
 test('p9 migration preserves schema8 active/deleted history, JSON bytes, receipts, inputs, query, answer, context and Workspace', () => {
   const f = legacy(); let db = f.db;
   try {
-    db.close(); db = openDatabase(f.path); expect(SCHEMA_VERSION).toBe(15); preserved(db,f);
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(15);
+    db.close(); db = openDatabase(f.path); expect(SCHEMA_VERSION).toBe(16); preserved(db,f);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(16);
     expect(db.query('SELECT native_header_json,current_leaf_id,history_format_version,storage_version FROM sessions').all()).toEqual(Array(2).fill({native_header_json:null,current_leaf_id:null,history_format_version:null,storage_version:0}));
     expect(db.query('SELECT * FROM memories').all()).toEqual([]);
     expect(db.query('PRAGMA foreign_keys').get()).toEqual({foreign_keys:1}); expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
@@ -183,7 +191,7 @@ test('p9 actual SQLite COMMIT lock failure rolls back migration, restores FK and
 test('p9 new schema enforces native identities, parent/leaf ownership, Run and Answer associations', () => {
   const root=mkdtempSync(join(tmpdir(),'medclaw-p9-fk-')), db=openDatabase(join(root,'app.sqlite'));
   try {
-    expect(SCHEMA_VERSION).toBe(15); const native=memoryNativeFixture(); const header=JSON.stringify(native.header);
+    expect(SCHEMA_VERSION).toBe(16); const native=memoryNativeFixture(); const header=JSON.stringify(native.header);
     db.query(`INSERT INTO sessions(id,native_session_id,creation_operation_ref,creation_request_json,creation_result_json,title,created_at,updated_at,native_header_json,history_format_version,storage_version)
       VALUES(1,?,'create-a','{}','{}','ENGINEERING A',?, ?,?,'pi-session/3;pi-sdk/0.87.1',1)`).run(native.header.id,memoryAt,memoryAt,header);
     db.query(`INSERT INTO sessions(id,native_session_id,creation_operation_ref,creation_request_json,creation_result_json,title,created_at,updated_at) VALUES(2,'b','create-b','{}','{}','ENGINEERING B',?,?)`).run(memoryAt,memoryAt);

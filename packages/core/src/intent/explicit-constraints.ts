@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { IntentInputProjectionSchema, TimeRangeSchema, type IntentInputProjection, type IntentGroundingFact } from '../../../contracts/src/intent';
 import type { IntentSnapshot } from '../../../contracts/src/query';
 import { nextDate } from '../data/catalog-service';
@@ -58,7 +57,5 @@ export function groundIntentInput(input:IntentInputProjection,rows:IntentSnapsho
       }
     }
   }
-  const hash=(text:string)=>createHash('sha256').update(text).digest('hex');
-  return IntentInputProjectionSchema.parse({...input,grounding:{contract:'medclaw.intent-grounding/v1',textHash:hash(input.text),
-    pendingTaskHash:input.pendingClarification?hash(input.pendingClarification.taskText):null,facts}});
+  return IntentInputProjectionSchema.parse({...input,grounding:{contract:'medclaw.intent-grounding/v1',facts}});
 }

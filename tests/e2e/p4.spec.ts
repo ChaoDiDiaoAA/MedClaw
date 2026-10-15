@@ -1,7 +1,6 @@
 import { test, expect, _electron as electron, type ElectronApplication, type Page } from '@playwright/test';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -101,22 +100,20 @@ async function messageShots(name: string, native: SessionMessagePage) {
 }
 function snapshotPackage(directory: string) {
   mkdirSync(directory, { recursive: true });
-  const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
   const csv = (values: string[]) => values.map(value => `"${value.replaceAll('"', '""')}"`).join(',');
   const names = ['A decrease one', 'A decrease two', 'Original manufacturer decrease', 'B unique increase device'];
   const masters = names.map((device_name, i) => ({ record_type: 'master', device_id: String(i + 1).padStart(5, '0'), device_name, source_submission_id: String(i + 1).padStart(5, '0'), source_applicant: 'Synthetic Applicant', category: 'Category', manufacturer: i === 2 ? '模拟厂家-02' : '模拟厂家-01' }));
-  const sourceLock = { schema: 'medclaw.source-lock/v1', sources: [{ source: 'fixture', path: 'original.csv', sha256: 'a'.repeat(64) }] };
-  const lockHash = hash(canonicalRequest(sourceLock)), cohortHash = hash(canonicalRequest(masters));
+  const sourceLock = { schema: 'medclaw.source-lock/v2', sources: [{ source: 'fixture', path: 'original.csv' }] };
   writeFileSync(join(directory, 'source-lock.json'), JSON.stringify(sourceLock)); writeFileSync(join(directory, 'entity-lineage.csv'), `${csv(Object.keys(masters[0]!))}\n${masters.map(master => csv(Object.values(master))).join('\n')}\n`);
   for (const name of ['adjustment-lineage.csv', 'validation-report.json', 'selection-report.json', '使用说明.md']) writeFileSync(join(directory, name), name.endsWith('.json') ? '{}' : 'fixture');
   const columns = ['device_id', 'device_name', 'source_submission_id', 'source_applicant', 'category', 'region', 'snapshot_date', 'price_cents', 'currency', 'unit', 'status', 'manufacturer', 'distributor', 'source_refs_json', 'field_origins_json'];
   const origins = Object.fromEntries(columns.slice(0, 13).map(key => [key, { kind: 'synthetic', ruleId: 'p4-fixture' }]));
   for (const [index, prices] of [[10000, 20000, 10000, 10000], [8000, 15000, 9000, 12000]].entries()) {
     const date = `2026-01-0${index + 1}`;
-    const text = `${csv(columns)}\n${masters.map((master, ordinal) => csv([master.device_id, master.device_name, master.source_submission_id, master.source_applicant, 'Category', '浙江', date, String(prices[ordinal]), 'CNY', '件', 'active', master.manufacturer, ordinal === 1 ? '模拟配送-02' : '模拟配送-01', JSON.stringify([{ sourceId: 'fixture', file: 'original.csv', row: ordinal + 1, recordId: master.source_submission_id, sha256: 'a'.repeat(64) }]), JSON.stringify(origins)])).join('\n')}\n`;
-    writeFileSync(join(directory, `zhejiang_${date}.csv`), text); writeFileSync(join(directory, `zhejiang_${date}.metadata.json`), JSON.stringify({ contract: 'medclaw.snapshot/v1', mappingVersion: 'medclaw.snapshot/v1', materialVersion: 'p4-fixture/v1', generatorVersion: 'p4-fixture/v1', seed: 1, sourceBundleId: 'p4-fixture', sourceLockHash: lockHash, scopeKey: 'p4-zhejiang', region: '浙江', cohortHash, snapshotDate: date, coverage: 'full', expectedEntityCount: 4, observedEntityCount: 4, declaredMissingEntityIds: [], fileSha256: hash(text), referenceDate: '2026-01-02', timezone: 'Asia/Shanghai' }));
+    const text = `${csv(columns)}\n${masters.map((master, ordinal) => csv([master.device_id, master.device_name, master.source_submission_id, master.source_applicant, 'Category', '浙江', date, String(prices[ordinal]), 'CNY', '件', 'active', master.manufacturer, ordinal === 1 ? '模拟配送-02' : '模拟配送-01', JSON.stringify([{ sourceId: 'fixture', file: 'original.csv', row: ordinal + 1, recordId: master.source_submission_id }]), JSON.stringify(origins)])).join('\n')}\n`;
+    writeFileSync(join(directory, `zhejiang_${date}.csv`), text); writeFileSync(join(directory, `zhejiang_${date}.metadata.json`), JSON.stringify({ contract: 'medclaw.snapshot/v2', mappingVersion: 'medclaw.snapshot/v1', materialVersion: 'p4-fixture/v1', generatorVersion: 'p4-fixture/v1', seed: 1, sourceBundleId: 'p4-fixture', scopeKey: 'p4-zhejiang', region: '浙江', snapshotDate: date, coverage: 'full', expectedEntityCount: 4, observedEntityCount: 4, declaredMissingEntityIds: [], referenceDate: '2026-01-02', timezone: 'Asia/Shanghai' }));
   }
-  const files = readdirSync(directory).filter(path => path !== 'manifest.json').sort().map(path => { const bytes = readFileSync(join(directory, path)); return { path, bytes: bytes.length, sha256: hash(bytes) }; });
+  const files = readdirSync(directory).filter(path => path !== 'manifest.json').sort().map(path => { const bytes = readFileSync(join(directory, path)); return { path, bytes: bytes.length }; });
   writeFileSync(join(directory, 'manifest.json'), JSON.stringify({ status: 'complete', files, businessFiles: 2, businessRows: 8, businessBytes: files.filter(file => /^zhejiang_.*\.csv$/.test(file.path)).reduce((sum, file) => sum + file.bytes, 0), totalPayloadBytes: files.reduce((sum, file) => sum + file.bytes, 0) }));
 }
 
@@ -188,7 +185,7 @@ test.beforeAll(async () => {
       if(context.nativeToolCallId==='p4-fault-query'&&!existsSync(release)){
         const call=this.readCall(context),query=this.readQuery(call?.data?.queryId);
         if(call?.name!=='query_device_changes'||call.status!=='succeeded'||!query||query.runId!==context.runId||query.sessionId!==context.sessionId||query.callRef!==context.runId+':'+context.nativeToolCallId)throw Error('fixture_identity_invalid');
-        writeFileSync(faultFile,JSON.stringify({runId:context.runId,sessionId:context.sessionId,toolId:call.id,queryId:query.id,resultHash:query.resultHash,nativeEntryId:entry,toolCallId:message.toolCallId,isError:message.isError,executions}));throw Error('storage_write_failed');
+        writeFileSync(faultFile,JSON.stringify({runId:context.runId,sessionId:context.sessionId,toolId:call.id,queryId:query.id,nativeEntryId:entry,toolCallId:message.toolCallId,isError:message.isError,executions}));throw Error('storage_write_failed');
       }return delivery.call(this,context,entry,message);
     };
     let seededManager,seedNative,seededOriginal;const load=SqliteMemoryStore.prototype.load;
@@ -441,7 +438,7 @@ async function queryFact(queryId: number, runId: number, sessionId: number, tool
   const result = await page.evaluate(queryId => window.medclaw.request('query.read', { queryId }), queryId); if (!result.ok) throw new Error(result.error.code);
   expect(result.data.query).toMatchObject({ id: queryId, runId, sessionId, callRef: `${runId}:${toolId}`, source: 'agent_tool', totalRows: expectedRows, scopeDeviceIds: null, interpretation: { requestedDate: null, requestedTime: { start: '2026-01-02', endExclusive: '2026-01-03' }, dataDates: ['2026-01-02'], referenceDate: '2026-01-02', timezone: 'Asia/Shanghai', basis: 'change_events', unit: 'events', quantity: expectedRows } });
   const facts = [];
-  for (const summary of result.data.evidence) { const read = await page.evaluate(input => window.medclaw.request('evidence.read', input), { queryId, evidenceId: summary.id }); if (!read.ok) throw new Error(read.error.code); expect(read.data.evidence).toMatchObject({ id: summary.id, queryId, resultHash: result.data.query.resultHash, calculationVersion: result.data.query.calculationVersion, materialVersion: result.data.query.materialVersion, provenance: 'synthetic-derived', snapshotCount: expectedRows * 2, eventCount: expectedRows }); facts.push(read.data.evidence); }
+  for (const summary of result.data.evidence) { const read = await page.evaluate(input => window.medclaw.request('evidence.read', input), { queryId, evidenceId: summary.id }); if (!read.ok) throw new Error(read.error.code); expect(read.data.evidence).toMatchObject({ id: summary.id, queryId, calculationVersion: result.data.query.calculationVersion, materialVersion: result.data.query.materialVersion, provenance: 'synthetic-derived', snapshotCount: expectedRows * 2, eventCount: expectedRows }); facts.push(read.data.evidence); }
   expect(facts).toHaveLength(1); return { query: result.data.query, evidence: facts };
 }
 
@@ -524,14 +521,14 @@ test('tool success survives failed delivery without a falsely consumed message o
   arm([() => ({ id: 'p4-fault-scope', name: 'read_data_scope', args: {} }), wire => { const scope = receipt<ScopeReceipt>(wire, 'p4-fault-scope'); return { id: 'p4-fault-query', name: 'query_device_changes', args: { batchIds: scope.scope.batchIds, time: { start: '2026-01-02', endExclusive: '2026-01-03' }, region: '浙江', changeField: 'price', direction: 'decrease', manufacturer: '模拟厂家-01', page: 1, pageSize: 50 } }; }]);
   await input().fill('P4-DELIVERY-SAVE-FAULT'); await page.getByRole('button', { name: 'Send', exact: true }).click();
   await expect.poll(() => existsSync(join(temporary, 'fault.json'))).toBe(true);
-  const fault = JSON.parse(readFileSync(join(temporary, 'fault.json'), 'utf8')) as { runId: number; sessionId: number; toolId: number; queryId: number; resultHash: string; nativeEntryId: string; toolCallId: string; isError: boolean; executions: number };
+  const fault = JSON.parse(readFileSync(join(temporary, 'fault.json'), 'utf8')) as { runId: number; sessionId: number; toolId: number; queryId: number; nativeEntryId: string; toolCallId: string; isError: boolean; executions: number };
   const origin = (await accepted())[acceptedBefore]!; expect(fault).toMatchObject({ runId: origin.runId, sessionId: a.id, toolCallId: 'p4-fault-query', isError: false, executions: 1 });
   await expect.poll(async () => { const active = await page.evaluate(() => window.medclaw.request('run.active', {})); return active.ok && active.data?.persistencePending; }).toBe(true);
   const failed = await readRun(origin.runId); expect(failed).toMatchObject({ status: 'failed', answerRef: null, error: { code: 'storage_write_failed' } });
   const control = await page.evaluate(() => window.medclaw.request('run.control.read', {})); expect(control).toMatchObject({ ok: true, data: { acceptingNewRuns: false, activeRootRun: { runId: origin.runId } } });
   const readTools = () => page.evaluate(runId => window.medclaw.request('tool.read', { runId, page: 1, pageSize: 50 }), origin.runId);
   const unsaved = await readTools(); if (!unsaved.ok) throw new Error(unsaved.error.code); const target = unsaved.data.items.find(tool => tool.nativeToolCallId === 'p4-fault-query'); expect(target).toMatchObject({ id: fault.toolId, sessionId: a.id, runId: origin.runId, status: 'succeeded', sdkReturned: false, nativeEntryId: null, sdkResultIsError: null }); expect(target?.nextModelCallId ?? null).toBeNull(); expect(target?.consumedAt ?? null).toBeNull(); expect(target?.consumptionEvidence).toBeUndefined();
-  const fact = await queryFact(fault.queryId, origin.runId, a.id, 'p4-fault-query', 2), native = await messages(a.id); expect(fact.query.resultHash).toBe(fault.resultHash); expect(native.items.find(item => item.toolCallRef === 'p4-fault-query')).toMatchObject({ nativeEntryId: fault.nativeEntryId, displayRole: 'tool_result', runId: null });
+  const fact = await queryFact(fault.queryId, origin.runId, a.id, 'p4-fault-query', 2), native = await messages(a.id); expect(fact.query.id).toBe(fault.queryId); expect(native.items.find(item => item.toolCallRef === 'p4-fault-query')).toMatchObject({ nativeEntryId: fault.nativeEntryId, displayRole: 'tool_result', runId: null });
   await showRun(origin.runId); const details = page.getByTestId('tool-call-details').locator('article').filter({ hasText: 'p4-fault-query' }); await expect(details).toContainText('succeeded'); await expect(details).toContainText('SDK return not confirmed'); await expect(details).toContainText('Model consumption: Unknown'); await expect(page.getByRole('button', { name: 'Retry save', exact: true })).toBeEnabled(); await details.getByText('SDK return not confirmed', { exact: true }).scrollIntoViewIfNeeded(); await shot('delivery-save-failed-tool'); await shot('delivery-save-failed');
   await expect(page.getByTestId('run-save-status')).toHaveText('Waiting to save');
   await expect(page.locator('#runtime-panel').getByRole('alert')).toContainText('Run facts have not been confirmed saved');

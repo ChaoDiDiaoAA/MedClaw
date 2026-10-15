@@ -31,11 +31,9 @@ CREATE TABLE IF NOT EXISTS queries (
   call_ref TEXT NOT NULL UNIQUE CHECK(length(call_ref)>0),
   kind TEXT NOT NULL CHECK(kind IN ('current','changes')),
   source TEXT NOT NULL DEFAULT 'agent_tool' CHECK(source='agent_tool'),
-  params_hash TEXT NOT NULL,
   params_json TEXT NOT NULL CHECK(json_valid(params_json)),
   batch_ids_json TEXT NOT NULL CHECK(json_valid(batch_ids_json)),
   result_json TEXT NOT NULL CHECK(json_valid(result_json)),
-  result_hash TEXT NOT NULL,
   created_at TEXT NOT NULL,
   FOREIGN KEY(run_id,session_id) REFERENCES runs(id,session_id)
 ) STRICT;
@@ -50,9 +48,7 @@ CREATE TABLE IF NOT EXISTS query_evidence (
   source_row_refs_json TEXT NOT NULL CHECK(json_valid(source_row_refs_json)),
   calculation_version TEXT NOT NULL,
   material_version TEXT NOT NULL,
-  source_bundle_id TEXT NOT NULL,
-  source_lock_hash TEXT NOT NULL,
-  result_hash TEXT NOT NULL
+  source_bundle_id TEXT NOT NULL
 ) STRICT;
 CREATE INDEX IF NOT EXISTS query_evidence_query ON query_evidence(query_id,id);
 

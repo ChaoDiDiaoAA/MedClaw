@@ -9,7 +9,7 @@ import { Repositories } from "../../../packages/storage/src/repositories.ts";
 import { SqliteMemoryStore } from '../../../packages/storage/src/memory-store.ts';
 import { ControllerEvidenceReader } from '../../../packages/storage/src/controller-evidence.ts';
 import { validateNativeHistory } from '../../../packages/runtime-pi/src/memory-store.ts';
-import { describeDataSelection, queryRowKeys } from '../../../packages/storage/src/workspace-selection.ts';
+import { describeDataSelection, queryRowKeys, queryTargetVersion } from '../../../packages/storage/src/workspace-selection.ts';
 import { PiModelRuntime, CatalogStore, SDK_VERSION, installedSdkVersion, type ResolvedModel } from "../../../packages/runtime-pi/src/model-runtime.ts";
 import { BridgeCredentialStore } from "../../../packages/runtime-pi/src/credential-store.ts";
 import { ModelCallRecorder } from "../../../packages/runtime-pi/src/model-call-recorder.ts";
@@ -40,10 +40,10 @@ import type { AnyToolDefinition } from '../../../packages/contracts/src/tool';
 import type { ToolConfiguration } from '../../../packages/contracts/src/tool-config';
 import { ToolRecorder } from '../../../packages/core/src/tools/recorder.ts';
 import { ToolExecutor } from '../../../packages/core/src/tools/executor.ts';
+import {legacyRunScope} from '../../../packages/storage/src/legacy-business-fields';
 import { RunScopeSchema, canonicalRequest, type ModelCallStarter } from '../../../packages/contracts/src/run.ts';
 import type { CompactionCallOwner } from '../../../packages/contracts/src/session';
 import { BUSINESS_RULES, createStoredQuerySchemas, QuerySummarySchema, EvidenceSummarySchema, type QueryExecutionContext, type QueryRecord, type Evidence } from '../../../packages/contracts/src/query.ts';
-import { StoredToolConfigurationSchema } from '../../../packages/contracts/src/tool-config.ts';
 import { AbsolutePathSchema } from '../../../packages/contracts/src/protocol.ts';
 import { ErrorLog } from "../../../packages/logging/src/error-log.ts";
 import { RuntimeLog } from "../../../packages/logging/src/runtime-log.ts";
@@ -232,7 +232,7 @@ async function initialize(raw: unknown) {
   const exports = new ExportService(config.instanceId, { store: new SqliteExportStore(database), artifacts,
     assertWritable: () => { if (application!.busy || imports.busy || deletions?.busy) throw new Error('runtime_busy'); },
     destination: {
-      describe: async input => ExportDestinationSchema.pick({ destinationIdentity: true }).parse(await credentials('export.destination.describe', input)),
+      describe: async input => privateCredentialMethodSchemas['export.destination.describe'].output.parse(await credentials('export.destination.describe', input)),
       copy: async input => ExportCopyReceiptSchema.parse(await credentials('export.destination.copy', input)),
       cancel: async operationRef => privateCredentialMethodSchemas['export.destination.cancel'].output.parse(await credentials('export.destination.cancel', { operationRef })),
       settlePrevious: async () => privateCredentialMethodSchemas['export.destination.settlePrevious'].output.parse(await credentials('export.destination.settlePrevious', {})),
@@ -270,13 +270,8 @@ function readContext(runId: number, requireSelectedSession = true): QueryExecuti
   const child=row.kind==='child'?readFrozenChild(database!,runId):null;
   if(requireSelectedSession&&repositories.readWorkspace().sessionId!==(child?.parentSessionId??row.session_id))throw new Error('access_denied');
   return { runId, inputId: row.input_id, sessionId: row.session_id, source: 'user_form', callRef: `read:${runId}`,
-    scope: RunScopeSchema.parse(JSON.parse(row.scope_json)), referenceDate: row.reference_date, timezone: row.timezone,
+    scope: RunScopeSchema.parse(legacyRunScope(JSON.parse(row.scope_json))), referenceDate: row.reference_date, timezone: row.timezone,
     signal: new AbortController().signal };
-}
-function frozenConfiguration(runId: number) {
-  const row = database!.query<{ config_json: string }, [number]>('SELECT config_json FROM runs WHERE id=?').get(runId);
-  const saved=row?JSON.parse(row.config_json):null,value=saved?.subagent?.toolConfiguration??saved?.toolConfiguration;
-  return value === undefined ? undefined : StoredToolConfigurationSchema.parse(value);
 }
 function queryView(queryId: number, page: number, pageSize: number) {
   const saved = toolStore.readQuery(queryId); if (!saved) throw new Error('operation_not_found');
@@ -284,7 +279,7 @@ function queryView(queryId: number, page: number, pageSize: number) {
   if(history.availability(readContext(saved.runId,false).scope.batchIds).sourceAvailability==='deleted')return history.query(queryId,page,pageSize);
   const context = readContext(saved.runId, false), query = queries.read(queryId, context);
   const resultPage = queries.page({ queryId, page, pageSize }, context), keys = queryRowKeys(query);
-  return { query: summary(query), page: { ...resultPage, targetVersion: query.resultHash, rowKeys: keys.slice((resultPage.page - 1) * resultPage.pageSize, resultPage.page * resultPage.pageSize) },
+  return { query: summary(query), page: { ...resultPage, targetVersion: queryTargetVersion(query), rowKeys: keys.slice((resultPage.page - 1) * resultPage.pageSize, resultPage.page * resultPage.pageSize) },
     evidence: evidence.readQuery(queryId, context).slice(0, BUSINESS_RULES.evidenceSummaryLimit).map(evidenceSummary) };
 }
 function dataCatalog(page: number, pageSize: number) {
@@ -293,7 +288,7 @@ function dataCatalog(page: number, pageSize: number) {
 async function dispatch(request: HostRequest): Promise<unknown> {
   const app = application;
   if (!app || !hello) throw new Error("host_not_ready");
-  if (app.exports?.busy && !isReadOnlyMethod(request.method) && !['host.shutdown', 'export.create', 'export.cancel', 'export.recover', 'run.cancel', 'session.cancelInput', 'import.cancel', 'operation.cancel'].includes(request.method)) throw new Error('runtime_busy');
+  if (app.exports?.busy && !isReadOnlyMethod(request.method) && !['export.copy.verify', 'host.shutdown', 'export.create', 'export.cancel', 'export.recover', 'run.cancel', 'session.cancelInput', 'import.cancel', 'operation.cancel'].includes(request.method)) throw new Error('runtime_busy');
   switch (request.method) {
     case "model.list": case "model.read": return app.directory();
     case "model.refresh": return { ...await app.refresh(request.operationRef, request.payload.providerId), directory: await app.directory() };
@@ -410,7 +405,7 @@ async function dispatch(request: HostRequest): Promise<unknown> {
       const context = readContext(saved.runId, false), record = evidence.read(payload.evidenceId, context);
       if (record.queryId !== payload.queryId) throw new Error('access_denied');
       const rows = evidence.rows(payload, context);
-      return { ...rows, ...availability, evidence: evidenceSummary(record), targetVersion: record.resultHash, rowKeys: rows.items.map(item => `snapshot:${item.id}`) };
+      return { ...rows, ...availability, evidence: evidenceSummary(record), targetVersion: queryTargetVersion(toolStore.readQuery(record.queryId)!), rowKeys: rows.items.map(item => `snapshot:${item.id}`) };
     }
     case 'tool.read': {
       const { runId, page, pageSize } = createPublicMethodSchemas()['tool.read'].input.parse(request.payload), context = readContext(runId, false);
@@ -429,6 +424,7 @@ async function dispatch(request: HostRequest): Promise<unknown> {
       });
       return { runId, scope: context.scope, items, totalRows, page, pageSize };
     }
+    case 'export.copy.verify': if (!app.exports) throw new Error('host_not_ready'); return app.exports.verifyCopy(request.payload);
     case "settings.prepare": return app.prepareConfig(request.payload.token, request.payload.candidate);
     case 'controller.evidence.read':return controllerEvidence.read(request.payload);
     case "settings.commit": { app.commitConfig(request.payload.token, request.payload.publishedVersion); return { configVersion: app.config.configVersion, selection: (await app.directory()).selection }; }

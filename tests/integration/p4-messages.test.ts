@@ -20,7 +20,6 @@ import { MAX_MESSAGE_PAGE_BYTES, SessionMessagePageSchema } from "../../packages
 import type { ToolCallRecord } from "../../packages/contracts/src/tool";
 import { CurrentQuerySchema } from "../../packages/contracts/src/query";
 import { canonicalRequest } from "../../packages/contracts/src/run";
-import { createHash } from "node:crypto";
 import { createToolControlObservation } from "../../packages/contracts/src/model";
 import * as PiSdk from "@earendil-works/pi-coding-agent";
 import type { ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
@@ -76,13 +75,13 @@ async function deliveryFixture(config: DeliveryFixtureOptions = {}) {
   closes.push(async () => { server.stop(true); db.close(); await rm(root, { recursive: true, force: true }); });
   if (config.query) {
     const now = new Date().toISOString();
-    db.query("INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_hash,preview_request_json,created_at,updated_at) VALUES(1,'import','fixture','imported','hash','{}',?,?)").run(now, now);
+    db.query("INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_json,created_at,updated_at) VALUES(1,'import','fixture','imported','{}',?,?)").run(now, now);
     db.query("UPDATE catalog_state SET revision=1,updated_at=?").run(now);
-    db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,
+    db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,coverage,
       expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at)
-      VALUES(1,1,'scope','2026-10-01','浙江','fixture/v1','bundle','lock','content','full','cohort',1,1,'[]','{}',1,NULL,1,?)`).run(now);
+      VALUES(1,1,'scope','2026-10-01','浙江','fixture/v1','bundle','full',1,1,'[]','{}',1,NULL,1,?)`).run(now);
     db.query("UPDATE batches SET metadata_json=? WHERE id=1").run(JSON.stringify({ referenceDate: "2026-10-01", timezone: "Asia/Shanghai" }));
-    const sources = JSON.stringify([{ sourceId: "fixture", file: "saved-source.csv", recordId: "device-1", row: 1, sha256: "a".repeat(64) }]);
+    const sources = JSON.stringify([{ sourceId: "fixture", file: "saved-source.csv", recordId: "device-1", row: 1 }]);
     db.query("INSERT INTO devices(id,source_device_id,source_bundle_id,source_submission_id,source_refs_json,created_at) VALUES(1,'device-1','bundle','submission',?,?)").run(sources, now);
     db.query(`INSERT INTO snapshots(id,batch_id,device_id,device_name,category,region,price_cents,currency,unit,status,manufacturer,distributor,source_row_ref,source_refs_json,field_origins_json)
       VALUES(1,1,1,'Fixture device','Fixture','浙江',100,'CNY','件','active','Fixture manufacturer','Fixture distributor','1:1',?,'{}')`).run(sources);
@@ -520,13 +519,13 @@ test("message links use the saved delivery entry and cannot borrow another sessi
   const insert = c.db.query("INSERT INTO tool_calls(session_id,run_id,native_tool_call_id,tool_name,tool_version,effect,execution_mode,args_json,status,result_json,delivery_json,requested_at,ended_at) VALUES(?,?,?,'query_current_devices','1','READ','sequential','{}','succeeded','{}',?,'2026-10-01T00:00:00.000Z','2026-10-01T00:00:01.000Z')");
   insert.run(a.id, runId, nativeToolCallId, JSON.stringify(delivery));
   insert.run(b.id, otherRun, nativeToolCallId, JSON.stringify({ ...delivery, nativeEntryId: forged }));
-  const params = CurrentQuerySchema.parse({ batchIds: [1] }), hash = createHash("sha256").update(canonicalRequest(params)).digest("hex");
+  const params = CurrentQuerySchema.parse({ batchIds: [1] });
   const savedResult = { scopeDeviceIds: null, rows: [], snapshotIds: [], eventIds: [], warnings: [], calculationVersion: "v1" };
-  const query = c.db.query("INSERT INTO queries(session_id,run_id,call_ref,kind,params_hash,params_json,batch_ids_json,result_json,result_hash,created_at) VALUES(?,?,?,'current',?,?,'[1]',?,'result','2026-10-01T00:00:00.000Z')");
-  query.run(a.id, runId, `${runId}:${nativeToolCallId}`, hash, JSON.stringify(params), JSON.stringify(savedResult));
-  query.run(b.id, otherRun, `${otherRun}:${nativeToolCallId}`, hash, JSON.stringify(params), JSON.stringify(savedResult));
-  query.run(a.id, laterRun, `${laterRun}:${nativeToolCallId}`, hash, JSON.stringify(params), JSON.stringify(savedResult));
-  c.db.query("INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,filters_json,calculation_version,material_version,source_bundle_id,source_lock_hash,result_hash) VALUES(1,'[1]','[]','[]','[]',?,'v1','','bundle','lock','result')").run(JSON.stringify(params));
+  const query = c.db.query("INSERT INTO queries(session_id,run_id,call_ref,kind,params_json,batch_ids_json,result_json,created_at) VALUES(?,?,?,'current',?,'[1]',?,'2026-10-01T00:00:00.000Z')");
+  query.run(a.id, runId, `${runId}:${nativeToolCallId}`, JSON.stringify(params), JSON.stringify(savedResult));
+  query.run(b.id, otherRun, `${otherRun}:${nativeToolCallId}`, JSON.stringify(params), JSON.stringify(savedResult));
+  query.run(a.id, laterRun, `${laterRun}:${nativeToolCallId}`, JSON.stringify(params), JSON.stringify(savedResult));
+  c.db.query("INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,filters_json,calculation_version,material_version,source_bundle_id) VALUES(1,'[1]','[]','[]','[]',?,'v1','','bundle')").run(JSON.stringify(params));
   expect("readMessageLinks" in c.repo).toBe(true);
   expect(c.repo.readMessageLinks(a.id, [])).toEqual(new Map());
   expect(c.repo.readMessageLinks(a.id, [forged])).toEqual(new Map());
@@ -565,9 +564,9 @@ for (const source of ["user_form", "intent"] as const) test(`message links exclu
   const nativeToolCallId = "manual-collision", message = { role: "toolResult" as const, toolCallId: nativeToolCallId, toolName: "bash", content: [{ type: "text" as const, text: '{"queryId":1}' }], isError: false, timestamp: 1 };
   const nativeEntryId = a.manager.appendMessage(message), delivery = { contract: "medclaw.tool-delivery/v1", resultRecorded: true, sdkReturned: true, nativeEntryId, deliveredAt: "2026-10-01T00:00:00.000Z", nextModelCallId: null, consumedAt: null, error: null, message };
   c.db.query("INSERT INTO tool_calls(session_id,run_id,native_tool_call_id,tool_name,tool_version,effect,execution_mode,args_json,status,result_json,delivery_json,requested_at,ended_at) VALUES(?, ?, ?, 'bash','1','READ','sequential','{}','succeeded','{}',?,'2026-10-01T00:00:00.000Z','2026-10-01T00:00:01.000Z')").run(a.id, runId, nativeToolCallId, JSON.stringify(delivery));
-  const params = CurrentQuerySchema.parse({ batchIds: [1] }), hash = createHash("sha256").update(canonicalRequest(params)).digest("hex"), result = { source, scopeDeviceIds: null, rows: [], snapshotIds: [], eventIds: [], warnings: [], calculationVersion: "v1" };
-  c.db.query("INSERT INTO queries(session_id,run_id,call_ref,source,kind,params_hash,params_json,batch_ids_json,result_json,result_hash,created_at) VALUES(?,?,?,?,'current',?,?,'[1]',?,'result','2026-10-01T00:00:00.000Z')").run(a.id, runId, `${runId}:${nativeToolCallId}`, source, hash, JSON.stringify(params), JSON.stringify(result));
-  c.db.query("INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,filters_json,calculation_version,material_version,source_bundle_id,source_lock_hash,result_hash) VALUES(1,'[1]','[]','[]','[]',?,'v1','','bundle','lock','result')").run(JSON.stringify(params));
+  const params = CurrentQuerySchema.parse({ batchIds: [1] }), result = { source, scopeDeviceIds: null, rows: [], snapshotIds: [], eventIds: [], warnings: [], calculationVersion: "v1" };
+  c.db.query("INSERT INTO queries(session_id,run_id,call_ref,source,kind,params_json,batch_ids_json,result_json,created_at) VALUES(?,?,?,?,'current',?,'[1]',?,'2026-10-01T00:00:00.000Z')").run(a.id, runId, `${runId}:${nativeToolCallId}`, source, JSON.stringify(params), JSON.stringify(result));
+  c.db.query("INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,filters_json,calculation_version,material_version,source_bundle_id) VALUES(1,'[1]','[]','[]','[]',?,'v1','','bundle')").run(JSON.stringify(params));
   const before = { queries: c.db.query("SELECT * FROM queries").all(), evidence: c.db.query("SELECT * FROM query_evidence").all(), tools: c.db.query("SELECT * FROM tool_calls").all(), workspace: c.repo.readWorkspace(), leaf: a.manager.getLeafId() };
   expect(c.repo.readMessageLinks(a.id, [nativeEntryId]).get(nativeEntryId)).toEqual({ runId, toolCallRef: nativeToolCallId, references: [`run:${runId}`, "tool:1"] });
   const service = new SessionService("p4-host", c.repo, c.adapter, async () => ({ ok: false, error: safeError("runtime_busy") }), () => null), page = await service.readMessages(read(a.id));
@@ -581,8 +580,8 @@ for (const decodedSource of ["user_form", "intent"] as const) test(`message link
   const message = { role: "toolResult" as const, toolCallId: "inconsistent-source", toolName: "query_current_devices", content: [{ type: "text" as const, text: "omitted" }], isError: false, timestamp: 1 }, nativeEntryId = a.manager.appendMessage(message);
   const delivery = { contract: "medclaw.tool-delivery/v1", resultRecorded: true, sdkReturned: true, nativeEntryId, deliveredAt: "2026-10-01T00:00:00.000Z", nextModelCallId: null, consumedAt: null, error: null, message };
   c.db.query("INSERT INTO tool_calls(session_id,run_id,native_tool_call_id,tool_name,tool_version,effect,execution_mode,args_json,status,result_json,delivery_json,requested_at,ended_at) VALUES(?,?,'inconsistent-source','query_current_devices','1','READ','sequential','{}','succeeded','{}',?,'2026-10-01T00:00:00.000Z','2026-10-01T00:00:01.000Z')").run(a.id, runId, JSON.stringify(delivery));
-  const params = CurrentQuerySchema.parse({ batchIds: [1] }), hash = createHash("sha256").update(canonicalRequest(params)).digest("hex");
-  c.db.query("INSERT INTO queries(session_id,run_id,call_ref,source,kind,params_hash,params_json,batch_ids_json,result_json,result_hash,created_at) VALUES(?,?,?,'agent_tool','current',?,?,'[1]',?,'result','2026-10-01T00:00:00.000Z')").run(a.id, runId, `${runId}:inconsistent-source`, hash, JSON.stringify(params), JSON.stringify({ source: decodedSource, scopeDeviceIds: null, rows: [], snapshotIds: [], eventIds: [], warnings: [], calculationVersion: "v1" }));
+  const params = CurrentQuerySchema.parse({ batchIds: [1] });
+  c.db.query("INSERT INTO queries(session_id,run_id,call_ref,source,kind,params_json,batch_ids_json,result_json,created_at) VALUES(?,?,?,'agent_tool','current',?,'[1]',?,'2026-10-01T00:00:00.000Z')").run(a.id, runId, `${runId}:inconsistent-source`, JSON.stringify(params), JSON.stringify({ source: decodedSource, scopeDeviceIds: null, rows: [], snapshotIds: [], eventIds: [], warnings: [], calculationVersion: "v1" }));
   const service = new SessionService("p4-host", c.repo, c.adapter, async () => ({ ok: false, error: safeError("runtime_busy") }), () => null);
   expect(await service.readMessages(read(a.id))).toMatchObject({ ok: false, error: { code: "storage_read_failed" } });
   expect(c.provider.requests).toHaveLength(1);
@@ -593,9 +592,9 @@ test("final enriched escaped-text pages retain the UTF8 budget and exclusive cur
   const runId = await c.run(a.id, "budget"), message = { role: "toolResult" as const, toolCallId: "budget-call", toolName: "query_current_devices", content: [{ type: "text" as const, text: "omitted" }], isError: false, timestamp: 1 };
   const nativeEntryId = a.manager.appendMessage(message), delivery = { contract: "medclaw.tool-delivery/v1", resultRecorded: true, sdkReturned: true, nativeEntryId, deliveredAt: "2026-10-01T00:00:00.000Z", nextModelCallId: null, consumedAt: null, error: null, message };
   c.db.query("INSERT INTO tool_calls(session_id,run_id,native_tool_call_id,tool_name,tool_version,effect,execution_mode,args_json,status,result_json,delivery_json,requested_at,ended_at) VALUES(?,?,'budget-call','query_current_devices','1','READ','sequential','{}','succeeded','{}',?,'2026-10-01T00:00:00.000Z','2026-10-01T00:00:01.000Z')").run(a.id, runId, JSON.stringify(delivery));
-  const params = CurrentQuerySchema.parse({ batchIds: [1] }), hash = createHash("sha256").update(canonicalRequest(params)).digest("hex");
-  c.db.query("INSERT INTO queries(session_id,run_id,call_ref,kind,params_hash,params_json,batch_ids_json,result_json,result_hash,created_at) VALUES(?,?,?,'current',?,?,'[1]',?,'result','2026-10-01T00:00:00.000Z')").run(a.id, runId, `${runId}:budget-call`, hash, JSON.stringify(params), JSON.stringify({ scopeDeviceIds: null, rows: [], snapshotIds: [], eventIds: [], warnings: [], calculationVersion: "v1" }));
-  for (let i = 0; i < 14; i++) c.db.query("INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,filters_json,calculation_version,material_version,source_bundle_id,source_lock_hash,result_hash) VALUES(1,'[1]','[]','[]','[]',?,'v1','','bundle','lock','result')").run(JSON.stringify(params));
+  const params = CurrentQuerySchema.parse({ batchIds: [1] });
+  c.db.query("INSERT INTO queries(session_id,run_id,call_ref,kind,params_json,batch_ids_json,result_json,created_at) VALUES(?,?,?,'current',?,'[1]',?,'2026-10-01T00:00:00.000Z')").run(a.id, runId, `${runId}:budget-call`, JSON.stringify(params), JSON.stringify({ scopeDeviceIds: null, rows: [], snapshotIds: [], eventIds: [], warnings: [], calculationVersion: "v1" }));
+  for (let i = 0; i < 14; i++) c.db.query("INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,filters_json,calculation_version,material_version,source_bundle_id) VALUES(1,'[1]','[]','[]','[]',?,'v1','','bundle')").run(JSON.stringify(params));
   for (let i = 0; i < 100; i++) a.manager.appendMessage({ role: "user", content: "\u0001".repeat(8192), timestamp: i });
   const service = new SessionService("p4-host", c.repo, c.adapter, async () => ({ ok: false, error: safeError("runtime_busy") }), () => null);
   expect("readMessages" in service).toBe(true);

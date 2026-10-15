@@ -9,6 +9,9 @@ import { contextAt } from '../fixtures/p8-context';
 import { seedWorkspaceQueries } from '../fixtures/p7-workspace';
 import { memoryNativeFixture } from '../fixtures/p9-memory';
 
+const retiredBusinessColumns=new Set(["preview_request_hash", "commit_request_hash", "fingerprint", "source_lock_hash", "content_hash", "cohort_hash", "params_hash", "result_hash", "scope_batch_hashes_json", "request_hash", "published_hash", "sha256"]);
+const retainedFields=(row:Record<string,unknown>)=>Object.fromEntries(Object.entries(row).filter(([key])=>!retiredBusinessColumns.has(key)));
+
 const migrationNames = ['001_p1.sql', '002_p2.sql', '003_p3.sql', '004_p5.sql', '005_p6.sql',
   '006_session_lifecycle.sql', '007_batch_deletion.sql', '008_p8.sql', '009_p9.sql', '010_p10.sql', '011_p11.sql', '012_p13.sql'];
 
@@ -48,20 +51,21 @@ function schema12() {
   const tables = db.query<{ name: string }, []>("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations' ORDER BY name").all().map(row => row.name);
   const rows = tables.map(name => db.query<Record<string, unknown>, []>(`SELECT * FROM ${name} ORDER BY id`).all());
   const schema = db.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all();
+  const migrations = db.query('SELECT * FROM schema_migrations ORDER BY version').all();
   db.close();
-  return { root, path, tables, rows, schema, input: { runId: 11, sessionId: 1, inputId: 201 } };
+  return { root, path, tables, rows, schema, migrations, input: { runId: 11, sessionId: 1, inputId: 201 } };
 }
 
 test('p14 schema12 upgrade preserves every old field, native/Query/tool/Context reference and P13 constraint', () => {
   const f = schema12();
   let db = openDatabase(f.path);
   try {
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(15);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(16);
     for (const [index, table] of f.tables.entries()) {
       const rows = db.query<Record<string, unknown>, []>(`SELECT * FROM ${table} ORDER BY id`).all();
       if (table === 'business_events') expect(rows.every(row => row.export_id === null)).toBe(true);
       if (table === 'artifacts') expect(rows.every(row => row.export_id === null && row.query_id === null)).toBe(true);
-      expect(rows.map((row, n) => Object.fromEntries(Object.keys(f.rows[index]![n] ?? row).map(key => [key, row[key]])))).toEqual(f.rows[index]);
+      expect(rows.map((row, n) => Object.fromEntries(Object.keys(retainedFields(f.rows[index]![n] ?? row)).map(key => [key, row[key]])))).toEqual(f.rows[index]!.map(retainedFields));
     }
     for (const table of ['intent_calls', 'route_decisions', 'query_contexts']) expect(db.query('SELECT name FROM sqlite_schema WHERE type=\'table\' AND name=?').get(table)).not.toBeNull();
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
@@ -73,7 +77,7 @@ test('p14 schema12 upgrade preserves every old field, native/Query/tool/Context 
       VALUES('invalid-compaction',1,'compaction',1,'logical_request',1,'{}','started',?)`).run(contextAt)).toThrow();
     expect(db.query("SELECT name FROM sqlite_schema WHERE type='trigger' AND name LIKE '%child%'").all().length).toBeGreaterThan(0);
     db.close(); db = openDatabase(f.path);
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(15);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(16);
   } finally { db.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -85,7 +89,7 @@ for (const phase of ['p14_copy', 'p14_rename', 'p14_marker']) test(`p14 ${phase}
     expect(reached).toBe(true);
     const db = new Database(f.path, { strict: true });
     try {
-      expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(12);
+      expect(db.query('SELECT * FROM schema_migrations ORDER BY version').all()).toEqual(f.migrations);
       for (const [index, table] of f.tables.entries()) expect(db.query(`SELECT * FROM ${table} ORDER BY id`).all()).toEqual(f.rows[index]);
       expect(db.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all()).toEqual(f.schema);
       expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);

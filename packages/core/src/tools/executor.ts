@@ -7,8 +7,6 @@ import { ToolRecorder } from "./recorder";
 import { ToolRegistry } from "./registry";
 import type { RunControl } from '../runtime/run-control';
 import type { CommittedChildExecutionProof } from '@medclaw/contracts/subagent';
-import { createHash } from 'node:crypto';
-import { canonicalRequest } from '@medclaw/contracts/run';
 
 type DeliveryResult = {
   result: { content: { type: string; text?: string; [key: string]: unknown }[]; details?: unknown; usage?: unknown; [key: string]: unknown };
@@ -169,7 +167,7 @@ export class ToolExecutor {
               const saved=proof.data,output=tool.outputSchema.safeParse(executed.data);
               if(saved.parentRunId!==context.runId||saved.originToolCallId!==record.id||saved.childRunId===context.runId||saved.childOutcome!=='completed'
                 ||!Number.isSafeInteger(saved.childRunId)||saved.childRunId<1||!Number.isSafeInteger(saved.storageVersion)||saved.storageVersion<1
-                ||!output.success||!isDeepStrictEqual(output.data,executed.data)||createHash('sha256').update(canonicalRequest(executed.data)).digest('hex')!==saved.originalReplyHash)
+                ||!output.success||!isDeepStrictEqual(output.data,executed.data)||!isDeepStrictEqual(executed.data,saved.originalReply))
                 result={status:'failed',error:this.recorder.failPersistence(context)};
               else result={status:'succeeded',data:executed.data};
             }

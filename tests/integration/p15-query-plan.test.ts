@@ -47,10 +47,12 @@ for (const phase of [null,'p15_plan_copy','p15_plan_rename','p15_plan_marker']) 
     }
     const db=openDatabase(f.path);
     try {
-      expect(db.query('SELECT MAX(version) AS n FROM schema_migrations').get()).toEqual({n:15});
+      expect(db.query('SELECT MAX(version) AS n FROM schema_migrations').get()).toEqual({n:16});
       for(const [i,name] of f.tables.entries()) {
         const actual=db.query<Record<string,unknown>,[]>(`SELECT * FROM ${name} ORDER BY id`).all();
-        expect(actual.map((row,n)=>Object.fromEntries(Object.keys(f.rows[i]![n]!).map(key=>[key,row[key]])))).toEqual(f.rows[i]!);
+        const retired=['preview_request_hash','commit_request_hash','fingerprint','source_lock_hash','content_hash','cohort_hash','params_hash','result_hash','scope_batch_hashes_json','sha256','metadata_sha256','request_hash','published_hash'];
+        const expected=f.rows[i]!.map(row=>Object.fromEntries(Object.entries(row).filter(([key])=>!retired.includes(key))));
+        expect(actual.map((row,n)=>Object.fromEntries(Object.keys(expected[n]!).map(key=>[key,row[key]])))).toEqual(expected);
       }
       expect(db.query('SELECT execution_plan_json FROM route_decisions').get()).toEqual({execution_plan_json:null});
       expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
@@ -59,13 +61,13 @@ for (const phase of [null,'p15_plan_copy','p15_plan_rename','p15_plan_marker']) 
   } finally {rmSync(f.root,{recursive:true,force:true});}
 });
 
-for (const scenario of ['compare','trend','freshness','multi','replay','second_failure','cancel','hash','missing_part','rollback','lost_return'] as const) test(`p15 ${scenario} executes the frozen product plan with zero main calls and an authoritative Answer`, async () => {
+for (const scenario of ['compare','trend','freshness','multi','replay','second_failure','cancel','answer_content','missing_part','rollback','lost_return'] as const) test(`p15 ${scenario} executes the frozen product plan with zero main calls and an authoritative Answer`, async () => {
   const mode=['compare','trend','freshness','multi'].includes(scenario)?scenario:'compare';
   let intentCalls=0;
   const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
     const path=new URL(request.url).pathname;
     if(path==='/api/version')return Response.json({version:'ENGINEERING'});
-    if(path==='/api/tags')return Response.json({models:[{name:'qwen3.5:0.8b',digest:'a'.repeat(64)}]});
+    if(path==='/api/tags')return Response.json({models:[{name:'qwen3.5:0.8b'}]});
     if(path==='/api/show')return Response.json({details:{family:'qwen35',parameter_size:'752.39M',quantization_level:'Q8_0'}});
     if(path!=='/api/chat')return new Response('',{status:404});
     const body=await request.json() as {messages:{content:string}[]};readIntentStageMessage(body.messages[1]!.content);intentCalls++;
@@ -77,12 +79,12 @@ for (const scenario of ['compare','trend','freshness','multi','replay','second_f
     return Response.json({model:'qwen3.5:0.8b',done:true,done_reason:'stop',message:{role:'assistant',content:JSON.stringify({contract:'medclaw.intent/v2',status:'RESOLVED',intents,candidateIntents:[],clarification:null})}});
   }});
   const f=await agentRuntimeFixture(undefined,false,undefined,{client:new OllamaIntentClient({classify:CLASSIFY_PROMPT,verify:VERIFY_PROMPT}),configuration:IntentModelConfigurationSchema.parse({
-    ...disabledIntentModel(),enabled:true,baseUrl:`http://127.0.0.1:${server.port}`,modelDigest:'sha256:'+'a'.repeat(64),verifiedEvidenceRef:'ENGINEERING'})});
+    ...disabledIntentModel(),enabled:true,baseUrl:`http://127.0.0.1:${server.port}`,verifiedEvidenceRef:'ENGINEERING'})});
   try {
     seedWorkspaceQueries(f.db,f.repos);
     f.db.query('UPDATE runs SET cleanup_json=? WHERE id=10').run(JSON.stringify({contract:'medclaw.run-cleanup/v1',executionStarted:false,stopConfirmed:true,requiredPersistenceComplete:true,inputsSettled:true,resourcesReleased:true,unconfirmedItems:[],secondaryErrors:[],verifiedAt:'2026-10-04T00:00:00.000Z'}));
     const batch=f.db.query<Record<string,unknown>,[]>('SELECT * FROM batches WHERE id=1').get()!;
-    Object.assign(batch,{id:2,snapshot_date:'2026-10-05',content_hash:'b'.repeat(64),is_baseline:0,previous_batch_id:1});
+    Object.assign(batch,{id:2,snapshot_date:'2026-10-05',is_baseline:0,previous_batch_id:1});
     const insert=(table:string,row:Record<string,unknown>)=>f.db.query(`INSERT INTO ${table}(${Object.keys(row).join(',')}) VALUES(${Object.keys(row).map(()=>'?').join(',')})`).run(...Object.values(row) as (string|number|null)[]);
     insert('batches',batch);
     for(const row of f.db.query<Record<string,unknown>,[]>('SELECT * FROM snapshots WHERE batch_id=1').all())insert('snapshots',{...row,id:Number(row.id)+3,batch_id:2,price_cents:200});
@@ -105,11 +107,14 @@ for (const scenario of ['compare','trend','freshness','multi','replay','second_f
     };
     f.repos.finalizeAgent=(runId,fact)=>{
       if(scenario==='lost_return'){finalize(runId,fact);throw new Error('COMMITTED_RECEIPT_LOST');}
-      if(corrupt&&(scenario==='missing_part'||scenario==='hash')){
+      if(corrupt&&(scenario==='missing_part'||scenario==='answer_content')){
         const changed=structuredClone(fact);
         const entry=changed.history!.newEntries.find(value=>(value as {customType?:string}).customType==='medclaw-intent-execution') as {data:{stepResults:{queryRefs:unknown[]}[]}};
         if(scenario==='missing_part')entry.data.stepResults[0]!.queryRefs.pop();
-        else (entry.data.stepResults[0]!.queryRefs[0] as {resultHash:string}).resultHash='f'.repeat(64);
+        else {
+          const result=changed.history!.newEntries.find(value=>(value as {customType?:string}).customType==='medclaw-query-result') as {content:string};
+          result.content+='\nForged numerical answer: 999 devices.';
+        }
         changed.productTurn!.history=changed.history!;
         return finalize(runId,changed);
       }
@@ -119,14 +124,14 @@ for (const scenario of ['compare','trend','freshness','multi','replay','second_f
     const text=mode==='compare'?'比较浙江2026-10-04和2026-10-05的快照记录总数，不限状态':mode==='trend'?'浙江2026-10-04至2026-10-05价格总额趋势，不限状态':mode==='freshness'?'查看浙江快照新鲜度':'查看浙江两日比较及价格趋势';
     const accepted=await f.app.runs.submitAgent({...f.request(text),mode:'send',routing:{mode:'intent',originRunId:null}},{instanceId:'host',operationRef:`plan-${mode}`});if(!accepted.ok)throw accepted.error;
     const runId=accepted.data.runId!;
-    if(['hash','missing_part','rollback'].includes(scenario)){
+    if(['answer_content','missing_part','rollback'].includes(scenario)){
       for(let i=0;i<1000&&!f.app.runs.persistencePending;i++)await Bun.sleep(2);
       expect(f.app.runs.persistencePending).toBe(true);
       expect(f.db.query('SELECT id FROM answers WHERE run_id=?').all(runId)).toHaveLength(0);
-      const before=f.db.query('SELECT id,result_hash FROM queries WHERE run_id=?').all(runId);expect(before).toHaveLength(2);
+      const before=f.db.query('SELECT id,params_json,result_json FROM queries WHERE run_id=?').all(runId);expect(before).toHaveLength(2);
       corrupt=false;if(scenario==='rollback')f.db.exec('DROP TRIGGER plan_final_rollback');
       expect(await f.app.runs.retrySave(runId)).toMatchObject({ok:true});
-      expect(f.db.query('SELECT id,result_hash FROM queries WHERE run_id=?').all(runId)).toEqual(before);
+      expect(f.db.query('SELECT id,params_json,result_json FROM queries WHERE run_id=?').all(runId)).toEqual(before);
     }
     await f.settle();const facts=f.repos.readIntent({runId});
     if(scenario==='second_failure'||scenario==='cancel'){

@@ -1,5 +1,4 @@
 import { expect,test } from 'bun:test';
-import { hashBytes } from '../../src/adapters/product-checksums.ts';
 import { canonicalRequest } from '../../../packages/contracts/src/run.ts';
 import { QueryParamsSchema } from '../../../packages/contracts/src/query.ts';
 import { intentConditions } from './intent-fixture.ts';
@@ -9,7 +8,7 @@ import type { CheckSpec,EvaluationContext } from '../../src/scoring/types.ts';
 const at='2026-10-12T00:00:00.000Z',target={op:'current' as const,region:'浙江',date:'2026-10-02'},conditions=intentConditions(target);
 const check=(metricId:string):CheckSpec=>({id:metricId,metricId,version:'v1',kind:'deterministic',required:true,hardConstraint:false,unit:'opportunities',goldKey:'values.expected',evidenceKey:'expected'});
 function original(selector:any,value:any) {const text=JSON.stringify(value);return {selector,ownerInstanceId:'host',original:value,bytes:Buffer.byteLength(text),protocolValidated:true};}
-function request(callId:string,payload:any) {const body=JSON.stringify(payload);return original({kind:'request',callId,runId:1,sessionId:1},[{instanceId:'host',sessionId:1,runId:1,callId,observedAt:at,boundary:'sdk_onPayload',sequence:1,body,bytes:Buffer.byteLength(body),sha256:hashBytes(body)}]);}
+function request(callId:string,payload:any) {const body=JSON.stringify(payload);return original({kind:'request',callId,runId:1,sessionId:1},[{instanceId:'host',sessionId:1,runId:1,callId,observedAt:at,boundary:'sdk_onPayload',sequence:1,body,bytes:Buffer.byteLength(body)}]);}
 function context(metric:string,expected:any):EvaluationContext {
   return {trialId:'trial',caseId:'MC-025',trialStatus:'completed',task:{checks:[check(metric)]},gold:{values:{expected:{opportunities:[{id:'authored-template',expected}]},stages:{'turn-1':{target}}}},
     observation:{trialId:'trial',instanceId:'host',identityChecks:[],missing:[],facts:{aliases:{runs:[{alias:'turn-1',runId:1}],sessions:[{alias:'main',sessionId:1}]},runs:[{id:1,kind:'agent',instanceId:'host',sessionId:1,status:'completed',cleanup:{stopConfirmed:true,requiredPersistenceComplete:true},stoppedAt:at}],providerRequests:[],toolOriginals:[],nativeHistory:[],modelCalls:[],toolCalls:[],answers:[],contexts:[]}}};
@@ -109,8 +108,8 @@ test('partial Run still fails a proven forbidden capability and a completed scop
 });
 function queryFacts(facts:Record<string,any>,region='浙江') {
   const params=QueryParamsSchema.parse({kind:'current',population:'snapshot',snapshotMode:'exact_date',batchIds:[1],region,time:{start:'2026-10-02',endExclusive:'2026-10-03'}});
-  const query={id:11,sessionId:1,runId:1,callRef:'1:native-one',kind:'current',params,batchIds:[1],scopeDeviceIds:null,warnings:[],calculationVersion:'v1',resultHash:'result',createdAt:at,totalRows:0};
-  facts.queries=[query];facts.queryPages=[{query,page:{queryId:11,rows:[],totalRows:0,page:1,pageSize:20,warnings:[],calculationVersion:'v1',evidenceIds:[],targetVersion:'a'.repeat(64),rowKeys:[]},evidence:[]}];facts.aliases.lastSendAlias='turn-1';
+  const query={id:11,sessionId:1,runId:1,callRef:'1:native-one',kind:'current',params,batchIds:[1],scopeDeviceIds:null,warnings:[],calculationVersion:'v1',createdAt:at,totalRows:0};
+  facts.queries=[query];facts.queryPages=[{query,page:{queryId:11,rows:[],totalRows:0,page:1,pageSize:20,warnings:[],calculationVersion:'v1',evidenceIds:[],targetVersion:'query:11:v1',rowKeys:[]},evidence:[]}];facts.aliases.lastSendAlias='turn-1';
 }
 
 test('fulfilled retrieval allows a later answer; missing tool originals cannot become a no-call success',async()=>{
@@ -194,7 +193,7 @@ test('actual SDK requests determine tool-decision opportunities; missing origina
 test('Hook-corrected final parameters do not conceal the wrong model-original parameters',async()=>{
   const c=context('tool.params',{parameters:conditions}),facts=c.observation!.facts as Record<string,any>;
   const before={batchIds:[1],region:'河南',time:{start:'2026-10-02',endExclusive:'2026-10-03'}},after={...before,region:'浙江'};
-  const tool={id:8,runId:1,sessionId:1,modelCallId:'one',nativeToolCallId:'native-one',name:'query_current',input:after,control:{inputValidation:'passed',hookInput:{beforeSha256:hashBytes(canonicalRequest(before)),afterSha256:hashBytes(canonicalRequest(after))}}};
+  const tool={id:8,runId:1,sessionId:1,modelCallId:'one',nativeToolCallId:'native-one',name:'query_current',input:after,control:{inputValidation:'passed',hookInput:{changed:true}}};
   facts.toolOriginals=[original({kind:'tool',runId:1,sessionId:1,toolCallId:8},tool)];facts.toolCalls=[tool];
   facts.nativeHistory=[original({kind:'history',runId:1,sessionId:1},{sessionId:1,entries:[{id:'entry',message:{content:[{type:'toolCall',id:'native-one',arguments:before}]}}]})];
   const result=await score(c);expect(result.status).toBe('FAIL');expect((result.actual as any).opportunities[0].actual).toMatchObject({originalParameters:{region:'河南'},finalParameters:{region:'浙江'}});
@@ -206,7 +205,7 @@ test('delivered Context facts are read from the actual projection, independently
   const params=QueryParamsSchema.parse({kind:'current',population:'snapshot',snapshotMode:'exact_date',batchIds:[1],region:'浙江',time:{start:'2026-10-02',endExclusive:'2026-10-03'}});
   const projection=JSON.stringify({executionScope:{batchIds:[1]},adoptedQueryContext:{params}});
   facts.providerRequests=[request('one',{messages:[{role:'system',content:projection}]})];facts.modelCalls=[{callId:'one',runId:1,kind:'main'}];
-  facts.contexts=[{kind:'snapshot',snapshot:{id:1,inputId:1,renderedProjection:projection,projectionHash:hashBytes(projection),workspaceContext:{revision:2}},deliveries:[{callId:'one',observation:{projectionHash:hashBytes(projection)}}]}];
+  facts.contexts=[{kind:'snapshot',snapshot:{id:1,inputId:1,renderedProjection:projection,workspaceContext:{revision:2}},deliveries:[{callId:'one',observation:{}}]}];
   expect(await score(c)).toMatchObject({status:'PASS',denominator:1});
   const wrong=JSON.stringify({executionScope:{batchIds:[1]},adoptedQueryContext:{params:{...params,region:'河南'}}});
   (facts.contexts[0] as any).snapshot.renderedProjection=wrong;facts.providerRequests=[request('one',{messages:[{content:wrong}]})];

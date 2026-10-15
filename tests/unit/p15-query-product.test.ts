@@ -3,7 +3,6 @@ import * as childProcess from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
@@ -57,12 +56,12 @@ test('p15 directory pin cancellation waits for the helper to close before confir
 function conditionValidation() {
   const data = intentCatalogData(), tools = ['query_current_devices', 'query_device_changes', 'resolve_device', 'read_device', 'read_source_metadata', 'list_filter_values', 'read_batch', 'read_query', 'list_query_evidence'];
   const input = IntentInputProjectionSchema.parse({ ...intentInput(), text: '继续当前条件',
-    scope: { ...intentInput().scope, batchIds: [1, 2, 3], allowedToolNames: tools }, scopeBatchHashes: data.batches.map(batch => batch.contentHash).sort(),
+    scope: { ...intentInput().scope, batchIds: [1, 2, 3], allowedToolNames: tools },
     availableToolNames: tools, enabledL2: Object.entries(INTENT_CAPABILITIES).filter(([, cap]) => cap.state === 'conditional').map(([key]) => key),
     availableData: { regions: ['浙江'], dates: data.batches.map(batch => batch.snapshotDate), currencies: ['CNY'], units: ['件'] },
     previousQueryContext: { contract: 'medclaw.query-form-context/v1', sessionId: 1, nativeLeafId: 'leaf', version: 1,
       sourceRunId: 1, sourceInputId: 1, decisionId: 1, params: queryProductParams({ batchIds: [1, 2, 3], time: { start: '2026-10-10', endExclusive: '2026-10-11' } }),
-      queryIds: [1], scopeBatchHashes: data.batches.map(batch => batch.contentHash).sort(), pendingClarification: null } });
+      queryIds: [1], pendingClarification: null } });
   const validator = new IntentValidator(new CatalogService(data));
   const check = (prediction: unknown = resolvedIntent(), projection: IntentInputProjection = input, mode: 'exact_date' | 'as_of' = 'exact_date') => validator.validateQueryParams(IntentResultSchema.parse(prediction),
     { sessionId: input.sessionId, runId: input.runId, inputId: input.inputId, scope: input.scope, source: 'intent', callRef: 'guard', referenceDate: input.referenceDate, timezone: input.timezone, signal: new AbortController().signal }, projection, '2026-10-11T01:00:00.000Z', mode);
@@ -79,7 +78,7 @@ test('p15 a complete prediction that drops an explicit status gets one semantic 
   expect(first.validation).toMatchObject({ state: 'invalid', adoptedIntents: [], reviewRequired: true });
   expect(first.validation.issues[0]).toMatchObject({ sourceSpan: { start: 14, end: 16 } });
   expect(first.candidates).toEqual([]);
-  const review = { mode: 'semantic_correction' as const, previousCallId: 'first', prediction, rawHash: 'a'.repeat(64), rawPreview: raw,
+  const review = { mode: 'semantic_correction' as const, previousCallId: 'first', prediction, rawPreview: raw,
     issues: first.validation.issues, candidates: [] };
   const stage = IntentStageInputSchema.parse({ input, stage: 'verify', review });
   const corrected = { ...prediction, intents: prediction.intents.map(item => ({ ...item, slots: { ...item.slots, status: 'active',
@@ -121,7 +120,7 @@ test('p15 correction excludes truncated, malformed, missing-parameter and scope-
   expect(check(JSON.stringify(missing), { ...input, text: '列出浙江新增的器械记录' }).validation).toMatchObject({ finalStatus: 'NEED_PARAMETERS', reviewRequired: false });
   expect(check(raw, { ...input, versions: f.input.versions }).validation.reviewRequired).toBe(false);
   const legacy = { input: { ...input, versions: f.input.versions }, stage: 'verify', review: { previousCallId: 'first', prediction,
-    rawHash: 'a'.repeat(64), rawPreview: raw, issues: [], candidates: [{ reasonCode: 'schema_recovery', intents: prediction.intents }] } };
+    rawPreview: raw, issues: [], candidates: [{ reasonCode: 'schema_recovery', intents: prediction.intents }] } };
   expect(IntentStageInputSchema.safeParse(legacy).success).toBe(true);
   expect(IntentStageInputSchema.safeParse({ ...legacy, review: { ...legacy.review, mode: 'semantic_correction', candidates: [] } }).success).toBe(false);
 });
@@ -252,12 +251,12 @@ test('p15 trend reads all saved pages and rejects changed identity or totals whi
     const saved = seedWorkspaceQueries(db).current, query = { ...saved, kind: 'trend' as const, totalRows: 501 };
     const rows = Array.from({ length: 501 }, (_, index) => ({ date: '2026-10-04', value: index, gap: false, unit: 'devices', metric: 'count' }));
     const reads: number[] = [], prefixes: number[] = [];
-    const read = async (page: number) => { reads.push(page); const part = rows.slice((page - 1) * 500, page * 500); return { query, evidence: [], page: { queryId: query.id, rows: part, totalRows: 501, page, pageSize: 500, targetVersion: query.resultHash, rowKeys: part.map(() => null), warnings: [], calculationVersion: query.calculationVersion, evidenceIds: [] } }; };
+    const read = async (page: number) => { reads.push(page); const part = rows.slice((page - 1) * 500, page * 500); return { query, evidence: [], page: { queryId: query.id, rows: part, totalRows: 501, page, pageSize: 500, targetVersion: `query:${query.id}:${query.calculationVersion}`, rowKeys: part.map(() => null), warnings: [], calculationVersion: query.calculationVersion, evidenceIds: [] } }; };
     expect(await loadTrendRows(query, read, prefix => prefixes.push(prefix.length), () => true)).toEqual(rows);
     expect(reads).toEqual([1, 2]); expect(prefixes).toEqual([500, 501]);
-    for (const change of ['hash', 'total', 'empty'] as const) {
+    for (const change of ['identity', 'total', 'empty'] as const) {
       prefixes.length = 0;
-      await expect(loadTrendRows(query, async page => { const value = await read(page); return page === 1 ? value : change === 'hash' ? { ...value, query: { ...query, resultHash: 'f'.repeat(64) } } : change === 'total' ? { ...value, page: { ...value.page, totalRows: 502 } } : { ...value, page: { ...value.page, rows: [], rowKeys: [] } }; }, prefix => prefixes.push(prefix.length), () => true)).rejects.toThrow('inconsistent');
+      await expect(loadTrendRows(query, async page => { const value = await read(page); return page === 1 ? value : change === 'identity' ? { ...value, query: { ...query, id: query.id+1 } } : change === 'total' ? { ...value, page: { ...value.page, totalRows: 502 } } : { ...value, page: { ...value.page, rows: [], rowKeys: [] } }; }, prefix => prefixes.push(prefix.length), () => true)).rejects.toThrow('inconsistent');
       expect(prefixes).toEqual([500]);
     }
     let active = true; reads.length = 0;
@@ -288,12 +287,12 @@ test('p15 form contracts keep complete explicit conditions and require matching 
     expectedRevision: 1, expectedBatchIds: [1], expectedQueryId: null, routing: { mode: 'user_form', params } };
   expect(SubmitInputSchema.safeParse(request).success).toBe(true);
   const context = { contract: 'medclaw.query-form-context/v1', decisionId: 1, sourceRunId: 2, sourceInputId: 3,
-    params, queryIds: [4], scopeBatchHashes: ['a'.repeat(64)] };
+    params, queryIds: [4] };
   expect(QueryContextRecordSchema.safeParse({ ...context, sessionId: 1, nativeLeafId: 'leaf', version: 1, pendingClarification: null }).success).toBe(true);
   const turn = { mode: 'user_form', runId: 2, sessionId: 1, inputId: 3, text: request.text, decisionId: 1,
     baseLeafId: null, baseStorageVersion: 0, occurredAt: '2026-10-11T00:00:00.000Z',
     result: { kind: 'result', text: 'Saved query', queryIds: [4], missingSlots: [] },
-    execution: { contract: 'medclaw.query-form-execution/v1', decisionId: 1, queryId: 4, resultHash: 'b'.repeat(64) }, adoptedContext: context };
+    execution: { contract: 'medclaw.query-form-execution/v1', decisionId: 1, queryId: 4 }, adoptedContext: context };
   expect(ProductTurnInputSchema.safeParse(turn).success).toBe(true);
   for (const patch of [{ result: { ...turn.result, queryIds: [5] } }, { decisionId: 2 }, { adoptedContext: { ...context, sourceInputId: 8 } },
     { adoptedContext: { ...context, queryIds: [4, 5] } }]) expect(ProductTurnInputSchema.safeParse({ ...turn, ...patch }).success).toBe(false);
@@ -343,42 +342,41 @@ test('p15 engineering fixture contains separate scopes, gaps, shared identifiers
 test('p15 export contracts reject forged completion, unsafe paths and inconsistent manifests', async () => {
   expect(await Bun.file(new URL('../../packages/contracts/src/export.ts', import.meta.url)).exists()).toBe(true);
   const { ExportRequestSchema, ExportOperationSchema, ExportManifestSchema, ExportCopyReceiptSchema } = await import('../../packages/contracts/src/export');
-  const sha = 'a'.repeat(64), time = '2026-10-11T01:00:00.000Z';
-  const request = { operationRef: 'export:one', queryId: 1, answerId: null, format: 'csv', destinationToken: 'grant', destinationIdentity: sha };
+  const time = '2026-10-11T01:00:00.000Z';
+  const request = { operationRef: 'export:one', queryId: 1, answerId: null, format: 'csv', destinationToken: 'grant' };
   expect(ExportRequestSchema.safeParse(request).success).toBe(true);
   expect(ExportRequestSchema.safeParse({ ...request, answerId: undefined }).success).toBe(false);
   expect(ExportRequestSchema.safeParse({ ...request, priorOperationRef: request.operationRef }).success).toBe(false);
   expect(ExportRequestSchema.safeParse({ ...request, destinationPath: 'C:/secret' }).success).toBe(false);
-  const manifest = { contract: 'medclaw.export-manifest/v1', artifactId: 2, originOperationRef: request.operationRef, queryId: 1, resultHash: sha,
-    answerId: null, format: 'csv', exportVersion: 'medclaw.export/v1', metadataHash: sha,
-    files: [{ path: 'result.csv', bytes: 3, sha256: sha }, { path: 'metadata.json', bytes: 4, sha256: sha }] };
+  const manifest = { contract: 'medclaw.export-manifest/v2', artifactId: 2, originOperationRef: request.operationRef, queryId: 1,
+    answerId: null, format: 'csv', exportVersion: 'medclaw.export/v2',
+    files: [{ path: 'result.csv', bytes: 3 }, { path: 'metadata.json', bytes: 4 }] };
   expect(ExportManifestSchema.safeParse(manifest).success).toBe(true);
   for (const files of [[manifest.files[0]], [manifest.files[0], manifest.files[0]], [{ ...manifest.files[0], path: '../result.csv' }]]) {
     expect(ExportManifestSchema.safeParse({ ...manifest, files }).success).toBe(false);
   }
-  const artifact = { id: 2, operationRef: request.operationRef, queryId: 1, format: 'csv', relativePath: 'artifacts/2', sha256: sha,
-    metadataSha256: sha, sizeBytes: 7, publishedAt: time, registeredAt: time };
-  const operation = { operationRef: request.operationRef, priorOperationRef: null, state: 'completed', requestHash: sha,
-    queryId: 1, answerId: null, format: 'csv', artifact, publishedHash: sha, copyState: 'verified', error: null, cancelRequestedAt: null, updatedAt: time };
+  const artifact = { id: 2, operationRef: request.operationRef, queryId: 1, format: 'csv', relativePath: 'artifacts/2',
+    sizeBytes: 7, publishedAt: time, registeredAt: time };
+  const operation = { operationRef: request.operationRef, priorOperationRef: null, state: 'completed',
+    queryId: 1, answerId: null, format: 'csv', artifact, copyState: 'verified', error: null, cancelRequestedAt: null, updatedAt: time };
   expect(ExportOperationSchema.safeParse(operation).success).toBe(true);
-  for (const patch of [{ artifact: null }, { copyState: 'unknown' }, { publishedHash: 'b'.repeat(64) }, { artifact: { ...artifact, queryId: 3 } },
+  for (const patch of [{ artifact: null }, { copyState: 'unknown' }, { artifact: { ...artifact, queryId: 3 } },
     { artifact: { ...artifact, relativePath: 'artifacts/3' } }, { artifact: { ...artifact, relativePath: '../2' } }]) {
     expect(ExportOperationSchema.safeParse({ ...operation, ...patch }).success).toBe(false);
   }
-  const receipt = { contract: 'medclaw.export-receipt/v1', operationRef: request.operationRef, artifactId: 2, destinationIdentity: sha,
-    contentHash: sha, verifiedAt: time, files: manifest.files.map(file => ({ name: file.path, bytes: file.bytes, sha256: file.sha256 })) };
+  const receipt = { contract: 'medclaw.export-receipt/v2', operationRef: request.operationRef, artifactId: 2, exportId:1, verifiedAt: time, files: manifest.files.map(file => ({ name: file.path, bytes: file.bytes })) };
   expect(ExportCopyReceiptSchema.safeParse(receipt).success).toBe(true);
   expect(ExportCopyReceiptSchema.safeParse({ ...receipt, files: [receipt.files[0], receipt.files[0]] }).success).toBe(false);
 });
 
 test('p15 private destination bridge validates safe capability fields and rejects raw paths', async () => {
   const { PrivateCredentialFrameSchema, PrivateCredentialReplySchema, privateCredentialMethodSchemas, HOST_PROTOCOL_VERSION } = await import('../../packages/contracts/src/protocol');
-  const payload = { operationRef: 'export:bridge', queryId: 1, answerId: null, format: 'json', destinationToken: 'grant', destinationIdentity: 'a'.repeat(64) };
+  const payload = { operationRef: 'export:bridge', queryId: 1, answerId: null, format: 'json', destinationToken: 'grant' };
   const frame = { protocolVersion: HOST_PROTOCOL_VERSION, kind: 'private', secret: true, instanceId: 'host', requestId: 'request', method: 'export.destination.describe', payload };
   expect(PrivateCredentialFrameSchema.safeParse(frame).success).toBe(true);
   expect(PrivateCredentialFrameSchema.safeParse({ ...frame, payload: { ...payload, destinationPath: 'D:/secret' } }).success).toBe(false);
   const { payload: _request, ...replyFields } = frame;
-  expect(PrivateCredentialReplySchema.safeParse({ ...replyFields, result: { ok: true, data: { destinationIdentity: payload.destinationIdentity } } }).success).toBe(true);
+  expect(PrivateCredentialReplySchema.safeParse({ ...replyFields, result: { ok: true, data: { valid:true } } }).success).toBe(true);
   expect(privateCredentialMethodSchemas['export.destination.cancel'].input.safeParse({ operationRef: payload.operationRef }).success).toBe(true);
   expect(privateCredentialMethodSchemas['export.destination.settlePrevious'].output.safeParse({ stopped: false }).success).toBe(false);
 });
@@ -394,9 +392,8 @@ test('p15 format artifacts preserve every saved row, typed values, formula escap
     expect(artifacts.verifyExport).toBeFunction();
     const source = store.readSource(seeded.current.id, null), callsBefore = db.query('SELECT * FROM model_calls').all();
     for (const format of ['csv', 'json', 'markdown'] as const) {
-      const operationRef = `format:${format}`, requestHash = createHash('sha256').update(canonicalRequest({ queryId: source.query.id, resultHash: source.query.resultHash,
-        answerId: null, answerTextHash: null, format, exportVersion: 'medclaw.export/v1', priorOperationRef: null, destinationIdentity: 'a'.repeat(64) })).digest('hex');
-      const reserved = store.accept({ operationRef, requestHash, instanceId: 'host', sessionId: 1, queryId: source.query.id, answerId: null,
+      const operationRef = `format:${format}`,request={operationRef,queryId:source.query.id,answerId:null,format,destinationToken:'grant'};
+      const reserved = store.accept({ operationRef, request, instanceId: 'host', sessionId: 1, queryId: source.query.id, answerId: null,
         format, priorExportId: null, reuseArtifactId: null, createdAt: '2026-10-11T01:00:00.000Z' });
       const published = await artifacts.publishExport({ artifactId: reserved.reservedArtifactId!, originOperationRef: operationRef, format, source }, new AbortController().signal);
       expect(store.find(operationRef)?.artifact).toBeNull();
@@ -407,7 +404,7 @@ test('p15 format artifacts preserve every saved row, typed values, formula escap
       if (format === 'csv') {
         const bytes = readFileSync(join(directory, 'result.csv')), csv = bytes.toString('utf8'), metadata = JSON.parse(readFileSync(join(directory, 'metadata.json'), 'utf8'));
         expect([...bytes.subarray(0, 3)]).toEqual([239, 187, 191]);
-        expect(metadata.totalRows).toBe(502); expect(metadata.scope).toBe('all_saved'); expect(metadata.query.resultHash).toBe(source.query.resultHash);
+        expect(metadata.totalRows).toBe(502); expect(metadata.scope).toBe('all_saved'); expect(metadata.query.id).toBe(source.query.id);expect(metadata.query.params).toEqual(source.query.params);
         expect(csv).toContain("' \t=2+3"); expect(csv).toContain("'+formula"); expect(csv).toContain('"priceCents","priceCNY"'); expect(csv).toContain('"1.05"');
         expect(csv.endsWith('\r\n')).toBe(true);
         const records = [...readCsvRecords(join(directory, 'result.csv'))], nameColumn = records[0]!.indexOf('deviceName');
@@ -449,7 +446,7 @@ test('p15 format empty, topN and mean-price artifacts retain their frozen scope 
     const queryCount = db.query('SELECT COUNT(*) n FROM queries').get();
     for (const [index, query] of queries.entries()) {
       const source = store.readSource(query.id, null), operationRef = `edge:${index}`;
-      const reserved = store.accept({ operationRef, requestHash: 'e'.repeat(64), instanceId: 'host', sessionId: 1, queryId: query.id, answerId: null, format: 'csv', priorExportId: null, reuseArtifactId: null, createdAt: '2026-10-11T01:00:00.000Z' });
+      const reserved = store.accept({ operationRef, request:{operationRef,queryId:query.id,answerId:null,format:'csv',destinationToken:'grant'}, instanceId: 'host', sessionId: 1, queryId: query.id, answerId: null, format: 'csv', priorExportId: null, reuseArtifactId: null, createdAt: '2026-10-11T01:00:00.000Z' });
       const published = await artifacts.publishExport({ artifactId: reserved.reservedArtifactId!, originOperationRef: operationRef, format: 'csv', source }, new AbortController().signal);
       const directory = join(root, 'artifacts', String(published.artifactId)), payload = join(directory, 'result.csv'), bytes = readFileSync(payload);
       const records = [...readCsvRecords(payload)], metadata = JSON.parse(readFileSync(join(directory, 'metadata.json'), 'utf8'));

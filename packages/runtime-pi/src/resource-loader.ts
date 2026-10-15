@@ -1,14 +1,12 @@
-import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, opendir, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DefaultResourceLoader, SettingsManager } from '@earendil-works/pi-coding-agent';
 import { AppErrorSchema, PositiveIdSchema, safeError } from '@medclaw/contracts/error';
-import { canonicalRequest } from '@medclaw/contracts/run';
-import { FrozenRunResourcesSchema, ResourceCatalogueSchema, ResourceFileSchema, ResourceRefSchema, ResourceSnapshotSchema, RESOURCE_LIMITS, resourceRefKey,
+import { FrozenRunResourcesSchema, ResourceCatalogueSchema, ResourceFileSchema, ResourceRefSchema, ResourceSnapshotSchema, RESOURCE_LIMITS,
   type FrozenRunResources, type ResourceDefinition, type ResourceDiagnostic, type ResourceDiagnosticReason, type ResourceFileSnapshot, type ResourceItem, type ResourceRef, type ResourceSnapshot, type ResourceSource } from '@medclaw/contracts/resources';
 
-const hash = (bytes: string | Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 type ResourceFailureReason = Exclude<ResourceDiagnosticReason, 'not_recorded' | 'sdk_warning'>;
 function fail(reason: ResourceFailureReason): never { throw safeError('resource_unavailable', undefined, { reason }); }
 function reason(error: unknown): ResourceFailureReason {
@@ -18,7 +16,7 @@ function reason(error: unknown): ResourceFailureReason {
 }
 const diagnostic = (resourceRef: ResourceRef | null, code: ResourceDiagnosticReason, file: string | null = null): ResourceDiagnostic =>
   ({ resourceRef, reason: code, file, message: `Resource verification: ${code}.` });
-const refOf = ({ kind, id, version, treeHash }: ResourceRef): ResourceRef => ({ kind, id, version, treeHash });
+const refOf = ({ kind, id, version }: ResourceRef): ResourceRef => ({ kind, id, version });
 
 /** Same lstat/realpath boundary as managed artifacts, with bounded opened-file reads. */
 export async function managedPath(root: string, file = '') {
@@ -48,7 +46,7 @@ export async function readText(root: string, file: string, limit = RESOURCE_LIMI
     const body = bytes.subarray(0, length); let content: string;
     try { content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(body); } catch { return fail('resource_invalid'); }
     if (!Buffer.from(content, 'utf8').equals(body)) fail('resource_invalid');
-    return { file, content, bytes: length, sha256: hash(body) };
+    return { file, content, bytes: length };
   } finally { await handle.close(); }
 }
 async function verifyFileSet(root: string, directory: string, files: string[]) {
@@ -65,11 +63,6 @@ async function verifyFileSet(root: string, directory: string, files: string[]) {
   };
   await visit('');
 }
-function treeHash(resource: Pick<ResourceSnapshot, 'ref' | 'entry' | 'keywords' | 'requiredTools' | 'requiredExtensions'>, files: ResourceFileSnapshot[]) {
-  return hash(canonicalRequest({ ...resource.ref, treeHash: undefined, entry: resource.entry, keywords: [...resource.keywords].sort(),
-    requiredTools: [...resource.requiredTools].sort(), requiredExtensions: [...resource.requiredExtensions].sort(),
-    files: [...files].sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0).map(f => ({ path: f.file, bytes: f.bytes, sha256: f.sha256 })) }));
-}
 async function filesFor(root: string, definition: ResourceDefinition | ResourceSnapshot) {
   const directory = dirname(definition.entry).split(sep).join('/'), names = definition.files.map(f => typeof f === 'string' ? f : f.file);
   await verifyFileSet(root, directory, names);
@@ -80,7 +73,6 @@ async function filesFor(root: string, definition: ResourceDefinition | ResourceS
 }
 async function parseVersion(root: string, definition: ResourceDefinition) {
   const ref = refOf(definition), files = await filesFor(root, definition);
-  if (treeHash({ ...definition, ref }, files) !== ref.treeHash) fail('resource_changed');
   const loader = new DefaultResourceLoader({ cwd: root, agentDir: join(root, '.managed-inspection'),
     settingsManager: SettingsManager.inMemory({ packages: [], extensions: [], skills: [], prompts: [], themes: [], defaultTools: [], enableAnalytics: false, enableInstallTelemetry: false }),
     noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, extensionFactories: [],
@@ -98,12 +90,12 @@ async function parseVersion(root: string, definition: ResourceDefinition) {
   const snapshot = ResourceSnapshotSchema.safeParse({ ref, name: resource.name, description: resource.description, keywords: definition.keywords, entry: definition.entry,
     requiredTools: definition.requiredTools, requiredExtensions: definition.requiredExtensions, disableModelInvocation: 'disableModelInvocation' in resource ? resource.disableModelInvocation : false, files });
   if (!snapshot.success) fail('resource_invalid');
-  const after = await filesFor(root, definition); if (treeHash(snapshot.data, after) !== ref.treeHash) fail('resource_changed');
+  const after = await filesFor(root, definition); if (!isDeepStrictEqual(files, after)) fail('resource_changed');
   return { snapshot: snapshot.data, diagnostics };
 }
 const metadata = (snapshot: ResourceSnapshot, diagnostics: ResourceDiagnostic[]): ResourceItem => {
   const { entry, ...fields } = snapshot;
-  return { ...fields, files: snapshot.files.map(({ file, bytes, sha256 }) => ({ file, bytes, sha256 })), enabled: false, availability: 'ready', diagnostics };
+  return { ...fields, files: snapshot.files.map(({ file, bytes }) => ({ file, bytes })), enabled: false, availability: 'ready', diagnostics };
 };
 
 export function createResourceSource(authorRoot: string): ResourceSource {
@@ -133,7 +125,6 @@ export function createResourceSource(authorRoot: string): ResourceSource {
       for (const raw of refs) {
         const ref = ResourceRefSchema.parse(raw), candidates = catalog.definitions.filter(d => d.kind === ref.kind && d.id === ref.id && d.version === ref.version);
         if (!candidates.length) fail('resource_missing'); if (candidates.length !== 1) fail('resource_conflict');
-        if (candidates[0]!.treeHash !== ref.treeHash) fail('resource_changed');
         try { snapshots.push((await parseVersion(root, candidates[0]!)).snapshot); } catch (error) { fail(reason(error)); }
       }
       return snapshots;
@@ -143,17 +134,14 @@ export function createResourceSource(authorRoot: string): ResourceSource {
 
 function checkedFrozen(raw: FrozenRunResources) {
   const frozen = FrozenRunResourcesSchema.safeParse(raw); if (!frozen.success) fail('resource_snapshot_invalid');
-  for (const snapshot of frozen.data.available) {
-    if (snapshot.files.some(f => hash(f.content) !== f.sha256) || treeHash(snapshot, snapshot.files) !== snapshot.ref.treeHash) fail('resource_snapshot_invalid');
-  }
   return frozen.data;
 }
 export async function verifyRunResourceFiles(workdir: string, raw: FrozenRunResources): Promise<void> {
   const frozen = checkedFrozen(raw); if (!frozen.available.length) return;
-  try { const root = await managedPath(workdir, 'resources'); for (const snapshot of frozen.available) if (treeHash(snapshot, await filesFor(root, snapshot)) !== snapshot.ref.treeHash) fail('resource_snapshot_invalid'); }
+  try { const root = await managedPath(workdir, 'resources'); for (const snapshot of frozen.available) if (!isDeepStrictEqual(await filesFor(root, snapshot), [...snapshot.files].sort((a,b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0))) fail('resource_snapshot_invalid'); }
   catch (error) { if (reason(error) === 'resource_path_invalid') fail('resource_path_invalid'); fail('resource_snapshot_invalid'); }
 }
-export async function materializeRunResources(runId: number, workdir: string, raw: FrozenRunResources): Promise<{ skillPaths: string[]; promptPaths: string[]; signature: string }> {
+export async function materializeRunResources(runId: number, workdir: string, raw: FrozenRunResources): Promise<{ skillPaths: string[]; promptPaths: string[] }> {
   PositiveIdSchema.parse(runId); const frozen = checkedFrozen(raw), root = join(workdir, 'resources');
   if (frozen.available.length) {
     await managedPath(workdir);
@@ -173,5 +161,5 @@ export async function materializeRunResources(runId: number, workdir: string, ra
     await verifyRunResourceFiles(workdir, frozen);
   }
   const skillPaths = frozen.available.filter(s => s.ref.kind === 'skill').map(s => join(root, s.entry)), promptPaths = frozen.available.filter(s => s.ref.kind === 'prompt').map(s => join(root, s.entry));
-  return { skillPaths, promptPaths, signature: hash(canonicalRequest({ refs: frozen.available.map(s => resourceRefKey(s.ref)), skillPaths, promptPaths })) };
+  return { skillPaths, promptPaths };
 }

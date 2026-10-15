@@ -24,14 +24,14 @@ export function renderQueryAnswer(plan: IntentQueryPlan, queries: QueryRecord[],
     if (step.metadata) {
       const fact=metadataFacts.find(value=>value.stepId===step.stepId)?.metadata;
       if (!fact || fact.basis!==step.metadata.basis) throw safeError('answer_evidence_invalid');
-      lines.push(`Snapshot freshness (not capture time): ${canonicalRequest(fact.batches.map(batch=>({batchId:batch.id,date:batch.snapshotDate,region:batch.region,hash:batch.contentHash})))}`);
+      lines.push(`Snapshot freshness (not capture time): ${canonicalRequest(fact.batches.map(batch=>({batchId:batch.id,date:batch.snapshotDate,region:batch.region})))}`);
       continue;
     }
     const parts=step.queries.map((params,part)=>{
       const suffix=`:${step.stepId}:${part}`, query=queries.find(value=>value.callRef.endsWith(suffix));
       if(!query || canonicalRequest(query.params)!==canonicalRequest(params) || ids.includes(query.id))throw safeError('answer_evidence_invalid');
       ids.push(query.id);lines.push(`Part ${part}: Query #${query.id}`, `Frozen conditions: ${canonicalRequest(params)}`,
-        `Interpretation: ${canonicalRequest(query.interpretation ?? null)}`,`Result hash: ${query.resultHash}`,
+        `Interpretation: ${canonicalRequest(query.interpretation ?? null)}`,
         `Complete result rows: ${query.rows.length}. Preview: first ${Math.min(20,query.rows.length)} rows.`,canonicalRequest(query.rows.slice(0,20)),
         `Warnings: ${canonicalRequest(query.warnings)}`);
       const amount=['sum_price','mean_price'].includes(params.metric ?? '');

@@ -35,7 +35,7 @@ async function fixture(barrier?:'child-before'|'child-after'|'child-save-gap'|'c
     onCredentialRequest:async frame=>frame.method==='export.destination.settlePrevious'?{ok:true,data:{stopped:true}}:frame.method==='credential.list'?{ok:true,data:[{providerId:'p13-fixture',type:'api_key'}]}:frame.method==='credential.read'?{ok:true,data:frame.payload.providerId==='p13-fixture'?{type:'api_key',key:'ENGINEERING'}:null}:{ok:false,error:safeError('access_denied')}});
   const initial=new MainSettings(host.paths.settingsPath).read();
   atomicWriteJson(host.paths.settingsPath,PublishedSettingsSchema.parse({...initial,model:{provider:'p13-fixture',modelId:'fixture'},customProviders:[{credentialRef:null,definition:{providerId:'p13-fixture',name:'ENGINEERING',api:'openai-completions',baseUrl:`http://127.0.0.1:${server.port}/v1`,models:[{id:'fixture',name:'ENGINEERING',input:['text'],reasoning:false,contextWindow:32768,maxTokens:1024,outputLimitConfirmed:true,pricingKnown:false,cost:null}]}}]}));
-  expect(await host.start()).toMatchObject({state:'ready',schemaVersion:15});
+  expect(await host.start()).toMatchObject({state:'ready',schemaVersion:16});
   const sql=(query:string)=>{const db=new Database(host.paths.databasePath,{readonly:true});try{return db.query<Record<string,unknown>,[]>(query).all();}finally{db.close();}};
   const workspace=async()=>WorkspaceViewSchema.parse(unwrap(await host.request('workspace.read',{})));
   const create=async(op:string)=>NewSessionResultSchema.parse(unwrap(await host.request('session.create',{expectedWorkspaceRevision:(await workspace()).revision},op)));
@@ -52,7 +52,7 @@ for(const barrier of ['child-before','child-after'] as const)test('p13 actual Ho
     const histories=f.sql('SELECT * FROM memories ORDER BY id'),before=f.sql("SELECT id,child_result_json FROM runs WHERE kind='child'");
     expect(before).toHaveLength(1);expect(before[0]!.child_result_json===null).toBe(barrier==='child-before');expect(f.requests).toHaveLength(3);
     const old=f.host.read().instanceId!,child=Reflect.get(f.host,'child') as ChildProcessWithoutNullStreams,closed=new Promise<void>(done=>child.once('close',()=>done()));
-    expect(child.kill('SIGKILL')).toBe(true);await closed;expect(await f.host.restart(old)).toMatchObject({state:'ready',schemaVersion:15});
+    expect(child.kill('SIGKILL')).toBe(true);await closed;expect(await f.host.restart(old)).toMatchObject({state:'ready',schemaVersion:16});
     expect(f.requests).toHaveLength(3);expect(f.sql('SELECT * FROM memories ORDER BY id')).toEqual(histories);
     expect(f.sql("SELECT id,child_result_json FROM runs WHERE kind='child'")).toEqual(before);
     const children=ReadRunResultSchema.parse(unwrap(await f.host.request('run.read',{recent:true,parentRunId:1})));expect(children.kind).toBe('recent');
@@ -74,7 +74,7 @@ test('p13 actual Host releases its writer and manager before a new instance rere
     expect(await f.host.request('query.list',{sessionId:children.runs[0].sessionId})).toMatchObject({ok:false});
     expect(await f.host.request('run.read',{runId:accepted.runId!})).toMatchObject({ok:true,data:{run:{groupUsage:{parent:{modelCalls:2,toolCalls:1,inputTokens:50,outputTokens:5,cost:null},children:{modelCalls:2,toolCalls:1,inputTokens:50,outputTokens:5,cost:null}}}}});
     expect(await f.host.request('run.read',{runId:id})).toMatchObject({ok:true,data:{run:{delivery:{sdkReturned:true,sdkResultIsError:false,consumptionEvidence:'provider_input_verified'},originSnapshotId:1,parentInputId:accepted.inputId}}});
-    const old=f.host.read().instanceId!;expect(await f.host.restart(old)).toMatchObject({state:'ready',schemaVersion:15});await f.idle();
+    const old=f.host.read().instanceId!;expect(await f.host.restart(old)).toMatchObject({state:'ready',schemaVersion:16});await f.idle();
     expect(f.host.read().instanceId).not.toBe(old);expect(unwrap(await f.host.request('session.messages.read',{childRunId:id}))).toEqual(history);expect(f.sql('SELECT * FROM memories ORDER BY id')).toEqual(facts);
     expect(f.requests).toHaveLength(4);expect(f.sql("SELECT id FROM sessions WHERE kind='child'")).toHaveLength(1);
   }finally{await f.close();}

@@ -16,7 +16,7 @@ function placeholder(ref: ResourceRef, code: 'resource_missing' | 'resource_chan
 }
 function asItem(snapshot: ResourceSnapshot): ResourceItem {
   const { entry, ...fields } = snapshot;
-  return { ...fields, files: snapshot.files.map(({ file, bytes, sha256 }) => ({ file, bytes, sha256 })), enabled: true, availability: 'ready', diagnostics: [] };
+  return { ...fields, files: snapshot.files.map(({ file, bytes }) => ({ file, bytes })), enabled: true, availability: 'ready', diagnostics: [] };
 }
 
 /** Published selection, immutable Run content and native evidence share the existing stores. */
@@ -96,8 +96,7 @@ export class ResourceService {
     failure(code && code !== 'sdk_warning' && code !== 'not_recorded' ? code : 'resource_invalid');
   }
   async validateSelection(sessionId: number, raw: ResourceSelection, allowedTools: readonly string[]): Promise<ResourceSelection> {
-    this.session(sessionId); const selection = ResourceSelectionSchema.parse(raw), current = refs(this.selection(this.readSettings(), sessionId));
-    for (const ref of refs(selection)) if (current.some(prior => prior.kind === ref.kind && prior.id === ref.id && prior.version === ref.version && prior.treeHash !== ref.treeHash)) failure('resource_changed');
+    this.session(sessionId); const selection = ResourceSelectionSchema.parse(raw);
     if (!refs(selection).length) return selection;
     const catalog = await this.discover(selection, allowedTools);
     for (const ref of refs(selection)) { const item = catalog.items.find(i => sameRef(i.ref, ref)); if (!item || item.availability !== 'ready') this.unavailable(item); }

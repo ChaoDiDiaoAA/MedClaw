@@ -22,7 +22,7 @@ test('p12 actual Main publication and Host read prove configuration without crea
   }, (path,value)=>{if(failWrite)throw new Error('ENGINEERING failed write');atomicWriteJson(path,value);});
   settings.read();
   try {
-    expect(await host.start()).toMatchObject({state:'ready',schemaVersion:15});
+    expect(await host.start()).toMatchObject({state:'ready',schemaVersion:16});
     const created=unwrap(await host.request('session.create',{expectedWorkspaceRevision:0},'create-a')) as {session:{id:number}};
     const sessionId=created.session.id;
     const read=ExtensionsReadResultSchema.parse(unwrap(await host.request('extensions.read',{source:'selection',sessionId})));
@@ -39,9 +39,10 @@ test('p12 actual Main publication and Host read prove configuration without crea
     if(read.source!=='selection'||!read.available)throw new Error('Shipped first-party descriptor missing');
     await settings.publish('2',{extensions:{bySession:{[String(sessionId)]:{extension:read.available.ref}}}},{kind:'extensions'});
     expect(unwrap(await host.request('extensions.read',{source:'selection',sessionId}))).toMatchObject({configVersion:'3',selection:{extension:read.available.ref},live:null});
-    const changed=await settings.publish('3',{extensions:{bySession:{[String(sessionId)]:{extension:{...read.available.ref,treeHash:'a'.repeat(64)}}}}},{kind:'extensions'}).catch(error=>error);
-    expect(changed).toMatchObject({code:'extension_unavailable'});expect(settings.read().configVersion).toBe('3');
-    await settings.publish('3',{extensions},{kind:'extensions'});
+    await settings.publish('3',{extensions:{bySession:{[String(sessionId)]:{extension:{...read.available.ref}}}}},{kind:'extensions'});
+    expect(settings.read().configVersion).toBe('4');
+    expect(unwrap(await host.request('extensions.read',{source:'selection',sessionId}))).toMatchObject({configVersion:'4',selection:{extension:read.available.ref},live:null});
+    await settings.publish('4',{extensions},{kind:'extensions'});
     const db=new Database(host.paths.databasePath,{readonly:true});
     try {expect(db.query<{n:number},[]>('SELECT count(*) AS n FROM runs').get()?.n).toBe(0);expect(db.query<{n:number},[]>('SELECT count(*) AS n FROM model_calls').get()?.n).toBe(0);} finally {db.close();}
   } finally {failWrite=false;if(host.read().instanceId&&!host.read().canStart)await host.stop(host.read().instanceId!);rmSync(root,{recursive:true,force:true});}

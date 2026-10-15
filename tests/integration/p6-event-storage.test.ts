@@ -37,13 +37,20 @@ test('schema4_to_latest_preserves_old_rows_and_checksums_with_only_lifecycle_met
    INSERT INTO session_inputs(id,session_id,client_sequence,operation_ref,mode,status,processing_status,content_json,target_run_id,run_id,native_entry_id,created_at,processed_at,updated_at) VALUES(1,1,2,'legacy-input','follow_up','consumed','failed','{ "raw": "旧输入😀", "unknown": null }',1,1,'original-entry','${at}','${at}','${at}');
   `)).immediate();
   const names=db.query<{name:string},[]>("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations' ORDER BY name").all().map(r=>r.name);
-  const before=names.map(n=>db.query(`SELECT * FROM ${n} ORDER BY id`).all());expect(names).toHaveLength(17);expect(before.every(rows=>rows.length>0)).toBe(true);const markers=db.query('SELECT * FROM schema_migrations ORDER BY version').all();db.close();db=openDatabase(path);
+  const before=names.map(n=>db.query<Record<string,unknown>,[]>(`SELECT * FROM ${n} ORDER BY id`).all());expect(names).toHaveLength(17);expect(before.every(rows=>rows.length>0)).toBe(true);const markers=db.query('SELECT * FROM schema_migrations ORDER BY version').all();db.close();db=openDatabase(path);
   expect(db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations'").all()).toHaveLength(26);
-  names.forEach((n,i)=>expect(db.query(`SELECT * FROM ${n} ORDER BY id`).all()).toEqual(n==='sessions'
-   ? before[i]!.map(row=>({...row as Record<string,unknown>,metadata_json:'{"titleOrigin":"user"}',metadata_revision:0,deleted_at:null,native_header_json:null,current_leaf_id:null,history_format_version:null}))
-   : n==='tool_calls'?before[i]!.map(row=>({...row as Record<string,unknown>,context_snapshot_id:null})):n==='batches'?before[i]!.map(row=>({...row as Record<string,unknown>,status:'active',deleted_at:null,deletion_operation_ref:null,cohort_json:'[{"deviceId":1,"sourceDeviceId":"device"}]'})):n==='runs'?before[i]!.map(row=>({...row as Record<string,unknown>,parent_run_id:null,origin_tool_call_id:null,child_result_json:null})):n==='artifacts'?before[i]!.map(row=>({...row as Record<string,unknown>,export_id:null,query_id:null})):n==='business_events'?before[i]!.map(row=>({...row as Record<string,unknown>,export_id:null})):before[i]));
+  for(const [i,n] of names.entries()) {
+    const expected=before[i]!.map(row=>({...row,
+      ...(n==='sessions'?{metadata_json:'{"titleOrigin":"user"}',metadata_revision:0,deleted_at:null,native_header_json:null,current_leaf_id:null,history_format_version:null}:{}),
+      ...(n==='tool_calls'?{context_snapshot_id:null}:{}),
+      ...(n==='batches'?{status:'active',deleted_at:null,deletion_operation_ref:null,cohort_json:'[{"deviceId":1,"sourceDeviceId":"device"}]'}:{}),
+      ...(n==='runs'?{parent_run_id:null,origin_tool_call_id:null,child_result_json:null}:{}),
+      ...(n==='artifacts'?{export_id:null,query_id:null}:{}),...(n==='business_events'?{export_id:null}:{}),
+    })).map(row=>Object.fromEntries(Object.entries(row).filter(([key])=>!['preview_request_hash','commit_request_hash','fingerprint','source_lock_hash','content_hash','cohort_hash','params_hash','result_hash','scope_batch_hashes_json','sha256','metadata_sha256','request_hash','published_hash'].includes(key))));
+    expect(db.query<Record<string,unknown>,[]>(`SELECT * FROM ${n} ORDER BY id`).all()).toEqual(expected);
+  }
   expect(db.query('SELECT * FROM schema_migrations ORDER BY version').all().slice(0,4)).toEqual(markers);
-  expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15].map(version=>({version})));
+  expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16].map(version=>({version})));
   expect(db.query('SELECT * FROM runtime_events').all()).toEqual([]);
   expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
  }finally{db.close();rmSync(root,{recursive:true,force:true});}

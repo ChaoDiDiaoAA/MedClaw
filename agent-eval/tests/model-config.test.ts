@@ -89,7 +89,7 @@ test('real local Host uses the configured endpoint, key and native capabilities 
   const server=Bun.serve({hostname:'127.0.0.1',port:0,fetch(request){
     const path=new URL(request.url).pathname;paths.push(path);
     if(path==='/api/version')return Response.json({version:'controlled-metadata'});
-    if(path==='/api/tags')return Response.json({models:[{name:'qwen3.5:0.8b',digest:`sha256:${'a'.repeat(64)}`}]});
+    if(path==='/api/tags')return Response.json({models:[{name:'qwen3.5:0.8b'}]});
     if(path==='/api/show')return Response.json({details:{family:'controlled',parameter_size:'fixture',quantization_level:'fixture'}});
     return new Response('Inference forbidden',{status:403});
   }});

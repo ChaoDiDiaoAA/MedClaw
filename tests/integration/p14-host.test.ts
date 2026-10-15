@@ -56,15 +56,15 @@ async function fixture(options?:{mainAuth?:boolean;verify?:boolean}){
     abort:async token=>unwrap(await host.request('settings.abort',{token})),
     readVersion:async()=>{const directory=unwrap(await host.request('model.read',{})) as {configVersion:string};return directory.configVersion;},
   });
-  const started=await host.start();if(started.state!=='ready')await close();expect(started).toMatchObject({state:'ready',schemaVersion:15});
+  const started=await host.start();if(started.state!=='ready')await close();expect(started).toMatchObject({state:'ready',schemaVersion:16});
   const sql=(query:string)=>{const db=new Database(host.paths.databasePath,{readonly:true});try{return db.query(query).all();}finally{db.close();}};
   const workspace=async()=>WorkspaceViewSchema.parse(unwrap(await host.request('workspace.read',{})));
   const create=async(op:string)=>NewSessionResultSchema.parse(unwrap(await host.request('session.create',{expectedWorkspaceRevision:(await workspace()).revision},op)));
   const idle=()=>until(async()=>RuntimeControlViewSchema.parse(unwrap(await host.request('run.control.read',{}))).acceptingNewRuns);
-  const intentModel=():IntentModelConfiguration=>IntentModelConfigurationSchema.parse({...disabledIntentModel(),enabled:true,baseUrl:`http://127.0.0.1:${server.port}`,modelDigest:'sha256:'+'a'.repeat(64),verifiedEvidenceRef:'ENGINEERING controlled protocol; not official quality evidence'});
+  const intentModel=():IntentModelConfiguration=>IntentModelConfigurationSchema.parse({...disabledIntentModel(),enabled:true,baseUrl:`http://127.0.0.1:${server.port}`,verifiedEvidenceRef:'ENGINEERING controlled protocol; not official quality evidence'});
   async function data(){
     const preview=ImportPreviewSchema.parse(unwrap(await host.request('import.preview',{operationRef:'fixture-import',fileToken:'ENGINEERING-token',mappingVersion:'medclaw.snapshot/v1'},'fixture-import')));expect(preview.canCommit).toBe(true);
-    const imported=ImportOperationSchema.parse(unwrap(await host.request('import.commit',{operationRef:'fixture-import',fileToken:'ENGINEERING-token',previewHash:preview.previewHash},'fixture-import')));
+    const imported=ImportOperationSchema.parse(unwrap(await host.request('import.commit',{operationRef:'fixture-import',fileToken:'ENGINEERING-token'},'fixture-import')));
     return WorkspaceViewSchema.parse(unwrap(await host.request('workspace.update',{expectedRevision:(await workspace()).revision,change:{batchIds:imported.result!.batchIds}})));
   }
   async function send(sessionId:number,text:string,op:string,intent=true){
@@ -81,25 +81,28 @@ test('p14 actual Host inspect and absent intent reads are independent read-only 
   const f=await fixture({mainAuth:false});try{
     const before={runs:f.sql('SELECT * FROM runs'),calls:f.sql('SELECT * FROM model_calls'),settings:f.settings.read()};
     const model=f.intentModel(),inspection=IntentModelInspectionSchema.parse(unwrap(await f.host.request('model.intent.inspect',{baseUrl:model.baseUrl,modelTag:model.modelTag})));
-    expect(inspection).toMatchObject({available:true,actualDigest:model.modelDigest,metadata:{family:'qwen35',quantization:'Q8_0'}});
+    expect(inspection).toMatchObject({available:true,metadata:{family:'qwen35',quantization:'Q8_0'}});
     expect(JSON.stringify(inspection)).not.toContain('untrusted template');expect(unwrap(await f.host.request('intent.read',{runId:999}))).toBeNull();
     expect({runs:f.sql('SELECT * FROM runs'),calls:f.sql('SELECT * FROM model_calls'),settings:f.settings.read()}).toEqual(before);
     expect(f.intentRequests).toHaveLength(0);expect(f.requests).toHaveLength(0);
   }finally{await f.close();}
 },20000);
 
-test('p14 independent intent settings publish checks the live digest without main auth or inference and failure retains old config',async()=>{
+test('p14 independent intent settings publish checks availability and ignores native digest metadata without main auth or inference and failure retains old config',async()=>{
   const f=await fixture({mainAuth:false});try{
     const initial=f.settings.read(),model=f.intentModel();
     const published=await f.settings.publish(initial.configVersion,{intentModel:model},{kind:'intent'});
     expect(published.intentModel).toEqual(model);expect(published.model).toEqual(initial.model);expect(published.credentialRefs).toEqual(initial.credentialRefs);
     expect(unwrap(await f.host.request('model.read',{}))).toMatchObject({configVersion:published.configVersion});
     f.identity('b'.repeat(64));
-    const mismatch=await f.settings.publish(published.configVersion,{intentModel:{...model,timeoutMs:16000}},{kind:'intent'}).then(()=>null,error=>error);
-    expect(mismatch).toMatchObject({code:'intent_model_identity_mismatch'});
-    expect(f.settings.read()).toEqual(published);
+    const updated=await f.settings.publish(published.configVersion,{intentModel:{...model,timeoutMs:16000}},{kind:'intent'});
+    expect(updated.intentModel?.timeoutMs).toBe(16000);
+    f.offline(true);
+    const unavailable=await f.settings.publish(updated.configVersion,{intentModel:{...model,timeoutMs:17000}},{kind:'intent'}).then(()=>null,error=>error);
+    expect(unavailable).toMatchObject({code:'intent_response_invalid'});
+    expect(f.settings.read()).toEqual(updated);
     const stale=await f.settings.publish(initial.configVersion,{intentModel:null},{kind:'intent'}).then(()=>null,error=>error);expect(stale).toMatchObject({code:'config_conflict'});
-    const disabled=await f.settings.publish(published.configVersion,{intentModel:{...model,enabled:false}},{kind:'intent'});expect(disabled.intentModel?.enabled).toBe(false);
+    const disabled=await f.settings.publish(updated.configVersion,{intentModel:{...model,enabled:false}},{kind:'intent'});expect(disabled.intentModel?.enabled).toBe(false);
     expect(f.sql('SELECT * FROM runs')).toEqual([]);expect(f.sql('SELECT * FROM model_calls')).toEqual([]);expect(f.intentRequests).toHaveLength(0);expect(f.requests).toHaveLength(0);
   }finally{await f.close();}
 },20000);
@@ -153,7 +156,7 @@ test('p14 actual Host strong restart retains program context without replay and 
     const instance=f.host.read().instanceId!,child=(f.host as unknown as {child:ChildProcessWithoutNullStreams}).child;
     const exited=new Promise<void>(done=>child.once('close',()=>done()));
     expect(child.kill('SIGKILL')).toBe(true);await exited;
-    expect(await f.host.restart(instance)).toMatchObject({state:'ready',schemaVersion:15});await f.idle();
+    expect(await f.host.restart(instance)).toMatchObject({state:'ready',schemaVersion:16});await f.idle();
     const detail=SessionDetailSchema.parse(unwrap(await f.host.request('session.read',{sessionId:session})));
     expect(detail).toMatchObject({runtime:{availability:'unloaded'},currentQueryContext:{sourceRunId:second.runId}});
     const messages=SessionMessagePageSchema.parse(unwrap(await f.host.request('session.messages.read',{sessionId:session})));
@@ -187,7 +190,7 @@ test('p14 actual Host interrupted classify is terminal after strong restart and 
     expect(f.sql("SELECT state FROM model_calls WHERE kind='intent'")).toEqual([{state:'started'}]);
     const instance=f.host.read().instanceId!,child=(f.host as unknown as {child:ChildProcessWithoutNullStreams}).child;
     const exited=new Promise<void>(done=>child.once('close',()=>done()));expect(child.kill('SIGKILL')).toBe(true);await exited;f.holdIntent(false);
-    expect(await f.host.restart(instance)).toMatchObject({state:'ready',schemaVersion:15});await f.idle();
+    expect(await f.host.restart(instance)).toMatchObject({state:'ready',schemaVersion:16});await f.idle();
     expect(unwrap(await f.host.request('run.read',{runId:pending.runId!}))).toMatchObject({kind:'one',run:{status:'failed'}});
     const intent=IntentReadResultSchema.parse(unwrap(await f.host.request('intent.read',{runId:pending.runId!})));
     expect(intent).toMatchObject({decision:null,calls:[{stage:'classify',state:'failed'}],execution:{runStatus:'failed',answerId:null,finalHistorySaved:false}});

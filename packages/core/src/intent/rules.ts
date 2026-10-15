@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { IntentInputProjectionSchema, IntentResultSchema, IntentSlotsSchema, RuleEvaluationSchema, TimeRangeSchema, INTENT_VERSIONS,
   type IntentInputProjection, type IntentResult } from '../../../contracts/src/intent';
 import { canonicalRequest } from '../../../contracts/src/run';
@@ -23,7 +22,7 @@ export function evaluateIntentRules(raw: IntentInputProjection, checkedAt: strin
   }
   const unique = [...new Map(matches.map(match => [canonicalRequest(match.result), match])).values()];
   return { evaluation: RuleEvaluationSchema.parse({ ruleVersion: INTENT_VERSIONS.ruleVersion,
-    ruleId: unique.length === 1 ? unique[0]!.ruleId : null, inputHash: createHash('sha256').update(canonicalRequest(input)).digest('hex'),
+    ruleId: unique.length === 1 ? unique[0]!.ruleId : null,
     outcome: unique.length === 1 ? 'hit' : unique.length ? 'conflict' : 'miss',
     reasonCode: unique.length === 1 ? 'complete_match' : unique.length ? 'conflicting_complete_matches' : 'no_complete_match', checkedAt }),
     result: unique.length === 1 ? unique[0]!.result : null };

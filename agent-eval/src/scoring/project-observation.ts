@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import {resolve} from 'node:path';
 import { z } from 'zod';
-import { QueryViewSchema as ProductQueryViewSchema, EvidenceViewSchema as ProductEvidenceViewSchema, QuerySummarySchema, EvidenceSummarySchema, SnapshotSchema, BatchSchema, SourceRefSchema, DesktopQueryPageSchema, AnswerRecordSchema, QueryParamsSchema } from '../../../packages/contracts/src/query.ts';
+import { QueryViewSchema as ProductQueryViewSchema, EvidenceViewSchema as ProductEvidenceViewSchema, QuerySummarySchema, SnapshotSchema, BatchSchema, SourceRefSchema, AnswerRecordSchema, QueryParamsSchema } from '../../../packages/contracts/src/query.ts';
 import { DataCatalogSchema } from '../../../packages/contracts/src/data.ts';
 import { ExportArtifactSchema, ExportOperationSchema } from '../../../packages/contracts/src/export.ts';
 import { readCsvRecords } from '../../../packages/core/src/data/import-service.ts';
@@ -10,18 +10,16 @@ import { equal, record,ratio } from './rules.ts';
 import type { CheckSpec, EvaluationContext,RuleResult } from './types.ts';
 import { projectIntent } from './project-intent.ts';
 import { projectHarness,verifiedOriginals,completeToolOriginals,acceptedChildQuery,publicMaterialReads,toolDeliveryRequest } from './project-harness.ts';
-import { projectPublicEvidence } from '../data-format.ts';
 import {registry} from './registry.ts';
 import {projectGeneralTools} from './project-general.ts';
 
-const PublicSnapshotSchema=SnapshotSchema.extend({sourceRefs:z.array(SourceRefSchema.omit({sha256:true}))});
-const PublicCatalogSchema=DataCatalogSchema.extend({batches:z.array(BatchSchema.omit({sourceLockHash:true,contentHash:true,cohortHash:true}))});
+const PublicSnapshotSchema=SnapshotSchema;
+const PublicCatalogSchema=DataCatalogSchema;
 type Snapshot=z.infer<typeof PublicSnapshotSchema>;
-const PublicEvidenceSummarySchema=EvidenceSummarySchema.omit({sourceLockHash:true,resultHash:true});
-const QueryViewSchema=ProductQueryViewSchema.extend({query:QuerySummarySchema.omit({resultHash:true}),page:z.strictObject(DesktopQueryPageSchema.shape).omit({targetVersion:true}).refine(page=>page.rowKeys.length===page.rows.length),evidence:z.array(PublicEvidenceSummarySchema)});
-const EvidenceViewSchema=z.strictObject(ProductEvidenceViewSchema.shape).omit({targetVersion:true}).extend({evidence:PublicEvidenceSummarySchema,items:z.array(PublicSnapshotSchema)}).refine(page=>page.rowKeys.length===page.items.length&&page.rowKeys.every(key=>key===null||key.startsWith('snapshot:')));
-const PublicExportArtifact=z.strictObject(ExportArtifactSchema.shape).omit({sha256:true,metadataSha256:true}).extend({protocolValidated:z.literal(true)});
-const PublicExportOperation=z.strictObject(ExportOperationSchema.shape).omit({requestHash:true,publishedHash:true}).extend({artifact:PublicExportArtifact.nullable()});
+const QueryViewSchema=ProductQueryViewSchema;
+const EvidenceViewSchema=ProductEvidenceViewSchema;
+const PublicExportArtifact=z.strictObject(ExportArtifactSchema.shape).extend({protocolValidated:z.literal(true)});
+const PublicExportOperation=z.strictObject(ExportOperationSchema.shape).extend({artifact:PublicExportArtifact.nullable()});
 
 type QueryView = ReturnType<typeof QueryViewSchema.parse>;
 type EvidenceView = ReturnType<typeof EvidenceViewSchema.parse>;
@@ -35,9 +33,11 @@ function completeQueries(facts: Record<string, unknown>): Map<number, CompleteQu
   if (!Array.isArray(facts.queryPages)) return undefined;
   const groups = new Map<number, QueryView[]>();
   for (const raw of facts.queryPages) {
-    const parsed = QueryViewSchema.safeParse(projectPublicEvidence(raw)); if (!parsed.success) return undefined;
+    const parsed = QueryViewSchema.safeParse(raw); if (!parsed.success) return undefined;
     const view = parsed.data;
-    if (view.query.id !== view.page.queryId || view.query.totalRows !== view.page.totalRows) return undefined;
+    if (view.query.id !== view.page.queryId || view.query.totalRows !== view.page.totalRows
+      || view.page.calculationVersion !== view.query.calculationVersion
+      || view.page.targetVersion !== `query:${view.query.id}:${view.query.calculationVersion}`) return undefined;
     const pages = groups.get(view.query.id) ?? []; pages.push(view); groups.set(view.query.id, pages);
   }
   const result = new Map<number, CompleteQuery>();
@@ -54,7 +54,7 @@ function attachEvidence(facts: Record<string, unknown>, queries: CompleteQuery[]
   const pages = list(facts.evidencePages);
   for (const query of queries) for (const summary of query.pages[0]!.evidence) {
     const matching = pages.filter(p => record(p) && record(p.evidence) && p.evidence.id === summary.id);
-    const parsed = matching.map(p => EvidenceViewSchema.safeParse(projectPublicEvidence(p)));
+    const parsed = matching.map(p => EvidenceViewSchema.safeParse(p));
     if (!parsed.length || parsed.some(p => !p.success)) return false;
     const views = parsed.flatMap(p => p.success ? [p.data] : []).sort((a, b) => a.page - b.page), first = views[0]!;
     if (views.length !== Math.max(1, Math.ceil(first.totalRows / first.pageSize)) || views.some((v, index) => v.page !== index + 1 || v.pageSize !== first.pageSize || v.totalRows !== first.totalRows || v.evidence.queryId !== query.query.id || !equal(v.evidence, summary) || v.items.length !== Math.min(first.pageSize, Math.max(0, first.totalRows - index * first.pageSize))) || first.totalRows !== summary.snapshotCount) return false;
@@ -99,7 +99,7 @@ export async function sourceIdentities(facts: Record<string, unknown>, snapshots
     const file = artifactFiles.find(f => f.relativePath === `input/${name}`);
     if (!file) return undefined;
     let rows = csv.get(file.evidencePath);
-    if (!rows) { rows = [...readCsvRecords(file.evidencePath, undefined, file.sha256)]; csv.set(file.evidencePath, rows); }
+    if (!rows) { rows = [...readCsvRecords(file.evidencePath)]; csv.set(file.evidencePath, rows); }
     const headers = rows[0], row = rows[line - 1];
     if (!headers || !row || row.length !== headers.length) return undefined;
     const source = Object.fromEntries(headers.map((h, index) => [h, row[index]]));
@@ -156,7 +156,7 @@ export async function sourceScope(facts:Record<string,unknown>,scope:{batchIds:n
     const artifact=list(facts.artifacts).find(artifact=>artifact.id===operation.artifactId),files=artifactFiles(facts).filter(file=>file.artifactId===operation.artifactId);
     if(!artifact)return undefined;await verifyCopiedArtifact(artifact,files);
     const source=files.find(file=>file.relativePath===`input/zhejiang_${batch.snapshotDate}.csv`);if(!source)return undefined;
-    const rows=[...readCsvRecords(source.evidencePath,undefined,source.sha256)],headers=rows[0]??[];
+    const rows=[...readCsvRecords(source.evidencePath)],headers=rows[0]??[];
     for(const row of rows.slice(1)) {
       const fields=Object.fromEntries(headers.map((header,index)=>[header,row[index]]));
       if(fields.snapshot_date===batch.snapshotDate&&fields.region===batch.region&&fields.device_id)ids.add(fields.device_id+'@'+batch.scopeKey);
@@ -445,8 +445,8 @@ export async function projectObservation(check: CheckSpec, context: EvaluationCo
       if (operations.length !== 1) return gap('Original export operation is missing or ambiguous');
       const { kind: _kind, ...operationValue } = operations[0];
       const registered=list(facts.artifacts).find(item=>item.id===operationValue.artifact?.id&&item.protocolValidated===true);
-      if(registered&&equal(projectPublicEvidence(operationValue.artifact),projectPublicEvidence(Object.fromEntries(Object.keys(operationValue.artifact).map(key=>[key,registered[key]])))))operationValue.artifact={...operationValue.artifact,protocolValidated:true};
-      const parsedOperation = PublicExportOperation.safeParse(projectPublicEvidence(operationValue));
+      if(registered&&equal(operationValue.artifact,Object.fromEntries(Object.keys(operationValue.artifact).map(key=>[key,registered[key]]))))operationValue.artifact={...operationValue.artifact,protocolValidated:true};
+      const parsedOperation = PublicExportOperation.safeParse(operationValue);
       if (!parsedOperation.success || !parsedOperation.data.artifact) return gap('Original registered export operation/Artifact is unavailable'+(!parsedOperation.success?': '+JSON.stringify(parsedOperation.error.issues):''));
       const operation = parsedOperation.data, artifact = PublicExportArtifact.parse(operation.artifact);
       const copied = artifactFiles(facts).filter(f => record(f) && f.artifactId === artifact.id) as (CopiedFile & { artifactId: number })[];
@@ -455,7 +455,7 @@ export async function projectObservation(check: CheckSpec, context: EvaluationCo
       let metadata: Record<string, any>, fileRows: unknown[], queryRows: unknown[], columns: string[];
       if (operation.format === 'csv' && csvFile && metadataFile) {
         metadata = JSON.parse(await readFile(metadataFile.evidencePath, 'utf8'));
-        const records = [...readCsvRecords(csvFile.evidencePath, undefined, csvFile.sha256)];
+        const records = [...readCsvRecords(csvFile.evidencePath)];
         columns = records[0] ?? [];
         const required = ['snapshotId', 'batchId', 'deviceId', 'date', 'scopeKey', 'deviceName', 'region', 'category', 'manufacturer', 'distributor', 'status', 'priceCents', 'priceCNY', 'currency', 'unit'];
         if (!equal(columns, required) || !Array.isArray(metadata.columns) || !equal(metadata.columns.map((c: any) => c.name), columns) || records.slice(1).some(r => r.length !== columns.length)) return gap('CSV columns or row widths do not satisfy the full current Query export contract');
@@ -467,7 +467,7 @@ export async function projectObservation(check: CheckSpec, context: EvaluationCo
         if (!record(metadata) || !Array.isArray(data.rows)) return gap('JSON export lacks full original rows/metadata');
         fileRows = data.rows; queryRows = q.rows; columns = [...new Set(q.rows.flatMap(row => Object.keys(row)))];
       } else return gap('Full registered export contents for this format are unavailable');
-      if (!record(metadata) || metadata.contract !== 'medclaw.export-metadata/v1' || metadata.artifactId !== artifact.id || !record(metadata.query) || metadata.totalRows !== q.rows.length || metadata.scope !== 'all_saved' || metadata.query.id !== q.query.id || !['id', 'sessionId', 'runId', 'kind', 'params', 'batchIds', 'scopeDeviceIds', 'warnings', 'calculationVersion', 'resultHash', 'createdAt', 'interpretation'].every(key => equal(metadata.query[key], q.query[key as keyof typeof q.query]))) return gap('Export metadata cannot be bound to the full original Query identity/conditions/interpretation');
+      if (!record(metadata) || !['medclaw.export-metadata/v1','medclaw.export-metadata/v2'].includes(metadata.contract) || metadata.artifactId !== artifact.id || !record(metadata.query) || metadata.totalRows !== q.rows.length || metadata.scope !== 'all_saved' || metadata.query.id !== q.query.id || !['id', 'sessionId', 'runId', 'kind', 'params', 'batchIds', 'scopeDeviceIds', 'warnings', 'calculationVersion', 'createdAt', 'interpretation'].every(key => equal(metadata.query[key], q.query[key as keyof typeof q.query]))) return gap('Export metadata cannot be bound to the full original Query identity/conditions/interpretation');
       const binding = list(record(facts.aliases) ? facts.aliases.queries : undefined).filter(a => record(a) && a.queryId === q.query.id && typeof a.alias === 'string');
       if (binding.length !== 1) return gap('Export Query does not have an unambiguous controller alias');
       const interpretation = q.query.interpretation;

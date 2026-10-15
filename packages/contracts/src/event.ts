@@ -31,7 +31,7 @@ export const RegisteredEventPayloadSchema = z.discriminatedUnion('type', [
   variant('tool_requested', { ...tool, status: z.literal('requested') }),
   variant('tool_started', { ...tool, status: z.literal('running') }),
   variant('tool_finished', { ...tool, status: z.enum(['succeeded', 'failed', 'cancelled']) }),
-  variant('query_completed', { queryId: PositiveIdSchema, resultHash: z.string().regex(/^[a-f0-9]{64}$/), batchIds: ids }),
+  variant('query_completed', { queryId: PositiveIdSchema, batchIds: ids }),
   variant('context_delivered', { snapshotId: PositiveIdSchema, callId: OpaqueIdSchema }),
   variant('history_saved', { storageVersion: PositiveIdSchema, nativeLeafId: OpaqueIdSchema.nullable() }),
   variant('intent_rule_evaluated', { runId: PositiveIdSchema, inputId: PositiveIdSchema, ruleEvaluation: z.lazy(() => RuleEvaluationSchema) }),
@@ -41,7 +41,7 @@ export const RegisteredEventPayloadSchema = z.discriminatedUnion('type', [
     state: z.enum(['completed', 'failed', 'cancelled']), validationState: z.enum(['valid', 'invalid', 'not_run']), errorCode: errorCode.nullable() }),
   variant('route_decided', { runId: PositiveIdSchema, inputId: PositiveIdSchema, decisionId: PositiveIdSchema, intentCallId: OpaqueIdSchema.nullable(),
     route: z.lazy(() => IntentDecisionSchema.shape.route), decisionSource: z.lazy(() => IntentDecisionSchema.shape.decisionSource),
-    matchedBy: z.lazy(() => IntentDecisionSchema.shape.matchedBy), status: z.lazy(() => IntentStatusSchema).nullable(), queryParamsHash: z.string().regex(/^[a-f0-9]{64}$/).nullable() }),
+    matchedBy: z.lazy(() => IntentDecisionSchema.shape.matchedBy), status: z.lazy(() => IntentStatusSchema).nullable() }),
   variant('compaction_completed', { operationRef: OpaqueIdSchema, reason: z.enum(['threshold', 'overflow']), nativeEntryId: OpaqueIdSchema, firstKeptEntryId: OpaqueIdSchema,
     storageVersion: PositiveIdSchema, tokensBefore: nonnegative, estimatedTokensAfter: nonnegative.nullable() }),
 ]);

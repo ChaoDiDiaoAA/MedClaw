@@ -31,10 +31,10 @@ function businessFixture() {
     db.query("INSERT INTO sessions(id,native_session_id,creation_operation_ref,creation_request_json,creation_result_json,title,created_at,updated_at) VALUES(?,? ,?,'{}','{}','Business fixture',?,?)").run(id, `native-${id}`, `session-${id}`, at, at);
     if (id === 1) db.query("INSERT INTO runs(id,session_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at) VALUES(?,?,'agent','host',?,1,json_object('sessionId',?,'clientSequence',1),'running','query','Business fixture',?,?,'{}',?,?,?)").run(id, id, `run-${id}`, id, JSON.stringify({ agent: { nativeSessionId: `native-${id}` } }), JSON.stringify(context.scope), context.referenceDate, context.timezone, at);
   }
-  db.query("INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_hash,preview_request_json,created_at,updated_at) VALUES(1,'import','host','imported','hash','{}',?,?)").run(at, at);
+  db.query("INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_json,created_at,updated_at) VALUES(1,'import','host','imported','{}',?,?)").run(at, at);
   db.query('UPDATE catalog_state SET revision=1,updated_at=?').run(at);
   db.transaction(() => {
-    for (const batch of data.batches) db.query("INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at) VALUES(?,1,?,?,?,?,?,?,?,?,?,?,? ,?,'{}',?,?,1,?)").run(batch.id, batch.scopeKey, batch.snapshotDate, batch.region, batch.materialVersion, batch.sourceBundleId, batch.sourceLockHash, batch.contentHash, batch.coverage, batch.cohortHash, batch.expectedEntityCount, batch.observedEntityCount, JSON.stringify(batch.declaredMissingDeviceIds), batch.previousBatchId === null ? 1 : 0, batch.previousBatchId, at);
+    for (const batch of data.batches) db.query("INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,coverage,expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at) VALUES(?,1,?,?,?,?,?,?,?,?,?,'{}',?,?,1,?)").run(batch.id, batch.scopeKey, batch.snapshotDate, batch.region, batch.materialVersion, batch.sourceBundleId, batch.coverage, batch.expectedEntityCount, batch.observedEntityCount, JSON.stringify(batch.declaredMissingDeviceIds), batch.previousBatchId === null ? 1 : 0, batch.previousBatchId, at);
     for (const device of data.devices) db.query('INSERT INTO devices(id,source_device_id,source_bundle_id,source_submission_id,source_applicant,source_refs_json,created_at) VALUES(?,?,?,?,?,?,?)').run(device.id, device.sourceDeviceId, device.sourceBundleId, device.sourceSubmissionId, device.sourceApplicant, JSON.stringify(device.sourceRefs), at);
     for (const row of data.snapshots) db.query('INSERT INTO snapshots(id,batch_id,device_id,device_name,category,region,price_cents,currency,unit,status,manufacturer,distributor,source_row_ref,source_refs_json,field_origins_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(row.id, row.batchId, row.deviceId, row.deviceName, row.category, row.region, row.priceCents, row.currency, row.unit, row.status, row.manufacturer, row.distributor, row.sourceRowRef, JSON.stringify(row.sourceRefs), JSON.stringify(row.fieldOrigins));
     for (const event of data.changes) db.query('INSERT INTO change_events(id,event_key,device_id,old_batch_id,new_batch_id,kind,field,old_value_json,new_value_json,delta_cents,ratio,calculation_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(event.id, `event-${event.id}`, event.deviceId, event.oldBatchId, event.newBatchId, event.kind, event.field, JSON.stringify(event.oldValue), JSON.stringify(event.newValue), event.deltaCents, event.ratio, event.calculationVersion, at);
@@ -191,14 +191,14 @@ for(const [phase,condition] of Object.entries(finalFaults))test(`p15 form final 
     const accepted=await f.app.runs.submitAgent(f.requestForm(),{instanceId:'host',operationRef:`form:final:${phase}`});if(!accepted.ok)throw accepted.error;
     for(let i=0;i<1000&&!f.app.runs.persistencePending;i++)await Bun.sleep(2);
     expect(f.app.runs.persistencePending).toBe(true);expect(appends).toBe(1);
-    const queries=f.db.query('SELECT id,result_hash FROM queries WHERE run_id=?').all(accepted.data.runId!);expect(queries).toHaveLength(1);
+    const queries=f.db.query('SELECT id,result_json,params_json FROM queries WHERE run_id=?').all(accepted.data.runId!);expect(queries).toHaveLength(1);
     expect(f.db.query('SELECT id FROM answers WHERE run_id=?').all(accepted.data.runId!)).toHaveLength(0);
     expect(f.db.query('SELECT id FROM memories WHERE run_id=?').all(accepted.data.runId!)).toHaveLength(0);
     expect(f.repos.readQueryContext(1)).toBeNull();expect(f.repos.readInput({inputId:accepted.data.inputId!})).toMatchObject({status:'queued',processingStatus:'pending'});
     expect(await f.app.runs.submitAgent(f.requestForm(),{instanceId:'host',operationRef:`form:blocked:${phase}`})).toMatchObject({ok:false,error:{code:'state_conflict'}});
     f.db.exec('DROP TRIGGER form_final_fault');
     expect(await f.app.runs.retrySave(accepted.data.runId!)).toMatchObject({ok:true,data:{status:'completed'}});
-    await f.settle();expect(f.db.query('SELECT id,result_hash FROM queries WHERE run_id=?').all(accepted.data.runId!)).toEqual(queries);
+    await f.settle();expect(f.db.query('SELECT id,result_json,params_json FROM queries WHERE run_id=?').all(accepted.data.runId!)).toEqual(queries);
     expect(f.db.query('SELECT id FROM answers WHERE run_id=?').all(accepted.data.runId!)).toHaveLength(1);expect(appends).toBe(1);
     expect(f.requests).toHaveLength(0);expect(f.authentications).toEqual([false]);
   }finally{f.db.exec('DROP TRIGGER IF EXISTS form_final_fault');if(f.app.runs.persistencePending&&f.app.runs.activeHandle)await f.app.runs.retrySave(f.app.runs.activeHandle.runId);await f.close();}
@@ -271,14 +271,14 @@ test('p15 form conditions reach natural-language recognition and the trusted as_
   const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
     const path=new URL(request.url).pathname;
     if(path==='/api/version')return Response.json({version:'ENGINEERING'});
-    if(path==='/api/tags')return Response.json({models:[{name:'qwen3.5:0.8b',digest:'a'.repeat(64)}]});
+    if(path==='/api/tags')return Response.json({models:[{name:'qwen3.5:0.8b'}]});
     if(path==='/api/show')return Response.json({details:{family:'qwen35',parameter_size:'752.39M',quantization_level:'Q8_0'}});
     const body=await request.json() as {messages:{content:string}[]};stages.push(readIntentStageMessage(body.messages[1]!.content) as IntentStageInput);
     return Response.json({model:'qwen3.5:0.8b',done:true,done_reason:'stop',message:{role:'assistant',content:JSON.stringify({...resolvedIntent(),
       intents:[{...productIntent(),slots:{...productIntent().slots,time,region:'浙江'}}]})},prompt_eval_count:21,eval_count:12});
   }});
   const f=await formFixture(IntentModelConfigurationSchema.parse({...disabledIntentModel(),enabled:true,baseUrl:`http://127.0.0.1:${server.port}`,
-    modelDigest:'sha256:'+'a'.repeat(64),verifiedEvidenceRef:'ENGINEERING'}));
+    verifiedEvidenceRef:'ENGINEERING'}));
   try{
     const first=f.requestForm();first.routing.params={...first.routing.params,time,snapshotMode:'as_of',region:'浙江'};first.text='Query form: '+canonicalRequest(first.routing.params);
     const accepted=await f.app.runs.submitAgent(first,{instanceId:'host',operationRef:'form:as-of'});if(!accepted.ok)throw accepted.error;await f.settle();
@@ -325,7 +325,7 @@ test('p15 form to automatic clear cannot resurrect an older filter and automatic
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     const path = new URL(request.url).pathname;
     if (path === '/api/version') return Response.json({ version: 'ENGINEERING' });
-    if (path === '/api/tags') return Response.json({ models: [{ name: 'qwen3.5:0.8b', digest: 'a'.repeat(64) }] });
+    if (path === '/api/tags') return Response.json({ models: [{ name: 'qwen3.5:0.8b' }] });
     if (path === '/api/show') return Response.json({ details: { family: 'qwen35', parameter_size: '752.39M', quantization_level: 'Q8_0' } });
     const body = await request.json() as { messages: { content: string }[] };
     const stage = readIntentStageMessage(body.messages[1]!.content); stages.push(stage);
@@ -333,7 +333,7 @@ test('p15 form to automatic clear cannot resurrect an older filter and automatic
     return Response.json({ model: 'qwen3.5:0.8b', done: true, done_reason: 'stop', message: { role: 'assistant', content: JSON.stringify({ ...resolvedIntent(),
       intents: [{ ...item, slots: { ...item.slots, time: { start: '2026-10-04', endExclusive: '2026-10-05' }, status: stages.length === 1 ? null : 'active' } }] }) }, prompt_eval_count: 21, eval_count: 12 });
   } });
-  const f = await formFixture(IntentModelConfigurationSchema.parse({ ...disabledIntentModel(), enabled: true, baseUrl: `http://127.0.0.1:${server.port}`, modelDigest: 'sha256:' + 'a'.repeat(64), verifiedEvidenceRef: 'ENGINEERING' }));
+  const f = await formFixture(IntentModelConfigurationSchema.parse({ ...disabledIntentModel(), enabled: true, baseUrl: `http://127.0.0.1:${server.port}`, verifiedEvidenceRef: 'ENGINEERING' }));
   try {
     const initial = f.requestForm(); initial.routing.params.status = 'active'; initial.text = 'Query form: ' + canonicalRequest(initial.routing.params);
     const first = await f.app.runs.submitAgent(initial, { instanceId: 'host', operationRef: 'form:clear:start' }); if (!first.ok) throw first.error; await f.settle();

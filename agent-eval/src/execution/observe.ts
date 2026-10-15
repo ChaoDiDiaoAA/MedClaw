@@ -1,6 +1,5 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { projectPublicEvidence } from '../data-format.ts';
 import { ProductAdapter, unwrap } from '../adapters/product.ts';
 import { listAllInputs, readAllMessages, type AliasState } from '../adapters/actions.ts';
 import { copyEvidenceTree, verifyCopiedArtifact,archiveArtifactFiles } from '../adapters/files.ts';
@@ -11,7 +10,6 @@ import type { SessionCheckpointPage } from '../../../packages/contracts/src/sess
 import type { EventPage } from '../../../packages/contracts/src/event.ts';
 import {QueryInventoryOriginalSchema} from '../../../packages/contracts/src/controller-evidence.ts';
 import {IntentReadResultSchema} from '../../../packages/contracts/src/intent.ts';
-import {hashBytes} from '../adapters/product-checksums.ts';
 import {TOOL_READ_RULES} from '../../../packages/contracts/src/tool.ts';
 
 /** Read every saved query in the original Run, including results omitted from the answer. */
@@ -134,7 +132,7 @@ export async function collectObservation(options: { executionId: string; trialId
       check(`resources.${runId}.owner`,resourceList.source==='run'&&resourceList.runId===runId,'Recorded resources belong to the original run');
       for(const resource of resourceList.items.filter(item=>item.enabled&&item.availability==='ready'))for(const file of resource.files){
         const text=await read('resources.read',{source:'run',runId,resourceRef:resource.ref,file:file.file});
-        if(text){const valid=text.source==='run'&&text.runId===runId&&text.resourceRef.kind===resource.ref.kind&&text.resourceRef.id===resource.ref.id&&text.resourceRef.version===resource.ref.version&&text.resourceRef.treeHash===resource.ref.treeHash&&text.sha256===file.sha256&&hashBytes(Buffer.from(text.content))===text.sha256&&text.file===file.file&&Buffer.byteLength(text.content)===text.bytes;check(`resource.${runId}.${resource.ref.id}.${file.file}`,valid,'Original resource identity and content bytes checked');if(valid)facts.resources!.push({runId,kind:resource.ref.kind,id:resource.ref.id,version:resource.ref.version,file:file.file,content:text.content,bytes:text.bytes,protocolValidated:true});}
+        if(text){const valid=text.source==='run'&&text.runId===runId&&text.resourceRef.kind===resource.ref.kind&&text.resourceRef.id===resource.ref.id&&text.resourceRef.version===resource.ref.version&&text.file===file.file&&text.bytes===file.bytes&&Buffer.byteLength(text.content)===text.bytes;check(`resource.${runId}.${resource.ref.id}.${file.file}`,valid,'Original resource identity and content bytes checked');if(valid)facts.resources!.push({runId,kind:resource.ref.kind,id:resource.ref.id,version:resource.ref.version,file:file.file,content:text.content,bytes:text.bytes,protocolValidated:true});}
       }
     }
     toolDiscovery.set(runId,false);
@@ -220,7 +218,7 @@ export async function collectObservation(options: { executionId: string; trialId
   }
   facts.providerRequests=[];facts.nativeHistory=[];facts.toolOriginals=[];facts.runOriginals=[];
   const capture=async(key:string,selector:Parameters<typeof readControllerOriginal>[1])=>{
-    try{const owner=(facts.runs!.find((run:any)=>run.id===selector.runId) as {instanceId?:string}|undefined)?.instanceId??product.instanceId;const original=await readControllerOriginal(product,selector,owner);facts[key]!.push(original);check(`${key}.${JSON.stringify(selector)}`,true,'Complete identity-bound product original verified before archive projection');
+    try{const owner=(facts.runs!.find((run:any)=>run.id===selector.runId) as {instanceId?:string}|undefined)?.instanceId??product.instanceId;const original=await readControllerOriginal(product,selector,owner);facts[key]!.push(original);check(`${key}.${JSON.stringify(selector)}`,true,'Complete identity-bound product original verified without altering the original content');
       if(selector.kind==='history')for(const [alias,session] of aliases.sessions)if(session.id===selector.sessionId) {
         const index=missing.findIndex(item=>item.key===`history.${alias}.fullText`);if(index>=0)missing.splice(index,1);
       }
@@ -246,7 +244,7 @@ export async function collectObservation(options: { executionId: string; trialId
       batches: [...aliases.batches].map(([alias, batchId]) => ({ alias, batchId })),
       operations: [...aliases.operations].map(([alias, operation]) => ({ alias, ...operation })),
     } }, missing };
-  const observation = projectPublicEvidence(body);
+  const observation = body;
   await writeFile(join(trialRoot, 'observation.json'), JSON.stringify(observation, null, 2), { mode: 0o600 });
   Object.defineProperty(observation.facts,'evidenceRoot',{value:trialRoot,enumerable:false});
   await product.flush(); return observation;

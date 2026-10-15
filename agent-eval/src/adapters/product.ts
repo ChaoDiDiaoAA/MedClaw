@@ -1,6 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { projectPublicEvidence } from '../data-format.ts';
 import { appendFile, mkdir, realpath, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { FileTokens } from '../../../apps/desktop/src/main/file-tokens.ts';
@@ -53,7 +52,12 @@ export class ProductAdapter {
   private traceFailure: unknown;
   private mainSettings: MainSettings | null = null;
   private handshake: { resolve(value: HostReady): void; reject(error: unknown): void } | null = null;
-  constructor(readonly options: ProductOptions) { this.destinations = new DestinationTokens(resolve(options.dataRoot)); }
+  constructor(readonly options: ProductOptions) {
+    this.destinations = new DestinationTokens(resolve(options.dataRoot),undefined,async(instanceId,input)=>{
+      if(instanceId!==this.instanceId)throw new Error('access_denied');
+      unwrap(await this.request('export.copy.verify',input,input.operationRef));
+    });
+  }
 
   private settings() {
     return this.mainSettings ??= new MainSettings(this.paths.settingsPath, {
@@ -65,7 +69,7 @@ export class ProductAdapter {
   }
 
   record(kind: string, value: Record<string, unknown> = {}) {
-    const entry = projectPublicEvidence({ ...(value.method==='controller.evidence.read'?{requestId:value.requestId,method:value.method}:value), kind, at: new Date().toISOString(), instanceId: this.instanceId });
+    const entry = { ...(['controller.evidence.read','export.copy.verify'].includes(String(value.method))?{requestId:value.requestId,method:value.method}:value), kind, at: new Date().toISOString(), instanceId: this.instanceId };
     this.traces.push(entry);
     this.traceWrites = this.traceWrites.then(() => appendFile(this.options.tracePath, `${JSON.stringify(entry)}\n`, { mode: 0o600 })).catch(error => { this.traceFailure = error; });
   }

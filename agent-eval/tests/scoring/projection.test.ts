@@ -7,8 +7,8 @@ import {tmpdir} from 'node:os';import {join} from 'node:path';
 
 const checks: CheckSpec[] = ['query.conditions', 'query.aggregate', 'query.trend'].map(metricId => ({ id: metricId, metricId, version: 'v1', kind: 'deterministic', required: true, hardConstraint: true, unit: 'original facts', goldKey: `values.${metricId.replace('.', '_')}`, evidenceKey: metricId.replace('.', '_') }));
 const params = QueryParamsSchema.parse({ kind: 'aggregate', population: 'snapshot', snapshotMode: 'exact_date', metric: 'count', batchIds: [1], region: '浙江', time: { start: '2026-09-28', endExclusive: '2026-09-29' } });
-const query = { id: 11, sessionId: 1, runId: 3, callRef: 'call', kind: 'aggregate', params, batchIds: [1], scopeDeviceIds: null, warnings: [], calculationVersion: 'v1', resultHash: 'result', createdAt: '2026-10-12T00:00:00.000Z', totalRows: 1 };
-const page = { query, page: { queryId: 11, rows: [{ metric: 'count', value: 6, unit: 'devices' }], totalRows: 1, page: 1, pageSize: 2, warnings: [], calculationVersion: 'v1', evidenceIds: [], targetVersion: 'a'.repeat(64), rowKeys: [null] }, evidence: [] };
+const query = { id: 11, sessionId: 1, runId: 3, callRef: 'call', kind: 'aggregate', params, batchIds: [1], scopeDeviceIds: null, warnings: [], calculationVersion: 'v1', createdAt: '2026-10-12T00:00:00.000Z', totalRows: 1 };
+const page = { query, page: { queryId: 11, rows: [{ metric: 'count', value: 6, unit: 'devices' }], totalRows: 1, page: 1, pageSize: 2, warnings: [], calculationVersion: 'v1', evidenceIds: [], targetVersion: 'query:11:v1', rowKeys: ['row:11:0'] }, evidence: [] };
 function context(queryPages: unknown[] = [page]): EvaluationContext {
   return { trialId: 't', caseId: 'c', task: { checks: checks.slice(0, 2) }, trialStatus: 'completed', gold: { values: { finalStageAlias: 'turn-1', querySelection: {}, query_conditions: { region: '浙江', regions: null, date: '2026-09-28', start: null, endExclusive: null, sourceDeviceId: null, manufacturer: null, category: null, status: null, snapshotMode: 'exact_date', threshold: null }, query_aggregate: [{ key: 'all', count: 6 }] } }, observation: { trialId: 't', facts: { aliases: { runs: [{ alias: 'turn-1', runId: 3 }], lastSendAlias: 'turn-1' }, queryPages }, missing: [], identityChecks: [] } };
 }
@@ -27,6 +27,10 @@ test('projection uses actual values, never Gold values, and preserves unknown wh
 test('projection rejects crossed Query page identity and unknown authored stage binding', async () => {
   const crossed = structuredClone(page); crossed.page.queryId = 99;
   expect((await evaluate(context([crossed]))).every(score => score.status === 'UNJUDGEABLE')).toBe(true);
+  const wrongVersion = structuredClone(page); wrongVersion.page.calculationVersion = 'v2';
+  expect((await evaluate(context([wrongVersion]))).every(score => score.status === 'UNJUDGEABLE')).toBe(true);
+  const wrongTarget = structuredClone(page); wrongTarget.page.targetVersion = 'query:99:v1';
+  expect((await evaluate(context([wrongTarget]))).every(score => score.status === 'UNJUDGEABLE')).toBe(true);
   const c = context(); c.gold = { values: { ...(c.gold.values as object), finalStageAlias: 'turn-2' } };
   expect((await evaluate(c)).every(score => score.status === 'UNJUDGEABLE')).toBe(true);
 });

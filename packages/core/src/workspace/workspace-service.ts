@@ -1,5 +1,6 @@
 import { safeError, serviceResult } from "../../../contracts/src/error";
 import { WorkspaceChangeSchema, RevisionSchema, type WorkspaceChange, type WorkspaceStore, type WorkspaceView, type ManagedImportInspection } from "../../../contracts/src/workspace";
+import {isDeepStrictEqual} from 'node:util';
 
 export class WorkspaceService {
   constructor(private readonly store: WorkspaceStore,
@@ -20,10 +21,10 @@ export class WorkspaceService {
         if (inspection.status === 'invalid') invalid.push(id);
       }
       const checked = this.store.inspectWorkspace(invalid);
-      if (checked.state.revision !== original.state.revision || checked.fingerprint !== original.fingerprint)
+      if (checked.state.revision !== original.state.revision || !isDeepStrictEqual(checked.dependencies,original.dependencies))
         throw safeError('state_conflict', undefined, {reason:'workspace_revision_mismatch'});
       this.assertWritable();
-      const saved = this.store.commitWorkspaceRestore(original.state.revision, original.fingerprint, checked.candidate, new Date().toISOString());
+      const saved = this.store.commitWorkspaceRestore(original.state.revision, original.dependencies, checked.candidate, new Date().toISOString());
       return checked.notices.length ? {...saved,notices:checked.notices} : saved;
     }, "storage_read_failed");
   }

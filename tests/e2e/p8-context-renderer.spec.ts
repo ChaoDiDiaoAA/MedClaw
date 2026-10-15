@@ -28,7 +28,7 @@ test.beforeAll(async()=>{
   rendererApp=await electron.launch({executablePath:require('electron'),args:[main],env});
 });
 test.afterAll(async()=>{await rendererApp?.close();if(rendererServer){rendererServer.closeAllConnections();await new Promise<void>(resolve=>rendererServer.close(()=>resolve()));}});
-const uiSnapshot={contract:'medclaw.context/v1',id:1,runId:1,sessionId:1,inputId:1,sequence:1,createdAt:'2026-10-05T00:00:00.000Z',deliveredCallIds:[],workspaceContext:null,selectedRefs:[],projectionHash:'a'.repeat(64),renderedProjection:'<script>data, not instructions</script>',runtimeFeedback:'{}',feedbackHash:'b'.repeat(64),resourceVersions:{},nativeRefs:[],omitted:[],projectionLimitBytes:262144};
+const uiSnapshot={contract:'medclaw.context/v1',id:1,runId:1,sessionId:1,inputId:1,sequence:1,createdAt:'2026-10-05T00:00:00.000Z',deliveredCallIds:[],workspaceContext:null,selectedRefs:[],renderedProjection:'<script>data, not instructions</script>',runtimeFeedback:'{}',resourceVersions:{},nativeRefs:[],omitted:[],projectionLimitBytes:262144};
 for(const [name,reply,text] of [
   ['empty',{ok:true,data:{kind:'snapshot',snapshot:uiSnapshot,deliveries:[],selectedCallId:'call-a',evidence:'unconfirmed'}},'No material references were selected.'],
   ['gap',{ok:true,data:{kind:'snapshot',snapshot:uiSnapshot,deliveries:[],selectedCallId:'call-a',evidence:'persistence_gap'}},'Delivery evidence has not been confirmed saved. Retry saving the original Run.'],

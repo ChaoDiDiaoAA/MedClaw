@@ -1,3 +1,4 @@
+import {queryTargetVersion} from '../../packages/storage/src/workspace-selection';
 import { sqliteHistory, nativeHistoryFixture } from '../fixtures/p9-memory';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -16,7 +17,7 @@ const closers: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of closers.splice(0)) await close(); });
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; };
 const workspace = (revision: number, queryId = 17) => ({ sessionId: 7, revision, materialVersion: null, batchRefs: [], deviceIds: [], queryId, activeView: 'query' as const,
-  selection: { formatVersion: 1 as const, kind: 'query-row' as const, targetId: String(queryId), targetVersion: 'a'.repeat(64), rowKey: 'snapshot:23', field: 'priceCents' } });
+  selection: { formatVersion: 1 as const, kind: 'query-row' as const, targetId: String(queryId), targetVersion: `query:${queryId}:v1`, rowKey: 'snapshot:23', field: 'priceCents' } });
 const scope = { batchIds: [], deviceIds: null, allowedToolNames: ['read_data_scope'], allowedResourceRefs: [], artifactIds: [], readOnly: true };
 async function fixture(options: { rejectConsumption?: (id: number) => boolean; appendThrows?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'medclaw-p7-native-'));
@@ -193,10 +194,10 @@ test('production accepted Input and Run preserve selected Query row through real
   let agent: PiAgentRuntime | undefined;
   closers.push(async () => { for (const gate of gates) gate.resolve(); await app?.runs.shutdown(); const bindings = agent && Reflect.get(agent, 'sessions') as Map<number, { session?: { dispose(): void } }> | undefined;
     bindings?.forEach(binding => binding.session?.dispose()); server.stop(true); db.close(); await rm(root, { recursive: true, force: true }); });
-  db.query(`INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_hash,preview_request_json,created_at,updated_at) VALUES(1,'import','fixture','imported','hash','{}',?,?)`).run(at, at);
+  db.query(`INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_json,created_at,updated_at) VALUES(1,'import','fixture','imported','{}',?,?)`).run(at, at);
   db.query('UPDATE catalog_state SET revision=1,updated_at=?').run(at);
-  db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at)
-    VALUES(1,1,'scope','2026-01-01','浙江','fixture/v1','bundle','lock',?,'full','cohort',2,2,'[]',?,1,NULL,1,?)`).run('a'.repeat(64), JSON.stringify({ referenceDate: '2026-01-01', timezone: 'Asia/Shanghai' }), at);
+  db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,coverage,expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at)
+    VALUES(1,1,'scope','2026-01-01','浙江','fixture/v1','bundle','full',2,2,'[]',?,1,NULL,1,?)`).run(JSON.stringify({ referenceDate: '2026-01-01', timezone: 'Asia/Shanghai' }), at);
   for (const deviceId of [1, 2]) {
     db.query(`INSERT INTO devices(id,source_device_id,source_bundle_id,source_submission_id,source_refs_json,created_at) VALUES(?,?,'bundle','submission','[]',?)`).run(deviceId, `device-${deviceId}`, at);
     db.query(`INSERT INTO snapshots(id,batch_id,device_id,device_name,region,price_cents,currency,unit,status,source_row_ref,source_refs_json,field_origins_json)
@@ -216,7 +217,7 @@ test('production accepted Input and Run preserve selected Query row through real
   const previous = queries.current(CurrentQuerySchema.parse({ batchIds: [1], time: { start: '2026-01-01', endExclusive: '2026-01-02' } }), { runId: 10, sessionId: session.id, nativeToolCallId: 'seed-query', scope: priorScope, referenceDate: '2026-01-01', timezone: 'Asia/Shanghai', signal: new AbortController().signal });
   db.query("UPDATE runs SET status='completed',ended_at=? WHERE id=10").run(at);
   const original = store.readQuery(previous.queryId)!;
-  repo.updateWorkspace({ queryId: original.id, activeView: 'query', selection: { formatVersion: 1, kind: 'query-row', targetId: String(original.id), targetVersion: original.resultHash, rowKey: 'snapshot:1', field: 'priceCents' } }, repo.readWorkspace().revision, at);
+  repo.updateWorkspace({ queryId: original.id, activeView: 'query', selection: { formatVersion: 1, kind: 'query-row', targetId: String(original.id), targetVersion: queryTargetVersion(original), rowKey: 'snapshot:1', field: 'priceCents' } }, repo.readWorkspace().revision, at);
   const frozen = toWorkspaceContext(repo.readWorkspace()), notices: RuntimeNotice[] = [];
   const settings = PublishedSettingsSchema.parse({ schemaVersion: 'medclaw.settings/p1-v1', configVersion: '1', model: { provider: 'p7-production', modelId: 'fixture' }, customProviders: [{ definition, credentialRef: null }], credentialRefs: {}, requestPolicy: { timeoutMs: 15000, maxRetries: 0, maxRetryDelayMs: 2000 }, ui: { navCollapsed: false, detailOpen: false, detailTab: 'conditions' }, previous: null, rollbackFromVersion: null });
   app = new Application('fixture', settings, runtime, repo, (_context, action) => action(), (runId, kind, time) => new ModelCallRecorder(repo, runId, kind, time), notice => notices.push(notice), undefined, agent);
@@ -234,7 +235,7 @@ test('production accepted Input and Run preserve selected Query row through real
   repo.updateWorkspace({ queryId: null, selection: null }, newWorkspace.revision, new Date().toISOString());
   gates[0]!.resolve(); await waitRequest(2);
   const rootResult = (requests[1]!.messages as { role: string; content: string }[]).filter(message => message.role === 'tool').map(message => JSON.parse(message.content));
-  expect(rootResult).toMatchObject([{ workspaceInputId: accepted.data.inputId, workspaceContext: { queryId: original.id, selection: { targetVersion: original.resultHash, rowKey: 'snapshot:1', field: 'priceCents' } } }]);
+  expect(rootResult).toMatchObject([{ workspaceInputId: accepted.data.inputId, workspaceContext: { queryId: original.id, selection: { targetVersion: queryTargetVersion(original), rowKey: 'snapshot:1', field: 'priceCents' } } }]);
   expect(repo.readInput({ inputId: queued.data.inputId })?.status).toBe('consumed');
   gates[1]!.resolve(); await waitRequest(3);
   const nextResult = (requests[2]!.messages as { role: string; content: string }[]).filter(message => message.role === 'tool').map(message => JSON.parse(message.content));

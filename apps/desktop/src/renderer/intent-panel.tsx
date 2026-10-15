@@ -80,7 +80,7 @@ export function IntentPanel(props:{host:HostView;runId:number;sessionId:number;i
       <section><h4>Rule</h4>{data.ruleEvaluation?<><p>{data.ruleEvaluation.outcome} · {data.ruleEvaluation.ruleId??'No matched rule'}</p><p className="tiny">{data.ruleEvaluation.reasonCode} · {data.ruleEvaluation.ruleVersion} · {data.ruleEvaluation.checkedAt}</p></>:<p>Not evaluated</p>}</section>
       {(['classify','verify'] as const).map(stage=>{const call=data.calls.find(value=>value.stage===stage);return <section key={stage}>
         <h4>{stage==='classify'?'Classification':'Review'}</h4>{!call?<p>Not called</p>:<>
-          <p>{call.state} · <code>{call.callId}</code></p><p className="tiny">{call.model.modelTag} · <code>{call.model.modelDigest}</code></p>
+          <p>{call.state} · <code>{call.callId}</code></p><p className="tiny">{call.model.modelTag}</p>
           <p className="tiny">Started: {call.startedAt} · Ended: {call.endedAt??'Unconfirmed'}</p>
           {call.previousCallId&&<p className="tiny">Previous call: <code>{call.previousCallId}</code></p>}
           {call.error&&<p role="alert">{errorMessage(call.error)}</p>}

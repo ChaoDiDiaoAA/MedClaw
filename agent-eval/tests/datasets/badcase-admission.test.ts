@@ -7,6 +7,8 @@ import {runBlockers} from '../../src/doctor.ts';
 import {recordDataChecks,verificationInputPaths} from '../../scripts/record-data-checks.ts';
 import {reportFixture} from '../report-fixture.ts';
 import {readReport} from '../../src/reports/write.ts';
+import {cases as currentCases} from '../../src/datasets/medclaw-badcase-v1.ts';
+import {goldDefinitions as currentGold} from '../../src/datasets/medclaw-badcase-v1.gold.ts';
 
 const primary=await loadDataset();
 async function controlledSourceFixture(root:string,suite:Awaited<ReturnType<typeof loadDataset>>,full=false){
@@ -42,14 +44,16 @@ function seal(snapshot:ReturnType<typeof provenanceFixture>) {
   return snapshot;
 }
 
-test('pending supplementary suite preserves its historical parent definitions when primary scorers evolve',async()=>{
+test('pending supplementary suite uses current declarations and preserves dated review history',async()=>{
+  const reviewPath=join(import.meta.dir,'../../src/datasets/medclaw-badcase-v1.review.json'),before=await readFile(reviewPath,'utf8'),historical=JSON.parse(before);
   const suite=await loadDataset('medclaw-badcase-v1');
   expect(suite.manifest.members).toEqual(['mc-bc-intent-zh-name','mc-v1-intent-resolve','mc-v1-intent-clarify-region']);
   expect(planTrials(suite.manifest.members,3)).toHaveLength(9);expect(primary.manifest.members).toHaveLength(50);expect(primary.manifest.smoke).toHaveLength(10);
-  for(const id of ['mc-v1-intent-resolve','mc-v1-intent-clarify-region']) {
-    expect(suite.snapshot.cases.find(item=>item.id===id)).toEqual(suite.snapshot.review.verifiedData.cases.find((item:{id:string})=>item.id===id));
-    expect(suite.snapshot.gold[id]).toEqual(suite.snapshot.review.verifiedData.gold[id]);
-  }
+  expect(suite.snapshot.cases).toEqual(currentCases);expect(suite.snapshot.gold).toEqual(currentGold);
+  expect(suite.snapshot.review.verifiedData).toEqual(historical.verifiedData);expect(suite.snapshot.review.verification).toEqual(historical.verification);
+  expect(suite.snapshot.review.cases).toEqual(historical.cases);expect(suite.snapshot.review.state).toBe('pending');
+  expect(Object.values(suite.reviews).every(review=>review.state==='pending')).toBe(true);
+  expect(await readFile(reviewPath,'utf8')).toBe(before);
   expect(suite.manifest.readiness).toBe('draft');
   expect(suite.snapshot.cases[0]!.name).toContain('中文');expect(suite.manifest.members).not.toContain('mc-bc-intent-source-id');
 });

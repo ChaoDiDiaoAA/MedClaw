@@ -58,7 +58,13 @@ async function setup() {
   invoke = async (name, envelope) => handlers.get(name)!({ sender: { id: 10, mainFrame }, senderFrame: mainFrame }, envelope);
   await import('../../apps/desktop/src/preload/index.ts');
   const client = bridge;
-  try { expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion:15 }); } catch (error) { rmSync(root, { recursive: true, force: true }); throw error; }
+  try { expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion:16 }); }
+  catch (error) {
+    // Cleanup failures must not replace the original setup failure.
+    try { const state = host.read(); if (state.instanceId && !state.canStart) await host.stop(state.instanceId); } catch {}
+    try { rmSync(root, { recursive: true, force: true }); } catch {}
+    throw error;
+  }
   const first = unwrap(await host.request('session.create', { expectedWorkspaceRevision: 0 }, 'create-a')) as { session: { id: number }; workspace: { revision: number } };
   const second = unwrap(await host.request('session.create', { expectedWorkspaceRevision: first.workspace.revision }, 'create-b')) as { session: { id: number } };
   const sql = (query: string) => { const db = new Database(host.paths.databasePath, { readonly: true }); try { return db.query(query).all(); } finally { db.close(); } };
@@ -95,7 +101,7 @@ hostTest('p11 publication write failure preserves old choices and lost commit re
     expect(recovered.selection).toEqual(selection); expect(recovered.configVersion).toBe('2'); expect(new Set(f.commits).size).toBe(1);
     expect(await f.client.request('resources.select', { sessionId: f.first, expectedConfigVersion: '1', selection }, 'same-old-expected')).toMatchObject({ ok: false, error: { code: 'config_conflict' } });
     const before = f.settings.read(); await expect(f.settings.publish('2', { model: null }, { kind: 'resources' })).rejects.toThrow('invalid_argument'); expect(f.settings.read()).toEqual(before);
-    expect(await f.client.request('resources.select', { sessionId: f.first, expectedConfigVersion: '2', selection: { prompt: { ...selection.prompt, treeHash: 'a'.repeat(64) }, skills: [] } }, 'same-version-changed')).toMatchObject({ ok: false, error: { reason: 'resource_changed' } });
+    expect(await f.client.request('resources.select', { sessionId: f.first, expectedConfigVersion: '2', selection: { prompt: { ...selection.prompt,version:'v999'}, skills: [] } }, 'missing-version')).toMatchObject({ ok: false, error: { reason: 'resource_missing' } });
     expect(await f.host.request('resources.list', { source: 'selection', sessionId: 999 })).toMatchObject({ ok: false, error: { code: 'input_invalid', reason: 'session_not_found' } });
     const publicationError = await f.settings.publish('2', { resources: { bySession: { '999': selection } } }, { kind: 'policy' }).then(() => null, error => error);
     expect(publicationError).toMatchObject({ code: 'input_invalid', reason: 'session_not_found' });

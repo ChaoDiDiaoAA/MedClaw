@@ -19,7 +19,7 @@ export async function prepareInstance(options: { trialRoot: string; workRoot?:st
     modelTag: options.config.intent.model });
   const inspection=await new OllamaIntentClient({classify:'Configuration inspection only',verify:'Configuration inspection only'}).inspect(candidate);
   if(!inspection.available)throw new Error('intent_model_unavailable:'+inspection.error?.code);
-  const intentModel=IntentModelConfigurationSchema.parse({...candidate,enabled:true,modelDigest:inspection.actualDigest,verifiedEvidenceRef:`eval:${options.owner?.executionId??'controlled-fixture'}/${options.owner?.trialId??'engineering'}/events.jsonl`});
+  const intentModel=IntentModelConfigurationSchema.parse({...candidate,enabled:true,verifiedEvidenceRef:`eval:${options.owner?.executionId??'controlled-fixture'}/${options.owner?.trialId??'engineering'}/events.jsonl`});
   const settings = PublishedSettingsSchema.parse({ ...initial, model: { provider: options.config.model.provider, modelId: options.config.model.model },
     customProviders:options.config.model.definition?[{definition:options.config.model.definition,credentialRef:options.modelCredential?'eval-model-key':null}]:[],
     credentialRefs:options.modelCredential?{[options.modelCredential.providerId]:'eval-model-key'}:{},

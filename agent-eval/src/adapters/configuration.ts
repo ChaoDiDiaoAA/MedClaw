@@ -19,7 +19,6 @@ export async function verifyPublishedConfiguration(product: ProductAdapter, conf
   if (!isDeepStrictEqual(current.policy, RequestPolicySchema.parse({ ...DEFAULT_REQUEST_POLICY, ...config.policy }))) throw new Error('published_policy_configuration_mismatch');
   const inspection = unwrap(await product.request('model.intent.inspect', { baseUrl: intent.baseUrl, modelTag: intent.modelTag }));
   if (!inspection.available) throw new Error(`published_intent_configuration_unavailable:${inspection.error?.code ?? 'unknown'}`);
-  if (inspection.actualDigest !== intent.modelDigest) throw new Error('intent_model_identity_mismatch');
   product.record('published_configuration_verified', { selection, intent, policy: current.policy, inspection });
   return { provider: selection.provider, modelId: selection.modelId, expectedConfigVersion: current.configVersion };
 }

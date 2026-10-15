@@ -4,8 +4,7 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ProductAdapter } from '../../src/adapters/product.ts';
 import { listAllInputs, readAllMessages } from '../../src/adapters/actions.ts';
-import { copyEvidenceTree, verifyCopiedArtifact, within } from '../../src/adapters/files.ts';
-import { hashBytes, hashValue } from '../../src/adapters/product-checksums.ts';
+import { archiveArtifactFiles,copyEvidenceTree, verifyCopiedArtifact, within } from '../../src/adapters/files.ts';
 import { cleanupInstance } from '../../src/execution/instance.ts';
 import type { VerifiedObservation } from '../../src/types.ts';
 import { canonicalRequest } from '../../../packages/contracts/src/run.ts';
@@ -36,24 +35,51 @@ test('cursor loops and changed native Session identities fail closed', async () 
   try { await expect(listAllInputs(product, 7)).rejects.toThrow('input_identity_or_cursor_mismatch'); }
   finally { inputSpy.mockRestore(); }
 });
-test('registered Artifact files are copied and checked against public manifest, identity and hashes', async () => {
+test('registered Artifact files retain exact content and are checked against manifest identity and file set', async () => {
   const root = await mkdtemp(join(tmpdir(), 'medclaw-eval-artifact-'));
   try {
     const source = join(root, 'source'), target = join(root, 'evidence'); await mkdir(source);
-    const payload = '{"result":"ENGINEERING"}', files = [{ path: 'result.json', bytes: Buffer.byteLength(payload), sha256: hashBytes(payload) }];
-    const manifest = ExportManifestSchema.parse({ contract: 'medclaw.export-manifest/v1', artifactId: 9, originOperationRef: 'operation', queryId: 5,
-      resultHash: 'a'.repeat(64), answerId: null, format: 'json', exportVersion: 'medclaw.export/v1', metadataHash: 'b'.repeat(64), files });
-    const artifact = ExportArtifactSchema.parse({ id: 9, operationRef: 'operation', queryId: 5, format: 'json', relativePath: 'artifacts/9', sha256: hashBytes(canonicalRequest(files)),
-      metadataSha256: manifest.metadataHash, sizeBytes: Buffer.byteLength(payload), publishedAt: null, registeredAt: '2026-10-12T00:00:00.000Z' });
+    const payload = '{ "result": "ENGINEERING", "oldMetadata": { "contentHash": "historical" } }\n', files = [{ path: 'result.json', bytes: Buffer.byteLength(payload) }];
+    const manifest = { contract: 'medclaw.export-manifest/v2', artifactId: 9, originOperationRef: 'operation', queryId: 5,
+      answerId: null, format: 'json', exportVersion: 'medclaw.export/v2', files };
+    const artifact = { id: 9, operationRef: 'operation', queryId: 5, format: 'json' as const, relativePath: 'artifacts/9',
+      sizeBytes: Buffer.byteLength(payload), publishedAt: null, registeredAt: '2026-10-12T00:00:00.000Z' };
     await writeFile(join(source, 'result.json'), payload); await writeFile(join(source, 'manifest.json'), canonicalRequest(manifest));
     const copied = await copyEvidenceTree(source, target); await verifyCopiedArtifact(artifact, copied);
+    expect(copied.every(file=>!('sha256' in file))).toBe(true);
+    const originalManifest=await readFile(join(target,'manifest.json'),'utf8');await archiveArtifactFiles(copied);
+    expect(copied.find(file=>file.relativePath==='result.json')!.content).toBe(payload);
+    expect(await readFile(join(target,'manifest.json'),'utf8')).toBe(originalManifest);
     expect(copied).toHaveLength(2); expect(await readFile(join(target, 'result.json'), 'utf8')).toBe(payload);
     await expect(verifyCopiedArtifact({ ...artifact, operationRef: 'different-operation' }, copied)).rejects.toThrow('artifact_manifest_identity_mismatch');
-    const tampered = copied.map(file => file.relativePath === 'result.json' ? { ...file, sha256: 'c'.repeat(64) } : file);
-    await expect(verifyCopiedArtifact(artifact, tampered)).rejects.toThrow('artifact_file_hash_mismatch');
+    await writeFile(join(target,'result.json'),payload.replace('ENGINEERING','engineering'));
+    await expect(verifyCopiedArtifact({...artifact,protocolValidated:true}, copied)).rejects.toThrow('artifact_content_mismatch');
+    await expect(verifyCopiedArtifact(artifact, copied.filter(file=>file.relativePath!=='result.json'))).rejects.toThrow('artifact_file_set_mismatch');
     expect(() => within(source, join(root, 'outside'))).toThrow('path_outside_owned_root');
     await expect(copyEvidenceTree(source, target)).rejects.toThrow();
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('legacy import and export manifest metadata is read without rewriting original files', async () => {
+  const root=await mkdtemp(join(tmpdir(),'medclaw-eval-legacy-artifact-'));
+  try {
+    for(const kind of ['import','export'] as const) {
+      const source=join(root,kind),target=join(root,kind+'-evidence'),content='original content\n';await mkdir(source);
+      const files=[{path:'result.json',bytes:Buffer.byteLength(content)}];
+      const metadata=kind==='import'?{schema:'medclaw.artifact/import/v1',artifactId:9,operationRef:'operation',files}:null;
+      const manifest=metadata?{...metadata,sourceHash:'historical',metadataHash:'historical',sourceLockHash:'historical',files:files.map(file=>({...file,sha256:'historical'}))}
+        :{contract:'medclaw.export-manifest/v1',artifactId:9,originOperationRef:'operation',queryId:5,answerId:null,format:'json',exportVersion:'medclaw.export/v1',resultHash:'historical',metadataHash:'historical',files:files.map(file=>({...file,sha256:'historical'}))};
+      const original=JSON.stringify(manifest,null,2)+'\n';
+      await writeFile(join(source,'result.json'),content);await writeFile(join(source,'manifest.json'),original);
+      const copied=await copyEvidenceTree(source,target);
+      const artifact=metadata?{id:9,operationRef:'operation',status:'ready',format:'csv',mimeType:'application/x-directory',bytes:Buffer.byteLength(content),metadata}
+        :{id:9,operationRef:'operation',queryId:5,format:'json',relativePath:'artifacts/9',sizeBytes:Buffer.byteLength(content),publishedAt:null,registeredAt:'2026-10-12T00:00:00.000Z'};
+      await verifyCopiedArtifact(artifact as never,copied);await archiveArtifactFiles(copied);
+      expect(await readFile(join(target,'manifest.json'),'utf8')).toBe(original);
+      expect(copied.find(file=>file.relativePath==='manifest.json')!.content).toBe(original);
+      await expect(verifyCopiedArtifact({...artifact,operationRef:'other'} as never,copied)).rejects.toThrow('artifact_manifest_identity_mismatch');
+    }
+  } finally {await rm(root,{recursive:true,force:true});}
 });
 
 test('ENGINEERING transport waits for both delayed shutdown acknowledgement and actual process exit', async () => {

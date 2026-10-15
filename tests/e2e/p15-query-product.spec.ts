@@ -1,6 +1,5 @@
 import { expect, test } from '@playwright/test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
@@ -12,12 +11,11 @@ test('p15 actual desktop form, correction, evidence, history, activity and three
   test.setTimeout(180000);
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p15-desktop-')), dataRoot = join(root, 'product'), source = join(root, 'source'), output = join(root, 'deliveries');
   createStartupPackage(source); mkdirSync(output);
-  const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
   const nextCsv = readFileSync(join(source, 'zhejiang_2026-01-01.csv'), 'utf8').replaceAll('2026-01-01', '2026-01-02').replace('"100"', '"150"');
   writeFileSync(join(source, 'zhejiang_2026-01-02.csv'), nextCsv);
   const nextMetadata = JSON.parse(readFileSync(join(source, 'zhejiang_2026-01-01.metadata.json'), 'utf8'));
-  writeFileSync(join(source, 'zhejiang_2026-01-02.metadata.json'), JSON.stringify({ ...nextMetadata, snapshotDate: '2026-01-02', fileSha256: hash(nextCsv) }));
-  const files = readdirSync(source).filter(name => name !== 'manifest.json').sort().map(path => { const bytes = readFileSync(join(source, path)); return { path, bytes: bytes.length, sha256: hash(bytes) }; });
+  writeFileSync(join(source, 'zhejiang_2026-01-02.metadata.json'), JSON.stringify({ ...nextMetadata, snapshotDate: '2026-01-02' }));
+  const files = readdirSync(source).filter(name => name !== 'manifest.json').sort().map(path => { const bytes = readFileSync(join(source, path)); return { path, bytes: bytes.length }; });
   const businessBytes = Buffer.byteLength(nextCsv) + readFileSync(join(source, 'zhejiang_2026-01-01.csv')).length;
   writeFileSync(join(source, 'manifest.json'), JSON.stringify({ status: 'complete', files, businessFiles: 2, businessRows: 2, businessBytes, totalPayloadBytes: files.reduce((sum, file) => sum + file.bytes, 0) }));
   const mainObserver = join(root, 'destination-observer.cjs');

@@ -4,10 +4,11 @@ import { ReferenceDateSchema } from './model';
 
 export const RevisionSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 export const WorkspaceTargetIdSchema = z.string().max(16).regex(/^[1-9][0-9]*$/).refine(id => Number.isSafeInteger(Number(id)), 'Identity exceeds safe integer range');
-export const WorkspaceTargetVersionSchema = z.string().regex(/^[a-f0-9]{64}$/);
+export const WorkspaceTargetVersionSchema = z.string().min(1).max(512);
 const snapshotKey = z.string().regex(/^snapshot:[1-9][0-9]*$/).refine(key => WorkspaceTargetIdSchema.safeParse(key.slice(9)).success);
 const changeKey = z.string().regex(/^change:[1-9][0-9]*$/).refine(key => WorkspaceTargetIdSchema.safeParse(key.slice(7)).success);
-export const WorkspaceRowKeySchema = z.union([snapshotKey, changeKey, z.string().regex(/^row:[a-f0-9]{64}$/)]);
+export const WorkspaceRowKeySchema = z.union([snapshotKey, changeKey, z.string().regex(/^row:[1-9][0-9]*:[0-9]+$/)
+  .refine(key => key.slice(4).split(':').every(value => Number.isSafeInteger(Number(value))), 'Row identity exceeds safe integer range')]);
 const field = z.string().min(1).max(256).regex(/^[A-Za-z_][A-Za-z0-9_]*$/)
   .refine(value => !['__proto__', 'prototype', 'constructor'].includes(value), 'Unsafe object field').nullable();
 const selectionFields = { formatVersion: z.literal(1), targetId: WorkspaceTargetIdSchema, targetVersion: WorkspaceTargetVersionSchema, field };
@@ -22,7 +23,6 @@ export const WorkspaceNoticeSchema = z.strictObject({ code: z.literal('reference
 const distinctIds = z.array(PositiveIdSchema).refine(ids => new Set(ids).size === ids.length, 'Duplicate identities');
 export const BatchRefSchema = z.strictObject({
   id: PositiveIdSchema,
-  contentHash: z.string().min(1),
   snapshotDate: ReferenceDateSchema,
   scopeKey: z.string().min(1),
 });
@@ -61,13 +61,13 @@ export type WorkspaceSelection = z.infer<typeof WorkspaceSelectionSchema>;
 export type WorkspaceNotice = z.infer<typeof WorkspaceNoticeSchema>;
 export type WorkspaceChange = z.infer<typeof WorkspaceChangeSchema>;
 export type BatchRef = z.infer<typeof BatchRefSchema>;
-export type WorkspaceInspection = { state: WorkspaceState; candidate: WorkspaceState; artifactIds: number[]; notices: WorkspaceNotice[]; fingerprint: string };
+export type WorkspaceInspection = { state: WorkspaceState; candidate: WorkspaceState; artifactIds: number[]; notices: WorkspaceNotice[]; dependencies: unknown };
 export interface WorkspaceStore {
   readWorkspace(): WorkspaceState;
   updateWorkspace(change: WorkspaceChange, expectedRevision: number, time: string): WorkspaceState;
   inspectWorkspace(invalidArtifactIds?: readonly number[]): WorkspaceInspection;
-  commitWorkspaceRestore(expectedRevision: number, expectedFingerprint: string, candidate: WorkspaceState, time: string): WorkspaceState;
+  commitWorkspaceRestore(expectedRevision: number, expectedDependencies: unknown, candidate: WorkspaceState, time: string): WorkspaceState;
 }
 export type ManagedImportInspection = { status: 'valid' }
-  | { status: 'invalid'; reason: 'missing_record' | 'owner_mismatch' | 'hash_mismatch' | 'missing_managed_file' }
+  | { status: 'invalid'; reason: 'missing_record' | 'owner_mismatch' | 'content_mismatch' | 'missing_managed_file' }
   | { status: 'unavailable'; reason: 'root_unavailable' | 'temporary_io' | 'storage_unavailable' };

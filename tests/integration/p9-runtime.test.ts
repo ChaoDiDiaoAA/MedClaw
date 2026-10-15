@@ -49,17 +49,17 @@ test('p9 final Answer uses original frozen and committed Query references, and k
   expect(ids).not.toContain(saved.secondQueryId);expect(f.repo.isFinalSaved(f.input.runId,f.fact)).toBe(true);expect(f.requests).toHaveLength(1);
 });
 
-for(const defect of ['hash','params','evidence','source','session','scope','source_rows','source_metadata'] as const)test(`p9 invalid ${defect} Query reference rolls back final history, Answer, input and Run without removing prior Query`,async()=>{
+for(const defect of ['version','params','evidence','source','session','scope','source_rows','source_metadata'] as const)test(`p9 invalid ${defect} Query reference rolls back final history, Answer, input and Run without removing prior Query`,async()=>{
   const base=await setup(),native=base.agent.allocate();base.repo.createSession({expectedWorkspaceRevision:0},'reference-invalid',native.nativeSessionId,memoryAt,native.history);native.bind(1);
   const saved=seedWorkspaceQueries(base.db,base.repo);base.repo.updateWorkspace({queryId:saved.current.id},base.repo.readWorkspace().revision,memoryAt);
   const f=await stoppedAnswer(base);
   // Simulate externally corrupted saved data; production immutable triggers stay covered elsewhere.
-  if(['hash','params','session'].includes(defect))f.db.exec('DROP TRIGGER queries_update_immutable');
+  if(['version','params','session'].includes(defect))f.db.exec('DROP TRIGGER queries_update_immutable');
   if(['evidence','source_rows','source_metadata'].includes(defect))f.db.exec('DROP TRIGGER query_evidence_update_immutable');
   if(defect==='source'||defect==='session')f.db.exec('PRAGMA foreign_keys=OFF');
-  if(defect==='hash')f.db.query('UPDATE queries SET result_hash=? WHERE id=?').run('b'.repeat(64),saved.current.id);
-  if(defect==='params')f.db.query("UPDATE queries SET params_hash='bad' WHERE id=?").run(saved.current.id);
-  if(defect==='evidence')f.db.query('UPDATE query_evidence SET result_hash=? WHERE id=?').run('b'.repeat(64),saved.evidenceId);
+  if(defect==='version')f.db.query("UPDATE queries SET result_json=json_set(result_json,'$.calculationVersion',?) WHERE id=?").run('ENGINEERING-altered-version',saved.current.id);
+  if(defect==='params')f.db.query("UPDATE queries SET params_json=json_set(params_json,'$.region','ENGINEERING-altered') WHERE id=?").run(saved.current.id);
+  if(defect==='evidence')f.db.query('UPDATE query_evidence SET calculation_version=? WHERE id=?').run('ENGINEERING-altered-version',saved.evidenceId);
   if(defect==='source_rows')f.db.query("UPDATE query_evidence SET source_row_refs_json='[\"ENGINEERING foreign source\"]' WHERE id=?").run(saved.evidenceId);
   if(defect==='source_metadata')f.db.query("UPDATE query_evidence SET source_bundle_id='ENGINEERING foreign bundle' WHERE id=?").run(saved.evidenceId);
   if(defect==='source')f.db.query("UPDATE batches SET status='deleted',deleted_at=?,deletion_operation_ref='ENGINEERING-delete' WHERE id=1").run(memoryAt);
@@ -74,7 +74,7 @@ for(const defect of ['hash','params','evidence','source','session','scope','sour
 test('p9 actual SDK read of an old Query contributes only its saved and provider-verified reference to the final Answer',async()=>{
   const base=await setup({tools:true}),native=base.agent.allocate();base.repo.createSession({expectedWorkspaceRevision:0},'actual-read-session',native.nativeSessionId,memoryAt,native.history);native.bind(1);
   const saved=seedWorkspaceQueries(base.db,base.repo);base.readQuery(saved.current.id);const f=await stoppedAnswer(base);
-  expect(f.requests).toHaveLength(2);expect(JSON.stringify(f.requests[1])).toContain(saved.current.resultHash);
+  expect(f.requests).toHaveLength(2);expect(JSON.stringify(f.requests[1])).toContain(saved.current.calculationVersion);
   const receipt=f.db.query<{delivery_json:string},[]>('SELECT delivery_json FROM tool_calls').get()!;expect(JSON.parse(receipt.delivery_json)).toMatchObject({sdkReturned:true,consumptionEvidence:'provider_input_verified',nextModelCallId:f.fact.calls[1]!.callId});
   f.repo.updateWorkspace({queryId:saved.secondQueryId},f.repo.readWorkspace().revision,memoryAt);commitAnswer(f);
   expect(JSON.parse(f.db.query<{query_ids_json:string},[]>('SELECT query_ids_json FROM answers').get()!.query_ids_json)).toEqual([saved.current.id]);expect(f.repo.isFinalSaved(f.input.runId,f.fact)).toBe(true);expect(f.requests).toHaveLength(2);

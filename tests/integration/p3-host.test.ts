@@ -1,7 +1,6 @@
 import { expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, renameSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { HostController } from '../../apps/desktop/src/main/host-controller';
@@ -35,7 +34,7 @@ function singleDayPackage(root: string) {
   mkdirSync(root);
   const input = resolve('data/archive/agent-input-20261008-original');
   for (const name of ['entity-lineage.csv', 'source-lock.json', 'adjustment-lineage.csv', 'validation-report.json', 'selection-report.json', '使用说明.md', 'zhejiang_2026-01-01.csv', 'zhejiang_2026-01-01.metadata.json']) copyFileSync(join(input, name), join(root, name));
-  const files = readdirSync(root).sort().map(path => { const bytes = readFileSync(join(root, path)); return { path, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') }; });
+  const files = readdirSync(root).sort().map(path => { const bytes = readFileSync(join(root, path)); return { path, bytes: bytes.length }; });
   writeFileSync(join(root, 'manifest.json'), JSON.stringify({ status: 'complete', files, businessFiles: 1, businessRows: 813, businessBytes: files.find(file => file.path === 'zhejiang_2026-01-01.csv')!.bytes, totalPayloadBytes: files.reduce((sum, file) => sum + file.bytes, 0) }));
 }
 async function setup(holdFinal = false, configuration: ToolConfiguration = structuredClone(TOOL_CONFIG)) {
@@ -83,7 +82,7 @@ test('P3 production Host imports through Main tokens, freezes trusted scope and 
   const f = await setup(); try {
     const { preview, fileToken } = await f.preview('import-1'); expect(preview).toMatchObject({ canCommit: true, rowCount: 813, entityCount: 813, batchCount: 1 });
     const before = await f.workspace(); expect(before.batchRefs).toEqual([]);
-    const result = ImportOperationSchema.parse(unwrap(await f.host.request('import.commit', { operationRef: 'import-1', previewHash: preview.previewHash, fileToken }, 'import-1')));
+    const result = ImportOperationSchema.parse(unwrap(await f.host.request('import.commit', { operationRef: 'import-1', fileToken }, 'import-1')));
     expect(result.state).toBe('imported'); expect(result.result?.acceptedRows).toBe(813);
     expect((await f.workspace()).batchRefs).toEqual([]); expect(f.requests).toHaveLength(0);
     const session = NewSessionResultSchema.parse(unwrap(await f.host.request('session.create', { expectedWorkspaceRevision: (await f.workspace()).revision }, 'new-session')));
@@ -135,7 +134,7 @@ test('form Query owns a new Run while native Steer Follow Up retain their origin
   const configuration = structuredClone(TOOL_CONFIG);
   const f = await setup(true, configuration); try {
     const { preview, fileToken } = await f.preview('import');
-    const imported = ImportOperationSchema.parse(unwrap(await f.host.request('import.commit', { operationRef: 'import', previewHash: preview.previewHash, fileToken }, 'import')));
+    const imported = ImportOperationSchema.parse(unwrap(await f.host.request('import.commit', { operationRef: 'import', fileToken }, 'import')));
     const session = NewSessionResultSchema.parse(unwrap(await f.host.request('session.create', { expectedWorkspaceRevision: (await f.workspace()).revision }, 'session-a')));
     const selected = WorkspaceViewSchema.parse(unwrap(await f.host.request('workspace.update', { expectedRevision: (await f.workspace()).revision, change: { batchIds: imported.result!.batchIds } })));
     const params = QueryParamsSchema.parse({ kind: 'aggregate', population: 'snapshot', snapshotMode: 'exact_date', batchIds: [1], metric: 'count' });
@@ -164,9 +163,9 @@ test('form Query owns a new Run while native Steer Follow Up retain their origin
     const savedEvidence = new Database(f.host.paths.databasePath);
     try {
       savedEvidence.query(`INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,
-        calculation_version,material_version,source_bundle_id,source_lock_hash,result_hash,filters_json,provenance)
+        calculation_version,material_version,source_bundle_id,filters_json,provenance)
         SELECT query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,
-        calculation_version,material_version,source_bundle_id,source_lock_hash,result_hash,filters_json,provenance
+        calculation_version,material_version,source_bundle_id,filters_json,provenance
         FROM query_evidence WHERE query_id=? LIMIT 1`).run(manual.query.id);
     } finally { savedEvidence.close(); }
     expect(await f.host.request('session.submit',request,'manual-query')).toMatchObject({ok:true,data:form});
@@ -209,7 +208,7 @@ test('form Query owns a new Run while native Steer Follow Up retain their origin
     console.info(JSON.stringify({ evidence: 'P3/P15 actual Host', runId: accepted.runId, rootInputId: accepted.inputId, formRunId:form.runId, inputEntries: users.map(item => ({ inputId: item.inputId, nativeEntryId: item.nativeEntryId })), httpRequests: settledRequestCount, modelCalls: 4, queries: 2, answers: 2, frozenConfigVersion: frozen.model.configVersion, publishedConfigVersion: f.publisher.read().configVersion }));
     expect(await f.host.request('session.submit',request,'manual-query')).toMatchObject({ok:true,data:form});
     expect(await f.host.request('session.submit', { ...request, expectedRevision: selected.revision + 1 }, 'manual-query')).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
-    expect(QueryViewSchema.parse(unwrap(await f.host.request('query.read', { queryId: manual.query.id }))).query.resultHash).toBe(manual.query.resultHash);
+    expect(QueryViewSchema.parse(unwrap(await f.host.request('query.read', { queryId: manual.query.id }))).query.id).toBe(manual.query.id);
     const next = NewSessionResultSchema.parse(unwrap(await f.host.request('session.create', { expectedWorkspaceRevision: (await f.workspace()).revision }, 'session-b')));
     expect(next.workspace.queryId).toBeNull();
     expect(QueryViewSchema.parse(unwrap(await f.host.request('query.read', { queryId: manual.query.id }))).query).toEqual(manual.query);

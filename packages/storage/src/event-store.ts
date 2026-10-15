@@ -1,7 +1,6 @@
 import type { Database } from 'bun:sqlite';
 import { isDeepStrictEqual } from 'node:util';
-import { createHash } from 'node:crypto';
-import { canonicalRequest } from '../../contracts/src/run';
+import { legacyEventPayload } from './legacy-business-fields';
 import { RegisteredEventDraftSchema, StoredRunEventSchema, EVENT_LIMITS, type EventStore, type RegisteredEventDraft, type StoredRunEvent, type EventRange } from '../../contracts/src/event';
 import { safeError } from '../../contracts/src/error';
 import { SqliteWriteTransactions } from './write-transactions';
@@ -9,7 +8,7 @@ type Row={id:number;run_id:number;session_id:number;sequence:number;type:string;
 function fail(code:'storage_write_failed'|'storage_read_failed'|'state_conflict'):never{throw Object.assign(new Error(code),{appError:safeError(code)});}
 export class SqliteEventStore implements EventStore {
  constructor(private readonly db:Database,private readonly transactions=SqliteWriteTransactions.forDatabase(db)){}
- private project(row:Row):StoredRunEvent {try{return StoredRunEventSchema.parse({eventId:row.id,runId:row.run_id,sessionId:row.session_id,sequence:row.sequence,type:row.type,source:row.source,sourceConnection:row.source_connection,sourceSequence:row.source_sequence,toolCallId:row.tool_call_id,payload:JSON.parse(row.payload_json),occurredAt:row.occurred_at,receivedAt:row.received_at});}catch{fail('storage_read_failed');}}
+ private project(row:Row):StoredRunEvent {try{return StoredRunEventSchema.parse({eventId:row.id,runId:row.run_id,sessionId:row.session_id,sequence:row.sequence,type:row.type,source:row.source,sourceConnection:row.source_connection,sourceSequence:row.source_sequence,toolCallId:row.tool_call_id,payload:legacyEventPayload(JSON.parse(row.payload_json)),occurredAt:row.occurred_at,receivedAt:row.received_at});}catch{fail('storage_read_failed');}}
  private owner(draft:RegisteredEventDraft,code:'storage_write_failed'|'storage_read_failed') {
   const identity=this.readRunIdentity(draft.runId);if(!identity||identity.sessionId!==draft.sessionId)fail(code);
   const owned=(table:string,id:number)=>!!this.db.query(`SELECT id FROM ${table} WHERE id=? AND run_id=? AND session_id=?`).get(id,draft.runId,draft.sessionId);
@@ -56,8 +55,7 @@ export class SqliteEventStore implements EventStore {
    const route=this.db.query<{input_id:number;call_id:string|null;route:string;decision_source:string;matched_by:string|null;business_status:string|null;query_params_json:string|null;created_at:string},[number,number,number]>(`SELECT d.*,m.call_id FROM route_decisions d
      LEFT JOIN intent_calls i ON i.id=d.intent_call_id LEFT JOIN model_calls m ON m.id=i.model_call_id WHERE d.id=? AND d.run_id=? AND d.session_id=?`).get(payload.decisionId,draft.runId,draft.sessionId);
    if(!route||route.input_id!==payload.inputId||route.call_id!==payload.intentCallId||route.route!==payload.route||route.decision_source!==payload.decisionSource
-     ||route.matched_by!==payload.matchedBy||route.business_status!==payload.status||route.created_at!==draft.occurredAt
-     ||(route.query_params_json===null?null:createHash('sha256').update(canonicalRequest(JSON.parse(route.query_params_json))).digest('hex'))!==payload.queryParamsHash)fail(code);
+     ||route.matched_by!==payload.matchedBy||route.business_status!==payload.status||route.created_at!==draft.occurredAt)fail(code);
   }
   if('answerId' in p&&p.answerId!==null&&!owned('answers',p.answerId))fail(code);
   if('queryId' in p&&!owned('queries',p.queryId))fail(code);

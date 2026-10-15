@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { AppErrorSchema, safeError } from '../../../contracts/src/error';
 import { IntentInputProjectionSchema, IntentStageInputSchema, IntentValidationSchema, INTENT_STAGE_INPUT_BYTES, type IntentInputProjection,
   type IntentModelClient, type IntentStore, type IntentCallCompletion, type IntentHttpObservation,
@@ -18,7 +18,6 @@ import { INTENT_CAPABILITIES } from './taxonomy';
 export type IntentExecution = { signal: AbortSignal; checkActive: () => void; control: RunControl;
   workspaceContext: WorkspaceContext; expectedCancelEpoch: number; admission?: FrozenIntentAdmission; inheritedSnapshotMode?:'exact_date'|'as_of'|null };
 const now = () => new Date().toISOString();
-const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 function stageInput(value: IntentStageInput): IntentStageInput {
   if(new TextEncoder().encode(JSON.stringify(value)).byteLength>INTENT_STAGE_INPUT_BYTES)throw safeError('intent_input_too_large');
   return IntentStageInputSchema.parse(value);
@@ -40,7 +39,6 @@ export class IntentService {
   readFreshness(item:import('../../../contracts/src/intent').IntentItem,context:import('../../../contracts/src/query').QueryContext) {return this.validator.readFreshness(item,context);}
   freeze(selection: IntentModelSelection, baseLeafId: string | null, baseStorageVersion: number): FrozenIntentAdmission {
     const frozen = FrozenIntentAdmissionSchema.parse({ contract: 'medclaw.intent-admission/v1', selection, baseLeafId, baseStorageVersion, prompts: this.client.prompts });
-    for(const prompt of Object.values(frozen.prompts))if(hash(prompt.text)!==prompt.hash)throw safeError('state_conflict');
     return frozen;
   }
   prepareInput(runId: number) {
@@ -98,7 +96,6 @@ export class IntentService {
         const inspection = await this.client.inspect(configuration, signal);
         active();
         if (!inspection.available) throw inspection.error ?? safeError('intent_model_unavailable');
-        if (inspection.actualDigest !== selection.modelDigest) throw safeError('intent_model_identity_mismatch');
         const snapshot = await this.contexts.prepareIntent({ runId: input.runId, sessionId: input.sessionId, inputId: input.inputId,
           baseLeafId: input.baseLeafId, baseStorageVersion: input.baseStorageVersion, workspaceContext, scope: input.scope,
           nativeRefs: [], projection, createdAt: now() });
@@ -139,7 +136,7 @@ export class IntentService {
       const first = await stage(stageInput({ input:modelInput, stage: 'classify', review: null }));
       active();
       const adopted = first.validation.reviewRequired ? await stage(stageInput({ input:modelInput, stage: 'verify', review: {
-        previousCallId: first.callId, prediction: first.prediction, rawHash: hash(first.outcome.rawOutput ?? ''),
+        previousCallId: first.callId, prediction: first.prediction,
         rawPreview: (first.outcome.rawOutput ?? '').slice(0, 4096), issues: first.validation.issues, candidates: first.candidates,
         mode: first.candidates.length ? 'candidate_selection' : 'semantic_correction' } })) : first;
       active();

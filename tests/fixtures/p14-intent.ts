@@ -20,12 +20,12 @@ export const resolvedIntent = () => ({
 
 export const disabledIntentModel = () => ({
   contract: 'medclaw.intent-model/v2', enabled: false, baseUrl: 'http://127.0.0.1:11434',
-  modelTag: 'qwen3.5:0.8b', modelDigest: null,
+  modelTag: 'qwen3.5:0.8b',
   sourceUrl: 'https://ollama.com/library/qwen3.5:0.8b', verifiedEvidenceRef: null, timeoutMs: 15000,
 });
 
 export const intentRuleFact = () => ({
-  ruleVersion: 'medclaw.intent-rules/v1' as const, ruleId: 'product.exact', inputHash: 'a'.repeat(64),
+  ruleVersion: 'medclaw.intent-rules/v1' as const, ruleId: 'product.exact',
   outcome: 'hit' as const, reasonCode: 'complete_match', checkedAt: '2026-10-10T03:00:00.000Z',
 });
 
@@ -40,7 +40,7 @@ export const intentInput = () => ({
   contract: 'medclaw.intent-input/v2', sessionId: 1, inputId: 2, runId: 3, baseLeafId: null, baseStorageVersion: 0,
   text: 'ENGINEERING intent task', referenceDate: '2026-10-10', timezone: 'Asia/Shanghai',
   scope: { batchIds: [], deviceIds: null, allowedToolNames: [], allowedResourceRefs: [], artifactIds: [], readOnly: true },
-  scopeBatchHashes: [], previousQueryContext: null, pendingClarification: null, recentTurns: [], selectedEntities: [],
+   previousQueryContext: null, pendingClarification: null, recentTurns: [], selectedEntities: [],
   availableData: { regions: [], dates: [], currencies: [], units: [] }, enabledL2: [], availableToolNames: [],
   versions: { configVersion: '1', taxonomyVersion: 'medclaw.intent-taxonomy/v1', ruleVersion: 'medclaw.intent-rules/v1',
     classifyPromptVersion: 'medclaw.intent-classify-prompt/v1', verifyPromptVersion: 'medclaw.intent-verify-prompt/v1',
@@ -48,10 +48,10 @@ export const intentInput = () => ({
 });
 
 export function intentCatalogData() {
-  const sourceRefs = [{ sourceId: 'ENGINEERING', file: 'fixture.csv', recordId: '1', row: 1, sha256: 'a'.repeat(64) }];
+  const sourceRefs = [{ sourceId: 'ENGINEERING', file: 'fixture.csv', recordId: '1', row: 1}];
   const batches = [1, 2, 3].map(id => ({ id, scopeKey: 'ENGINEERING-zhejiang', snapshotDate: `2026-10-${String(id + 7).padStart(2, '0')}`,
     region: '浙江', coverage: 'full', previousBatchId: id === 1 ? null : id - 1, materialVersion: 'ENGINEERING/v1',
-    sourceBundleId: 'ENGINEERING', sourceLockHash: 'a'.repeat(64), contentHash: String(id).repeat(64), cohortHash: 'b'.repeat(64),
+    sourceBundleId: 'ENGINEERING',
     catalogRevision: 1, expectedEntityCount: 2, observedEntityCount: 2, declaredMissingDeviceIds: [] }));
   const devices = [1, 2].map(id => ({ id, sourceDeviceId: String(id), sourceBundleId: 'ENGINEERING',
     sourceSubmissionId: `submission-${id}`, sourceApplicant: '申报来源，不能作为厂家', sourceRefs }));

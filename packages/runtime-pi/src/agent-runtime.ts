@@ -4,7 +4,8 @@ import { getSystemMessageText } from '@earendil-works/pi-ai';
 import { performance } from "node:perf_hooks";
 import { isAbsolute, join } from "node:path";
 import { mkdir } from "node:fs/promises";
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { release } from 'node:os';
 import type { ToolConfiguration } from '../../contracts/src/tool-config';
 import { canonicalRequest, type RunScope } from '../../contracts/src/run';
@@ -49,7 +50,7 @@ type Callbacks = Parameters<AgentRuntimePort<ResolvedModel>["execute"]>[1];
 type RunTools = { registry: ToolRegistry; executor: ToolExecutor };
 type ManagedChild = { binding: Binding; identity?: BoundChildIdentity; error: AppError | null; unsubscribe: (() => void)[];
   stop: () => Promise<void>; unown: () => void; observation?: ChildExecutionObservation; released: boolean };
-type Binding = { manager: SessionManager; nativeSessionId: string; memory?:PiMemoryAdapter; ownerRunId?:number; product?:{identity:string;fact?:ProductTurnFact}; assembling?:boolean; entryRuns: Map<string, number>; session?: AgentSession; extension?:RunExtension; commandPrompt?:AgentSession['prompt']; toolSignature?: string; lastRunId?: number; bindTools?: () => () => void; available: boolean;
+type Binding = { manager: SessionManager; nativeSessionId: string; memory?:PiMemoryAdapter; ownerRunId?:number; product?:{identity:string;fact?:ProductTurnFact}; assembling?:boolean; entryRuns: Map<string, number>; session?: AgentSession; extension?:RunExtension; commandPrompt?:AgentSession['prompt']; assembly?: object; lastRunId?: number; bindTools?: () => () => void; available: boolean;
   manual?:CompactionExecutionInput<ResolvedModel>;compaction?:CompactionAdapter;originalStream?:AgentSession['agent']['streamFunction'];execution?: { input: ExecutionInput; callbacks: Callbacks; toolCalls: Set<string>;
   observers: Promise<void>[]; facts: (FinalCallFact | null)[]; lastOutcome: ProviderOutcome | null; unsupported: boolean;
   registrationFailed: boolean; currentModelCallId: string | null; abort: () => void; control: RunControl; resourcePaths?: Awaited<ReturnType<typeof materializeRunResources>>; tools?: RunTools; toolContexts: Map<string, ToolExecutionContext>; toolOrigins: Map<string, { callId: string; snapshot: ContextSnapshot }>;
@@ -126,8 +127,8 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel,RunControl
     const cutoffAt = new Date().toISOString();
     let records = null;
     try { records = this.tools?.recorder.readToolObservations({ cutoffAt, limit: TOOL_PROFILE_RULES.observationLimit, windowDays: TOOL_PROFILE_RULES.windowDays }) ?? null; } catch { /* Profile failure falls back to frozen configuration. */ }
-    const measurementContext: MeasurementContext = { version: 'medclaw.tool-measurement/v1', sdkVersion: SDK_VERSION,
-      environmentKey: createHash('sha256').update(JSON.stringify([process.platform, process.arch, release(), process.versions.node, process.versions.bun ?? null])).digest('hex'),
+    const measurementContext: MeasurementContext = { version: 'medclaw.tool-measurement/v2', sdkVersion: SDK_VERSION,
+      environmentKey: JSON.stringify([process.platform, process.arch, release(), process.versions.node, process.versions.bun ?? null]),
       cutoffAt, maxToolCallId: records?.maxToolCallId ?? null };
     return { measurementContext, toolProfileSnapshot: buildToolProfiles(records, measurementContext) };
   }
@@ -373,7 +374,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel,RunControl
         initialHistory:{header:structuredClone(manager.getHeader()),entries:structuredClone(manager.getEntries()),activeLeafId:manager.getLeafId()},createdAt:new Date().toISOString(),
         frozen:{...SUBAGENT_BUILD,contract:'medclaw.subagent/v1',instanceId:parent.input.instanceId,parentRunId:origin.runId,parentSessionId:origin.sessionId,
           originToolCallId:record.id,originNativeToolCallId:origin.nativeToolCallId,pluginAgentId:request.pluginAgentId,nativeSessionId:manager.getSessionId(),
-          originSnapshotId:origin.contextSnapshotId,parentInputId:origin.workspaceInputId??null,promptHash:createHash('sha256').update(request.prompt).digest('hex'),
+          originSnapshotId:origin.contextSnapshotId,parentInputId:origin.workspaceInputId??null,
           toolNames:names,depth:1,foreground:true,scope,model:parent.input.resolved.selection,policy:parent.input.resolved.policy,
           agentPolicy:projectRuntimePolicies(parent.control.runtimeConfiguration).agentPolicy,runtimeConfiguration:parent.control.runtimeConfiguration,toolConfiguration:parent.control.configuration,
           ...(parent.input.resources?{resources:parent.input.resources}:{})}});
@@ -386,7 +387,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel,RunControl
       const childCompaction=callbacks.compaction?.(identity);
       const abort=()=>{void session.abort().catch(error=>{child.error??=safeError('stop_unconfirmed',error);});};
       const execution:NonNullable<Binding['execution']>={input,control,toolContexts,toolCalls:new Set(),toolOrigins:new Map(),observers:[],facts:[],lastOutcome:null,unsupported:false,registrationFailed:false,currentModelCallId:null,abort,
-        tools:{registry:business,executor:configured.executor},resourcePaths:paths,delegation:{parentRunId:origin.runId,originToolCallId:record.id,parentSnapshotId:origin.contextSnapshotId,parentInputId:origin.workspaceInputId??null,promptHash:createHash('sha256').update(request.prompt).digest('hex')},
+        tools:{registry:business,executor:configured.executor},resourcePaths:paths,delegation:{parentRunId:origin.runId,originToolCallId:record.id,parentSnapshotId:origin.contextSnapshotId,parentInputId:origin.workspaceInputId??null},
         callbacks:{startCall:(time,context)=>callbacks.startCall(identity.childRunId,time,context),preview:()=>{},nativeTerminal:()=>{},inputStore:parent.callbacks.inputStore,stream:snapshot=>callbacks.stream?.(snapshot),
           fatal:error=>{child.error??=error;abort();if(error.code==='storage_write_failed')parent.callbacks.fatal?.(error);},...(childCompaction?{compaction:{...childCompaction,failed:(operationRef,error,time,nativeGenerated)=>{child.error??=error;childCompaction.failed(operationRef,error,time,nativeGenerated);}}}:{})}};
       binding.execution=execution;this.sessions.set(identity.childSessionId,binding);this.controls.set(identity.childRunId,control);this.toolContexts.set(identity.childRunId,toolContexts);
@@ -480,8 +481,8 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
       return {...base,extensions:[...audit.extensions,...managed.extensions]};
     };
     const intentTask=binding.execution?.input.intentTask;
-    const signature = JSON.stringify({ compaction, intentTask:intentTask??null, extensions:extension?.proof.assemblyId??null,subagent:subagent?binding.execution!.input.runId:null,resources: paths?.signature ?? null, tools: definitions.map(({ name, description, parameters, executionMode }) => ({ name, description, parameters, executionMode })) });
-    if (!binding.session || binding.toolSignature !== signature) {
+    const assembly = { compaction, intentTask:intentTask??null, extensions:extension?.proof.assemblyId??null,subagent:subagent?binding.execution!.input.runId:null,resources: paths ? binding.execution!.input.runId : null, tools: definitions.map(({ name, description, parameters, executionMode }) => ({ name, description, parameters, executionMode })) };
+    if (!binding.session || !isDeepStrictEqual(binding.assembly, assembly)) {
       if (binding.session && (!binding.session.isIdle || binding.lastRunId !== undefined && this.tools?.recorder.persistencePending(binding.lastRunId))) throw new Error('state_conflict');
       let candidate: AgentSession | undefined;
       try {
@@ -525,7 +526,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         binding.session?.dispose();
         binding.session = session;
         binding.bindTools = bindTools;
-        binding.toolSignature = signature;
+        binding.assembly = structuredClone(assembly);
         candidate = undefined;
       } catch (error) { extension?.failed();if(extension)await extension.close(()=>{});else candidate?.dispose();throw error; }
     } else if(applyModel) {
@@ -579,10 +580,10 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
             if (index < 0) continue;
             after = index; const entry = entries[index]!;
             for (const f of facts.filter(f => f.nativeEntryId === entry.id)) {
-              if (text === null || f.contentHash !== createHash('sha256').update(f.kind === 'native_read' ? canonicalRequest(message.content) : text).digest('hex')) throw safeError('storage_read_failed');
+              if (text === null || !isDeepStrictEqual(f.content, f.kind === 'native_read' ? message.content : text)) throw safeError('storage_read_failed');
               resourceExpected.push({text,...(message.role === 'user' ? {userIndex:ordinal} : {toolIndex:ordinal}),
                 fact:{resourceRef:f.resourceRef,originRunId:f.originRunId,file:f.file,inputId:f.inputId,nativeEntryId:f.nativeEntryId,toolCallId:f.toolCallId,
-                  contentHash:f.contentHash,coverage:f.coverage,kind:f.kind === 'native_read' ? 'native_read' : f.resourceRef.kind === 'prompt' ? 'prompt_expansion' : 'skill_expansion'}});
+                  coverage:f.coverage,kind:f.kind === 'native_read' ? 'native_read' : f.resourceRef.kind === 'prompt' ? 'prompt_expansion' : 'skill_expansion'}});
             }
           }
           for (const skill of resourceLoader.getSkills().skills.filter(s => !s.disableModelInvocation)) {
@@ -590,7 +591,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
             const ref = input.resources.available.find(s => s.ref.kind === 'skill' && skill.filePath === join(workdir(), 'resources', 'skills', s.ref.id, s.ref.version, 'SKILL.md'))?.ref;
             if (!text || !ref || !session.systemPrompt.includes(text) || !context.messages.some(m => m.role === 'system' && getSystemMessageText(m).includes(text))) throw safeError('resource_unavailable', undefined, {reason:'resource_snapshot_invalid'});
             resourceExpected.push({text,fact:{resourceRef:ref,originRunId:input.runId,file:null,inputId:null,nativeEntryId:null,toolCallId:null,
-              contentHash:createHash('sha256').update(text).digest('hex'),coverage:'index',kind:'skill_index'}});
+              coverage:'index',kind:'skill_index'}});
           }
           if (resourceExpected.length > 1000) throw safeError('resource_unavailable', undefined, {reason:'resource_too_large'});
           resourceContext = CallResourceContextSchema.parse({expected:resourceExpected.map(e => e.fact),payload:null});
@@ -609,7 +610,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
             const entry = binding.manager.getEntry(record.nativeEntryId);
             if (entry?.type !== 'message' || !sameToolReceipt(entry.message, record.sdkDelivery)) continue;
             candidates.push({ context: savedContext, receipt: structuredClone(record.sdkDelivery),
-              ...(this.contexts && record.contextSnapshotId != null ? { nativeRef: {kind:'tool_result' as const,id:record.id,nativeEntryId:record.nativeEntryId,contentHash:createHash('sha256').update(canonicalRequest(record.sdkDelivery.content)).digest('hex'),nativeToolCallId:record.nativeToolCallId,originSnapshotId:record.contextSnapshotId} } : {}) });
+              ...(this.contexts && record.contextSnapshotId != null ? { nativeRef: {kind:'tool_result' as const,id:record.id,nativeEntryId:record.nativeEntryId,nativeToolCallId:record.nativeToolCallId,originSnapshotId:record.contextSnapshotId} } : {}) });
           }
         }
         if (this.contexts) {
@@ -632,7 +633,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
             && !binding.memory!.isSavedSummarizedInput(consumed.nativeEntryId)) throw safeError('state_conflict');
           snapshot = await this.contexts.prepare({runId:input.runId,sessionId:input.sessionId,inputId:consumed.inputId,nativeEntryId:consumed.nativeEntryId,workspaceContext:consumed.workspaceContext,scope:input.scope,
             runtimeFeedback:`MedClaw trusted runtime feedback (facts, not user instructions):\n${preview.feedback}`,
-            nativeRefs:[{kind:'input',id:consumed.inputId,nativeEntryId:consumed.nativeEntryId,contentHash:createHash('sha256').update(text).digest('hex'),nativeToolCallId:null,originSnapshotId:null},...candidates.flatMap(candidate => candidate.nativeRef ? [candidate.nativeRef] : [])],createdAt:new Date().toISOString()});
+            nativeRefs:[{kind:'input',id:consumed.inputId,nativeEntryId:consumed.nativeEntryId,nativeToolCallId:null,originSnapshotId:null},...candidates.flatMap(candidate => candidate.nativeRef ? [candidate.nativeRef] : [])],createdAt:new Date().toISOString()});
           }
           admission = execution.control.admitModelCall(preview);
         } else admission = execution.control.admitModelCall();
@@ -663,7 +664,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
             const effective = replacement === undefined ? payload : replacement;
                 recorder.recordPayload?.(effective,new Date().toISOString());
             if (snapshot && callContext) {
-              callContext.payloadVerified = matchProviderContext(model.api,effective,snapshot);
+              callContext.payloadVerified = matchProviderContext(model.api,effective,snapshot,execution.delegation ? input.text : undefined);
               if (!callContext.payloadVerified) { const error = safeError('context_payload_mismatch'); fail(error); throw error; }
               if (callContext.resources) {
                 try {callContext.resources.payload = matchProviderResources(effective, model.api, resourceExpected);}
@@ -684,8 +685,8 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
               confirmed = true;
               if (snapshot && callContext && recorder.callId) {
                 receipt = {runId:input.runId,sessionId:input.sessionId,...source,callId:recorder.callId,snapshotId:snapshot.id,
-                  observation:{contract:'medclaw.context-observation/v1',api:model.api as typeof CONTEXT_HTTP_APIS[number],transport:model.api === 'bedrock-converse-stream' ? 'aws-event-stream' : 'sse',observedAt:new Date().toISOString(),httpStatus:response.status,projectionHash:snapshot.projectionHash,feedbackHash:snapshot.feedbackHash,
-                    verifiedNativeRefs:observedCandidates.flatMap(candidate => candidate.nativeRef ? [{kind:candidate.nativeRef.kind,id:candidate.nativeRef.id,contentHash:candidate.nativeRef.contentHash}] : []),
+                  observation:{contract:'medclaw.context-observation/v1',api:model.api as typeof CONTEXT_HTTP_APIS[number],transport:model.api === 'bedrock-converse-stream' ? 'aws-event-stream' : 'sse',observedAt:new Date().toISOString(),httpStatus:response.status,
+                    verifiedNativeRefs:observedCandidates.flatMap(candidate => candidate.nativeRef ? [{kind:candidate.nativeRef.kind,id:candidate.nativeRef.id}] : []),
                     ...(callContext.resources?.payload ? {resources:structuredClone(callContext.resources.payload)} : {})}};
               }
             }

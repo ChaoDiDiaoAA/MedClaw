@@ -15,7 +15,7 @@ async function correctionFixture(mode: 'corrected' | 'still_wrong' | 'cancel' | 
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     const path = new URL(request.url).pathname;
     if (path === '/api/version') return Response.json({ version: 'ENGINEERING' });
-    if (path === '/api/tags') return Response.json({ models: [{ name: 'qwen3.5:0.8b', digest: 'a'.repeat(64) }] });
+    if (path === '/api/tags') return Response.json({ models: [{ name: 'qwen3.5:0.8b' }] });
     if (path === '/api/show') return Response.json({ details: { family: 'qwen35', parameter_size: '752.39M', quantization_level: 'Q8_0' } });
     if (path !== '/api/chat') return new Response('Unexpected endpoint', { status: 404 });
     const body = await request.json() as { messages: { content: string }[] };
@@ -29,7 +29,7 @@ async function correctionFixture(mode: 'corrected' | 'still_wrong' | 'cancel' | 
   } });
   f = await agentRuntimeFixture(undefined, false, undefined, { client: new OllamaIntentClient({ classify: CLASSIFY_PROMPT, verify: VERIFY_PROMPT }),
     configuration: IntentModelConfigurationSchema.parse({ ...disabledIntentModel(), enabled: true, baseUrl: `http://127.0.0.1:${server.port}`,
-      modelDigest: 'sha256:' + 'a'.repeat(64), verifiedEvidenceRef: 'ENGINEERING', timeoutMs: 60000 }) });
+      verifiedEvidenceRef: 'ENGINEERING', timeoutMs: 60000 }) });
   seedWorkspaceQueries(f.db, f.repos);
   f.db.query('UPDATE runs SET cleanup_json=? WHERE id=10').run(JSON.stringify({ contract: 'medclaw.run-cleanup/v1', executionStarted: false, stopConfirmed: true,
     requiredPersistenceComplete: true, inputsSettled: true, resourcesReleased: true, unconfirmedItems: [], secondaryErrors: [], verifiedAt: '2026-10-04T00:00:00.000Z' }));

@@ -1,5 +1,4 @@
 import type { Database } from 'bun:sqlite';
-import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { PositiveIdSchema, TimestampSchema, safeError } from '../../contracts/src/error';
@@ -22,15 +21,20 @@ import { SqliteCatalogStore } from './catalog-store';
 import { SqliteToolStore } from './tool-store';
 import { readWorkspaceBatchReferences } from './workspace-selection';
 
-const hash = (text: string) => createHash('sha256').update(text).digest('hex');
+import { legacyContextBody, legacyInputContent, legacyIntentAdmission, legacyIntentStage, legacyIntentExecution, legacyModelCallContext, legacyModelSelection, legacyQueryContext, legacyRunScope, legacyEventPayload, omitLegacyFields, readLegacyIntentContext } from './legacy-business-fields';
 const json = (value: unknown) => value == null ? null : JSON.stringify(value);
 function fail(code: string): never { throw new Error(code); }
 function checked<T>(schema: z.ZodType<T>, value: unknown, code = 'storage_read_failed'): T {
   const parsed = schema.safeParse(value); return parsed.success ? parsed.data : fail(code);
 }
+function legacyMetadata(value: unknown): unknown {
+  const model=omitLegacyFields(value,['completionHash']) as Record<string,unknown>|null;
+  if(model===null||typeof model!=='object'||Array.isArray(model))return model;
+  return {...model,selection:legacyModelSelection(model.selection),context:legacyModelCallContext(model.context)};
+}
 function decoded(value: string | null): unknown { try { return value === null ? null : JSON.parse(value); } catch { fail('storage_read_failed'); } }
 const metadataSchema = z.strictObject({ selection: IntentModelSelectionSchema, responseModel: z.string().nullable(), sdkStopReason: z.null(),
-  context: ModelCallContextSchema, completionHash: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
+  context: ModelCallContextSchema,
   http: IntentHttpOutcomeSchema.omit({ rawOutput: true, observation: true }).nullable() });
 type RunRow = { id: number; session_id: number; input_id: number; input_text: string; kind: string; parent_run_id: number | null; status: string;
   cancel_requested_at: string | null; reference_date: string; timezone: string; scope_json: string; config_json:string; cleanup_json: string | null };
@@ -59,7 +63,7 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
   }
   readContextProjection(cached:Record<string,unknown>):QueryContextRecord {
     const common={sessionId:cached.session_id,nativeLeafId:cached.native_leaf_id,version:cached.version,sourceRunId:cached.source_run_id,
-      sourceInputId:cached.source_input_id,scopeBatchHashes:decoded(cached.scope_batch_hashes_json as string),queryIds:decoded(cached.query_ids_json as string),
+      sourceInputId:cached.source_input_id,queryIds:decoded(cached.query_ids_json as string),
       pendingClarification:decoded(cached.pending_clarification_json as string|null)};
     if(cached.schema_version==='medclaw.query-form/v1'){
       const route=this.route(cached.source_run_id as number);
@@ -86,7 +90,7 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
       toolCallId: null, occurredAt: at, receivedAt: at });
   }
   private registration(row: CallRow): IntentCallRegistration {
-    const model = checked(metadataSchema, decoded(row.model_json)), input = checked(IntentStageInputSchema, decoded(row.input_projection_json));
+    const model = checked(metadataSchema, legacyMetadata(decoded(row.model_json))), input = checked(IntentStageInputSchema, legacyIntentStage(decoded(row.input_projection_json)));
     const previous = row.previous_call_id === null ? null : this.db.query<{ call_id: string }, [number]>('SELECT m.call_id FROM intent_calls i JOIN model_calls m ON m.id=i.model_call_id WHERE i.id=?').get(row.previous_call_id);
     const registration = checked(IntentCallRegistrationSchema, { callId: row.call_id, runId: row.run_id, sessionId: row.session_id,
       inputId: row.input_id, snapshotId: row.snapshot_id, selection: model.selection, input, stage: row.stage,
@@ -106,16 +110,15 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
         || this.db.query('SELECT id FROM intent_calls WHERE run_id=? AND stage=?').get(run.id, input.stage)
         || this.db.query('SELECT id FROM route_decisions WHERE run_id=?').get(run.id)) fail('state_conflict');
       const accepted = this.db.query<{ content_json: string }, [number]>('SELECT content_json FROM session_inputs WHERE id=?').get(input.inputId)!;
-      const content = checked(InputContentSchema, decoded(accepted.content_json)), projection = input.input.input;
+      const content = checked(InputContentSchema, legacyInputContent(decoded(accepted.content_json))), projection = input.input.input;
       if (projection.text !== content.text || projection.referenceDate !== run.reference_date || projection.timezone !== run.timezone
-        || !isDeepStrictEqual(projection.scope, checked(RunScopeSchema, decoded(run.scope_json)))) fail('access_denied');
+        || !isDeepStrictEqual(projection.scope, checked(RunScopeSchema, legacyRunScope(decoded(run.scope_json))))) fail('access_denied');
       const snapshot = this.db.query<{ run_id: number; session_id: number; input_id: number; snapshot_json: string }, [number]>('SELECT * FROM context_snapshots WHERE id=?').get(input.snapshotId);
       if (!snapshot || snapshot.run_id !== run.id || snapshot.session_id !== run.session_id || snapshot.input_id !== run.input_id) fail('access_denied');
-      const body = checked(ContextSnapshotBodySchema, decoded(snapshot.snapshot_json));
+      const body = checked(ContextSnapshotBodySchema, legacyContextBody(decoded(snapshot.snapshot_json)));
       const source = intentContextSource(input.input);
       if (!isDeepStrictEqual(body.intentSource, source) || body.delegationSource || !isDeepStrictEqual(body.workspaceContext, content.workspaceContext)
-        || body.renderedProjection !== renderIntentContext(input.input)
-        || hash(body.renderedProjection) !== body.projectionHash || hash(body.runtimeFeedback) !== body.feedbackHash) fail('access_denied');
+        || body.renderedProjection !== renderIntentContext(input.input)) fail('access_denied');
       const session = this.db.query<{ current_leaf_id: string | null; storage_version: number }, [number]>('SELECT current_leaf_id,storage_version FROM sessions WHERE id=?').get(run.session_id)!;
       if (session.current_leaf_id !== projection.baseLeafId || session.storage_version !== projection.baseStorageVersion) fail('state_conflict');
       let previousPk: number | null = null;
@@ -125,11 +128,11 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
         const review = input.input.review!;
         if (!validation.reviewRequired || validation.rawOutputTruncated || !isDeepStrictEqual(previous.selection, input.selection)
           || !isDeepStrictEqual(previous.input.input, projection) || !isDeepStrictEqual(review.prediction, decoded(prior.parsed_result_json))
-          || !isDeepStrictEqual(review.issues, validation.issues) || review.rawHash !== hash(prior.raw_output ?? '')
+          || !isDeepStrictEqual(review.issues, validation.issues)
           || review.rawPreview !== (prior.raw_output ?? '').slice(0, 4096)) fail('state_conflict');
         previousPk = prior.id;
       }
-      const model = checked(metadataSchema, { selection: input.selection, responseModel: null, sdkStopReason: null, completionHash: null, http: null,
+      const model = checked(metadataSchema, { selection: input.selection, responseModel: null, sdkStopReason: null, http: null,
         context: { contract: 'medclaw.context-call/v1', snapshotId: input.snapshotId, inputId: input.inputId,
           intentSource: source, observation: null, responseStatus: null, payloadVerified: null } }, 'invalid_argument');
       const modelCallPk = Number(this.db.query(`INSERT INTO model_calls(call_id,run_id,session_id,input_id,kind,attempt,granularity,attempt_count_unknown,model_json,state,started_at)
@@ -149,14 +152,13 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
     this.write(() => {
       const input = checked(IntentCallCompletionSchema, raw, 'invalid_argument'), run = this.owner(input.runId, input.sessionId, input.inputId), row = this.call(input.callId);
       if (!row || row.run_id !== run.id || row.input_id !== run.input_id || row.stage !== input.stage) fail('access_denied');
-      const model = checked(metadataSchema, decoded(row.model_json)), completionHash = hash(canonicalRequest(input));
-      if (model.completionHash !== null) { if (model.completionHash !== completionHash) fail('state_conflict'); return; }
+      const model = checked(metadataSchema, legacyMetadata(decoded(row.model_json)));
       const { outcome } = input;
       if (input.parsed !== null) {
         try { if (outcome.rawOutput === null || !isDeepStrictEqual(checked(IntentResultSchema, JSON.parse(outcome.rawOutput), 'state_conflict'), input.parsed)) fail('state_conflict'); }
         catch { fail('state_conflict'); }
       }
-      if (row.state !== 'started' || Date.parse(outcome.startedAt) < Date.parse(row.started_at) || input.validation.state === 'pending'
+      if (Date.parse(outcome.startedAt) < Date.parse(row.started_at) || input.validation.state === 'pending'
         || input.validation.rawOutputTruncated !== outcome.rawOutputTruncated || Date.parse(outcome.endedAt) < Date.parse(outcome.startedAt)
         || outcome.observation !== null && (Date.parse(outcome.observation.observedAt) < Date.parse(outcome.startedAt)
           || Date.parse(outcome.observation.observedAt) > Date.parse(outcome.endedAt))) fail('state_conflict');
@@ -173,7 +175,13 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
         rawOutputTruncated: outcome.rawOutputTruncated, checkedAt: null }) : input.validation;
       if (validation.state === 'pending') fail('state_conflict');
       const { rawOutput: _raw, observation: _observation, ...http } = outcome;
-      const savedModel = checked(metadataSchema, { ...model, responseModel: outcome.responseModel, completionHash, http });
+      if(model.http!==null){
+        if(row.state!==state||row.raw_output!==outcome.rawOutput||!isDeepStrictEqual(decoded(row.parsed_result_json),input.parsed)
+          ||!isDeepStrictEqual(decoded(row.validation_json),validation)||!isDeepStrictEqual(model.http,http))fail('state_conflict');
+        return;
+      }
+      if(row.state!=='started')fail('state_conflict');
+      const savedModel = checked(metadataSchema, { ...model, responseModel: outcome.responseModel, http });
       this.db.query(`UPDATE model_calls SET state=?,model_json=?,ended_at=?,duration_ms=?,input_tokens=?,output_tokens=?,cost=NULL,cost_currency=NULL,
         usage_source=?,error_json=? WHERE id=?`).run(state, JSON.stringify(savedModel), outcome.endedAt, outcome.durationMs,
           outcome.inputTokens, outcome.outputTokens, outcome.inputTokens !== null || outcome.outputTokens !== null ? 'ollama_reported' : null,
@@ -191,7 +199,7 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
       if (!calls.length) return;
       const run = this.owner(runId), error = safeError('runtime_interrupted', undefined, { runId });
       for (const call of calls) {
-        checked(metadataSchema, decoded(call.model_json));
+        checked(metadataSchema, legacyMetadata(decoded(call.model_json)));
         if (call.validation_state !== 'pending' || call.raw_output !== null || call.parsed_result_json !== null || call.validation_json !== null) fail('storage_read_failed');
         const state = run.cancel_requested_at !== null || run.status === 'cancelled' ? 'cancelled' : 'failed';
         const validation = checked(IntentValidationSchema, { contract: 'medclaw.intent-validation/v2', state: 'not_run', finalStatus: null,
@@ -209,7 +217,7 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
   private rule(runId: number) {
     const row = this.db.query<{ payload_json: string }, [number]>("SELECT payload_json FROM runtime_events WHERE run_id=? AND type='intent_rule_evaluated'").get(runId);
     if (!row) return null;
-    const fact = checked(RegisteredEventPayloadSchema, { type: 'intent_rule_evaluated', payload: decoded(row.payload_json) });
+    const fact = checked(RegisteredEventPayloadSchema, { type: 'intent_rule_evaluated', payload: legacyEventPayload(decoded(row.payload_json)) });
     if (fact.type !== 'intent_rule_evaluated') fail('storage_read_failed'); return fact.payload.ruleEvaluation;
   }
   private route(runId: number): RouteRow | null {
@@ -221,7 +229,7 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
       adoptedIntents: decoded(row.adopted_intents_json), contextIntentId: row.context_intent_id, adoptedSlots: decoded(row.adopted_slots_json),
       queryParams: decoded(row.query_params_json), missingSlots: decoded(row.missing_slots_json), issues: decoded(row.issues_json),
       ...(row.execution_plan_json===null?{}:{executionPlan:decoded(row.execution_plan_json)}),
-      ruleEvaluation: decoded(row.rule_evaluation_json), decisionSource: row.decision_source, schemaVersion: row.schema_version, policyVersion: row.policy_version });
+      ruleEvaluation: omitLegacyFields(decoded(row.rule_evaluation_json),['inputHash']), decisionSource: row.decision_source, schemaVersion: row.schema_version, policyVersion: row.policy_version });
   }
   commitRoute(raw: RouteCommit): { decisionId: number } {
     return this.write(() => {
@@ -241,14 +249,14 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
         if (!isDeepStrictEqual(this.rule(run.id), decision.ruleEvaluation) || this.db.query('SELECT id FROM intent_calls WHERE run_id=?').get(run.id)) fail('state_conflict');
       } else if (decision.decisionSource === 'explicit_agent_fallback') {
         const accepted=this.db.query<{content_json:string},[number]>('SELECT content_json FROM session_inputs WHERE id=?').get(run.input_id)!;
-        const content=checked(InputContentSchema,decoded(accepted.content_json)),request=content.originalSubmitInput;
+        const content=checked(InputContentSchema,legacyInputContent(decoded(accepted.content_json))),request=content.originalSubmitInput;
         if(request.mode!=='send'||request.routing?.mode!=='explicit_agent_fallback'||content.intentAdmission||this.db.query('SELECT id FROM intent_calls WHERE run_id=?').get(run.id))fail('state_conflict');
         const origin=this.owner(request.routing.originRunId,run.session_id);
         if(origin.id>=run.id||!['failed','cancelled','completed'].includes(origin.status)||origin.input_text!==content.text
           ||origin.reference_date!==content.referenceDate||origin.timezone!==content.timezone)fail('state_conflict');
       } else if (decision.decisionSource === 'user_form') {
         const accepted=this.db.query<{content_json:string},[number]>('SELECT content_json FROM session_inputs WHERE id=?').get(run.input_id)!;
-        const content=checked(InputContentSchema,decoded(accepted.content_json)),request=content.originalSubmitInput;
+        const content=checked(InputContentSchema,legacyInputContent(decoded(accepted.content_json))),request=content.originalSubmitInput;
         if(request.mode!=='send'||request.routing?.mode!=='user_form'||content.intentAdmission||content.resourceInputPlan
           ||content.text!=='Query form: '+canonicalRequest(request.routing.params)||!isDeepStrictEqual(decision.queryParams,request.routing.params)
           ||!isDeepStrictEqual(request.routing.params.batchIds,content.scope.batchIds)
@@ -260,14 +268,14 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
           JSON.stringify(decision.missingSlots), JSON.stringify(decision.issues), decision.schemaVersion, decision.policyVersion, input.createdAt,json(decision.executionPlan??null)).lastInsertRowid);
       this.event(run, { type: 'route_decided', payload: { contract: 'medclaw.event/v1', runId: run.id, inputId: run.input_id, decisionId,
         intentCallId: decision.intentCallId, route: decision.route, decisionSource: decision.decisionSource, matchedBy: decision.matchedBy,
-        status: decision.status, queryParamsHash: decision.queryParams === null ? null : hash(canonicalRequest(decision.queryParams)) } }, `route:${decisionId}`, 1, input.createdAt);
+        status: decision.status } }, `route:${decisionId}`, 1, input.createdAt);
       return { decisionId };
     });
   }
   readModelCall(modelCallPk: number) {
     checked(PositiveIdSchema, modelCallPk, 'invalid_argument');
     const row = this.db.query<CallRow, [number]>(callSelect + ' WHERE m.id=?').get(modelCallPk); if (!row) fail('storage_read_failed');
-    const model = checked(metadataSchema, decoded(row.model_json));
+    const model = checked(metadataSchema, legacyMetadata(decoded(row.model_json)));
     return checked(IntentModelCallViewSchema, { id: row.model_call_id, callId: row.call_id, inputId: row.input_id, kind: 'intent', state: row.state,
       model: model.selection, responseModel: model.responseModel, sdkStopReason: null, contextSnapshotId: model.context.snapshotId,
       granularity: row.granularity, attempt: row.attempt, attemptCountUnknown: row.attempt_count_unknown === 1,
@@ -300,8 +308,10 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
     const registration=this.registration(row),run=this.owner(row.run_id,row.session_id,row.input_id);
     const snapshot=this.db.query<{run_id:number;session_id:number;input_id:number;snapshot_json:string},[number]>('SELECT * FROM context_snapshots WHERE id=?').get(row.snapshot_id);
     if(!snapshot||snapshot.run_id!==run.id||snapshot.session_id!==run.session_id||snapshot.input_id!==run.input_id)fail('storage_read_failed');
-    const body=checked(ContextSnapshotBodySchema,decoded(snapshot.snapshot_json));
-    if(!isDeepStrictEqual(body.intentSource,intentContextSource(registration.input))||body.renderedProjection!==renderIntentContext(registration.input)||hash(body.renderedProjection)!==body.projectionHash)fail('storage_read_failed');
+    const body=checked(ContextSnapshotBodySchema,legacyContextBody(decoded(snapshot.snapshot_json)));
+    const rawBody=decoded(snapshot.snapshot_json) as {intentSource?:{stageInput?:unknown}};
+    const stage=readLegacyIntentContext(body.renderedProjection,rawBody.intentSource?.stageInput);
+    if(!isDeepStrictEqual(body.intentSource,intentContextSource(registration.input))||!isDeepStrictEqual(stage,registration.input))fail('storage_read_failed');
     return registration.input;
   }
   prepareIntentInput(raw: PrepareIntentInput) {
@@ -310,14 +320,12 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
       const session=this.db.query<{current_leaf_id:string|null;storage_version:number},[number]>('SELECT current_leaf_id,storage_version FROM sessions WHERE id=?').get(run.session_id);
       const accepted=this.db.query<{content_json:string;status:string;target_run_id:number},[number]>('SELECT content_json,status,target_run_id FROM session_inputs WHERE id=?').get(run.input_id);
       if(!session||!accepted||accepted.status!=='queued'||accepted.target_run_id!==run.id||!['created','running'].includes(run.status)||run.cancel_requested_at!==null)fail('state_conflict');
-      const content=checked(InputContentSchema,decoded(accepted.content_json)),frozen=checked(FrozenIntentAdmissionSchema,content.intentAdmission);
+      const content=checked(InputContentSchema,legacyInputContent(decoded(accepted.content_json))),frozen=checked(FrozenIntentAdmissionSchema,content.intentAdmission);
       const configuration=decoded(run.config_json) as {intentAdmission?:unknown};
-      if(!isDeepStrictEqual(checked(FrozenIntentAdmissionSchema,configuration.intentAdmission),frozen))fail('storage_read_failed');
+      if(!isDeepStrictEqual(checked(FrozenIntentAdmissionSchema,legacyIntentAdmission(configuration.intentAdmission)),frozen))fail('storage_read_failed');
       if(session.current_leaf_id!==frozen.baseLeafId||session.storage_version!==frozen.baseStorageVersion)fail('state_conflict');
-      for(const prompt of Object.values(frozen.prompts))if(hash(prompt.text)!==prompt.hash)fail('storage_read_failed');
-      const scope=checked(RunScopeSchema,decoded(run.scope_json)),refs=readWorkspaceBatchReferences(this.db,scope.batchIds).refs;
+      const scope=checked(RunScopeSchema,legacyRunScope(decoded(run.scope_json))),refs=readWorkspaceBatchReferences(this.db,scope.batchIds).refs;
       if(!isDeepStrictEqual(scope,content.scope)||refs.some(ref=>!content.workspaceContext.batchRefs.some(value=>isDeepStrictEqual(ref,value))))fail('access_denied');
-      const scopeBatchHashes=[...new Set(refs.map(ref=>ref.contentHash))].sort();
       type NativeRow={native_entry_id:string;parent_entry_id:string|null;run_id:number|null;entry_json:string};
       const branch=new Map<string,NativeRow>();let cursor=session.current_leaf_id;
       while(cursor!==null){if(branch.has(cursor))fail('storage_read_failed');
@@ -355,10 +363,10 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
               const prior=this.owner(details.runId,run.session_id,details.inputId),route=this.route(prior.id);
               if(!route||route.id!==details.decisionId)fail('storage_read_failed');
               const decision=this.decision(route),projection=decision.intentCallId===null?null:this.readIntentStageInput(decision.intentCallId).input;
-              if(projection&&isDeepStrictEqual(projection.scopeBatchHashes,scopeBatchHashes)){
+              if(projection&&isDeepStrictEqual(projection.scope.batchIds,scope.batchIds)){
                 const original=this.db.query<{content_json:string},[number]>('SELECT content_json FROM session_inputs WHERE id=?').get(details.inputId);
                 if(!original)fail('storage_read_failed');
-                pendingClarification={taskText:projection.pendingClarification?.taskText??checked(InputContentSchema,decoded(original.content_json)).text,missingSlots:details.missingSlots};
+                pendingClarification={taskText:projection.pendingClarification?.taskText??checked(InputContentSchema,legacyInputContent(decoded(original.content_json))).text,missingSlots:details.missingSlots};
               }
             }
           }
@@ -367,7 +375,7 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
       }
       let previousQueryContext:QueryContextRecord|null=null;
       if(nearestCondition){
-        const entry=decoded(nearestCondition.entry_json) as {data:unknown},adopted=checked(QueryContextFactSchema,entry.data);
+        const entry=decoded(nearestCondition.entry_json) as {data:unknown},adopted=checked(QueryContextFactSchema,legacyQueryContext(entry.data));
         const cached=this.db.query<Record<string,unknown>,[number]>('SELECT * FROM query_contexts WHERE session_id=?').get(run.session_id);
         const branchIds=[...branch.keys()],projectionIndex=branchIds.indexOf(cached?.native_leaf_id as string);
         if(!cached||projectionIndex<0||projectionIndex>branchIds.indexOf(nearestCondition.native_entry_id)
@@ -377,18 +385,18 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
         const executionRow=nearestCondition.parent_entry_id===null?null:branch.get(nearestCondition.parent_entry_id);
         const nativeExecution=executionRow?decoded(executionRow.entry_json) as {type:string;customType:string;data:unknown}:null;
         if(source.status!=='completed'||!route||route.id!==decisionId||executionRow?.run_id!==source.id||nativeExecution?.type!=='custom')fail('storage_read_failed');
-        const decision=this.decision(route),queryRefs:{queryId:number;resultHash:string}[]=[];
+        const decision=this.decision(route),queryRefs:{queryId:number}[]=[];
         if(adopted.contract==='medclaw.query-form-context/v1'){
           if(!('contract' in context)||nativeExecution.customType!=='medclaw-query-form-execution'||decision.decisionSource!=='user_form')fail('storage_read_failed');
           const {sessionId:_sessionId,nativeLeafId:_leaf,version:_version,pendingClarification:_pending,...fact}=context;
-          const execution=checked(FormExecutionFactSchema,nativeExecution.data);
+          const execution=checked(FormExecutionFactSchema,omitLegacyFields(nativeExecution.data,['resultHash']));
           if(!isDeepStrictEqual(fact,adopted)||!isDeepStrictEqual(decision.queryParams,adopted.params)||execution.decisionId!==decisionId
             ||!isDeepStrictEqual(adopted.queryIds,[execution.queryId]))fail('storage_read_failed');
-          queryRefs.push({queryId:execution.queryId,resultHash:execution.resultHash});
+          queryRefs.push({queryId:execution.queryId});
         }else{
           if('contract' in context||nativeExecution.customType!=='medclaw-intent-execution'||decision.decisionSource==='user_form')fail('storage_read_failed');
           const {contract:_contract,decisionId:_decision,...adoptedFields}=adopted,{sessionId:_sessionId,nativeLeafId:_leaf,version:_version,...contextFields}=context;
-          const execution=checked(IntentExecutionFactSchema,nativeExecution.data);
+          const execution=checked(IntentExecutionFactSchema,legacyIntentExecution(nativeExecution.data));
           if(!isDeepStrictEqual(adoptedFields,contextFields)||execution.decisionId!==decisionId||!isDeepStrictEqual(execution.taskIntents,adopted.taskIntents)
             ||!isDeepStrictEqual(decision.adoptedIntents,adopted.taskIntents)||decision.contextIntentId!==adopted.contextIntentId
             ||!isDeepStrictEqual(decision.adoptedSlots,adopted.adoptedSlots))fail('storage_read_failed');
@@ -396,16 +404,16 @@ export class SqliteIntentStore implements Omit<IntentStore, 'readIntent'> {
         }
         const queries=new SqliteToolStore(this.db);
         for(const queryId of adopted.queryIds){const query=queries.readQuery(queryId),ref=queryRefs.find(ref=>ref.queryId===queryId);
-          if(!query||!ref||query.runId!==source.id||query.sessionId!==run.session_id||query.inputId!==source.input_id||query.resultHash!==ref.resultHash
+          if(!query||!ref||query.runId!==source.id||query.sessionId!==run.session_id||query.inputId!==source.input_id
             ||adopted.contract==='medclaw.query-form-context/v1'&&(query.source!=='user_form'||!isDeepStrictEqual(query.params,adopted.params)
               ||query.callRef!==`form:${source.id}:${source.input_id}`))fail('storage_read_failed');}
-        if(isDeepStrictEqual(context.scopeBatchHashes,scopeBatchHashes))previousQueryContext=context;
+        if(isDeepStrictEqual(checked(RunScopeSchema,legacyRunScope(decoded(source.scope_json))).batchIds,scope.batchIds))previousQueryContext=context;
       }
       const catalog=new SqliteCatalogStore(this.db),batches=catalog.readBatches(scope.batchIds),rows=catalog.readIntentSnapshots(scope.batchIds,scope.deviceIds);
       const unique=(values:string[])=>[...new Set(values)].sort();
       return checked(IntentInputProjectionSchema,{contract:'medclaw.intent-input/v2',runId:run.id,sessionId:run.session_id,inputId:run.input_id,
         baseLeafId:frozen.baseLeafId,baseStorageVersion:frozen.baseStorageVersion,text:content.text,referenceDate:run.reference_date,timezone:run.timezone,
-        scope,scopeBatchHashes,previousQueryContext,pendingClarification:latestBusinessResultSeen?pendingClarification:previousQueryContext?.pendingClarification??null,recentTurns:recentTurns.reverse(),
+        scope,previousQueryContext,pendingClarification:latestBusinessResultSeen?pendingClarification:previousQueryContext?.pendingClarification??null,recentTurns:recentTurns.reverse(),
         selectedEntities:(scope.deviceIds??[]).map(deviceId=>{const row=rows.find(row=>row.deviceId===deviceId);if(!row)fail('access_denied');return {deviceId,label:row.deviceName};}),
         availableData:{regions:unique(batches.map(batch=>batch.region)),dates:unique(batches.map(batch=>batch.snapshotDate)),currencies:unique(rows.map(row=>row.currency)),units:unique(rows.map(row=>row.unit))},
         enabledL2:input.enabledL2,availableToolNames:scope.allowedToolNames,versions:{configVersion:frozen.selection.configVersion,

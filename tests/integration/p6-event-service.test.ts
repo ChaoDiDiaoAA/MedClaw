@@ -112,7 +112,7 @@ test('every_new_open_initialization_failure_releases_its_slot',()=>fixture(f=>{
 test('event_pages_shrink_by_whole_facts_and_payload_overflow_never_allocates_sequence',()=>fixture(f=>{
  const queryIds=Array.from({length:12000},(_,i)=>i+1);
  f.tx.immediate(()=>{
-  const insert=f.db.query("INSERT INTO queries(id,session_id,run_id,call_ref,kind,params_hash,params_json,batch_ids_json,result_json,result_hash,created_at) VALUES(?,1,1,?,'current','p','{}','[]','{}','r',?)");for(const id of queryIds)insert.run(id,'q'+id,at);
+  const insert=f.db.query("INSERT INTO queries(id,session_id,run_id,call_ref,kind,params_json,batch_ids_json,result_json,created_at) VALUES(?,1,1,?,'current','{}','[]','{}',?)");for(const id of queryIds)insert.run(id,'q'+id,at);
   const tool=f.db.query("INSERT INTO tool_calls(id,session_id,run_id,native_tool_call_id,tool_name,tool_version,effect,execution_mode,args_json,status,result_json,requested_at,ended_at) VALUES(?,1,1,?,'current','v','READ','sequential','{}','succeeded','{}',?,?)");
   for(let id=1;id<=70;id++){tool.run(id,'tool'+id,at,at);f.service.appendInTransaction({...f.draft,type:'tool_finished',source:'tool',toolCallId:id,payload:{contract:'medclaw.event/v1',callId:id,nativeToolCallId:'tool'+id,status:'succeeded',queryIds,errorCode:null}});}
  });

@@ -18,7 +18,7 @@ export class EvidenceReader {
   list(input: PageInput & { queryId: number }, context: QueryContext) {
     const query = this.queries.read(input.queryId, context);
     const rows = this.store.listEvidence(input.queryId);
-    if (new Set(rows.map(row => row.id)).size !== rows.length || rows.some(row => row.queryId !== query.id || row.resultHash !== query.resultHash
+    if (new Set(rows.map(row => row.id)).size !== rows.length || rows.some(row => row.queryId !== query.id
       || row.calculationVersion !== query.calculationVersion)) throw new Error('tool_output_inconsistent');
     const page = pageItems(rows, input);
     for (const evidence of page.items) this.validate(evidence, query, context);
@@ -36,12 +36,12 @@ export class EvidenceReader {
   private validate(evidence: Evidence, query: QueryRecord, context: QueryContext): void {
     const batches = this.catalog.batches(evidence.batchIds, context);
     const snapshots = new Set(query.snapshotIds), events = new Set(query.eventIds);
-    if (evidence.queryId !== query.id || evidence.resultHash !== query.resultHash || evidence.calculationVersion !== query.calculationVersion
+    if (evidence.queryId !== query.id || evidence.calculationVersion !== query.calculationVersion
       || evidence.batchIds.some(id => !query.batchIds.includes(id)) || evidence.snapshotIds.some(id => !snapshots.has(id)) || evidence.eventIds.some(id => !events.has(id))
       || new Set(evidence.snapshotIds).size !== evidence.snapshotIds.length || new Set(evidence.eventIds).size !== evidence.eventIds.length
       || new Set(evidence.sourceRowRefs).size !== evidence.sourceRowRefs.length
       || evidence.filters !== undefined && canonicalRequest(evidence.filters) !== canonicalRequest(query.params)
-      || batches.some(batch => batch.materialVersion !== evidence.materialVersion || batch.sourceBundleId !== evidence.sourceBundleId || batch.sourceLockHash !== evidence.sourceLockHash))
+      || batches.some(batch => batch.materialVersion !== evidence.materialVersion || batch.sourceBundleId !== evidence.sourceBundleId))
       throw new Error('tool_output_inconsistent');
     this.catalog.checkActive(context);
   }

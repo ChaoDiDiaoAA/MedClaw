@@ -1,5 +1,4 @@
 import { expect, test } from 'bun:test';
-import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,7 +15,6 @@ import { SqliteMemoryStore } from '../../packages/storage/src/memory-store';
 import { SqliteWriteTransactions } from '../../packages/storage/src/write-transactions';
 import { validateNativeHistory } from '../../packages/runtime-pi/src/memory-store';
 
-const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 function fixture(history?: { nativeSessionId: string; initialHistory: InitialNativeHistory }) {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p14-context-')), db = openDatabase(join(root, 'app.sqlite'));
   const accepted = acceptContextInput(db, { consume: false, text: 'ENGINEERING intent task', ...(history ? { nativeSessionId: history.nativeSessionId,
@@ -41,18 +39,18 @@ test('p14 prepares a frozen actual intent snapshot without consuming the accepte
     const snapshot = await f.service.prepareIntent(f.input);
     expect(snapshot.intentSource).toEqual({ contract: 'medclaw.intent-context/v1', inputId: f.input.inputId, baseLeafId: null, baseStorageVersion: 0 });
     expect(snapshot.renderedProjection).toBe(renderIntentContext(f.input.projection));
-    expect(snapshot.projectionHash).toBe(hash(snapshot.renderedProjection));
+    expect(snapshot.renderedProjection).toContain(f.input.projection.input.text);
     expect(snapshot.nativeRefs).toEqual([]);
     expect(snapshot.selectedRefs).toMatchObject([{ kind: 'input', id: String(f.input.inputId), channel: 'product_projection' }]);
     expect(f.db.query('SELECT status,run_id,native_entry_id FROM session_inputs').get()).toEqual({ status: 'queued', run_id: null, native_entry_id: null });
     expect(f.db.query('SELECT id FROM memories').all()).toEqual([]);
     const registration = IntentCallRegistrationSchema.parse({ callId: 'context-classify', runId: f.input.runId, sessionId: f.input.sessionId,
       inputId: f.input.inputId, snapshotId: snapshot.id, stage: 'classify', previousCallId: null, input: f.input.projection, createdAt: contextAt,
-      selection: { ...disabledIntentModel(), enabled: true, modelDigest: 'sha256:' + 'a'.repeat(64), verifiedEvidenceRef: 'ENGINEERING', configVersion: '1', api: 'ollama-chat', ...INTENT_VERSIONS } });
+      selection: { ...disabledIntentModel(), enabled: true,  verifiedEvidenceRef: 'ENGINEERING', configVersion: '1', api: 'ollama-chat', ...INTENT_VERSIONS } });
     f.accepted.repos.registerIntentCall(registration);
     f.store.recordDelivery({ runId: f.input.runId, sessionId: f.input.sessionId, inputId: f.input.inputId, callId: registration.callId,
       snapshotId: snapshot.id, observation: { contract: 'medclaw.context-observation/v1', api: 'ollama-chat', transport: 'json', observedAt: contextAt,
-        httpStatus: 200, payloadHash: hash('ENGINEERING payload'), projectionHash: snapshot.projectionHash, feedbackHash: snapshot.feedbackHash, verifiedNativeRefs: [] } });
+        httpStatus: 200,    verifiedNativeRefs: [] } });
     expect(f.store.read({ callId: registration.callId })).toMatchObject({ kind: 'snapshot', evidence: 'saved', selectedCallId: registration.callId });
   } finally { f.dispose(); }
 });
@@ -81,7 +79,7 @@ test('p14 context selection rechecks cancellation at save and refuses forged tas
   try {
     expect(() => f.store.selectIntent({ ...f.input, projection: { ...f.input.projection, input: { ...f.input.projection.input, text: 'forged' } } })).toThrow('access_denied');
     expect(() => f.store.selectIntent({ ...f.input, nativeRefs: [{ kind: 'input', id: f.input.inputId, nativeEntryId: 'invented',
-      contentHash: hash(f.input.projection.input.text), nativeToolCallId: null, originSnapshotId: null }] })).toThrow('access_denied');
+       nativeToolCallId: null, originSnapshotId: null }] })).toThrow('access_denied');
     expect(() => f.store.selectIntent({ ...f.input, baseStorageVersion: 1, projection: { ...f.input.projection,
       input: { ...f.input.projection.input, baseStorageVersion: 1 } } })).toThrow('state_conflict');
     const selection = f.store.selectIntent(f.input);
@@ -100,12 +98,12 @@ test('p14 a session rename does not invalidate the frozen input or switch the se
   } finally { f.dispose(); }
 });
 
-test('p14 Context reads reject a changed request footer even if its saved hash is recomputed', async () => {
+test('p14 Context reads reject a changed request footer using the saved stage input', async () => {
   const f = fixture();
   try {
     const snapshot = await f.service.prepareIntent(f.input);
     const { id: _id, runId: _run, sessionId: _session, inputId: _input, sequence: _seq, createdAt: _at, deliveredCallIds: _calls, ...body } = snapshot;
-    body.renderedProjection += ' tampered'; body.projectionHash = hash(body.renderedProjection);
+    body.renderedProjection += ' tampered';
     f.db.exec('DROP TRIGGER context_snapshot_no_update');
     f.db.query('UPDATE context_snapshots SET snapshot_json=? WHERE id=?').run(JSON.stringify(body), snapshot.id);
     expect(() => f.store.read({ snapshotId: snapshot.id })).toThrow('storage_read_failed');

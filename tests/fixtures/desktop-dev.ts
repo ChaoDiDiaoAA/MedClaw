@@ -1,7 +1,6 @@
 import { chromium, type Browser, type Page } from '@playwright/test';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { mkdirSync, writeFileSync, readdirSync, readFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { createServer } from 'node:net';
 import { join, resolve } from 'node:path';
 import { canonicalRequest } from '../../packages/contracts/src/run';
@@ -86,20 +85,19 @@ export async function launchActualDev(temporary: string, dataRoot: string, impor
 
 export function createStartupPackage(root: string) {
   mkdirSync(root, { recursive: true });
-  const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
   const csv = (values: string[]) => values.map(value => `"${value.replaceAll('"', '""')}"`).join(',');
   const master = { record_type: 'master', device_id: '00001', device_name: 'Startup fixture device', source_submission_id: '00009', source_applicant: 'Applicant', category: 'Category', manufacturer: 'Synthetic manufacturer' };
-  const sourceLock = { schema: 'medclaw.source-lock/v1', sources: [{ source: 'fda', path: 'fixture.zip', sha256: 'a'.repeat(64), url: 'https://example.invalid/source' }] };
+  const sourceLock = { schema: 'medclaw.source-lock/v2', sources: [{ source: 'fda', path: 'fixture.zip', url: 'https://example.invalid/source' }] };
   writeFileSync(join(root, 'source-lock.json'), JSON.stringify(sourceLock));
   writeFileSync(join(root, 'entity-lineage.csv'), `${csv(Object.keys(master))}\n${csv(Object.values(master))}\n`);
   for (const name of ['adjustment-lineage.csv', 'validation-report.json', 'selection-report.json', '使用说明.md']) writeFileSync(join(root, name), name.endsWith('.json') ? '{}' : 'Engineering fixture');
   const headers = ['device_id', 'device_name', 'source_submission_id', 'source_applicant', 'category', 'region', 'snapshot_date', 'price_cents', 'currency', 'unit', 'status', 'manufacturer', 'distributor', 'source_refs_json', 'field_origins_json'];
   const origins = Object.fromEntries(headers.slice(0, 13).map(key => [key, { kind: 'synthetic', ruleId: 'startup-fixture' }]));
-  const refs = [{ sourceId: 'fda', file: 'fixture.zip', row: 1, recordId: '00009', sha256: 'a'.repeat(64) }];
+  const refs = [{ sourceId: 'fda', file: 'fixture.zip', row: 1, recordId: '00009' }];
   const text = `${csv(headers)}\r\n${csv(['00001', master.device_name, '00009', 'Applicant', 'Category', '浙江', '2026-01-01', '100', 'CNY', '件', 'active', master.manufacturer, 'Distributor', JSON.stringify(refs), JSON.stringify(origins)])}\r\n`;
   writeFileSync(join(root, 'zhejiang_2026-01-01.csv'), text);
-  writeFileSync(join(root, 'zhejiang_2026-01-01.metadata.json'), JSON.stringify({ contract: 'medclaw.snapshot/v1', mappingVersion: 'medclaw.snapshot/v1', materialVersion: 'startup-fixture/v1', generatorVersion: 'startup-fixture/v1', seed: 1, sourceBundleId: 'fixture', sourceLockHash: hash(canonicalRequest(sourceLock)), scopeKey: 'startup-scope', region: '浙江', cohortHash: hash(canonicalRequest([master])), snapshotDate: '2026-01-01', coverage: 'full', expectedEntityCount: 1, observedEntityCount: 1, declaredMissingEntityIds: [], fileSha256: hash(text), referenceDate: '2026-01-01', timezone: 'Asia/Shanghai' }));
-  const files = readdirSync(root).sort().map(path => { const bytes = readFileSync(join(root, path)); return { path, bytes: bytes.length, sha256: hash(bytes) }; });
+  writeFileSync(join(root, 'zhejiang_2026-01-01.metadata.json'), JSON.stringify({ contract: 'medclaw.snapshot/v2', mappingVersion: 'medclaw.snapshot/v1', materialVersion: 'startup-fixture/v1', generatorVersion: 'startup-fixture/v1', seed: 1, sourceBundleId: 'fixture', scopeKey: 'startup-scope', region: '浙江', snapshotDate: '2026-01-01', coverage: 'full', expectedEntityCount: 1, observedEntityCount: 1, declaredMissingEntityIds: [], referenceDate: '2026-01-01', timezone: 'Asia/Shanghai' }));
+  const files = readdirSync(root).sort().map(path => { const bytes = readFileSync(join(root, path)); return { path, bytes: bytes.length }; });
   writeFileSync(join(root, 'manifest.json'), JSON.stringify({ status: 'complete', files, businessFiles: 1, businessRows: 1, businessBytes: Buffer.byteLength(text), totalPayloadBytes: files.reduce((sum, file) => sum + file.bytes, 0) }));
 }
 

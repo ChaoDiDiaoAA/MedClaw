@@ -35,7 +35,7 @@ export function ContextDetails(props: {host:HostView;callId:string;runId:number;
       <p className="tiny">Snapshot {result.snapshot.id} · Run {result.snapshot.runId} · Session {result.snapshot.sessionId} · Input {result.snapshot.inputId ?? 'Unknown'} · Selection revision {result.snapshot.workspaceContext?.revision ?? 'Unknown'}</p>
       <h4>Selected materials</h4>
       {!result.snapshot.selectedRefs.length && <p className="muted">No material references were selected.</p>}
-      {result.snapshot.selectedRefs.map(ref => <details key={`${ref.kind}:${ref.id}:${ref.channel}`}><summary>{ref.kind.replaceAll('_',' ')} {ref.id} · {ref.channel === 'native_history' ? 'Native history observed' : 'Product projection'}</summary><dl className="facts"><dt>Version</dt><dd>{ref.version}</dd><dt>Content hash</dt><dd><code>{ref.hash}</code></dd></dl></details>)}
+      {result.snapshot.selectedRefs.map(ref => <details key={`${ref.kind}:${ref.id}:${ref.channel}`}><summary>{ref.kind.replaceAll('_',' ')} {ref.id} · {ref.channel === 'native_history' ? 'Native history observed' : 'Product projection'}</summary><dl className="facts"><dt>Version</dt><dd>{ref.version}</dd></dl></details>)}
       <details><summary>Rendered materials and sources</summary><pre>{result.snapshot.renderedProjection}</pre></details>
       <details><summary>Frozen runtime feedback</summary><pre>{result.snapshot.runtimeFeedback}</pre></details>
       {!!result.snapshot.omitted.length && <p role="status">Optional rows omitted to fit the material limit: {result.snapshot.omitted.map(item => `${item.kind} ${item.id}: ${item.omittedRows}`).join('; ')}.</p>}

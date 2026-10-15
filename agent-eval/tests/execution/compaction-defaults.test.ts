@@ -12,7 +12,7 @@ test('provider failure stops dependent preparation and compaction while preservi
   const server=Bun.serve({hostname:'127.0.0.1',port:0,fetch(request){
     const path=new URL(request.url).pathname;
     if(path==='/api/version')return Response.json({version:'ENGINEERING'});
-    if(path==='/api/tags')return Response.json({models:[{name:'qwen3.5:0.8b',digest:'sha256:'+'a'.repeat(64)}]});
+    if(path==='/api/tags')return Response.json({models:[{name:'qwen3.5:0.8b'}]});
     if(path==='/api/show')return Response.json({details:{family:'ENGINEERING',parameter_size:'fixture',quantization_level:'fixture'}});
     calls++;return Response.json({error:{message:'Insufficient Balance'}},{status:402});
   }});
@@ -35,7 +35,7 @@ test('real SDK keeps short-history no_op distinct from persisted default compact
   const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
     const path=new URL(request.url).pathname;
     if(path==='/api/version')return Response.json({version:'ENGINEERING'});
-    if(path==='/api/tags')return Response.json({models:[{name:'qwen3.5:0.8b',digest:'sha256:'+'a'.repeat(64)}]});
+    if(path==='/api/tags')return Response.json({models:[{name:'qwen3.5:0.8b'}]});
     if(path==='/api/show')return Response.json({details:{family:'ENGINEERING',parameter_size:'fixture',quantization_level:'fixture'}});
     if(!path.endsWith('/chat/completions'))throw new Error('unexpected_local_route');
     const body=await request.json() as any;requests.push(body);

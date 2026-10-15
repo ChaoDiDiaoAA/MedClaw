@@ -26,11 +26,11 @@ function fixture() {
 function query(context: ToolExecutionContext): Omit<QueryRecord, "id"> {
   return { sessionId: context.sessionId, runId: context.runId, callRef: `${context.runId}:${context.nativeToolCallId}`,
     kind: "current", params: CurrentQuerySchema.parse({ batchIds: [1] }), batchIds: [1], scopeDeviceIds: context.scope.deviceIds, rows: [{ deviceId: 1, priceCents: 250 }],
-    snapshotIds: [1], eventIds: [], warnings: [], calculationVersion: "query/v1", resultHash: "result-hash", createdAt: "2026-10-01T00:00:00.000Z" };
+    snapshotIds: [1], eventIds: [], warnings: [], calculationVersion: "query/v1", createdAt: "2026-10-01T00:00:00.000Z" };
 }
 function evidence(): Omit<Evidence, "id" | "queryId"> {
   return { batchIds: [1], snapshotIds: [1], eventIds: [], sourceRowRefs: ["row-1"], calculationVersion: "query/v1",
-    materialVersion: "1", sourceBundleId: "bundle", sourceLockHash: "lock", resultHash: "result-hash" };
+    materialVersion: "1", sourceBundleId: "bundle" };
 }
 
 test("request replays original identity and rejects changed Run, tool, mode or parameters", () => {
@@ -85,15 +85,19 @@ test("failed and cancelled calls require matching safe errors and JSON results",
 test("query and evidence commit atomically and replay reads immutable original result", () => {
   const { db, store, context } = fixture(), input = query(context);
   const committed = store.commitQuery(input, [evidence()], context);
-  const replay = store.commitQuery({ ...input, rows: [{ deviceId: 999 }], resultHash: "later" }, [], context);
+  const replay = store.commitQuery({ ...input, createdAt: '2026-10-01T00:00:01.000Z' }, [evidence()], context);
   expect(replay).toEqual(committed);
+  for (const changed of [{ rows: [{ deviceId: 999 }] }, { snapshotIds: [2] }, { eventIds: [3] },
+    { warnings: ['different facts'] }, { calculationVersion: 'query/v2' }]) {
+    expect(() => store.commitQuery({ ...input, ...changed }, [evidence()], context)).toThrow('state_conflict');
+  }
   expect(store.readQuery(committed.id)).toEqual(committed);
   const savedEvidence = store.listEvidence(committed.id);
   expect(savedEvidence).toHaveLength(1);
   expect(store.readEvidence(savedEvidence[0]!.id)).toEqual(savedEvidence[0]!);
   expect(() => store.commitQuery({ ...input, params: CurrentQuerySchema.parse({ batchIds: [1], manufacturer: "other" }) }, [evidence()], context)).toThrow("state_conflict");
   expect(db.query("SELECT COUNT(*) AS n FROM queries").get()).toEqual({ n: 1 });
-  expect(() => db.exec("UPDATE queries SET result_hash='changed'")).toThrow();
+  expect(() => db.exec("UPDATE queries SET result_json='{}'")).toThrow();
   expect(() => db.exec("DELETE FROM query_evidence")).toThrow();
 });
 

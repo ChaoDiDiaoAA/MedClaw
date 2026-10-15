@@ -2,7 +2,6 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, readdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
 import { canonicalRequest } from '../../packages/contracts/src/run';
 import { openDatabase } from '../../packages/storage/src/database';
 import { ArtifactStore } from '../../packages/storage/src/artifact-store';
@@ -10,36 +9,11 @@ import { SqliteImportStore } from '../../packages/storage/src/import-store';
 import { ImportService, readCsvRecords } from '../../packages/core/src/data/import-service';
 
 const roots: string[] = [];
-const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const csv = (values: string[]) => values.map(value => `"${value.replaceAll('"', '""')}"`).join(',');
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-export function packageFixture(root: string, options: { prices?: (number | null)[]; missing?: boolean; scopeKey?: string; referenceDate?: string } = {}) {
-  mkdirSync(root, { recursive: true });
-  const masters = [{ record_type: 'master', device_id: '00001', device_name: 'Device,\nwith quote "', source_submission_id: '00009', source_applicant: 'Applicant', category: 'Category', manufacturer: 'Synthetic manufacturer' }];
-  const cohortHash = hash(canonicalRequest(masters));
-  const sourceLock = { schema: 'medclaw.source-lock/v1', sources: [{ source: 'fda', path: 'missing-original.zip', sha256: 'a'.repeat(64), url: 'https://example.invalid/source' }] };
-  const sourceLockHash = hash(canonicalRequest(sourceLock));
-  writeFileSync(join(root, 'source-lock.json'), JSON.stringify(sourceLock));
-  writeFileSync(join(root, 'entity-lineage.csv'), `${csv(Object.keys(masters[0]!))}\n${csv(Object.values(masters[0]!))}\n`);
-  for (const name of ['adjustment-lineage.csv', 'validation-report.json', 'selection-report.json', '使用说明.md']) writeFileSync(join(root, name), name.endsWith('.json') ? '{}' : 'auxiliary');
-  const refs = [{ sourceId: 'fda', file: 'missing-original.zip', row: 1, recordId: '00009', sha256: 'a'.repeat(64) }];
-  const headers = ['device_id', 'device_name', 'source_submission_id', 'source_applicant', 'category', 'region', 'snapshot_date', 'price_cents', 'currency', 'unit', 'status', 'manufacturer', 'distributor', 'source_refs_json', 'field_origins_json'];
-  const origins = Object.fromEntries(headers.slice(0, 13).map(key => [key, { kind: 'synthetic', ruleId: 'fixture' }]));
-  const prices = options.prices ?? [100, 80];
-  for (const [index, price] of prices.entries()) {
-    const date = `2026-01-0${index + 1}`;
-    const missing = options.missing && index === 1;
-    const text = `${csv(headers)}\r\n${missing ? '' : `${csv(['00001', masters[0]!.device_name, '00009', 'Applicant', 'Category', '浙江', date, price === null ? '' : String(price), 'CNY', '件', 'active', 'Synthetic manufacturer', 'Distributor', JSON.stringify(refs), JSON.stringify(origins)])}\r\n`}`;
-    writeFileSync(join(root, `zhejiang_${date}.csv`), text);
-    writeFileSync(join(root, `zhejiang_${date}.metadata.json`), JSON.stringify({ contract: 'medclaw.snapshot/v1', mappingVersion: 'medclaw.snapshot/v1', materialVersion: 'fixture/v1', generatorVersion: 'fixture/v1', seed: 1, sourceBundleId: 'fixture', sourceLockHash, scopeKey: options.scopeKey ?? 'scope', region: '浙江', cohortHash, snapshotDate: date, coverage: 'full', expectedEntityCount: 1, observedEntityCount: missing ? 0 : 1, declaredMissingEntityIds: missing ? ['00001'] : [], ...(missing ? { missingReason: 'Fixture unavailable' } : {}), fileSha256: hash(text), referenceDate: options.referenceDate ?? `2026-01-0${prices.length}`, timezone: 'Asia/Shanghai' }));
-  }
-  refreshManifest(root, prices.length, options.missing ? prices.length - 1 : prices.length);
-}
-export function refreshManifest(root: string, count: number, rowCount: number) {
-  const files = readdirSync(root).filter(name => name !== 'manifest.json').sort().map(path => { const bytes = readFileSync(join(root, path)); return { path, bytes: bytes.length, sha256: hash(bytes) }; });
-  writeFileSync(join(root, 'manifest.json'), JSON.stringify({ status: 'complete', files, businessFiles: count, businessRows: rowCount, businessBytes: files.filter(file => /^zhejiang_.*\.csv$/.test(file.path)).reduce((sum, file) => sum + file.bytes, 0), totalPayloadBytes: files.reduce((sum, file) => sum + file.bytes, 0) }));
-}
+import {packageFixture,refreshManifest} from '../fixtures/snapshot-package';
+export {packageFixture,refreshManifest};
 function fixture(options: Parameters<typeof packageFixture>[1] = {}) {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p3-import-')); roots.push(root);
   const source = join(root, 'source'); packageFixture(source, options);
@@ -57,16 +31,16 @@ test('P3 package preview reserves files without business writes; atomic commit c
     expect(f.db.query('SELECT count(*) n FROM snapshots').get()).toEqual({ n: 0 });
     const operation = await f.service.read('import-1'); expect(operation.ok && operation.data?.state).toBe('ready');
     expect(operation.ok && operation.data?.artifactId).toBeGreaterThan(0);
-    const committed = await f.service.commit({ operationRef: 'import-1', previewHash: preview.data.previewHash, fileToken: 'allowed' });
+    const committed = await f.service.commit({ operationRef: 'import-1', fileToken: 'allowed' });
     expect(committed.ok && committed.data.state).toBe('imported');
     expect(f.db.query('SELECT field,delta_cents,ratio FROM change_events').all()).toEqual([{ field: 'price', delta_cents: -20, ratio: -0.2 }]);
     expect(f.db.query('SELECT source_device_id,source_submission_id FROM devices').get()).toEqual({ source_device_id: '00001', source_submission_id: '00009' });
     const duplicate = await f.service.preview({ operationRef: 'import-2', fileToken: 'allowed', mappingVersion: 'medclaw.snapshot/v1' });
     expect(duplicate.ok && duplicate.data.duplicateBatchCount).toBe(2); if (!duplicate.ok) return;
-    const result = await f.service.commit({ operationRef: 'import-2', previewHash: duplicate.data.previewHash, fileToken: 'allowed' });
+    const result = await f.service.commit({ operationRef: 'import-2', fileToken: 'allowed' });
     expect(result.ok && result.data.result?.acceptedRows).toBe(0); expect(result.ok && result.data.state).toBe('duplicate');
     expect(f.store.revision()).toBe(1); expect(f.db.query("SELECT status FROM artifacts ORDER BY id").all()).toEqual([{ status: 'ready' }, { status: 'ready' }]);
-    expect(await f.service.commit({ operationRef: 'import-1', previewHash: preview.data.previewHash, fileToken: 'allowed' })).toEqual(committed);
+    expect(await f.service.commit({ operationRef: 'import-1', fileToken: 'allowed' })).toEqual(committed);
   } finally { f.db.close(); }
 });
 test('P3 rejects unauthorized token, damaged package and stale source or managed copy', async () => {
@@ -75,7 +49,7 @@ test('P3 rejects unauthorized token, damaged package and stale source or managed
     expect(denied.ok).toBe(false);
     const preview = await f.preview(); if (!preview.ok) throw new Error('preview');
     writeFileSync(join(f.source, '使用说明.md'), 'changed');
-    const stale = await f.service.commit({ operationRef: 'import-1', previewHash: preview.data.previewHash, fileToken: 'allowed' });
+    const stale = await f.service.commit({ operationRef: 'import-1', fileToken: 'allowed' });
     expect(stale.ok).toBe(false); if (!stale.ok) expect(stale.error.code).toBe('import_preview_stale');
     expect(f.store.revision()).toBe(0); expect((await f.service.read('import-1')).ok).toBe(true);
     const broken = await f.service.preview({ operationRef: 'broken', fileToken: 'allowed', mappingVersion: 'medclaw.snapshot/v1' });
@@ -91,7 +65,7 @@ test('P3 imports optional README only as a manifest-bound package file', async (
     expect(preview.ok && preview.data.canCommit).toBe(true);
     if (!preview.ok) throw new Error('preview');
     writeFileSync(join(f.source, 'README.md'), '# Changed after preview\n');
-    const stale = await f.service.commit({ operationRef: 'import-1', previewHash: preview.data.previewHash, fileToken: 'allowed' });
+    const stale = await f.service.commit({ operationRef: 'import-1', fileToken: 'allowed' });
     expect(stale).toMatchObject({ ok: false, error: { code: 'import_preview_stale' } });
     expect(f.store.revision()).toBe(0);
     expect(f.db.query('SELECT count(*) n FROM snapshots').get()).toEqual({ n: 0 });
@@ -101,14 +75,14 @@ test('P3 day failure rolls back the whole package and cancellation never commits
   const f = fixture(); try {
     const preview = await f.preview(); if (!preview.ok) throw new Error('preview');
     f.db.exec("CREATE TRIGGER fixture_fail BEFORE INSERT ON snapshots WHEN NEW.batch_id=2 BEGIN SELECT RAISE(ABORT,'fixture'); END;");
-    const failed = await f.service.commit({ operationRef: 'import-1', previewHash: preview.data.previewHash, fileToken: 'allowed' });
+    const failed = await f.service.commit({ operationRef: 'import-1', fileToken: 'allowed' });
     expect(failed.ok).toBe(false); expect(f.store.revision()).toBe(0);
     for (const table of ['devices', 'batches', 'snapshots', 'change_events']) expect(f.db.query(`SELECT count(*) n FROM ${table}`).get()).toEqual({ n: 0 });
     f.db.exec('DROP TRIGGER fixture_fail');
     const next = await f.service.preview({ operationRef: 'cancelled', priorOperationRef: 'import-1', fileToken: 'allowed', mappingVersion: 'medclaw.snapshot/v1' });
     if (!next.ok) throw new Error('preview');
     expect((await f.service.cancel('cancelled')).ok).toBe(true);
-    const cancelled = await f.service.commit({ operationRef: 'cancelled', previewHash: next.data.previewHash, fileToken: 'allowed' });
+    const cancelled = await f.service.commit({ operationRef: 'cancelled', fileToken: 'allowed' });
     expect(cancelled.ok && cancelled.data.state).toBe('cancelled'); expect(f.store.revision()).toBe(0);
   } finally { f.db.close(); }
 });
@@ -121,7 +95,7 @@ test('P3 accepted commit stays observable during token validation and cancellati
   const service = new ImportService({ store: f.store, artifacts: f.artifacts, resolveToken: () => { enter(); return authorized; }, instanceId: 'instance' });
   try {
     const preview = await f.preview(); if (!preview.ok) throw new Error('preview');
-    const request = { operationRef: 'import-1', previewHash: preview.data.previewHash, fileToken: 'allowed' };
+    const request = { operationRef: 'import-1', fileToken: 'allowed' };
     const commit = service.commit(request); await entered;
     expect(await service.read(request.operationRef)).toMatchObject({ ok: true, data: { state: 'committing', result: null } });
     expect(f.store.read(request.operationRef)?.commitRequest).toEqual(request);
@@ -150,12 +124,12 @@ test('P3 stream CSV keeps BOM, leading zeros, escaped quotes and multiline logic
 test('P3 strictly appends new dates, preserves duplicate facts and rejects changed history or scope binding', async () => {
   const f = fixture(); try {
     const preview = await f.preview(); if (!preview.ok) throw new Error('preview');
-    await f.service.commit({ operationRef: 'import-1', previewHash: preview.data.previewHash, fileToken: 'allowed' });
+    await f.service.commit({ operationRef: 'import-1', fileToken: 'allowed' });
     packageFixture(f.source, { prices: [100, 80, 70], referenceDate: '2026-01-02' });
     const append = await f.service.preview({ operationRef: 'append', fileToken: 'allowed', mappingVersion: 'medclaw.snapshot/v1' });
     expect(append.ok && append.data.canCommit).toBe(true); if (!append.ok) return;
     expect(append.data.newBatchCount).toBe(1); expect(append.data.duplicateBatchCount).toBe(2);
-    const appended = await f.service.commit({ operationRef: 'append', previewHash: append.data.previewHash, fileToken: 'allowed' });
+    const appended = await f.service.commit({ operationRef: 'append', fileToken: 'allowed' });
     expect(appended.ok && appended.data.result?.acceptedRows).toBe(1); expect(appended.ok && appended.data.result?.duplicateRows).toBe(2);
     expect(f.store.revision()).toBe(2); expect(f.db.query('SELECT previous_batch_id FROM batches ORDER BY id').all()).toEqual([{ previous_batch_id: null }, { previous_batch_id: 1 }, { previous_batch_id: 2 }]);
     packageFixture(f.source, { prices: [101, 80, 70], referenceDate: '2026-01-02' });
@@ -172,7 +146,7 @@ test('P3 explicit missing and null or zero prices generate different determinist
   for (const options of [{ prices: [0, 50] }, { prices: [null, 0] }, { missing: true }]) {
     const f = fixture(options); try {
       const preview = await f.preview(); if (!preview.ok) throw new Error('preview');
-      const committed = await f.service.commit({ operationRef: 'import-1', previewHash: preview.data.previewHash, fileToken: 'allowed' });
+      const committed = await f.service.commit({ operationRef: 'import-1', fileToken: 'allowed' });
       expect(committed.ok && committed.data.state).toBe('imported');
       const events = f.db.query('SELECT kind,field,old_value_json,new_value_json,delta_cents,ratio FROM change_events').all();
       if ('missing' in options) expect(events).toEqual([{ kind: 'missing', field: null, old_value_json: 'null', new_value_json: 'null', delta_cents: null, ratio: null }]);
@@ -183,7 +157,7 @@ test('P3 explicit missing and null or zero prices generate different determinist
 test('P3 recover reads committed facts after source moves and interrupts only stopped previous instances', async () => {
   const f = fixture(); try {
     const preview = await f.preview(); if (!preview.ok) throw new Error('preview');
-    await f.service.commit({ operationRef: 'import-1', previewHash: preview.data.previewHash, fileToken: 'allowed' });
+    await f.service.commit({ operationRef: 'import-1', fileToken: 'allowed' });
     rmSync(f.source, { recursive: true });
     const restarted = new ImportService({ store: f.store, artifacts: f.artifacts, resolveToken: () => { throw new Error('file_token_invalid'); }, instanceId: 'next-instance' });
     const recovered = await restarted.recover('import-1'); expect(recovered.ok && recovered.data.state).toBe('imported'); expect(f.store.revision()).toBe(1);
@@ -203,12 +177,12 @@ test('P3 revalidates catalog revision and managed copy and guards same-operation
     const preview = await f.preview(); if (!preview.ok) throw new Error('preview');
     const different = await f.service.preview({ operationRef: 'import-1', fileToken: 'different', mappingVersion: 'medclaw.snapshot/v1' }); expect(different.ok).toBe(false); if (!different.ok) expect(different.error.code).toBe('state_conflict');
     const second = await f.service.preview({ operationRef: 'import-2', fileToken: 'allowed', mappingVersion: 'medclaw.snapshot/v1' }); if (!second.ok) throw new Error('preview');
-    await f.service.commit({ operationRef: 'import-1', previewHash: preview.data.previewHash, fileToken: 'allowed' });
-    const stale = await f.service.commit({ operationRef: 'import-2', previewHash: second.data.previewHash, fileToken: 'allowed' }); expect(stale.ok).toBe(false); if (!stale.ok) expect(stale.error.code).toBe('import_preview_stale');
+    await f.service.commit({ operationRef: 'import-1', fileToken: 'allowed' });
+    const stale = await f.service.commit({ operationRef: 'import-2', fileToken: 'allowed' }); expect(stale.ok).toBe(false); if (!stale.ok) expect(stale.error.code).toBe('import_preview_stale');
     const third = await f.service.preview({ operationRef: 'import-3', fileToken: 'allowed', mappingVersion: 'medclaw.snapshot/v1' }); if (!third.ok) throw new Error('preview');
     const operation = await f.service.read('import-3'); if (!operation.ok || !operation.data?.artifactId) throw new Error('read');
     writeFileSync(join(f.artifacts.inputPath(operation.data.artifactId), 'validation-report.json'), 'changed');
-    const changed = await f.service.commit({ operationRef: 'import-3', previewHash: third.data.previewHash, fileToken: 'allowed' }); expect(changed.ok).toBe(false); if (!changed.ok) expect(changed.error.code).toBe('import_preview_stale'); expect(f.store.revision()).toBe(1);
+    const changed = await f.service.commit({ operationRef: 'import-3', fileToken: 'allowed' }); expect(changed.ok).toBe(false); if (!changed.ok) expect(changed.error.code).toBe('import_preview_stale'); expect(f.store.revision()).toBe(1);
   } finally { f.db.close(); }
 });
 test('P3 validates manifest traversal and file membership, source refs, cohort, JSON, amounts and collection counts', async () => {
@@ -222,14 +196,14 @@ test('P3 validates manifest traversal and file membership, source refs, cohort, 
         writeFileSync(manifestPath, JSON.stringify(manifest));
       } else if (scenario === 'cohort' || scenario === 'missing-reason') {
         const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
-        if (scenario === 'cohort') metadata.cohortHash = '0'.repeat(64); else metadata.declaredMissingEntityIds = ['00001'];
+        if (scenario === 'cohort') metadata.expectedEntityCount = 2; else metadata.declaredMissingEntityIds = ['00001'];
         writeFileSync(metadataPath, JSON.stringify(metadata)); refreshManifest(f.source, 2, 2);
       } else {
         const records = [...readCsvRecords(file)], headers = records[0]!, row = records[1]!;
         const key = scenario === 'amount' ? 'price_cents' : scenario === 'json' || scenario === 'source' ? 'source_refs_json' : 'field_origins_json';
-        row[headers.indexOf(key)] = scenario === 'amount' ? '-0.01' : scenario === 'json' ? '{invalid' : scenario === 'source' ? JSON.stringify([{ sourceId: 'outside', file: 'outside.zip', row: 1, recordId: '1', sha256: 'a'.repeat(64) }]) : '{}';
+        row[headers.indexOf(key)] = scenario === 'amount' ? '-0.01' : scenario === 'json' ? '{invalid' : scenario === 'source' ? JSON.stringify([{ sourceId: 'outside', file: 'outside.zip', row: 1, recordId: '1' }]) : '{}';
         const text = records.map(csv).join('\n') + '\n'; writeFileSync(file, text);
-        const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')); metadata.fileSha256 = hash(text); writeFileSync(metadataPath, JSON.stringify(metadata)); refreshManifest(f.source, 2, 2);
+        const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')); writeFileSync(metadataPath, JSON.stringify(metadata)); refreshManifest(f.source, 2, 2);
       }
       const preview = await f.preview(); expect(preview.ok && preview.data.canCommit).toBe(false); expect(f.store.revision()).toBe(0); expect(f.db.query('SELECT count(*) n FROM batches').get()).toEqual({ n: 0 });
     } finally { f.db.close(); }
@@ -239,7 +213,7 @@ test('P3 same scope rejects coherent new source bindings and historical backfill
   const f = fixture(); try {
     rmSync(join(f.source, 'zhejiang_2026-01-01.csv')); rmSync(join(f.source, 'zhejiang_2026-01-01.metadata.json')); refreshManifest(f.source, 1, 1);
     const initial = await f.preview(); if (!initial.ok) throw new Error('preview');
-    const result = await f.service.commit({ operationRef: 'import-1', previewHash: initial.data.previewHash, fileToken: 'allowed' }); expect(result.ok && result.data.state).toBe('imported');
+    const result = await f.service.commit({ operationRef: 'import-1', fileToken: 'allowed' }); expect(result.ok && result.data.state).toBe('imported');
     packageFixture(f.source);
     const backfill = await f.service.preview({ operationRef: 'backfill', fileToken: 'allowed', mappingVersion: 'medclaw.snapshot/v1' }); expect(backfill.ok && backfill.data.canCommit).toBe(false); expect(backfill.ok && backfill.data.issues[0]?.code).toBe('import_conflict');
     for (const file of readdirSync(f.source).filter(file => file.endsWith('.metadata.json'))) { const path = join(f.source, file), metadata = JSON.parse(readFileSync(path, 'utf8')); metadata.sourceBundleId = 'another-source-bundle'; writeFileSync(path, JSON.stringify(metadata)); }
@@ -273,4 +247,32 @@ test('P3 rejected source directory inventory preserves the import rejection stat
     expect(f.db.query('SELECT count(*) n FROM batches').get()).toEqual({ n: 0 });
     expect(f.store.revision()).toBe(0);
   } finally { f.db.close(); }
+});
+
+test('legacy import JSON remains byte for byte unchanged during a status-only update',async()=>{
+  const f=fixture();
+  try {
+    const preview=await f.preview();if(!preview.ok)throw preview.error;
+    const originalPreview=JSON.stringify({...preview.data,previewHash:'historical-preview',sourceHash:'historical-source',metadataHash:'historical-metadata'});
+    const originalCommit='{ "fileToken": "allowed", "previewHash": "historical-preview", "operationRef": "import-1" }';
+    f.db.query('UPDATE imports SET preview_json=?,commit_request_json=? WHERE operation_ref=?').run(originalPreview,originalCommit,'import-1');
+    f.store.update('import-1',{state:'cancelled',error:null});
+    expect(f.db.query('SELECT preview_json,commit_request_json FROM imports WHERE operation_ref=?').get('import-1')).toEqual({preview_json:originalPreview,commit_request_json:originalCommit});
+    expect(f.store.read('import-1')!.operation.preview).not.toHaveProperty('previewHash');
+    expect(f.store.read('import-1')!.commitRequest).toEqual({operationRef:'import-1',fileToken:'allowed'});
+  }finally{f.db.close();}
+});
+
+test('a legacy v1 package stays usable for partial batch deletion after normalization',async()=>{
+  const f=fixture();
+  try {
+    for(const name of readdirSync(f.source).filter(name=>name.endsWith('.metadata.json'))) {
+      const path=join(f.source,name),metadata=JSON.parse(readFileSync(path,'utf8'));
+      Object.assign(metadata,{contract:'medclaw.snapshot/v1',sourceLockHash:'historical-source',cohortHash:'historical-cohort',fileSha256:'historical-file'});
+      writeFileSync(path,JSON.stringify(metadata));
+    }
+    refreshManifest(f.source,2,2);const preview=await f.preview();expect(preview.ok&&preview.data.canCommit).toBe(true);
+    const result=await f.service.commit({operationRef:'import-1',fileToken:'allowed'});expect(result.ok&&result.data.state).toBe('imported');
+    expect(await f.artifacts.planBatchDeletion([1])).toEqual([{artifactId:1,path:'input/zhejiang_2026-01-01.metadata.json'},{artifactId:1,path:'input/zhejiang_2026-01-01.csv'}]);
+  }finally{f.db.close();}
 });

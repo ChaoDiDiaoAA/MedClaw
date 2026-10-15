@@ -17,6 +17,9 @@ import {SqliteEventStore} from '../../packages/storage/src/event-store';
 import { toWorkspaceContext } from '../../packages/contracts/src/workspace';
 import { SqliteContextStore } from '../../packages/storage/src/context-store';
 
+const retiredBusinessColumns=new Set(["preview_request_hash", "commit_request_hash", "fingerprint", "source_lock_hash", "content_hash", "cohort_hash", "params_hash", "result_hash", "scope_batch_hashes_json", "request_hash", "published_hash", "sha256"]);
+const retainedFields=(row:Record<string,unknown>)=>Object.fromEntries(Object.entries(row).filter(([key])=>!retiredBusinessColumns.has(key)));
+
 function schema9() {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p10-')), path = join(root, 'app.sqlite'), db = new Database(path, { strict: true });
   const names = ['001_p1.sql','002_p2.sql','003_p3.sql','004_p5.sql','005_p6.sql','006_session_lifecycle.sql','007_batch_deletion.sql','008_p8.sql','009_p9.sql'];
@@ -40,19 +43,21 @@ function schema9() {
   }).immediate();
   const tables = db.query<{name:string},[]>("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations' ORDER BY name").all().map(row=>row.name);
   const rows = tables.map(name=>db.query<Record<string, unknown>, []>(`SELECT * FROM ${name} ORDER BY id`).all());
-  return { root,path,db,tables,rows };
+  const schema = db.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all();
+  const migrations = db.query('SELECT * FROM schema_migrations ORDER BY version').all();
+  return { root,path,db,tables,rows,schema,migrations };
 }
 
 test('p10 schema9 migration preserves complete old rows and native/P8 references while admitting only explicit manual ownership', () => {
   const f = schema9(); let db = f.db;
   try {
-    db.close(); db = openDatabase(f.path); expect(SCHEMA_VERSION).toBe(15);
+    db.close(); db = openDatabase(f.path); expect(SCHEMA_VERSION).toBe(16);
     for (const [i,name] of f.tables.entries()) {
       const rows = db.query<Record<string, unknown>, []>(`SELECT * FROM ${name} ORDER BY id`).all();
-      expect(rows.map((row, n) => Object.fromEntries(Object.keys(f.rows[i]![n]!).map(key => [key, row[key]])))).toEqual(f.rows[i]);
+      expect(rows.map((row, n) => Object.fromEntries(Object.keys(retainedFields(f.rows[i]![n]!)).map(key => [key, row[key]])))).toEqual(f.rows[i]!.map(retainedFields));
     }
     expect(db.query<Record<string, unknown>, []>('SELECT parent_run_id,origin_tool_call_id,child_result_json FROM runs').all().every(row => Object.values(row).every(value => value === null))).toBe(true);
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(15);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(16);
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]); expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
     expect(db.query('PRAGMA foreign_keys').get()).toEqual({foreign_keys:1});
     const metadata = { compaction: { contract: 'medclaw.compaction/v1', operationRef: 'manual', source: 'manual', reason: 'manual', ordinal: 1 } };
@@ -82,8 +87,9 @@ for (const fault of ['p10_copy','p10_rename','p10_marker']) test(`p10 ${fault} f
     expect(reached).toBe(true);
     const raw = new Database(f.path,{strict:true});
     try {
-      expect(raw.query('SELECT version FROM schema_migrations').all()).toHaveLength(9);
+      expect(raw.query('SELECT * FROM schema_migrations ORDER BY version').all()).toEqual(f.migrations);
       for (const [i,name] of f.tables.entries()) expect(raw.query(`SELECT * FROM ${name} ORDER BY id`).all()).toEqual(f.rows[i]);
+      expect(raw.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all()).toEqual(f.schema);
       expect(raw.query("SELECT name FROM sqlite_schema WHERE name='model_calls_p10'").get()).toBeNull();
       expect(raw.query('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally { raw.close(); }

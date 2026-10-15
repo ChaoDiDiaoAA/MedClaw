@@ -7,7 +7,6 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { createServer, type Server } from 'node:http';
 import type { SessionInput, SubmitResult } from '../../packages/contracts/src/session';
-import { createHash } from 'node:crypto';
 import { canonicalRequest } from '../../packages/contracts/src/run';
 import { safeError } from '../../packages/contracts/src/error';
 
@@ -44,22 +43,20 @@ function save(name: string, data: unknown) { mkdirSync(evidence, { recursive: tr
 
 function snapshotPackage(directory: string) {
   mkdirSync(directory, { recursive: true });
-  const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
   const csv = (values: string[]) => values.map(value => `"${value.replaceAll('"', '""')}"`).join(',');
   const names = ['A decrease one', 'A decrease two', 'Original manufacturer decrease', 'B unique increase device'];
   const masters = names.map((device_name, i) => ({ record_type: 'master', device_id: String(i + 1).padStart(5, '0'), device_name, source_submission_id: String(i + 1).padStart(5, '0'), source_applicant: 'Synthetic Applicant', category: 'Category', manufacturer: i === 2 ? '模拟厂家-02' : '模拟厂家-01' }));
-  const sourceLock = { schema: 'medclaw.source-lock/v1', sources: [{ source: 'fixture', path: 'original.csv', sha256: 'a'.repeat(64) }] };
-  const lockHash = hash(canonicalRequest(sourceLock)), cohortHash = hash(canonicalRequest(masters));
+  const sourceLock = { schema: 'medclaw.source-lock/v2', sources: [{ source: 'fixture', path: 'original.csv' }] };
   writeFileSync(join(directory, 'source-lock.json'), JSON.stringify(sourceLock)); writeFileSync(join(directory, 'entity-lineage.csv'), `${csv(Object.keys(masters[0]!))}\n${masters.map(master => csv(Object.values(master))).join('\n')}\n`);
   for (const name of ['adjustment-lineage.csv', 'validation-report.json', 'selection-report.json', '使用说明.md']) writeFileSync(join(directory, name), name.endsWith('.json') ? '{}' : 'fixture');
   const columns = ['device_id', 'device_name', 'source_submission_id', 'source_applicant', 'category', 'region', 'snapshot_date', 'price_cents', 'currency', 'unit', 'status', 'manufacturer', 'distributor', 'source_refs_json', 'field_origins_json'];
   const origins = Object.fromEntries(columns.slice(0, 13).map(key => [key, { kind: 'synthetic', ruleId: 'p4-fixture' }]));
   for (const [index, prices] of [[10000, 20000, 10000, 10000], [8000, 15000, 9000, 12000]].entries()) {
     const date = `2026-01-0${index + 1}`;
-    const text = `${csv(columns)}\n${masters.map((master, ordinal) => csv([master.device_id, master.device_name, master.source_submission_id, master.source_applicant, 'Category', '浙江', date, String(prices[ordinal]), 'CNY', '件', 'active', master.manufacturer, ordinal === 1 ? '模拟配送-02' : '模拟配送-01', JSON.stringify([{ sourceId: 'fixture', file: 'original.csv', row: ordinal + 1, recordId: master.source_submission_id, sha256: 'a'.repeat(64) }]), JSON.stringify(origins)])).join('\n')}\n`;
-    writeFileSync(join(directory, `zhejiang_${date}.csv`), text); writeFileSync(join(directory, `zhejiang_${date}.metadata.json`), JSON.stringify({ contract: 'medclaw.snapshot/v1', mappingVersion: 'medclaw.snapshot/v1', materialVersion: 'p4-fixture/v1', generatorVersion: 'p4-fixture/v1', seed: 1, sourceBundleId: 'p4-fixture', sourceLockHash: lockHash, scopeKey: 'p4-zhejiang', region: '浙江', cohortHash, snapshotDate: date, coverage: 'full', expectedEntityCount: 4, observedEntityCount: 4, declaredMissingEntityIds: [], fileSha256: hash(text), referenceDate: '2026-01-02', timezone: 'Asia/Shanghai' }));
+    const text = `${csv(columns)}\n${masters.map((master, ordinal) => csv([master.device_id, master.device_name, master.source_submission_id, master.source_applicant, 'Category', '浙江', date, String(prices[ordinal]), 'CNY', '件', 'active', master.manufacturer, ordinal === 1 ? '模拟配送-02' : '模拟配送-01', JSON.stringify([{ sourceId: 'fixture', file: 'original.csv', row: ordinal + 1, recordId: master.source_submission_id }]), JSON.stringify(origins)])).join('\n')}\n`;
+    writeFileSync(join(directory, `zhejiang_${date}.csv`), text); writeFileSync(join(directory, `zhejiang_${date}.metadata.json`), JSON.stringify({ contract: 'medclaw.snapshot/v2', mappingVersion: 'medclaw.snapshot/v1', materialVersion: 'p4-fixture/v1', generatorVersion: 'p4-fixture/v1', seed: 1, sourceBundleId: 'p4-fixture', scopeKey: 'p4-zhejiang', region: '浙江', snapshotDate: date, coverage: 'full', expectedEntityCount: 4, observedEntityCount: 4, declaredMissingEntityIds: [], referenceDate: '2026-01-02', timezone: 'Asia/Shanghai' }));
   }
-  const files = readdirSync(directory).filter(path => path !== 'manifest.json').sort().map(path => { const bytes = readFileSync(join(directory, path)); return { path, bytes: bytes.length, sha256: hash(bytes) }; });
+  const files = readdirSync(directory).filter(path => path !== 'manifest.json').sort().map(path => { const bytes = readFileSync(join(directory, path)); return { path, bytes: bytes.length }; });
   writeFileSync(join(directory, 'manifest.json'), JSON.stringify({ status: 'complete', files, businessFiles: 2, businessRows: 8, businessBytes: files.filter(file => /^zhejiang_.*\.csv$/.test(file.path)).reduce((sum, file) => sum + file.bytes, 0), totalPayloadBytes: files.reduce((sum, file) => sum + file.bytes, 0) }));
 }
 
@@ -214,7 +211,7 @@ test('A03 device and change choices use saved stable identities and server versi
   await expect(page.getByTestId('confirmed-selection').last()).toContainText(`snapshot:${identity.id}`);
   const device = sql('SELECT * FROM workspace')[0], selection = JSON.parse(device.selection_json);
   expect(selection).toMatchObject({ kind: 'device', targetId: String(identity.device_id), rowKey: `snapshot:${identity.id}`, field: null });
-  expect(selection.targetVersion).toBe(sql('SELECT content_hash FROM batches WHERE id=2')[0].content_hash);
+  expect(selection.targetVersion).toBe('batch:2:p4-fixture/v1');
   await page.getByRole('button', { name: 'Read batch 2 changes', exact: true }).click();
   const event = sql('SELECT id FROM change_events WHERE new_batch_id=2 ORDER BY id')[0];
   await page.getByRole('button', { name: `Select change ${event.id}`, exact: true }).click();
@@ -338,14 +335,14 @@ async function savedQuery() {
 }
 
 test('A03 Query row and field selections use immutable page sidecars', async () => {
-  const query = await savedQuery(), saved = sql(`SELECT result_json,result_hash FROM queries WHERE id=${query.queryId}`)[0];
+  const query = await savedQuery(), saved = sql(`SELECT result_json FROM queries WHERE id=${query.queryId}`)[0];
   const viewed = await page.evaluate(queryId => window.medclaw.request('query.read', { queryId }), query.queryId); if (!viewed.ok) throw Error(viewed.error.code);
   const key = viewed.data.page.rowKeys[0]!;
   await page.getByRole('button', { name: `Select Query ${query.queryId} ${key} field deltaCents`, exact: true }).click();
   await expect.poll(() => sql('SELECT selection_json FROM workspace')[0].selection_json).not.toBeNull();
   const workspace = sql('SELECT * FROM workspace')[0];
   expect(JSON.parse(workspace.selection_json)).toMatchObject({ kind: 'query-row', targetId: String(query.queryId), targetVersion: viewed.data.page.targetVersion, rowKey: key, field: 'deltaCents' });
-  expect(sql(`SELECT result_json,result_hash FROM queries WHERE id=${query.queryId}`)[0]).toEqual(saved);
+  expect(sql(`SELECT result_json FROM queries WHERE id=${query.queryId}`)[0]).toEqual(saved);
   const evidenceId = viewed.data.page.evidenceIds[0]!; await page.getByRole('button', { name: `Read evidence ${evidenceId}`, exact: true }).click();
   await page.getByRole('button', { name: `Select Evidence ${evidenceId}`, exact: true }).click();
   await expect.poll(() => JSON.parse(sql('SELECT selection_json FROM workspace')[0].selection_json).kind).toBe('evidence');

@@ -228,7 +228,7 @@ export type PreparedInput = { operationRef: string; originalSubmitInput: SubmitI
   execution: { mode: "send"; run: Omit<RegisterAgentInput, "inputId" | "submission"> } | { mode: "steer" | "follow_up"; targetRunId: number } };
 export interface InputStore {
   /** Same-Session facts for original native history entries, before Provider delivery. */
-  readResourceOrigins?(sessionId: number, nativeEntryIds: readonly string[]): import('./resources').ResourceEvidence[];
+  readResourceOrigins?(sessionId: number, nativeEntryIds: readonly string[]): Array<import('./resources').ResourceEvidence & { content: unknown }>;
   acceptInput(plan: PreparedInput): SubmitResult;
   beginInputDelivery(inputId: number, instanceId: string, at: string): void;
   recordInputDelivery(inputId: number, at: string): void;

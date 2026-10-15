@@ -1,7 +1,6 @@
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { getApiProvider, getApiProviders } from "@earendil-works/pi-ai/compat";
 import type { Api, AssistantMessage, AuthInteraction, AuthType, CredentialStore, Model, ModelsStore, ModelsStoreEntry } from "@earendil-works/pi-ai";
-import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { readFile, mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -213,7 +212,7 @@ export class PiModelRuntime implements ModelRuntimePort<ResolvedModel> {
     const custom = this.custom.get(model.provider)?.models.find(m => m.id === model.id);
     const rates = [model.cost, ...(model.cost.tiers ?? [])].flatMap(cost => [cost.input, cost.output, cost.cacheRead, cost.cacheWrite]);
     const pricingKnown = custom ? custom.pricingKnown : rates.every(rate => Number.isFinite(rate) && rate >= 0) && rates.some(rate => rate > 0);
-    return { model: freezeModel(model), policy: Object.freeze({ ...policy }), pricingKnown, selection: Object.freeze({ provider: model.provider, modelId: model.id, endpointRef: `endpoint:${createHash("sha256").update(model.baseUrl).digest("hex")}`, api: model.api, configVersion, credentialRef, maxOutputTokens: model.maxTokens, capabilitySource: custom ? "user_declared" : "pi_catalog", sdkVersion: SDK_VERSION }) };
+    return { model: freezeModel(model), policy: Object.freeze({ ...policy }), pricingKnown, selection: Object.freeze({ provider: model.provider, modelId: model.id, endpointRef: null, api: model.api, configVersion, credentialRef, maxOutputTokens: model.maxTokens, capabilitySource: custom ? "user_declared" : "pi_catalog", sdkVersion: SDK_VERSION }) };
   }
   async execute(resolved: ResolvedModel, text: string, signal: AbortSignal, onPreview: (text: string) => void, onTerminal: () => void = () => {}): Promise<ProviderOutcome> {
     const stream = this.native.streamSimple(resolved.model, { messages: [{ role: "user", content: text, timestamp: Date.now() }] }, { signal, maxTokens: resolved.selection.maxOutputTokens, maxRetries: resolved.policy.maxRetries, maxRetryDelayMs: resolved.policy.maxRetryDelayMs });

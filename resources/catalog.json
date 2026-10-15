@@ -18,8 +18,7 @@
       "requiredExtensions": [],
       "files": [
         "query.md"
-      ],
-      "treeHash": "56b81b11b44cdf84350d49a20c212f7d4df3c31b6885ccd96dfa29d4aa1f27df"
+      ]
     },
     {
       "kind": "skill",
@@ -40,8 +39,7 @@
       "files": [
         "SKILL.md",
         "references/facts-and-assumptions.md"
-      ],
-      "treeHash": "ec9d25f2be255ee5d0136ce1720fc021825059925d5602973c714371178fda41"
+      ]
     }
   ]
 }

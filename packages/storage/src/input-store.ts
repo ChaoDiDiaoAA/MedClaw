@@ -1,6 +1,6 @@
 import type { Database } from 'bun:sqlite';
 import { z } from 'zod';
-import { createHash } from 'node:crypto';
+import { legacyInputContent } from './legacy-business-fields';
 import { NativeInputReceiptSchema } from '../../contracts/src/resources';
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, safeError, type AppError } from '../../contracts/src/error';
 import { InputContentSchema, SessionInputSchema, ReadInputRequestSchema, ListInputsRequestSchema, SessionInputPageSchema, MAX_INPUT_PAGE_BYTES,
@@ -26,8 +26,7 @@ export class SqliteInputStore {
  }
  row(inputId:number):InputRow|null {check(PositiveIdSchema,inputId);return this.db.query<InputRow,[number]>('SELECT * FROM session_inputs WHERE id=?').get(inputId);}
  required(inputId:number):InputRow {return this.row(inputId)??fail('input_not_found');}
- content(row:InputRow):InputContent {const content=check(InputContentSchema,readJson(row.content_json),'storage_read_failed'); if(content.originalSubmitInput.sessionId!==row.session_id||content.originalSubmitInput.clientSequence!==row.client_sequence||content.originalSubmitInput.mode!==row.mode
-   || content.nativeInput && createHash('sha256').update(content.nativeInput.text).digest('hex')!==content.nativeInput.sha256
+ content(row:InputRow):InputContent {const content=check(InputContentSchema,legacyInputContent(readJson(row.content_json)),'storage_read_failed'); if(content.originalSubmitInput.sessionId!==row.session_id||content.originalSubmitInput.clientSequence!==row.client_sequence||content.originalSubmitInput.mode!==row.mode
    || content.resourceInputPlan && row.status==='consumed' && !content.nativeInput)fail('storage_read_failed');return content;}
  projection(row:InputRow):SessionInput {
   const c=this.content(row),p=safePreview(c.text,8192);
@@ -50,7 +49,7 @@ export class SqliteInputStore {
   check(OpaqueIdSchema,instanceId);check(TimestampSchema,at);const row=this.required(inputId),c=this.content(row);
   if(c.deliveryAttempt){if(c.deliveryAttempt.instanceId===instanceId&&c.deliveryAttempt.startedAt===at)return;fail('state_conflict');}
   if(row.status!=='queued'||row.processing_status!=='pending')fail('state_conflict');
-  c.deliveryAttempt={instanceId,startedAt:at};const saved=this.db.query('UPDATE session_inputs SET content_json=?,updated_at=? WHERE id=? AND content_json=?').run(canonicalRequest(c),at,inputId,row.content_json);if(saved.changes!==1)fail('state_conflict');
+  c.deliveryAttempt={instanceId,startedAt:at};const saved=this.db.query('UPDATE session_inputs SET content_json=?,updated_at=? WHERE id=? AND content_json=?').run(JSON.stringify({...readJson(row.content_json) as object,deliveryAttempt:c.deliveryAttempt}),at,inputId,row.content_json);if(saved.changes!==1)fail('state_conflict');
  }
  recordInputDelivery(inputId:number,at:string):void {
   check(TimestampSchema,at);const row=this.required(inputId);if(!this.content(row).deliveryAttempt)fail('state_conflict');
@@ -64,7 +63,6 @@ export class SqliteInputStore {
   const row=this.required(inputId), content=this.content(row);
   if(row.session_id!==fact.sessionId||row.target_run_id!==fact.runId)fail('state_conflict');
   const receipt=fact.nativeInput===undefined?undefined:check(NativeInputReceiptSchema,fact.nativeInput);
-  if(receipt&&createHash('sha256').update(receipt.text).digest('hex')!==receipt.sha256)fail('invalid_argument');
   if(content.resourceInputPlan&&!receipt||receipt&&!content.resourceInputPlan)fail('state_conflict');
   if(row.status==='consumed'){if(row.run_id===fact.runId&&row.native_entry_id===fact.nativeEntryId&&canonicalRequest(content.nativeInput??null)===canonicalRequest(receipt??null))return;fail('state_conflict');}
   if(row.status==='cancelled'||row.status==='failed')fail('native_state_invalid');
@@ -73,7 +71,7 @@ export class SqliteInputStore {
   if(this.db.query('SELECT id FROM session_inputs WHERE session_id=? AND native_entry_id=? AND id<>?').get(row.session_id,fact.nativeEntryId,row.id))fail('native_state_invalid');
   if(receipt)content.nativeInput=receipt;
   check(InputContentSchema,content);
-  this.cas(row,'consumed',row.processing_status,fact.at,row.error_json,fact.runId,fact.nativeEntryId,canonicalRequest(content));
+  this.cas(row,'consumed',row.processing_status,fact.at,row.error_json,fact.runId,fact.nativeEntryId,receipt?JSON.stringify({...readJson(row.content_json) as object,nativeInput:receipt}):row.content_json);
  }
  settleProductInput(inputId:number,fact:{runId:number;sessionId:number;nativeEntryId:string;at:string}):void {
   if(!this.db.inTransaction)fail('state_conflict');
@@ -87,10 +85,10 @@ export class SqliteInputStore {
   const message=native?(readJson(native.entry_json) as {message?:{role?:string;content?:unknown}}).message:null;
   if(message?.role!=='user'||canonicalRequest(message.content)!==canonicalRequest([{type:'text',text:content.text}])
     ||this.db.query('SELECT id FROM session_inputs WHERE session_id=? AND native_entry_id=? AND id<>?').get(fact.sessionId,fact.nativeEntryId,inputId))fail('session_history_invalid');
-  if(content.resourceInputPlan)content.nativeInput=check(NativeInputReceiptSchema,{text:content.text,sha256:createHash('sha256').update(content.text).digest('hex')});
+  if(content.resourceInputPlan)content.nativeInput=check(NativeInputReceiptSchema,{text:content.text});
   check(InputContentSchema,content);
   this.db.query('UPDATE session_inputs SET delivered_at=? WHERE id=? AND delivered_at IS NULL').run(fact.at,inputId);
-  this.cas(this.required(inputId),'consumed','pending',fact.at,null,fact.runId,fact.nativeEntryId,canonicalRequest(content),'product_history_saved');
+  this.cas(this.required(inputId),'consumed','pending',fact.at,null,fact.runId,fact.nativeEntryId,content.resourceInputPlan?JSON.stringify({...readJson(row.content_json) as object,nativeInput:content.nativeInput}):row.content_json,'product_history_saved');
   this.cas(this.required(inputId),'consumed','completed',fact.at,null);
  }
  settleProgramFailure(inputId:number,fact:{runId:number;sessionId:number;status:'failed'|'cancelled';at:string;error:AppError|null}):void {

@@ -15,7 +15,6 @@ import { resolve } from 'node:path';
 import { realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { createHash } from 'node:crypto';
 import { canonicalRequest } from '../../contracts/src/run';
 import type { FrozenRunResources } from '../../contracts/src/resources';
 import { verifyRunResourceFiles } from './resource-loader';
@@ -471,8 +470,7 @@ export function createPiNativeTools(
         const provedLines = truncation?.outputLines ?? selected.length, prefix = selected.slice(0, provedLines).join('\n');
         const coverage = start === 0 && selected.length === lines.length && text === file.content ? 'complete'
           : prefix.length > 0 && (text === prefix || text?.startsWith(prefix + '\n\n[')) ? 'partial' : 'unknown';
-        recorder.recordResourceRead(context, {resourceRef:snapshot.ref,file:file.file,fileHash:file.sha256,
-          returnedContentHash:createHash('sha256').update(canonicalRequest(message.content)).digest('hex'),coverage,observedAt:new Date().toISOString()});
+        recorder.recordResourceRead(context, {resourceRef:snapshot.ref,file:file.file,coverage,observedAt:new Date().toISOString()});
       }
     };
     const unsubscribe = boundSession.agent.subscribe(async (event, signal) => {

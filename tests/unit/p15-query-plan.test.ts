@@ -17,7 +17,7 @@ test('p15 resolved comparison freezes both dates in a deterministic plan, with n
   const data = intentCatalogData();
   const input = IntentInputProjectionSchema.parse({ ...intentInput(), versions: { ...intentInput().versions, ...INTENT_VERSIONS },
     text: '比较浙江2026-10-09和2026-10-10的快照记录总数，不限状态',
-    scope: { ...intentInput().scope, batchIds: [2, 3], allowedToolNames: ['query_current_devices', 'query_device_changes', 'read_query', 'list_query_evidence'] }, scopeBatchHashes: data.batches.slice(1).map(b => b.contentHash),
+    scope: { ...intentInput().scope, batchIds: [2, 3], allowedToolNames: ['query_current_devices', 'query_device_changes', 'read_query', 'list_query_evidence'] },
     enabledL2: ['PERIOD_COMPARE'], availableToolNames: ['query_current_devices', 'query_device_changes', 'read_query', 'list_query_evidence'],
     availableData: { regions: ['浙江'], dates: ['2026-10-09', '2026-10-10'], currencies: ['CNY'], units: ['件'] } });
   const periods = [{ start: '2026-10-09', endExclusive: '2026-10-10' }, { start: '2026-10-10', endExclusive: '2026-10-11' }];

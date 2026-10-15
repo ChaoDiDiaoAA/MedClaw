@@ -86,7 +86,7 @@ test('p8 original Pi request sends the saved projection and records a real succe
   const messages = f.requests[0]!.messages as {role:string;content:unknown}[];
   expect(messages.filter(message => contextMessageText(message.content) === read.snapshot.renderedProjection)).toHaveLength(1);
   expect(matchProviderContext('openai-completions',f.requests[0],read.snapshot)).toBe(true);
-  expect(read.deliveries[0]?.observation).toMatchObject({httpStatus:200,api:'openai-completions',projectionHash:read.snapshot.projectionHash});
+  expect(read.deliveries[0]?.observation).toMatchObject({httpStatus:200,api:'openai-completions'});
 });
 
 test('p8 actually consumed queued input and original tool facts bind distinct snapshots on the real Pi chain', async () => {

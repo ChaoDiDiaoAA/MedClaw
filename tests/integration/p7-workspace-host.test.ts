@@ -1,3 +1,4 @@
+import {queryTargetVersion} from '../../packages/storage/src/workspace-selection';
 import { test, expect } from 'bun:test';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join, resolve, relative } from 'node:path';
@@ -20,8 +21,8 @@ const original=WorkspaceService.prototype.restore;WorkspaceService.prototype.res
   const host=new HostController({dataRoot:root,hostEntry:entry,bunExecutable:process.execPath,onCredentialRequest:async frame=>frame.method==='export.destination.settlePrevious'?{ok:true,data:{stopped:true}}:frame.method==='credential.list'?{ok:true,data:[]} : frame.method==='credential.read'?{ok:true,data:null}:{ok:false,error:safeError('access_denied')}});
   new MainSettings(host.paths.settingsPath).read();
   const db=openDatabase(host.paths.databasePath), saved=savedQueries?seedWorkspaceQueries(db):null;
-  if(!savedQueries)db.run('UPDATE workspace SET selection_json=? WHERE id=1',[JSON.stringify({formatVersion:1,kind:'device',targetId:'999',targetVersion:'a'.repeat(64),rowKey:'snapshot:999',field:null})]);db.close();
-  expect(await host.start()).toMatchObject({state:'ready',schemaVersion:15,sdkVersion:'0.87.1'});
+  if(!savedQueries)db.run('UPDATE workspace SET selection_json=? WHERE id=1',[JSON.stringify({formatVersion:1,kind:'device',targetId:'999',targetVersion:'batch:999:missing',rowKey:'snapshot:999',field:null})]);db.close();
+  expect(await host.start()).toMatchObject({state:'ready',schemaVersion:16,sdkVersion:'0.87.1'});
   const read=async()=>WorkspaceViewSchema.parse(unwrap(await host.request('workspace.read',{})));
   const sql=(query:string)=>{const db=new Database(host.paths.databasePath,{readonly:true});try{return db.query(query).all();}finally{db.close();}};
   const count=()=>existsSync(calls)?readFileSync(calls,'utf8').trim().split('\n').length:0;
@@ -39,7 +40,7 @@ test('A03 real Host Query pages keep saved snapshot identities across page sizes
     expect(one.page.rowKeys).toEqual(['snapshot:1']);expect(two.page.rowKeys).toEqual(['snapshot:2']);expect(three.page.rowKeys).toEqual(['snapshot:3']);
     expect(wide.page.rowKeys).toEqual(['snapshot:1','snapshot:2']);expect(tail.page.rowKeys).toEqual(['snapshot:3']);
     expect(wide.page.rows).toEqual([...one.page.rows,...two.page.rows]);expect(tail.page.rows).toEqual(three.page.rows);
-    for(const view of [one,two,three,wide,tail])expect(view.page.targetVersion).toBe(f.saved!.current.resultHash);
+    for(const view of [one,two,three,wide,tail])expect(view.page.targetVersion).toBe(queryTargetVersion(f.saved!.current));
     expect({workspace:f.sql('SELECT * FROM workspace'),queries:f.sql('SELECT * FROM queries'),runs:f.sql('SELECT * FROM runs')}).toEqual(before);
     expect(f.sql('SELECT count(*) AS n FROM model_calls')).toEqual([{n:0}]);expect(f.sql('SELECT count(*) AS n FROM session_inputs')).toEqual([{n:0}]);
   } finally {await f.close();}
@@ -47,13 +48,13 @@ test('A03 real Host Query pages keep saved snapshot identities across page sizes
 
 // Break caught: page-local duplicate detection incorrectly grants identities
 // to equal legacy aggregate rows that are separated by a page boundary.
-test('A03 real Host marks duplicate saved aggregate rows null even when split across pages', async () => {
+test('A03 real Host gives duplicate saved aggregate rows stable distinct indices across pages', async () => {
   const f=await fixture(false,true);try {
     const queryId=f.saved!.duplicate.id,before=f.sql('SELECT * FROM queries');
     const read=async(page:number,pageSize:number)=>QueryViewSchema.parse(unwrap(await f.host.request('query.read',{queryId,page,pageSize})));
     const first=await read(1,1),second=await read(2,1),unique=await read(3,1),together=await read(1,2),tail=await read(2,2);
-    expect(first.page.rowKeys).toEqual([null]);expect(second.page.rowKeys).toEqual([null]);expect(together.page.rowKeys).toEqual([null,null]);
-    const stable='row:1578a93f1a1904e940d9c08b36fe6bab4ab94407cf8517a9c2c50a0ce72075bf';
+    expect(first.page.rowKeys).toEqual([`row:${queryId}:0`]);expect(second.page.rowKeys).toEqual([`row:${queryId}:1`]);expect(together.page.rowKeys).toEqual([`row:${queryId}:0`,`row:${queryId}:1`]);
+    const stable=`row:${queryId}:2`;
     expect(unique.page.rowKeys).toEqual([stable]);expect(tail.page.rowKeys).toEqual([stable]);expect(unique.page.rows).toEqual([{region:'浙江',value:7}]);
     expect(first.page.rows).toEqual(second.page.rows);expect(f.sql('SELECT * FROM queries')).toEqual(before);
   } finally {await f.close();}

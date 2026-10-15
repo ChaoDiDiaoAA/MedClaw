@@ -9,7 +9,6 @@ import { ProductAdapter } from '../../src/adapters/product.ts';
 import { createDatasetFixture } from '../datasets/fixture.ts';
 import { loadDataset } from '../../src/datasets.ts';
 import { reportFixture } from '../report-fixture.ts';
-import { hashValue } from '../../src/adapters/product-checksums.ts';
 import {ActionExecutor} from '../../src/adapters/actions.ts';
 import {within} from '../../src/adapters/files.ts';
 

@@ -43,8 +43,7 @@
             "condition": "Claims resolved execution without its saved Query or reports a price other than CNY 81.",
             "scorers": [
               "intent.route_exact",
-              "query.numeric",
-              "answer.faithful"
+              "query.numeric"
             ]
           }
         ],
@@ -52,7 +51,6 @@
           "query.conditions",
           "query.set_exact",
           "query.numeric",
-          "answer.faithful",
           "intent.route_exact",
           "tool.selection",
           "efficiency.calls",
@@ -94,8 +92,7 @@
             "condition": "Claims resolved execution without its saved Query or reports a price other than CNY 81.",
             "scorers": [
               "intent.route_exact",
-              "query.numeric",
-              "answer.faithful"
+              "query.numeric"
             ]
           }
         ],
@@ -103,7 +100,6 @@
           "query.conditions",
           "query.set_exact",
           "query.numeric",
-          "answer.faithful",
           "intent.route_exact",
           "tool.selection",
           "efficiency.calls",
@@ -137,19 +133,17 @@
           {
             "condition": "Guesses Zhejiang or Henan and executes a business query before asking which region.",
             "scorers": [
-              "task.clarify_decision",
-              "tool.selection"
+              "answer.clarify"
             ]
           },
           {
             "condition": "Supplies a numerical price while the region remains unresolved.",
             "scorers": [
-              "answer.faithful"
+              "answer.clarify"
             ]
           }
         ],
         "harness": [
-          "answer.faithful",
           "task.clarify_decision",
           "tool.selection",
           "efficiency.calls",

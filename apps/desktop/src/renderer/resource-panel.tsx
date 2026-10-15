@@ -80,7 +80,7 @@ export function ResourcePanel(props:{host:HostView;source:ResourceSourceInput|nu
         {props.source.source==='run'&&<><h3>Actual resource evidence</h3><p>Following instructions has not been evaluated</p>{!data.evidence.length&&<p>No recorded resource use on this page. Delivery is unconfirmed.</p>}
           {data.evidence.map((e,i)=><article key={i}><p>{e.kind==='native_read'?'Read':e.kind==='provider_delivery'?'Delivered':'SDK expanded'} · {e.resourceRef.id} {e.resourceRef.version} · {e.coverage}</p>
             {e.originRunId!==(props.source?.source==='run'?props.source.runId:null)&&<p>Historical content from run {e.originRunId}</p>}
-            <p>Input {e.inputId??'None'} · Tool {e.toolCallId??'None'} · Call {e.modelCallId??'None'} · Entry {e.nativeEntryId??'None'} · Hash <code>{e.contentHash}</code></p>
+            <p>Input {e.inputId??'None'} · Tool {e.toolCallId??'None'} · Call {e.modelCallId??'None'} · Entry {e.nativeEntryId??'None'}</p>
             {e.file&&<button onClick={()=>void read({source:'run',runId:e.originRunId},e.resourceRef,e.file!)}>Read historical {e.resourceRef.id} {e.file}</button>}
             {props.onEvidence&&<button onClick={props.onEvidence}>View Tool, Context and History facts</button>}
           </article>)}<p>Evidence page {data.evidenceInfo.page} · {data.evidenceInfo.totalRows} facts</p>

@@ -1,5 +1,4 @@
 import { expect, test } from 'bun:test';
-import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,7 +16,6 @@ import { IntentCallRegistrationSchema, IntentCallCompletionSchema, IntentStageIn
 import { contextAt, acceptContextInput } from '../fixtures/p8-context';
 import { disabledIntentModel, intentInput, intentDecision, intentRuleFact, resolvedIntent } from '../fixtures/p14-intent';
 
-const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const validation = () => IntentValidationSchema.parse({ contract: 'medclaw.intent-validation/v2', state: 'valid', finalStatus: 'RESOLVED',
   adoptedIntents: resolvedIntent().intents, missingSlots: [], issues: [], resolvedDeviceIds: [], reviewRequired: false,
   rawOutputTruncated: false, checkedAt: contextAt });
@@ -30,14 +28,14 @@ function fixture() {
   const events = new SqliteEventStore(db), transactions = SqliteWriteTransactions.forDatabase(db);
   const projection = { ...intentInput(), runId: accepted.input.runId, sessionId: accepted.input.sessionId, inputId: accepted.input.inputId,
     text: accepted.request.text, scope: accepted.input.scope, referenceDate: accepted.request.referenceDate };
-  const selection = { ...disabledIntentModel(), enabled: true, modelDigest: 'sha256:' + 'a'.repeat(64), verifiedEvidenceRef: 'protocol-1',
+  const selection = { ...disabledIntentModel(), enabled: true,  verifiedEvidenceRef: 'protocol-1',
     configVersion: '1', api: 'ollama-chat', ...INTENT_VERSIONS };
   const store = new SqliteIntentStore(db);
   const stage = (callId = 'classify-1', review: unknown = null) => {
     const input = IntentStageInputSchema.parse({ input: projection, stage: review === null ? 'classify' : 'verify', review });
     const renderedProjection = renderIntentContext(input), runtimeFeedback = '';
     const body = ContextSnapshotBodySchema.parse({ contract: 'medclaw.context/v1', workspaceContext: accepted.input.workspaceContext,
-      selectedRefs: [], projectionHash: hash(renderedProjection), renderedProjection, runtimeFeedback, feedbackHash: hash(runtimeFeedback),
+      selectedRefs: [],  renderedProjection, runtimeFeedback,
       resourceVersions: {}, nativeRefs: [], omitted: [], projectionLimitBytes: 24 * 1024,
       intentSource: { contract: 'medclaw.intent-context/v1', inputId: projection.inputId, baseLeafId: null, baseStorageVersion: 0 } });
     const snapshotId = Number(db.query(`INSERT INTO context_snapshots(run_id,session_id,input_id,sequence,snapshot_json,created_at)
@@ -49,7 +47,7 @@ function fixture() {
   const observation = (registration: IntentCallRegistration): IntentHttpObservation => {
     const body = JSON.parse(db.query<{ snapshot_json: string }, [number]>('SELECT snapshot_json FROM context_snapshots WHERE id=?').get(registration.snapshotId)!.snapshot_json);
     return { contract: 'medclaw.context-observation/v1', api: 'ollama-chat', transport: 'json', observedAt: contextAt, httpStatus: 200,
-      projectionHash: body.projectionHash, feedbackHash: body.feedbackHash, payloadHash: hash('ENGINEERING payload'), verifiedNativeRefs: [] };
+         verifiedNativeRefs: [] };
   };
   const completion = (registration: IntentCallRegistration) => IntentCallCompletionSchema.parse({ callId: registration.callId,
     runId: registration.runId, sessionId: registration.sessionId, inputId: registration.inputId, stage: registration.stage, state: 'completed',
@@ -168,7 +166,7 @@ test('p14 bounded review preserves the first prediction, frozen input and model 
     completion.validation = IntentValidationSchema.parse({ ...completion.validation, state: 'invalid', finalStatus: null, adoptedIntents: [],
       reviewRequired: true, issues: [{ code: 'hierarchy_conflict', intentId: 's1', slot: 'l1', severity: 'invalid', message: 'ENGINEERING conflict', candidates: [] }] });
     f.repos.finishIntentCall(completion);
-    const review = { previousCallId: first.callId, prediction: completion.parsed, rawHash: hash(completion.outcome.rawOutput!),
+    const review = { previousCallId: first.callId, prediction: completion.parsed,
       rawPreview: completion.outcome.rawOutput, issues: completion.validation.issues,
       candidates: [{ intents: resolvedIntent().intents, reasonCode: 'hierarchy_conflict' }] };
     const second = f.stage('verify-1', review);
@@ -250,7 +248,7 @@ test('p14 events cannot claim a call, its completion or a route without the corr
         intentCallId: registration.callId, callId: registration.callId, state: 'completed', validationState: 'valid', errorCode: null } })).toThrow('storage_write_failed');
     expect(() => append({ ...base, type: 'route_decided', source: 'application', sourceConnection: 'route:999', sourceSequence: 1,
       payload: { contract: 'medclaw.event/v1', runId: registration.runId, inputId: registration.inputId, decisionId: 999,
-        intentCallId: registration.callId, route: 'agent', decisionSource: 'validated_model', matchedBy: 'qwen_prompt', status: 'RESOLVED', queryParamsHash: null } })).toThrow('storage_write_failed');
+        intentCallId: registration.callId, route: 'agent', decisionSource: 'validated_model', matchedBy: 'qwen_prompt', status: 'RESOLVED'} })).toThrow('storage_write_failed');
   } finally { f.dispose(); }
 });
 

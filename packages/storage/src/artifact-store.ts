@@ -3,7 +3,11 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import { lstat, mkdir, readdir, realpath, writeFile, readFile, unlink, rmdir } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
-import { createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import {open} from 'node:fs/promises';
+import {readPackageRows} from './snapshot-rows';
+import {SnapshotMetadataSchema} from '../../contracts/src/data';
+import {omitLegacyFields,legacySourceRef,legacyFieldOrigins} from './legacy-business-fields';
 import { ArtifactSchema, type Artifact, type CheckedPackage } from '../../contracts/src/data';
 import { AppErrorSchema, PositiveIdSchema, serviceResult, type Result } from '../../contracts/src/error';
 import { canonicalRequest } from '../../contracts/src/run';
@@ -14,7 +18,6 @@ import { EXPORT_VERSION, ExportArtifactSchema, ExportManifestSchema, FrozenExpor
 import { SqliteExportStore } from './export-store';
 import { publishNoReplace } from './publish-no-replace';
 
-const exportHash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const currentColumns = ['snapshotId', 'batchId', 'deviceId', 'date', 'scopeKey', 'deviceName', 'region', 'category', 'manufacturer', 'distributor', 'status', 'priceCents', 'priceCNY', 'currency', 'unit'];
 const changesColumns = ['eventId', 'deviceId', 'deviceName', 'oldBatchId', 'newBatchId', 'date', 'scopeKey', 'kind', 'field', 'region', 'category', 'manufacturer', 'status', 'currency', 'unit', 'oldValue', 'newValue', 'deltaCents', 'deltaCNY', 'ratio'];
 function cny(value: number): string {
@@ -25,7 +28,7 @@ function markdown(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
     .replace(/[\\`|*_[\]{}()#!~]/g, '\\$&').replaceAll('\r', '\\r').replaceAll('\n', '\\n');
 }
-function exportContent(input: ExportPublication) {
+function exportContent(input: ExportPublication, legacyMetadata?: Record<string,unknown>) {
   const source = FrozenExportSourceSchema.parse(input.source), query = source.query, params = query.params;
   const priceMetric = 'metric' in params && (params.metric === 'sum_price' || params.metric === 'mean_price');
   const group = 'groupBy' in params ? params.groupBy : null;
@@ -51,7 +54,12 @@ function exportContent(input: ExportPublication) {
     columns: columns.map(name => ({ name, type: name === 'gap' ? 'boolean' : ['oldValue', 'newValue'].includes(name) ? 'scalar' : numeric.has(name) ? 'number' : 'string',
       nullable: true, unit: ['priceCents', 'deltaCents'].includes(name) || name === 'value' && priceMetric ? 'CNY cents' : name in derived ? 'CNY' : name === 'ratio' ? 'ratio' : null,
       derivedFrom: derived[name] ?? null, representation: name in derived ? 'csv/markdown display' : 'original' })), nullCells, escapedCells };
-  const metadataText = canonicalRequest(metadata), metadataHash = exportHash(metadataText);
+  if(legacyMetadata) {
+    const query=omitLegacyFields(legacyMetadata.query,['resultHash']);
+    const evidence=Array.isArray(legacyMetadata.evidence)?legacyMetadata.evidence.map(item=>omitLegacyFields(item,['resultHash','sourceLockHash'])):legacyMetadata.evidence;
+    if(canonicalRequest({...legacyMetadata,query,evidence})!==canonicalRequest({...metadata,exportVersion:'medclaw.export/v1'})) throw new Error('artifact_not_ready');
+  }
+  const metadataText = canonicalRequest(legacyMetadata??metadata);
   const files: { path: ExportFile['path']; content: Buffer }[] = [];
   if (input.format === 'csv') {
     const cell = (value: string | number | boolean | null) => value === null ? '' : typeof value !== 'string' ? String(value)
@@ -59,23 +67,33 @@ function exportContent(input: ExportPublication) {
     files.push({ path: 'result.csv', content: Buffer.from('\uFEFF' + [columns.map(cell).join(','), ...display.map(row => row.map(cell).join(','))].join('\r\n') + '\r\n') },
       { path: 'metadata.json', content: Buffer.from(metadataText) });
   } else if (input.format === 'json') {
-    files.push({ path: 'result.json', content: Buffer.from(canonicalRequest({ metadata, rows: query.rows, answer: source.answer })) });
+    files.push({ path: 'result.json', content: Buffer.from(canonicalRequest({ metadata:legacyMetadata??metadata, rows: query.rows, answer: source.answer })) });
   } else {
     const safeMetadata = metadataText.replaceAll('`', '\\u0060').replaceAll('<', '\\u003c').replaceAll('>', '\\u003e').replaceAll('&', '\\u0026');
     const table = [columns.map(markdown), columns.map(() => '---'), ...display.map(row => row.map(value => value === null ? 'Missing' : markdown(String(value))))]
       .map(row => `| ${row.join(' | ')} |`).join('\n');
     files.push({ path: 'result.md', content: Buffer.from(`# Query ${query.id}\n\n${table}\n${source.answer ? `\n## Answer\n\n${markdown(source.answer.text)}\n` : ''}\n## Metadata\n\n\`\`\`json\n${safeMetadata}\n\`\`\`\n`) });
   }
-  return { files, metadataHash };
+  return { files };
 }
 
-const digest = z.string().regex(/^[a-f0-9]{64}$/);
-const managedManifest = z.strictObject({ schema: z.literal('medclaw.artifact/import/v1'), artifactId: PositiveIdSchema,
-  operationRef: z.string().min(1), role: z.literal('snapshot_package'), sourceHash: digest, metadataHash: digest,
-  files: z.array(z.strictObject({path:z.string(),bytes:z.number().int().nonnegative().safe(),sha256:digest})).min(1).max(300),
-  mappingVersion:z.string().min(1),calculationVersion:z.string().min(1),sourceLockHash:z.string().min(1),
-  sourceBundleId:z.string().min(1),materialVersion:z.string().min(1),verifiedAt:z.string().datetime() });
-
+function readExportManifest(value:unknown) {
+  if(value&&typeof value==='object'&&'contract' in value&&value.contract==='medclaw.export-manifest/v1') {
+    const item=omitLegacyFields(value,['resultHash','metadataHash']) as Record<string,unknown>;
+    if(item.exportVersion!=='medclaw.export/v1') throw new Error('artifact_not_ready');
+    return ExportManifestSchema.parse({...item,contract:'medclaw.export-manifest/v2',exportVersion:EXPORT_VERSION,
+      files:Array.isArray(item.files)?item.files.map(file=>omitLegacyFields(file,['sha256'])):item.files});
+  }
+  return ExportManifestSchema.parse(value);
+}
+const managedManifest = z.strictObject({ schema: z.enum(['medclaw.artifact/import/v1','medclaw.artifact/import/v2']), artifactId: PositiveIdSchema,
+  operationRef:z.string().min(1),role:z.literal('snapshot_package'),
+  files:z.array(z.strictObject({path:z.string(),bytes:z.number().int().nonnegative().safe()})).min(1).max(300),
+  mappingVersion:z.string().min(1),calculationVersion:z.string().min(1),sourceBundleId:z.string().min(1),materialVersion:z.string().min(1),verifiedAt:z.string().datetime() });
+function importManifest(value: unknown) {
+  const item=omitLegacyFields(value,['sourceHash','metadataHash','sourceLockHash']) as Record<string,unknown>;
+  return managedManifest.parse({...item,files:Array.isArray(item.files)?item.files.map(file=>omitLegacyFields(file,['sha256'])):item.files});
+}
 export const PACKAGE_LIMITS = { files: 300, bytes: 2 * 1024 * 1024 * 1024, rows: 1000000 } as const;
 export function permittedRelativePath(path: string): boolean {
   return !!path && !isAbsolute(path) && !path.includes('\\') && !path.includes(':') && !path.split('/').some(part => !part || part === '.' || part === '..');
@@ -103,12 +121,19 @@ export async function listPackageFiles(root: string, signal?: AbortSignal): Prom
   await visit(root);
   return files.sort();
 }
-export async function hashFile(path: string, signal?: AbortSignal): Promise<{ bytes: number; sha256: string }> {
-  const hash = createHash('sha256'); let bytes = 0;
-  for await (const chunk of createReadStream(path, { signal })) { signal?.throwIfAborted(); bytes += chunk.length; hash.update(chunk); }
-  return { bytes, sha256: hash.digest('hex') };
+export async function filesEqual(left:string,right:string,signal?:AbortSignal):Promise<boolean> {
+  const a=await open(left,'r'); let b;
+  try {
+    b=await open(right,'r'); const sa=await a.stat(),sb=await b.stat();
+    if(!sa.isFile()||!sb.isFile()||sa.size!==sb.size) return false;
+    const ab=Buffer.alloc(65536),bb=Buffer.alloc(65536);let position=0;
+    while(position<sa.size){signal?.throwIfAborted();const n=Math.min(ab.length,sa.size-position);
+      const ar=await a.read(ab,0,n,position),br=await b.read(bb,0,n,position);
+      if(ar.bytesRead!==n||br.bytesRead!==n||!ab.subarray(0,n).equals(bb.subarray(0,n))) return false;position+=n;}
+    const afterA=await a.stat(),afterB=await b.stat();
+    return afterA.size===sa.size&&afterA.mtimeMs===sa.mtimeMs&&afterB.size===sb.size&&afterB.mtimeMs===sb.mtimeMs;
+  } finally {await a.close();await b?.close();}
 }
-
 /** Files are evidence; only the business transaction can mark a reserved Artifact ready. */
 export class ArtifactStore {
   constructor(private readonly db: Database, private readonly artifactsRoot: string) {
@@ -122,12 +147,12 @@ export class ArtifactStore {
     if (!row || row.kind !== 'export' || row.status !== 'reserved' || row.operation_ref !== input.originOperationRef || row.query_id !== input.source.query.id || row.format !== input.format) throw new Error('state_conflict');
     const source = new SqliteExportStore(this.db).readSource(input.source.query.id, input.source.answer?.id ?? null);
     if (canonicalRequest(source) !== canonicalRequest(input.source)) throw new Error('state_conflict');
-    const content = exportContent(input), files = content.files.map(file => ({ path: file.path, bytes: file.content.length, sha256: exportHash(file.content) })).sort((a, b) => a.path.localeCompare(b.path));
-    const manifest = ExportManifestSchema.parse({ contract: 'medclaw.export-manifest/v1', artifactId: input.artifactId, originOperationRef: input.originOperationRef,
-      queryId: source.query.id, resultHash: source.query.resultHash, answerId: source.answer?.id ?? null, format: input.format, exportVersion: EXPORT_VERSION, metadataHash: content.metadataHash, files });
+    const content = exportContent(input), files = content.files.map(file => ({ path: file.path, bytes: file.content.length })).sort((a, b) => a.path.localeCompare(b.path));
+    const manifest = ExportManifestSchema.parse({ contract: 'medclaw.export-manifest/v2', artifactId: input.artifactId, originOperationRef: input.originOperationRef,
+      queryId: source.query.id, answerId: source.answer?.id ?? null, format: input.format, exportVersion: EXPORT_VERSION, files });
     await mkdir(this.artifactsRoot, { recursive: true });
-    const root = await this.exportRoot(), initialRoot = await lstat(root), opKey = exportHash(input.originOperationRef);
-    const temporary = join(root, `.${input.artifactId}.${opKey}.tmp`), target = join(root, String(input.artifactId));
+    const root = await this.exportRoot(), initialRoot = await lstat(root);
+    const temporary = join(root, `.${input.artifactId}.${randomUUID()}.tmp`), target = join(root, String(input.artifactId));
     await mkdir(temporary);
     const initialTemporary = await lstat(temporary);
     let published = false;
@@ -135,8 +160,8 @@ export class ArtifactStore {
       for (const file of content.files) { signal.throwIfAborted(); await writeFile(join(temporary, file.path), file.content, { flag: 'wx', signal }); }
       await writeFile(join(temporary, 'manifest.json'), canonicalRequest(manifest), { flag: 'wx', signal });
       for (const file of files) {
-        const path = join(temporary, file.path), stat = await lstat(path), actual = await hashFile(path, signal);
-        if (!stat.isFile() || stat.isSymbolicLink() || actual.bytes !== file.bytes || actual.sha256 !== file.sha256) throw new Error('artifact_not_ready');
+        const path = join(temporary, file.path), stat = await lstat(path), actual = await readFile(path,{signal});
+        if (!stat.isFile() || stat.isSymbolicLink() || actual.length !== file.bytes || !actual.equals(content.files.find(item=>item.path===file.path)!.content)) throw new Error('artifact_not_ready');
       }
       const nowRoot = await lstat(root), nowTemporary = await lstat(temporary);
       if (initialRoot.dev !== nowRoot.dev || initialRoot.ino !== nowRoot.ino || nowRoot.isSymbolicLink()
@@ -158,27 +183,26 @@ export class ArtifactStore {
     }
   }
 
-  async verifyExport(artifactId: number): Promise<PublishedExport> {
+  async verifyExport(artifactId: number, copyPath?: string, signal?: AbortSignal): Promise<PublishedExport> {
     PositiveIdSchema.parse(artifactId);
     const row = this.db.query<{ operation_ref: string; kind: string; query_id: number; format: string; status: string; metadata_json: string;
-      sha256: string | null; bytes: number | null; metadata_sha256: string | null; published_at: string | null }, [number]>('SELECT * FROM artifacts WHERE id=?').get(artifactId);
+      bytes: number | null; published_at: string | null }, [number]>('SELECT * FROM artifacts WHERE id=?').get(artifactId);
     if (!row || row.kind !== 'export') throw new Error('artifact_not_ready');
     try {
       const root = await this.exportRoot(), directory = join(root, String(artifactId)), stat = await lstat(directory);
       if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(directory) !== directory) throw new Error('artifact_not_ready');
       const manifestStat = await lstat(join(directory, 'manifest.json'));
       if (!manifestStat.isFile() || manifestStat.isSymbolicLink() || manifestStat.size > 65536) throw new Error('artifact_not_ready');
-      const manifest = ExportManifestSchema.parse(JSON.parse(await readFile(join(directory, 'manifest.json'), 'utf8')));
+      const rawManifest=JSON.parse(await readFile(join(directory,'manifest.json'),'utf8')),legacy=rawManifest.contract==='medclaw.export-manifest/v1';
+      const manifest=readExportManifest(rawManifest);
       if (manifest.artifactId !== artifactId || manifest.originOperationRef !== row.operation_ref || manifest.queryId !== row.query_id || manifest.format !== row.format) throw new Error('artifact_not_ready');
       if (canonicalRequest((await readdir(directory)).sort()) !== canonicalRequest([...manifest.files.map(file => file.path), 'manifest.json'].sort())) throw new Error('artifact_not_ready');
       for (const file of manifest.files) {
         const path = join(directory, file.path), stat = await lstat(path);
         if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('artifact_not_ready');
-        const actual = await hashFile(path);
-        if (actual.bytes !== file.bytes || actual.sha256 !== file.sha256) throw new Error('artifact_not_ready');
+        if (stat.size !== file.bytes) throw new Error('artifact_not_ready');
       }
       const source = new SqliteExportStore(this.db).readSource(manifest.queryId, manifest.answerId);
-      if (source.query.resultHash !== manifest.resultHash) throw new Error('artifact_not_ready');
       let metadata: unknown;
       if (manifest.format === 'csv') metadata = JSON.parse(await readFile(join(directory, 'metadata.json'), 'utf8'));
       else if (manifest.format === 'json') metadata = z.object({ metadata: z.unknown() }).parse(JSON.parse(await readFile(join(directory, 'result.json'), 'utf8'))).metadata;
@@ -188,17 +212,39 @@ export class ArtifactStore {
         metadata = JSON.parse(text.slice(start + 8, -5));
       }
       const availability = z.object({ sourceAvailability: z.enum(['available', 'deleted']), deletedBatchIds: z.array(PositiveIdSchema) })
-        .refine(value => value.deletedBatchIds.every(id => source.query.batchIds.includes(id)) && new Set(value.deletedBatchIds).size === value.deletedBatchIds.length
+        .refine(value => value.deletedBatchIds.every(id => source.query.batchIds.includes(id) && source.deletedBatchIds.includes(id)) && new Set(value.deletedBatchIds).size === value.deletedBatchIds.length
           && (value.sourceAvailability === 'deleted') === (value.deletedBatchIds.length > 0)).parse(metadata);
-      const expected = exportContent({ artifactId, originOperationRef: manifest.originOperationRef, format: manifest.format, source: { ...source, ...availability } });
-      if (expected.metadataHash !== manifest.metadataHash || expected.files.some(file => {
-        const stored = manifest.files.find(item => item.path === file.path);
-        return !stored || stored.bytes !== file.content.length || stored.sha256 !== exportHash(file.content);
-      })) throw new Error('artifact_not_ready');
-      const sha256 = exportHash(canonicalRequest(manifest.files)), sizeBytes = manifest.files.reduce((sum, file) => sum + file.bytes, 0);
-      if (row.status === 'ready' && (row.sha256 !== sha256 || row.bytes !== sizeBytes || row.metadata_sha256 !== manifest.metadataHash
-        || canonicalRequest(JSON.parse(row.metadata_json)) !== canonicalRequest(manifest))) throw new Error('artifact_not_ready');
-      return { artifactId, relativePath: `artifacts/${artifactId}`, manifest, sha256, sizeBytes, metadataSha256: manifest.metadataHash, publishedAt: row.published_at };
+      const expected = exportContent({ artifactId, originOperationRef: manifest.originOperationRef, format: manifest.format, source: { ...source, ...availability } },legacy?metadata as Record<string,unknown>:undefined);
+      if(expected.files.length!==manifest.files.length) throw new Error('artifact_not_ready');
+      if (copyPath) {
+        if (!isAbsolute(copyPath) || await realpath(copyPath) !== resolve(copyPath)) throw new Error('artifact_not_ready');
+        if (manifest.format === 'csv') {
+          const copyStat = await lstat(copyPath);
+          if (!copyStat.isDirectory() || copyStat.isSymbolicLink()
+            || canonicalRequest((await readdir(copyPath)).sort()) !== canonicalRequest(manifest.files.map(file => file.path).sort())) throw new Error('artifact_not_ready');
+        }
+      }
+      for(const file of expected.files) {
+        signal?.throwIfAborted();
+        const stored=manifest.files.find(item=>item.path===file.path);
+        if(!stored||stored.bytes!==file.content.length||!(await readFile(join(directory,file.path))).equals(file.content)) throw new Error('artifact_not_ready');
+        if (copyPath) {
+          const target = manifest.format === 'csv' ? join(copyPath, file.path) : copyPath, before = await lstat(target, { bigint: true });
+          if (!before.isFile() || before.isSymbolicLink() || before.size !== BigInt(file.content.length)
+            || await realpath(target) !== resolve(target)) throw new Error('artifact_not_ready');
+          const handle = await open(target, 'r');
+          try {
+            const opened = await handle.stat({ bigint: true });
+            if (opened.dev !== before.dev || opened.ino !== before.ino || !(await handle.readFile()).equals(file.content)) throw new Error('artifact_not_ready');
+            signal?.throwIfAborted();
+            const after = await handle.stat({ bigint: true }), current = await lstat(target, { bigint: true });
+            if (after.size !== before.size || after.mtimeNs !== before.mtimeNs || current.dev !== before.dev || current.ino !== before.ino) throw new Error('artifact_not_ready');
+          } finally { await handle.close(); }
+        }
+      }
+      const sizeBytes=manifest.files.reduce((sum,file)=>sum+file.bytes,0);
+      if(row.status==='ready'&&(row.bytes!==sizeBytes||canonicalRequest(readExportManifest(JSON.parse(row.metadata_json)))!==canonicalRequest(manifest))) throw new Error('artifact_not_ready');
+      return {artifactId,relativePath:`artifacts/${artifactId}`,manifest,sizeBytes,publishedAt:row.published_at};
     } catch (error) {
       if (AppErrorSchema.safeParse(error).success) throw error;
       const code = (error as NodeJS.ErrnoException).code;
@@ -228,32 +274,41 @@ export class ArtifactStore {
   }
   async writeManifest(id: number, operationRef: string, pkg: CheckedPackage): Promise<void> {
     const first = pkg.days[0]!.metadata;
-    const manifest = { schema: 'medclaw.artifact/import/v1', artifactId: id, operationRef, role: 'snapshot_package', files: pkg.files.map(file => ({ ...file, path: `input/${file.path}` })), sourceHash: pkg.sourceHash, metadataHash: pkg.metadataHash, mappingVersion: first.mappingVersion, calculationVersion: pkg.calculationVersion, sourceLockHash: first.sourceLockHash, sourceBundleId: first.sourceBundleId, materialVersion: first.materialVersion, verifiedAt: new Date().toISOString() };
+    const manifest = { schema: 'medclaw.artifact/import/v2', artifactId: id, operationRef, role: 'snapshot_package', files: pkg.files.map(file => ({ ...file, path: `input/${file.path}` })), mappingVersion: first.mappingVersion, calculationVersion: pkg.calculationVersion, sourceBundleId: first.sourceBundleId, materialVersion: first.materialVersion, verifiedAt: new Date().toISOString() };
     await writeFile(this.manifestPath(id), canonicalRequest(manifest), { flag: 'wx' });
-    this.db.query('UPDATE artifacts SET relative_path=?,sha256=?,bytes=?,metadata_sha256=?,metadata_json=? WHERE id=? AND status=\'reserved\'').run(String(id), pkg.sourceHash, pkg.totalBytes, createHash('sha256').update(canonicalRequest(manifest)).digest('hex'), canonicalRequest(manifest), id);
+    this.db.query('UPDATE artifacts SET relative_path=?,bytes=?,metadata_json=? WHERE id=? AND status=\'reserved\'').run(String(id), pkg.totalBytes, canonicalRequest(manifest), id);
     this.db.query('UPDATE imports SET manifest_path=? WHERE operation_ref=?').run(`${id}/manifest.json`, operationRef);
   }
   async verifyManifest(id: number, operationRef: string, pkg?: CheckedPackage): Promise<void> {
-    const row = this.db.query<{ metadata_sha256: string | null; metadata_json: string; status: string; sha256:string|null;bytes:number|null }, [number]>('SELECT metadata_sha256,metadata_json,status,sha256,bytes FROM artifacts WHERE id=?').get(id);
-    if (!row?.metadata_sha256) throw new Error('artifact_not_ready');
-    const text = await readFile(this.manifestPath(id), 'utf8');
-    const parsed = managedManifest.safeParse(JSON.parse(text));
-    if (!parsed.success) throw new Error('import_preview_stale');
-    const manifest = parsed.data;
-    if (createHash('sha256').update(text).digest('hex') !== row.metadata_sha256 || manifest.artifactId !== id || manifest.operationRef !== operationRef || canonicalRequest(manifest) !== row.metadata_json) throw new Error('import_preview_stale');
-    if (pkg && manifest.sourceHash !== pkg.sourceHash) throw new Error('import_preview_stale');
-    const sourceFiles = manifest.files.map(file => ({...file,path:file.path.slice(6)}));
-    if (new Set(manifest.files.map(file=>file.path)).size!==manifest.files.length || manifest.sourceHash!==row.sha256
-      || createHash('sha256').update(canonicalRequest(sourceFiles)).digest('hex')!==manifest.sourceHash
-      || manifest.files.reduce((sum,file)=>sum+file.bytes,0)!==row.bytes) throw new Error('import_preview_stale');
+    const row=this.db.query<{metadata_json:string;status:string;bytes:number|null;import_id:number},[number]>('SELECT metadata_json,status,bytes,import_id FROM artifacts WHERE id=?').get(id);
+    if(!row||row.bytes===null) throw new Error('artifact_not_ready');
+    const manifest=importManifest(JSON.parse(await readFile(this.manifestPath(id),'utf8'))),saved=importManifest(JSON.parse(row.metadata_json));
+    if(manifest.artifactId!==id||manifest.operationRef!==operationRef||canonicalRequest(manifest)!==canonicalRequest(saved)) throw new Error('import_preview_stale');
+    const sourceFiles=manifest.files.map(file=>({...file,path:file.path.slice(6)}));
+    if(new Set(manifest.files.map(file=>file.path)).size!==manifest.files.length||manifest.files.reduce((sum,file)=>sum+file.bytes,0)!==row.bytes
+      ||pkg&&canonicalRequest(sourceFiles)!==canonicalRequest(pkg.files)) throw new Error('import_preview_stale');
     const removed=new Set(pkg?[]:this.deletedFilePaths(id));
     const actualFiles = await listPackageFiles(this.inputPath(id));
     if (canonicalRequest(actualFiles.filter(path=>!removed.has(`input/${path}`))) !== canonicalRequest(manifest.files.filter(file=>!removed.has(file.path)).map(file => file.path.slice(6)).sort())) throw new Error('import_preview_stale');
     for (const file of manifest.files) {
       if (!permittedRelativePath(file.path) || !file.path.startsWith('input/')) throw new Error('import_preview_stale');
       if(removed.has(file.path)&&!actualFiles.includes(file.path.slice(6)))continue;
-      const actual = await hashFile(join(this.artifactsRoot, String(id), file.path));
-      if (actual.bytes !== file.bytes || actual.sha256 !== file.sha256) throw new Error('import_preview_stale');
+      const actual = await lstat(join(this.artifactsRoot, String(id), file.path));
+      if (actual.size !== file.bytes) throw new Error('import_preview_stale');
+    }
+    if(row.status==='ready') await this.verifyImportedRows(id);
+  }
+  private async verifyImportedRows(id:number):Promise<void> {
+    const batches=this.db.query<{id:number;metadata_json:string},[number]>("SELECT b.id,b.metadata_json FROM imports i JOIN batches b ON b.id IN (SELECT value FROM json_each(i.result_json,'$.batchIds')) WHERE i.artifact_id=? AND b.status='active'").all(id);
+    for(const batch of batches) {
+      const raw=omitLegacyFields(JSON.parse(batch.metadata_json),['fileSha256','sourceLockHash','cohortHash']) as object;
+      const metadata=SnapshotMetadataSchema.parse({...raw,contract:'medclaw.snapshot/v2'}),file=`zhejiang_${metadata.snapshotDate}.csv`;
+      const current=SnapshotMetadataSchema.parse({...omitLegacyFields(JSON.parse(await readFile(join(this.inputPath(id),file.replace(/\.csv$/,'.metadata.json')),'utf8')),['fileSha256','sourceLockHash','cohortHash']) as object,contract:'medclaw.snapshot/v2'});
+      if(canonicalRequest(current)!==canonicalRequest(metadata)) throw new Error('import_preview_stale');
+      const incoming=[...readPackageRows(this.inputPath(id),file,metadata)].sort((a,b)=>a.sourceDeviceId<b.sourceDeviceId?-1:a.sourceDeviceId>b.sourceDeviceId?1:0);
+      const saved=this.db.query<Record<string,unknown>,[number]>(`SELECT s.*,d.source_device_id,d.source_submission_id,d.source_applicant FROM snapshots s JOIN devices d ON d.id=s.device_id WHERE s.batch_id=? ORDER BY d.source_device_id`).all(batch.id)
+        .map(row=>({sourceDeviceId:row.source_device_id,sourceSubmissionId:row.source_submission_id,sourceApplicant:row.source_applicant,deviceName:row.device_name,category:row.category,region:row.region,snapshotDate:metadata.snapshotDate,priceCents:row.price_cents,currency:row.currency,unit:row.unit,status:row.status,manufacturer:row.manufacturer,distributor:row.distributor,sourceRowRef:row.source_row_ref,sourceRefs:JSON.parse(String(row.source_refs_json)).map(legacySourceRef),fieldOrigins:legacyFieldOrigins(JSON.parse(String(row.field_origins_json)))}));
+      if(canonicalRequest(incoming)!==canonicalRequest(saved)) throw new Error('import_preview_stale');
     }
   }
   private deletedFilePaths(id:number,operationRef?:string):string[]{
@@ -267,7 +322,7 @@ export class ArtifactStore {
     const plans:DataDeleteFile[]=[];
     for(const owner of owners){
       await this.verifyManifest(owner.artifact_id,owner.operation_ref);
-      const manifest=managedManifest.parse(JSON.parse(await readFile(this.manifestPath(owner.artifact_id),'utf8')));
+      const manifest=importManifest(JSON.parse(await readFile(this.manifestPath(owner.artifact_id),'utf8')));
       const resultIds=JSON.parse(owner.result_json).batchIds as number[];
       const active=this.db.query<{id:number},[string]>("SELECT id FROM batches WHERE status='active' AND id IN (SELECT value FROM json_each(?))").all(JSON.stringify(resultIds));
       if(active.every(row=>batchIds.includes(row.id))){for(const file of manifest.files)if(!this.deletedFilePaths(owner.artifact_id).includes(file.path))plans.push({artifactId:owner.artifact_id,path:file.path});continue;}
@@ -275,7 +330,9 @@ export class ArtifactStore {
         const metadata=JSON.parse(await readFile(join(this.artifactsRoot,String(owner.artifact_id),file.path),'utf8'));
         const target=targets.find(batch=>batch.scope_key===metadata.scopeKey&&batch.snapshot_date===metadata.snapshotDate&&resultIds.includes(batch.id));
         if(!target)continue;
-        if(canonicalRequest(metadata)!==canonicalRequest(JSON.parse(target.metadata_json)))throw new Error('import_preview_stale');
+        const currentMetadata={...omitLegacyFields(metadata,['fileSha256','sourceLockHash','cohortHash']) as object,contract:'medclaw.snapshot/v2'};
+        const savedMetadata={...omitLegacyFields(JSON.parse(target.metadata_json),['fileSha256','sourceLockHash','cohortHash']) as object,contract:'medclaw.snapshot/v2'};
+        if(canonicalRequest(currentMetadata)!==canonicalRequest(savedMetadata))throw new Error('import_preview_stale');
         const csv=file.path.replace(/\.metadata\.json$/,'.csv');if(!manifest.files.some(entry=>entry.path===csv))throw new Error('import_preview_stale');
         plans.push({artifactId:owner.artifact_id,path:file.path},{artifactId:owner.artifact_id,path:csv});
       }
@@ -295,12 +352,12 @@ export class ArtifactStore {
     const target=join(directory,parts.at(-1)!);
     let stat;try{stat=await lstat(target);}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return;throw error;}
     if(!stat.isFile()||stat.isSymbolicLink())throw new Error('access_denied');
-    const artifact=this.db.query<{operation_ref:string;metadata_sha256:string;metadata_json:string},[number]>('SELECT operation_ref,metadata_sha256,metadata_json FROM artifacts WHERE id=?').get(file.artifactId);
+    const artifact=this.db.query<{operation_ref:string;metadata_json:string},[number]>('SELECT operation_ref,metadata_json FROM artifacts WHERE id=?').get(file.artifactId);
     if(!artifact)throw new Error('artifact_not_ready');
-    const manifestText=await readFile(this.manifestPath(file.artifactId),'utf8'),manifest=managedManifest.parse(JSON.parse(manifestText));
-    if(createHash('sha256').update(manifestText).digest('hex')!==artifact.metadata_sha256||canonicalRequest(manifest)!==artifact.metadata_json||manifest.artifactId!==file.artifactId||manifest.operationRef!==artifact.operation_ref)throw new Error('artifact_not_ready');
+    const manifestText=await readFile(this.manifestPath(file.artifactId),'utf8'),manifest=importManifest(JSON.parse(manifestText));
+    if(canonicalRequest(manifest)!==canonicalRequest(importManifest(JSON.parse(artifact.metadata_json)))||manifest.artifactId!==file.artifactId||manifest.operationRef!==artifact.operation_ref)throw new Error('artifact_not_ready');
     const expected=manifest.files.find(value=>value.path===file.path);if(!expected)throw new Error('access_denied');
-    const actual=await hashFile(target);if(actual.sha256!==expected.sha256||actual.bytes!==expected.bytes)throw new Error('artifact_not_ready');
+    const actual=await lstat(target);if(actual.size!==expected.bytes)throw new Error('artifact_not_ready');
     await unlink(target);
   }
   async inspectManagedImport(id: number): Promise<ManagedImportInspection> {
@@ -322,7 +379,7 @@ export class ArtifactStore {
     try {
       const directory=await lstat(join(this.artifactsRoot,String(id)));
       const manifest=await lstat(this.manifestPath(id));
-      if (!directory.isDirectory() || directory.isSymbolicLink() || !manifest.isFile() || manifest.isSymbolicLink()) return {status:'invalid',reason:'hash_mismatch'};
+      if (!directory.isDirectory() || directory.isSymbolicLink() || !manifest.isFile() || manifest.isSymbolicLink()) return {status:'invalid',reason:'content_mismatch'};
       await this.verifyManifest(id,operationRef);
       return {status:'valid'};
     } catch (error) {
@@ -331,29 +388,27 @@ export class ArtifactStore {
         try { await readdir(this.artifactsRoot); } catch { return {status:'unavailable',reason:'root_unavailable'}; }
         return {status:'invalid',reason:'missing_managed_file'};
       }
-      if (error instanceof SyntaxError || error instanceof Error && ['import_preview_stale','import_invalid','artifact_not_ready'].includes(error.message)) return {status:'invalid',reason:'hash_mismatch'};
+      if (error instanceof SyntaxError || error instanceof z.ZodError || error instanceof Error && ['import_preview_stale','import_invalid','artifact_not_ready'].includes(error.message)) return {status:'invalid',reason:'content_mismatch'};
       return {status:'unavailable',reason: error instanceof Error && error.name==='SQLiteError' ? 'storage_unavailable' : 'temporary_io'};
     }
   }
   read(id: number): Promise<Result<Artifact | ExportArtifact | null>> {
     return serviceResult(async () => {
-      const row = this.db.query<{ id: number; operation_ref: string; kind: string; query_id: number | null; format: string; relative_path: string | null; metadata_sha256: string | null;
-        published_at: string | null; registered_at: string | null; status: string; bytes: number | null; sha256: string | null; metadata_json: string }, [number]>('SELECT * FROM artifacts WHERE id=?').get(PositiveIdSchema.parse(id));
+      const row = this.db.query<{ id: number; operation_ref: string; kind: string; query_id: number | null; format: string; relative_path: string | null;
+        published_at: string | null; registered_at: string | null; status: string; bytes: number | null; metadata_json: string }, [number]>('SELECT * FROM artifacts WHERE id=?').get(PositiveIdSchema.parse(id));
       if (!row) return null;
       if (row.kind === 'export') {
         new SqliteExportStore(this.db).readSource(row.query_id!, null);
         if (row.status !== 'ready') throw new Error('artifact_not_ready');
-        const manifest = ExportManifestSchema.parse(JSON.parse(row.metadata_json));
+        const manifest = readExportManifest(JSON.parse(row.metadata_json));
         new SqliteExportStore(this.db).readSource(manifest.queryId, manifest.answerId);
-        if (manifest.artifactId !== row.id || manifest.queryId !== row.query_id || manifest.originOperationRef !== row.operation_ref || manifest.format !== row.format
-          || row.metadata_sha256 !== manifest.metadataHash || row.bytes !== manifest.files.reduce((total, file) => total + file.bytes, 0)
-          || row.sha256 !== exportHash(canonicalRequest([...manifest.files].sort((a, b) => a.path.localeCompare(b.path))))) throw new Error('storage_read_failed');
+        await this.verifyExport(row.id);
         return ExportArtifactSchema.parse({ id: row.id, operationRef: row.operation_ref, queryId: row.query_id, format: row.format, relativePath: row.relative_path,
-          sha256: row.sha256, metadataSha256: row.metadata_sha256, sizeBytes: row.bytes, publishedAt: row.published_at, registeredAt: row.registered_at });
+          sizeBytes: row.bytes, publishedAt: row.published_at, registeredAt: row.registered_at });
       }
       const metadata = JSON.parse(row.metadata_json) as Record<string, unknown>;
       const deletedBatchIds=this.db.query("SELECT name FROM sqlite_schema WHERE name='data_deletions'").get()?this.db.query<{id:number},[number]>("SELECT b.id FROM imports i,batches b WHERE i.artifact_id=? AND b.status='deleted' AND b.id IN (SELECT value FROM json_each(i.result_json,'$.batchIds')) ORDER BY b.id").all(row.id).map(batch=>batch.id):[];
-      return ArtifactSchema.parse({ id: row.id, operationRef: row.operation_ref, status: row.status, format: 'csv', mimeType: 'application/x-directory', bytes: row.bytes, sha256: row.sha256, sourceLockHash: typeof metadata.sourceLockHash === 'string' ? metadata.sourceLockHash : null, metadata,sourceAvailability:deletedBatchIds.length?'deleted':'available',deletedBatchIds,unavailableFiles:this.deletedFilePaths(row.id) });
+      return ArtifactSchema.parse({ id: row.id, operationRef: row.operation_ref, status: row.status, format: 'csv', mimeType: 'application/x-directory', bytes: row.bytes, metadata: ['medclaw.artifact/import/v1','medclaw.artifact/import/v2'].includes(String(metadata.schema))?importManifest(metadata):omitLegacyFields(metadata,['sourceHash','metadataHash','sourceLockHash']),sourceAvailability:deletedBatchIds.length?'deleted':'available',deletedBatchIds,unavailableFiles:this.deletedFilePaths(row.id) });
     }, 'storage_read_failed');
   }
 }

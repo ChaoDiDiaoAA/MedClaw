@@ -11,7 +11,6 @@ import { isDeepStrictEqual } from "node:util";
 import type { ContextSnapshot } from '../../contracts/src/context';
 import type { ResourceDeliveryRef, ResourcePayloadObservation } from '../../contracts/src/resources';
 import { ResourcePayloadObservationSchema } from '../../contracts/src/resources';
-import { createHash } from 'node:crypto';
 import { canonicalRequest } from '../../contracts/src/run';
 import { getSystemMessageText } from '@earendil-works/pi-ai';
 import { ProductResultDetailsSchema } from '../../contracts/src/intent';
@@ -76,7 +75,7 @@ export function matchProviderResources(payload: unknown, api: string, expected: 
     } else verified = e.userIndex !== undefined && users[e.userIndex] === e.text;
     if (!verified) throw safeError('context_payload_mismatch');
   }
-  return ResourcePayloadObservationSchema.parse({payloadHash:createHash('sha256').update(canonicalRequest(payload)).digest('hex'),verified:expected.map(e => e.fact)});
+  return ResourcePayloadObservationSchema.parse({verified:expected.map(e => e.fact)});
 }
 
 const encoder = new TextEncoder();
@@ -99,7 +98,7 @@ export function contextMessageText(content: unknown): string | null {
   return texts.every(text => text !== null && text.isWellFormed()) ? texts.join('\n') : null;
 }
 
-export function matchProviderContext(api: string, payload: unknown, snapshot: Pick<ContextSnapshot, 'renderedProjection' | 'runtimeFeedback'> & Partial<Pick<ContextSnapshot,'delegationSource'>>): boolean {
+export function matchProviderContext(api: string, payload: unknown, snapshot: Pick<ContextSnapshot, 'renderedProjection' | 'runtimeFeedback'> & Partial<Pick<ContextSnapshot,'delegationSource'>>, delegationPrompt?: string): boolean {
   const body = object(payload); if (!body) return false;
   let messages: unknown, systems: unknown[] = [];
   switch (api) {
@@ -122,7 +121,7 @@ export function matchProviderContext(api: string, payload: unknown, snapshot: Pi
   const feedback = snapshot.runtimeFeedback;
   // Pi folds later system content with double-newline boundaries for Anthropic/Bedrock.
   const matchesFeedback = (text: string) => text === feedback || text.startsWith(`${feedback}\n\n`) || text.endsWith(`\n\n${feedback}`) || text.includes(`\n\n${feedback}\n\n`);
-  const delegationMatches=!snapshot.delegationSource||users.filter(text=>createHash('sha256').update(text).digest('hex')===snapshot.delegationSource!.promptHash).length===1;
+  const delegationMatches=!snapshot.delegationSource||typeof delegationPrompt === 'string' && users.filter(text=>text===delegationPrompt).length===1;
   return delegationMatches && users.filter(text => text === snapshot.renderedProjection).length === 1 && trusted.filter(matchesFeedback).length === 1;
 }
 

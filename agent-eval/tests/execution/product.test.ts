@@ -2,7 +2,7 @@ import { afterAll, expect, test } from 'bun:test';
 import { mkdtemp, readFile, writeFile, rm, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { childEnvironment } from '../../src/adapters/product.ts';
+import { childEnvironment, ProductAdapter } from '../../src/adapters/product.ts';
 import { cleanupInstance, prepareInstance } from '../../src/execution/instance.ts';
 import { unwrap } from '../../src/adapters/product.ts';
 import { ActionExecutor, readAllMessages } from '../../src/adapters/actions.ts';
@@ -10,7 +10,6 @@ import { verifyPublishedConfiguration } from '../../src/adapters/configuration.t
 import { collectObservation } from '../../src/execution/observe.ts';
 import { runTrial } from '../../src/execution/trial.ts';
 import { reportFixture } from '../report-fixture.ts';
-import { hashValue } from '../../src/adapters/product-checksums.ts';
 import { loadDataset, materializeInputs } from '../../src/datasets.ts';
 import type { EvalCase } from '../../src/evaluation.ts';
 import { canonicalRequest } from '../../../packages/contracts/src/run.ts';
@@ -19,11 +18,11 @@ import { evaluate } from '../../src/scoring/evaluate.ts';
 import {observedConditions} from '../../src/scoring/project-observation.ts';
 import type { CheckSpec } from '../../src/scoring/types.ts';
 
-const intentPaths: string[] = [], intentDigest = `sha256:${'a'.repeat(64)}`;
+const intentPaths: string[] = [];
 const intentMetadata = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
   const path = new URL(request.url).pathname; intentPaths.push(path);
   if (path === '/api/version') return Response.json({ version: 'ENGINEERING metadata fixture; no model' });
-  if (path === '/api/tags') return Response.json({ models: [{ name: 'qwen3.5:0.8b',digest:intentDigest }] });
+  if (path === '/api/tags') return Response.json({ models: [{ name: 'qwen3.5:0.8b' }] });
   if (path === '/api/show') return Response.json({ details: { family: 'ENGINEERING', parameter_size: 'fixture', quantization_level: 'fixture' } });
   return new Response('ENGINEERING inference prohibited', { status: 403 });
 } });
@@ -42,6 +41,18 @@ function controlledCase(): EvalCase {
       { id: 'read', trigger: 'ready', action: { action: 'read_control' }, timeoutMs: 10000 }],
     expected: { maxToolCalls:0,mustHaveEvidence:false, expectedAnswerHint:'ENGINEERING',forbiddenConditions:['Failure'],success: ['ENGINEERING'], failure: ['ENGINEERING'], checks: [], goldRef: 'controlled' } };
 }
+test('private export copy verification journals correlation without temporary paths or request contents', async () => {
+  const root=await mkdtemp(join(tmpdir(),'medclaw-eval-copy-trace-'));
+  try {
+    const tracePath=join(root,'trace.jsonl'),product=new ProductAdapter({dataRoot:root,tracePath});product.instanceId='host';
+    product.record('request',{requestId:'copy-request',method:'export.copy.verify',payload:{operationRef:'copy',exportId:1,artifactId:2,temporaryPath:join(root,'private-copy')}});
+    product.record('reply',{requestId:'copy-request',method:'export.copy.verify',result:{ok:true,data:{verified:true}}});
+    await product.flush();
+    const text=await readFile(tracePath,'utf8');expect(text).not.toContain('temporaryPath');expect(text).not.toContain('private-copy');
+    expect(product.traces.every(entry=>entry.requestId==='copy-request'&&entry.method==='export.copy.verify'&&!('payload' in entry)&&!('result' in entry))).toBe(true);
+  } finally {await rm(root,{recursive:true,force:true});}
+});
+
 test('child environment does not inherit parent keys, judge settings or dotenv', () => {
   const previousMarker = process.env.ENGINEERING_SECRET, previousKey = process.env.OPENAI_API_KEY;
   process.env.ENGINEERING_SECRET = 'do-not-inherit'; process.env.OPENAI_API_KEY = 'do-not-inherit';
@@ -135,7 +146,7 @@ test('startup applies policy and verifies transient product identity without sto
  try {
   product=await prepareInstance({trialRoot:join(root,'valid'),config:selected});
   const current=unwrap(await product.request('model.config.read',{}));expect(current.policy).toEqual(selected.policy);
-  expect(current.intentModel).toMatchObject({enabled:true,modelDigest:intentDigest});
+  expect(current.intentModel).toMatchObject({enabled:true,});
   await expect(verifyPublishedConfiguration(product,{...selected,intent:{...selected.intent,baseUrl:selected.intent.baseUrl+'/'}})).rejects.toThrow('published_intent_configuration_mismatch');
   await expect(prepareInstance({trialRoot:join(root,'wrong-tokens'),config:{...selected,model:{...selected.model,maxTokens:42}}})).rejects.toThrow('published_model_configuration_mismatch');
   expect(JSON.parse(await readFile(join(root,'wrong-tokens','startup-shutdown.json'),'utf8'))).toMatchObject({stopped:true,closed:true,processExited:true});
@@ -173,7 +184,7 @@ test('real Host imports public projection, resolves batches and archives actual 
     expect(result).toMatchObject({ status: 'completed', stopped: true, closed: true, reason: null }); expect(result.observation?.missing).toEqual([]);
     const operations = result.observation?.facts.operations as { state: string; result: { batchIds: number[]; rowCount: number } }[];
     expect(operations).toHaveLength(1); expect(operations[0]).toMatchObject({ state: 'imported', result: { rowCount: 12 } }); expect(operations[0]!.result.batchIds).toHaveLength(4);
-    const files = result.observation?.facts.artifactFiles as { relativePath: string; evidencePath: string; sha256: string }[];
+    const files = result.observation?.facts.artifactFiles as { relativePath: string; evidencePath: string; bytes: number }[];
     expect(files.length).toBeGreaterThan(1); expect(files.every(file => !('sha256' in file))).toBe(true);
     const trace = await readFile(join(root, 'trial', 'events.jsonl'), 'utf8'); expect(trace).not.toContain('ENGINEERING GOLD NOT PRODUCT INPUT');
     expect(result.observation?.facts.modelCalls).toEqual([]); expect(result.observation?.identityChecks.every(check => check.passed)).toBe(true);

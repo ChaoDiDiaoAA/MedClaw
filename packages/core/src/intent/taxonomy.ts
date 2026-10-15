@@ -59,7 +59,7 @@ export const INTENT_CAPABILITIES = {
   FRESHNESS: capability('conditional', [], ['basis'], ['snapshot_date'], null, ['read_batch', 'read_source_metadata'],
     ['basis=snapshot_date', 'capture_time_unavailable']),
   MONITOR_REPORT: capability('disabled', ['time'], ['format'], ['query_id', 'evidence_id'], null, [], ['formal_report_service_not_accepted']),
-  EXPORT_RESULT: capability('disabled', [], ['format', 'resultRef'], ['query_id', 'result_hash', 'evidence_id'], null, [],
+  EXPORT_RESULT: capability('disabled', [], ['format', 'resultRef'], ['query_id', 'evidence_id'], null, [],
     ['export_service_not_accepted', 'xlsx_requires_separate_implementation_and_acceptance', 'delivery_slots_never_replace_query_context']),
 } satisfies Record<L2, IntentCapability>;
 

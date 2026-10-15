@@ -83,7 +83,6 @@ test('P3 query transaction preserves a trusted deadline failure and rolls back b
       eventIds: [],
       warnings: [],
       calculationVersion: 'query/v1',
-      resultHash: 'empty',
       createdAt: '2026-10-01T00:00:00.000Z',
     }, [], guarded);
   } catch (error) { thrown = error; }
@@ -150,7 +149,7 @@ test('P3 observation window freezes the maximum ID across all ages and skips lat
   expect(() => store.readToolObservations({ windowDays: TOOL_PROFILE_RULES.windowDays, cutoffAt: '2026-10-02T00:00:00.000Z', limit: 0 })).toThrow('invalid_argument');
 });
 
-test('P3 saved Query metadata rejects corrupted parameter hashes and conflicting duplicate identities', () => {
+test('P3 saved Query metadata rejects invalid stored parameters and conflicting duplicate identities', () => {
   const { db, store, context } = fixture();
   const query = store.commitQuery({
     sessionId: 1,
@@ -165,16 +164,15 @@ test('P3 saved Query metadata rejects corrupted parameter hashes and conflicting
     eventIds: [],
     warnings: [],
     calculationVersion: 'query/v1',
-    resultHash: 'empty',
     createdAt: '2026-10-01T00:00:00.000Z',
   }, [], context);
-  const saved = db.query<{ params_hash: string; result_json: string }, [number]>('SELECT params_hash,result_json FROM queries WHERE id=?').get(query.id)!;
+  const saved = db.query<{ params_json: string; result_json: string }, [number]>('SELECT params_json,result_json FROM queries WHERE id=?').get(query.id)!;
   db.exec('DROP TRIGGER queries_update_immutable');
-  db.query("UPDATE queries SET params_hash='wrong' WHERE id=?").run(query.id);
+  db.query("UPDATE queries SET params_json='{\"batchIds\":[]}' WHERE id=?").run(query.id);
   let thrown: unknown;
   try { store.readQuery(query.id); } catch (error) { thrown = error; }
   expect(thrown).toMatchObject({ code: 'tool_output_inconsistent' });
-  db.query('UPDATE queries SET params_hash=?,result_json=? WHERE id=?').run(saved.params_hash, JSON.stringify({ ...JSON.parse(saved.result_json), runId: 99 }), query.id);
+  db.query('UPDATE queries SET params_json=?,result_json=? WHERE id=?').run(saved.params_json, JSON.stringify({ ...JSON.parse(saved.result_json), runId: 99 }), query.id);
   thrown = undefined;
   try { store.readQuery(query.id); } catch (error) { thrown = error; }
   expect(thrown).toMatchObject({ code: 'tool_output_inconsistent' });

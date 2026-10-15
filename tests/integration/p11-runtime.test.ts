@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os';
 import { join, resolve, relative } from 'node:path';
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { createHash } from 'node:crypto';
 import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
 import { PiModelRuntime } from '../../packages/runtime-pi/src/model-runtime';
 import { PiAgentRuntime } from '../../packages/runtime-pi/src/agent-runtime';
@@ -51,7 +50,7 @@ test('p11 ordinary Send freezes author bytes and records the one real SDK expans
     expect(frozen.selection).toEqual({ prompt: f.prompt, skills: [f.skill] }); expect(frozen.available).toHaveLength(2);
     expect(saved.scope.allowedResourceRefs).toEqual(frozen.available.map(s => resourceRefKey(s.ref)));
     expect(saved.nativeInput?.text).toContain(raw); expect(saved.nativeInput?.text).not.toBe(saved.resourceInputPlan?.dispatchText);
-    expect(saved.nativeInput?.sha256).toBe(createHash('sha256').update(saved.nativeInput!.text).digest('hex'));
+    expect(saved.nativeInput).toEqual({text:saved.nativeInput!.text});
     expect(f.requests).toHaveLength(1); const messages = f.requests[0]!.messages as { role: string; content: unknown }[];
     expect(messages.filter(m => m.role === 'user' && contextMessageText(m.content) === saved.nativeInput!.text)).toHaveLength(1);
     expect(f.errors).toEqual([]); expect(f.repos.readInput({ inputId })).toMatchObject({ status: 'consumed', processingStatus: 'completed' });
@@ -206,7 +205,7 @@ test('p11 actual SDK capture checks receipt budget before native dispatch and pr
   const f = await fixture(); try {
     const { previous, rollbackFromVersion, ...old } = f.app.config;
     await f.app.prepareConfig('budget-plain', { ...f.app.config, configVersion: '2', previous: old, resources: { bySession: {} } }); f.app.commitConfig('budget-plain', '2');
-    const text = '"receipt"\n\\ budget', budget = Buffer.byteLength(JSON.stringify({ text, sha256: createHash('sha256').update(text).digest('hex') })); let limit = budget - 1;
+    const text = '"receipt"\n\\ budget', budget = Buffer.byteLength(JSON.stringify({ text})); let limit = budget - 1;
     const execute = f.agent.execute.bind(f.agent); f.agent.execute = (input, callbacks) => execute({ ...input, nativeReceiptLimitBytes: limit }, callbacks);
     const result = await f.app.runs.submitAgent(f.request(text), { instanceId: 'host', operationRef: 'capture-budget' });
     if (!result.ok || !result.data.runId || !result.data.inputId) throw new Error('No saved Input'); await f.settle();
@@ -289,10 +288,9 @@ test('p11 reopened SQLite and new native Session preserve old v1 history while a
     const first=await f.app.runs.submitAgent(f.request('/skill:query historical v1'),{instanceId:'host',operationRef:'v1-before-restart'});if(!first.ok||!first.data.runId)throw new Error('No v1');await f.settle();
     const catalogue=ResourceCatalogueSchema.parse(JSON.parse(readFileSync(join(f.author,'catalog.json'),'utf8'))),v1=catalogue.definitions.find(d=>d.kind==='skill')!;
     const folder=join(f.author,'skills/query/v2');cpSync(join(f.author,'skills/query/v1'),folder,{recursive:true});writeFileSync(join(folder,'SKILL.md'),readFileSync(join(folder,'SKILL.md'),'utf8')+'\nENGINEERING version two.\n');
-    const definition={...v1,version:'v2',entry:'skills/query/v2/SKILL.md',treeHash:''};const hash=(text:string)=>createHash('sha256').update(text).digest('hex');
-    const metadata={kind:definition.kind,id:definition.id,version:definition.version,entry:definition.entry,keywords:[...definition.keywords].sort(),requiredTools:[...definition.requiredTools].sort(),requiredExtensions:[...definition.requiredExtensions].sort(),files:definition.files.map(path=>{const bytes=readFileSync(join(folder,path));return {path,bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')};}).sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0)};
-    definition.treeHash=hash(canonicalRequest(metadata));catalogue.definitions.push(definition);writeFileSync(join(f.author,'catalog.json'),JSON.stringify(catalogue));
-    const v2={kind:definition.kind,id:definition.id,version:definition.version,treeHash:definition.treeHash}, {previous,rollbackFromVersion,...old}=f.app.config;
+    const definition={...v1,version:'v2',entry:'skills/query/v2/SKILL.md'};
+    catalogue.definitions.push(definition);writeFileSync(join(f.author,'catalog.json'),JSON.stringify(catalogue));
+    const v2={kind:definition.kind,id:definition.id,version:definition.version}, {previous,rollbackFromVersion,...old}=f.app.config;
     await f.app.prepareConfig('v2-selected',{...f.app.config,configVersion:'2',previous:old,resources:{bySession:{'1':{prompt:null,skills:[v2]}}}});f.app.commitConfig('v2-selected','2');
     const nextRequest=f.request('new v2 question');await f.app.runs.shutdown();f.db.close();second=openDatabase(join(f.root,'app.sqlite'));
     const history=sqliteHistory(second),repos=new Repositories(second,undefined,undefined,undefined,history.store),contexts=new SqliteContextStore(second),tools=new SqliteToolStore(second),catalog=new CatalogService(new SqliteCatalogStore(second)),queries=new QueryService(catalog,tools);

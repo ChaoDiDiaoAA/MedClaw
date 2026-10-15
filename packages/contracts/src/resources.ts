@@ -4,16 +4,15 @@ import { AppErrorSchema, ConfigVersionSchema, OpaqueIdSchema, PositiveIdSchema, 
 export const RESOURCE_LIMITS = Object.freeze({ catalog: 128, skills: 32, files: 32, fileBytes: 64 * 1024,
   versionBytes: 1024 * 1024, replyBytes: 1024 * 1024, runBytes: 2 * 1024 * 1024, nativeBytes: 2 * 1024 * 1024,
   inputAcceptBytes: 1024 * 1024, nativeReceiptBytes: 2 * 1024 * 1024, inputSavedBytes: 3 * 1024 * 1024 });
-export const ResourceHashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 export const ResourceIdSchema = z.string().min(1).max(64).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 export const ResourceVersionSchema = z.string().max(32).regex(/^v[1-9][0-9]*$/);
 export const ResourceFileSchema = z.string().min(1).max(256).refine(file =>
   !/[\\:*?"<>|\u0000-\u001f\u007f]/.test(file) && file.split('/').every(part => part !== '' && part !== '.' && part !== '..' && !/[. ]$/.test(part)
     && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part)), 'Expected a canonical relative resource file');
-export const ResourceRefSchema = z.strictObject({ kind: z.enum(['prompt', 'skill']), id: ResourceIdSchema, version: ResourceVersionSchema, treeHash: ResourceHashSchema });
+export const ResourceRefSchema = z.strictObject({ kind: z.enum(['prompt', 'skill']), id: ResourceIdSchema, version: ResourceVersionSchema });
 export type ResourceRef = z.infer<typeof ResourceRefSchema>;
 export type ResourceKind = ResourceRef['kind'];
-export const resourceRefKey = (ref: ResourceRef): string => `${ref.kind}:${ref.id}@${ref.version}#${ref.treeHash}`;
+export const resourceRefKey = (ref: ResourceRef): string => `${ref.kind}:${ref.id}@${ref.version}`;
 const names = z.array(z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/)).max(32).refine(a => new Set(a).size === a.length, 'Duplicate dependency');
 const keywords = z.array(z.string().min(1).max(64)).max(32).refine(a => new Set(a).size === a.length, 'Duplicate keyword');
 export const ResourceDefinitionSchema = ResourceRefSchema.extend({ entry: ResourceFileSchema, files: z.array(ResourceFileSchema).min(1).max(RESOURCE_LIMITS.files),
@@ -34,7 +33,7 @@ export const ResourceDiagnosticSchema = z.strictObject({ resourceRef: ResourceRe
   message: z.string().min(1).max(1000) });
 export type ResourceDiagnostic = z.infer<typeof ResourceDiagnosticSchema>;
 export type ResourceDiagnosticReason = ResourceDiagnostic['reason'];
-const fileMetadata = z.strictObject({ file: ResourceFileSchema, bytes: z.number().int().nonnegative().max(RESOURCE_LIMITS.fileBytes), sha256: ResourceHashSchema });
+const fileMetadata = z.strictObject({ file: ResourceFileSchema, bytes: z.number().int().nonnegative().max(RESOURCE_LIMITS.fileBytes) });
 export const ResourceItemSchema = z.strictObject({ ref: ResourceRefSchema, name: ResourceIdSchema.nullable(), description: z.string().max(1024).nullable(), keywords,
   enabled: z.boolean(), availability: z.enum(['ready', 'missing', 'conflict', 'invalid', 'dependency_missing', 'content_changed']), disableModelInvocation: z.boolean().nullable(),
   files: z.array(fileMetadata).max(RESOURCE_LIMITS.files), requiredTools: names.nullable(), requiredExtensions: names.nullable(), diagnostics: z.array(ResourceDiagnosticSchema).max(256) });
@@ -53,10 +52,10 @@ export type ResourceReadInput = z.infer<typeof ResourceReadInputSchema>;
 export type ResourceSelectInput = z.infer<typeof ResourceSelectInputSchema>;
 const evidenceIdentity = { resourceRef: ResourceRefSchema, originRunId: PositiveIdSchema, file: ResourceFileSchema.nullable(),
   inputId: PositiveIdSchema.nullable(), nativeEntryId: OpaqueIdSchema.nullable(), toolCallId: PositiveIdSchema.nullable(),
-  contentHash: ResourceHashSchema, coverage: z.enum(['index', 'complete', 'partial', 'unknown']) };
+  coverage: z.enum(['index', 'complete', 'partial', 'unknown']) };
 export const ResourceEvidenceSchema = z.strictObject({ ...evidenceIdentity, kind: z.enum(['sdk_expansion', 'native_read', 'provider_delivery']), modelCallId: OpaqueIdSchema.nullable(),
-  payloadHash: ResourceHashSchema.nullable(), observedAt: TimestampSchema }).refine(f =>
-    f.kind === 'provider_delivery' ? f.modelCallId !== null && f.payloadHash !== null : f.modelCallId === null && f.payloadHash === null, 'Delivery evidence requires original call and payload');
+  observedAt: TimestampSchema }).refine(f =>
+    f.kind === 'provider_delivery' ? f.modelCallId !== null : f.modelCallId === null, 'Delivery evidence requires the original call');
 export type ResourceEvidence = z.infer<typeof ResourceEvidenceSchema>;
 const listFields = { configVersion: ConfigVersionSchema, selection: ResourceSelectionSchema, items: z.array(ResourceItemSchema).max(RESOURCE_LIMITS.catalog + RESOURCE_LIMITS.skills + 1),
   diagnostics: z.array(ResourceDiagnosticSchema).max(1000), catalogError: AppErrorSchema.nullable(), evidence: z.array(ResourceEvidenceSchema).max(100),
@@ -79,7 +78,7 @@ export const ResourceSnapshotSchema = z.strictObject({ ref: ResourceRefSchema, n
     && s.files.reduce((sum, f) => sum + f.bytes, 0) <= RESOURCE_LIMITS.versionBytes, 'Snapshot identity or capacity mismatch');
 export type ResourceFileSnapshot = z.infer<typeof ResourceFileSnapshotSchema>;
 export type ResourceSnapshot = z.infer<typeof ResourceSnapshotSchema>;
-const sameRef = (a: ResourceRef, b: ResourceRef) => a.kind === b.kind && a.id === b.id && a.version === b.version && a.treeHash === b.treeHash;
+const sameRef = (a: ResourceRef, b: ResourceRef) => a.kind === b.kind && a.id === b.id && a.version === b.version;
 export const FrozenRunResourcesSchema = z.strictObject({ contract: z.literal('medclaw.run-resources/v1'), sdkVersion: z.literal('0.87.1'), sessionId: PositiveIdSchema,
   configVersion: ConfigVersionSchema, selection: ResourceSelectionSchema, available: z.array(ResourceSnapshotSchema).max(RESOURCE_LIMITS.skills + 1),
   knownPromptNames: z.array(ResourceIdSchema).max(RESOURCE_LIMITS.catalog), omitted: z.array(ResourceDiagnosticSchema).max(1000) })
@@ -90,18 +89,18 @@ export const FrozenRunResourcesSchema = z.strictObject({ contract: z.literal('me
 export type FrozenRunResources = z.infer<typeof FrozenRunResourcesSchema>;
 export const ResourceInputPlanSchema = z.strictObject({ kind: z.enum(['plain', 'prompt', 'skill']), resourceRef: ResourceRefSchema.nullable(),
   dispatchText: z.string().refine(t => t.isWellFormed()) }).refine(p => p.kind === 'plain' ? p.resourceRef === null : p.resourceRef?.kind === p.kind, 'Input plan resource mismatch');
-export const NativeInputReceiptSchema = z.strictObject({ text: z.string().refine(t => t.isWellFormed() && new TextEncoder().encode(t).byteLength <= RESOURCE_LIMITS.nativeBytes), sha256: ResourceHashSchema })
+export const NativeInputReceiptSchema = z.strictObject({ text: z.string().refine(t => t.isWellFormed() && new TextEncoder().encode(t).byteLength <= RESOURCE_LIMITS.nativeBytes) })
   .refine(r => new TextEncoder().encode(JSON.stringify(r)).byteLength <= RESOURCE_LIMITS.nativeReceiptBytes, 'Native receipt exceeds JSON budget');
 export type ResourceInputPlan = z.infer<typeof ResourceInputPlanSchema>;
 export type NativeInputReceipt = z.infer<typeof NativeInputReceiptSchema>;
-export const ResourceReadFactSchema = z.strictObject({ resourceRef: ResourceRefSchema, file: ResourceFileSchema, fileHash: ResourceHashSchema,
-  returnedContentHash: ResourceHashSchema, coverage: z.enum(['complete', 'partial', 'unknown']), observedAt: TimestampSchema });
+export const ResourceReadFactSchema = z.strictObject({ resourceRef: ResourceRefSchema, file: ResourceFileSchema,
+  coverage: z.enum(['complete', 'partial', 'unknown']), observedAt: TimestampSchema });
 export type ResourceReadFact = z.infer<typeof ResourceReadFactSchema>;
 export const ResourceDeliveryRefSchema = z.strictObject({ ...evidenceIdentity, kind: z.enum(['prompt_expansion', 'skill_expansion', 'skill_index', 'native_read']) })
   .refine(f => f.kind === 'skill_index' ? f.resourceRef.kind === 'skill' && f.file === null && f.inputId === null && f.nativeEntryId === null && f.toolCallId === null && f.coverage === 'index'
     : f.kind === 'native_read' ? f.file !== null && f.toolCallId !== null && f.nativeEntryId !== null && f.inputId === null && f.coverage !== 'index'
     : f.resourceRef.kind === (f.kind === 'prompt_expansion' ? 'prompt' : 'skill') && f.file !== null && f.inputId !== null && f.nativeEntryId !== null && f.toolCallId === null && f.coverage === 'complete', 'Resource delivery identity mismatch');
-export const ResourcePayloadObservationSchema = z.strictObject({ payloadHash: ResourceHashSchema, verified: z.array(ResourceDeliveryRefSchema).max(1000) });
+export const ResourcePayloadObservationSchema = z.strictObject({ verified: z.array(ResourceDeliveryRefSchema).max(1000) });
 export const CallResourceContextSchema = z.strictObject({ expected: z.array(ResourceDeliveryRefSchema).max(1000), payload: ResourcePayloadObservationSchema.nullable() })
   .refine(c => c.payload === null || JSON.stringify(c.expected) === JSON.stringify(c.payload.verified), 'Resource payload must verify every expected identity in order');
 export type ResourceDeliveryRef = z.infer<typeof ResourceDeliveryRefSchema>;

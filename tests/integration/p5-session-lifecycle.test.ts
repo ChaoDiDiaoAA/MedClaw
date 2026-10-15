@@ -18,7 +18,7 @@ test('schema6 migration preserves original identity and JSON, initializes only p
   insert.run(1,'native-1','old-1','{ "expectedWorkspaceRevision": 0 }',JSON.stringify({session:{id:1,title:'新会话 1',nativeSessionId:'native-1',kind:'user',status:'active',storageVersion:0,leafId:null,nextSubmissionSequence:1},workspace:{revision:1,sessionId:1,materialVersion:null,batchRefs:[],deviceIds:[],queryId:null,activeView:'data',selection:null}}),'新会话 1','{ "other": "字节😀" }',at,at);
   insert.run(2,'native-2','old-2','{}','{"session":{"id":2,"title":"original"}}','新会话 2','{"other":42}',at,at);
   const old=db.query<Record<string,unknown>,[]>('SELECT * FROM sessions ORDER BY id').all(),markers=db.query('SELECT * FROM schema_migrations').all();db.close();db=openDatabase(path);
-  expect(SCHEMA_VERSION).toBe(15);const rows=db.query<Record<string,unknown>,[]>('SELECT * FROM sessions ORDER BY id').all();
+  expect(SCHEMA_VERSION).toBe(16);const rows=db.query<Record<string,unknown>,[]>('SELECT * FROM sessions ORDER BY id').all();
   for(const [i,row] of rows.entries()){for(const [key,value] of Object.entries(old[i]!))if(key!=='metadata_json')expect(row[key]).toEqual(value);expect(row.metadata_revision).toBe(0);expect(row.deleted_at).toBeNull();}
   expect(JSON.parse(String(rows[0]!.metadata_json))).toEqual({other:'字节😀',titleOrigin:'default'});expect(JSON.parse(String(rows[1]!.metadata_json))).toEqual({other:42,titleOrigin:'user'});
   expect(db.query('SELECT * FROM schema_migrations WHERE version<=5').all()).toEqual(markers);expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
@@ -62,8 +62,8 @@ test('management conflicts across operation sources, strict column facts, and ro
  f.db.query("UPDATE business_events SET actor='system' WHERE operation_ref='rename'").run();expect(()=>f.repos.readManagementOperation({operationRef:'rename'})).toThrow('storage_read_failed');expect(renamed.session.title).toBe('new');
  }finally{f.dispose();}
 });
-test('workspace restore fingerprint detects metadata changes without workspace revision changes',()=>{
- const f=fixture();try{const s=create(f),inspection=f.repos.inspectWorkspace();f.repos.renameSession({sessionId:s.session.id,title:'changed',expectedMetadataRevision:0},'rename',later);expect(f.repos.readWorkspace().revision).toBe(inspection.state.revision);expect(()=>f.repos.commitWorkspaceRestore(inspection.state.revision,inspection.fingerprint,inspection.candidate,later)).toThrow();}finally{f.dispose();}
+test('workspace restore dependencies detect metadata changes without workspace revision changes',()=>{
+ const f=fixture();try{const s=create(f),inspection=f.repos.inspectWorkspace();f.repos.renameSession({sessionId:s.session.id,title:'changed',expectedMetadataRevision:0},'rename',later);expect(f.repos.readWorkspace().revision).toBe(inspection.state.revision);expect(()=>f.repos.commitWorkspaceRestore(inspection.state.revision,inspection.dependencies,inspection.candidate,later)).toThrow();}finally{f.dispose();}
 });
 import { DEFAULT_REQUEST_POLICY } from '../../packages/contracts/src/model';
 import { safeError } from '../../packages/contracts/src/error';
@@ -110,15 +110,15 @@ import { CatalogService } from '../../packages/core/src/data/catalog-service';
 import { describeDataSelection } from '../../packages/storage/src/workspace-selection';
 import { CurrentQuerySchema } from '../../packages/contracts/src/query';
 function dataFixture(f:ReturnType<typeof fixture>){
- f.db.query("INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_hash,preview_request_json,created_at,updated_at) VALUES(1,'import','host','imported','hash','{}',?,?)").run(at,at);
- for(const batch of [1,2])f.db.query("INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at) VALUES(?,1,'scope',?,'浙江','v','bundle','lock',?,'full','cohort',1,1,'[]','{}',?,?,1,?)").run(batch,`2026-10-0${batch}`,String(batch).repeat(64),batch===1?1:0,batch===1?null:1,at);
+ f.db.query("INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_json,created_at,updated_at) VALUES(1,'import','host','imported','{}',?,?)").run(at,at);
+ for(const batch of [1,2])f.db.query("INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,coverage,expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at) VALUES(?,1,'scope',?,'浙江','v','bundle','full',1,1,'[]','{}',?,?,1,?)").run(batch,`2026-10-0${batch}`,batch===1?1:0,batch===1?null:1,at);
  f.db.query("INSERT INTO devices(id,source_device_id,source_bundle_id,source_submission_id,source_refs_json,created_at) VALUES(1,'device','bundle','submission','[]',?)").run(at);
  for(const batch of [1,2])f.db.query("INSERT INTO snapshots(id,batch_id,device_id,device_name,region,price_cents,currency,unit,status,source_row_ref,source_refs_json,field_origins_json) VALUES(?,?,1,'器械','浙江',100,'CNY','台','active','row','[]','{}')").run(batch,batch);
  f.db.query("INSERT INTO change_events(id,event_key,device_id,old_batch_id,new_batch_id,kind,field,old_value_json,new_value_json,delta_cents,ratio,calculation_version,created_at) VALUES(1,'change',1,1,2,'field_changed','price','100','80',-20,-0.2,'diff/v1',?)").run(at);
  f.repos.updateWorkspace({batchIds:[1,2],deviceIds:[1]},f.repos.readWorkspace().revision,at);
 }
 test('current deletion preserves valid batches/devices and compatible device/change selections, clears actual Query/evidence view',()=>{
- for(const selection of [null,{formatVersion:1 as const,kind:'device' as const,targetId:'1',targetVersion:'2'.repeat(64),rowKey:'snapshot:2',field:'priceCents'}, {formatVersion:1 as const,kind:'change' as const,targetId:'1',targetVersion:'diff/v1',rowKey:'change:1',field:'deltaCents'}]){
+ for(const selection of [null,{formatVersion:1 as const,kind:'device' as const,targetId:'1',targetVersion:'batch:2:v',rowKey:'snapshot:2',field:'priceCents'}, {formatVersion:1 as const,kind:'change' as const,targetId:'1',targetVersion:'change:1:diff/v1',rowKey:'change:1',field:'deltaCents'}]){
   const f=fixture();try{const s=create(f);dataFixture(f);const scope=f.repos.freezeAgentScope(f.repos.readWorkspace(),[]);
   f.db.query("INSERT INTO runs(id,session_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at) VALUES(10,1,'agent','host','query',1,'{\"sessionId\":1,\"clientSequence\":1}','running','answer','query','{\"agent\":{\"nativeSessionId\":\"native-create\"}}',?,'{}','2026-10-04','Asia/Shanghai',?)").run(JSON.stringify(scope),at);
   const store=new SqliteToolStore(f.db),queries=new QueryService(new CatalogService(new SqliteCatalogStore(f.db)),store);
@@ -126,7 +126,7 @@ test('current deletion preserves valid batches/devices and compatible device/cha
   f.db.query("UPDATE runs SET status='completed',ended_at=?,cleanup_json=? WHERE id=10").run(later,JSON.stringify(closed));
   const ws=f.repos.readWorkspace();if(selection?.kind!=='change')f.repos.updateWorkspace({queryId:result.queryId},ws.revision,at);
   const compatible=selection?.kind==='change'?describeDataSelection(new SqliteCatalogStore(f.db).readChanges([2],[1],null)[0]!,new SqliteCatalogStore(f.db).readBatches([1,2])):selection;
-  const chosen=compatible??{formatVersion:1 as const,kind:'evidence' as const,targetId:String(result.evidenceIds[0]),targetVersion:store.readQuery(result.queryId)!.resultHash,rowKey:null,field:null};
+  const chosen=compatible??{formatVersion:1 as const,kind:'evidence' as const,targetId:String(result.evidenceIds[0]),targetVersion:`query:${result.queryId}:${store.readQuery(result.queryId)!.calculationVersion}`,rowKey:null,field:null};
   f.repos.updateWorkspace({selection:chosen,activeView:selection?.kind==='change'?'changes':'evidence'},f.repos.readWorkspace().revision,at);
   const before=f.repos.readWorkspace(),rows=f.db.query('SELECT * FROM queries').all(),evidence=f.db.query('SELECT * FROM query_evidence').all();
   const removed=f.repos.deleteSession({sessionId:s.session.id,expectedMetadataRevision:0,expectedWorkspaceRevision:before.revision},'delete',later);expect(removed.workspace).toMatchObject({sessionId:null,queryId:null,batchRefs:before.batchRefs,deviceIds:[1],materialVersion:'v',activeView:selection?.kind==='change'?'changes':'data',selection:compatible,revision:before.revision+1});expect(f.db.query('SELECT * FROM queries').all()).toEqual(rows);expect(f.db.query('SELECT * FROM query_evidence').all()).toEqual(evidence);expect(f.db.query('PRAGMA foreign_key_check').all()).toEqual([]);

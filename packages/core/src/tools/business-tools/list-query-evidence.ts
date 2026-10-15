@@ -11,7 +11,7 @@ export const createListQueryEvidenceTool = (dependencies: {
     name: 'list_query_evidence',
     version: '1.0.0',
     label: 'List query evidence',
-    description: 'List saved evidence summaries for a query in the current session with pagination, preserving query, batch, and result hash associations.',
+    description: 'List saved evidence summaries for a query in the current session with pagination, preserving query and batch associations.',
     inputSchema: schemas.list_query_evidence.input,
     outputSchema: schemas.list_query_evidence.output,
     effect: 'READ',
@@ -24,7 +24,6 @@ export const createListQueryEvidenceTool = (dependencies: {
           id: item.id,
           queryId: item.queryId,
           batchIds: item.batchIds,
-          resultHash: item.resultHash,
           materialVersion: item.materialVersion,
         })),
       };

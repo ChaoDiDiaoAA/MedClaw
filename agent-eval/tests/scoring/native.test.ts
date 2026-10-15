@@ -1,6 +1,5 @@
 import { expect, test } from 'bun:test';
 import { evaluate } from '../../src/scoring/evaluate.ts';
-import { hashBytes } from '../../src/adapters/product-checksums.ts';
 import type { CheckSpec } from '../../src/scoring/types.ts';
 
 type Fixture = [string, Record<string, unknown>, Record<string, unknown>, Record<string, unknown>];

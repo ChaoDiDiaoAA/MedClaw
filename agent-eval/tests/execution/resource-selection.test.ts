@@ -11,11 +11,11 @@ import { loadFixtureFiles, loadProductResources } from '../../src/dataset-fixtur
 import { prepareInstance } from '../../src/execution/instance';
 import type { ResolvedRunConfig } from '../../src/types';
 
-const paths: string[] = [], digest = `sha256:${'a'.repeat(64)}`;
+const paths: string[] = [];
 const metadata = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
   const path = new URL(request.url).pathname; paths.push(path);
   if (path === '/api/version') return Response.json({ version: 'ENGINEERING metadata only' });
-  if (path === '/api/tags') return Response.json({ models: [{ name: 'qwen3.5:0.8b', digest }] });
+  if (path === '/api/tags') return Response.json({ models: [{ name: 'qwen3.5:0.8b' }] });
   if (path === '/api/show') return Response.json({ details: { family: 'ENGINEERING', parameter_size: 'fixture', quantization_level: 'fixture' } });
   return new Response('ENGINEERING inference prohibited', { status: 403 });
 } });

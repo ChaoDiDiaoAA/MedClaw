@@ -1,9 +1,7 @@
-import { createHash } from 'node:crypto';
 import { lstat, mkdir, open, opendir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { PositiveIdSchema, safeError } from '@medclaw/contracts/error';
-import { canonicalRequest } from '@medclaw/contracts/run';
 import type { PublishedSettings } from '@medclaw/contracts/model';
 import { ExtensionManifestSchema, FrozenRunExtensionsSchema, EXTENSION_LIMITS, type FrozenRunExtensions, type ExtensionDescriptor } from '@medclaw/contracts/extensions';
 import { managedPath, readText } from './resource-loader';
@@ -13,18 +11,13 @@ import { ExtensionOwnerSchema, ExtensionAssemblyProofSchema, ExtensionStatusSche
 import type { AnyToolDefinition } from '@medclaw/contracts/tool';
 import type { AppError } from '@medclaw/contracts/error';
 
-const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const unavailable = () => safeError('extension_unavailable');
 function sourceRef(source: NonNullable<FrozenRunExtensions['source']>) {
-  const { manifest, files } = source;
-  const metadata = { id: manifest.id, version: manifest.version, sdkVersion: manifest.sdkVersion,
-    files: files.map(({file,bytes,sha256}) => ({file,bytes,sha256})).sort((a,b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0) };
-  return { id: manifest.id, version: manifest.version, treeHash: hash(canonicalRequest(metadata)) };
+  return { id: source.manifest.id, version: source.manifest.version };
 }
 function checkedFrozen(value: FrozenRunExtensions) {
   const frozen = FrozenRunExtensionsSchema.parse(value);
-  if (frozen.source && (frozen.source.files.some(file => hash(file.content) !== file.sha256)
-    || !isDeepStrictEqual(JSON.parse(frozen.source.files.find(file => file.file === 'manifest.json')!.content), frozen.source.manifest)
+  if (frozen.source && (!isDeepStrictEqual(JSON.parse(frozen.source.files.find(file => file.file === 'manifest.json')!.content), frozen.source.manifest)
     || !isDeepStrictEqual(sourceRef(frozen.source), frozen.selection.extension))) throw unavailable();
   return frozen;
 }
@@ -57,7 +50,7 @@ export async function freezeRunExtensions(root: string | undefined, sessionId: n
 export async function materializeRunExtension(workdir: string, value: FrozenRunExtensions): Promise<string | null> {
   try {
     const frozen = checkedFrozen(value); if (!frozen.source) return null;
-    const directory = `extensions/tool-audit/v1/${frozen.selection.extension!.treeHash}`;
+    const directory = 'extensions/tool-audit/v1';
     await managedPath(workdir); let prefix = '';
     for (const part of directory.split('/')) {
       prefix = [prefix,part].filter(Boolean).join('/');
@@ -69,7 +62,7 @@ export async function materializeRunExtension(workdir: string, value: FrozenRunE
       try { const handle = await open(join(workdir,path),'wx'); try {await handle.writeFile(Buffer.from(file.content,'utf8'));} finally {await handle.close();} }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
       const actual = await readText(workdir,path,file.file === 'manifest.json' ? EXTENSION_LIMITS.manifestBytes : EXTENSION_LIMITS.entryBytes);
-      if (actual.sha256 !== file.sha256 || actual.bytes !== file.bytes) throw unavailable();
+      if (actual.content !== file.content || actual.bytes !== file.bytes) throw unavailable();
     }
     return join(workdir,directory,'index.ts');
   } catch { throw unavailable(); }

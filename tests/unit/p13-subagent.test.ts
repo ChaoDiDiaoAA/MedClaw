@@ -10,7 +10,6 @@ import { ChildResultSchema, ChildResultViewSchema, BoundChildIdentitySchema } fr
 import { RunControl } from '../../packages/core/src/runtime/run-control';
 import { normalizeRuntimeConfiguration } from '../../packages/contracts/src/runtime-config';
 import { performance } from 'node:perf_hooks';
-import { createHash } from 'node:crypto';
 import { matchProviderContext } from '../../packages/runtime-pi/src/messages';
 import {RunEventProjection} from '../../apps/desktop/src/renderer/use-run-events';
 import type {EventPage,MessageStreamSnapshot,StoredRunEvent} from '../../packages/contracts/src/event';
@@ -23,13 +22,13 @@ test('p13 subagent contracts can be imported first in a fresh process', () => {
 
 test('p13 delegated payload proof requires the actual prompt alongside projection and trusted feedback', () => {
   const prompt='ENGINEERING delegated prompt',source={parentRunId:1,originToolCallId:2,parentSnapshotId:3,parentInputId:4,
-    promptHash:createHash('sha256').update(prompt).digest('hex'),nativeEntryId:'child-input'};
+    nativeEntryId:'child-input'};
   const snapshot={renderedProjection:'ENGINEERING projection',runtimeFeedback:'ENGINEERING feedback',delegationSource:source};
   const messages=[{role:'system',content:snapshot.runtimeFeedback},{role:'user',content:snapshot.renderedProjection}];
-  expect(matchProviderContext('openai-completions',{messages},snapshot)).toBe(false);
-  expect(matchProviderContext('openai-completions',{messages:[...messages,{role:'user',content:prompt}]},snapshot)).toBe(true);
-  expect(matchProviderContext('openai-completions',{messages:[...messages,{role:'user',content:'changed prompt'}]},snapshot)).toBe(false);
-  expect(matchProviderContext('openai-completions',{messages:[...messages,{role:'user',content:prompt},{role:'user',content:prompt}]},snapshot)).toBe(false);
+  expect(matchProviderContext('openai-completions',{messages},snapshot,prompt)).toBe(false);
+  expect(matchProviderContext('openai-completions',{messages:[...messages,{role:'user',content:prompt}]},snapshot,prompt)).toBe(true);
+  expect(matchProviderContext('openai-completions',{messages:[...messages,{role:'user',content:'changed prompt'}]},snapshot,prompt)).toBe(false);
+  expect(matchProviderContext('openai-completions',{messages:[...messages,{role:'user',content:prompt},{role:'user',content:prompt}]},snapshot,prompt)).toBe(false);
 });
 
 test('p13 child control shares root limits, reserves a parent call and isolates native attempt identities', () => {
@@ -121,7 +120,7 @@ test('p13 committed execution delivery failure stays safe and cannot trigger aut
 
 test('p13 model context keeps positive user input distinct from null delegated input', () => {
   const base = { contract: 'medclaw.context-call/v1', snapshotId: 4, observation: null, responseStatus: null, payloadVerified: null };
-  const source = { parentRunId: 1, originToolCallId: 2, parentSnapshotId: 3, parentInputId: 4, promptHash: 'a'.repeat(64), nativeEntryId: 'child-prompt' };
+  const source = { parentRunId: 1, originToolCallId: 2, parentSnapshotId: 3, parentInputId: 4,  nativeEntryId: 'child-prompt' };
   expect(ModelCallContextSchema.safeParse({ ...base, inputId: 4 }).success).toBe(true);
   expect(ModelCallContextSchema.safeParse({ ...base, inputId: null, delegationSource: source }).success).toBe(true);
   expect(ModelCallContextSchema.safeParse({ ...base, inputId: null }).success).toBe(false);
@@ -135,12 +134,12 @@ test('p13 committed child JSON retains original reply only internally and reject
   const identity = { instanceId: 'host', parentRunId: 1, parentSessionId: 2, originToolCallId: 3, originNativeToolCallId: 'original-call', pluginAgentId: 'plugin-child', nativeSessionId: 'native-child', childRunId: 4, childSessionId: 5 };
   expect(BoundChildIdentitySchema.safeParse(identity).success).toBe(true);
   expect(BoundChildIdentitySchema.safeParse({ ...identity, childSessionId: 2 }).success).toBe(false);
-  const result = { contract: 'medclaw.child-result/v1', childRunId: 4, childSessionId: 5, parentRunId: 1, originToolCallId: 3, pluginAgentId: 'plugin-child', nativeSessionId: 'native-child', outcome: 'failed', text: '', queryRefs: [], evidenceIds: [], gaps: ['ENGINEERING failed'], truncated: false, originalReply: { content: [{ type: 'text', text: 'original reply' }], details: {} }, originalReplyHash: 'a'.repeat(64), finalLeafId: null, storageVersion: 1, committedAt: '2026-10-07T00:00:00.000Z' };
+  const result = { contract: 'medclaw.child-result/v1', childRunId: 4, childSessionId: 5, parentRunId: 1, originToolCallId: 3, pluginAgentId: 'plugin-child', nativeSessionId: 'native-child', outcome: 'failed', text: '', queryRefs: [], evidenceIds: [], gaps: ['ENGINEERING failed'], truncated: false, originalReply: { content: [{ type: 'text', text: 'original reply' }], details: {} },  finalLeafId: null, storageVersion: 1, committedAt: '2026-10-07T00:00:00.000Z' };
   expect(ChildResultSchema.safeParse(result).success).toBe(true);
   const { originalReply, ...view } = result;
   expect(ChildResultViewSchema.safeParse(view).success).toBe(true);
   expect(ChildResultViewSchema.safeParse(result).success).toBe(false);
   expect(ChildResultSchema.safeParse({ ...result, inputId: 1 }).success).toBe(false);
   expect(ChildResultSchema.safeParse({ ...result, originalReply: { ...originalReply, details: { action: () => {} } } }).success).toBe(false);
-  expect(ChildResultSchema.safeParse({ ...result, queryRefs: [{ queryId: 1, resultHash: 'b'.repeat(64) }, { queryId: 1, resultHash: 'b'.repeat(64) }] }).success).toBe(false);
+  expect(ChildResultSchema.safeParse({ ...result, queryRefs: [{ queryId: 1}, { queryId: 1}] }).success).toBe(false);
 });

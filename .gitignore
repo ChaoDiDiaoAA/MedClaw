@@ -5,6 +5,8 @@ node_modules/
 /.build/
 /.medclaw-dev/
 /.superpowers/
+/.codebase-memory/
+/.codegraph/
 /test-results/
 /playwright-report/
 **/credentials.enc.json
@@ -13,7 +15,6 @@ node_modules/
 .env
 .env.local
 /agent-eval/runs/
-/agent-eval/configs/agent-frozen.json
 /agent-eval/configs/*.local.json
 /agent-eval/configs/environment
 /agent-eval/configs/agent.json

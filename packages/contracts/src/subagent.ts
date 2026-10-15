@@ -26,7 +26,7 @@ export const BoundChildIdentitySchema = z.strictObject({
 export type BoundChildIdentity = z.infer<typeof BoundChildIdentitySchema>;
 export const DelegationSourceSchema = z.strictObject({
   parentRunId: PositiveIdSchema, originToolCallId: PositiveIdSchema, parentSnapshotId: PositiveIdSchema,
-  parentInputId: PositiveIdSchema.nullable(), promptHash: hash, nativeEntryId: OpaqueIdSchema,
+  parentInputId: PositiveIdSchema.nullable(), nativeEntryId: OpaqueIdSchema,
 });
 export type DelegationSource = z.infer<typeof DelegationSourceSchema>;
 
@@ -42,17 +42,17 @@ export const ChildResultSchema = z.strictObject({
   contract: z.literal('medclaw.child-result/v1'), childRunId: PositiveIdSchema, childSessionId: PositiveIdSchema,
   parentRunId: PositiveIdSchema, originToolCallId: PositiveIdSchema, pluginAgentId: OpaqueIdSchema, nativeSessionId: OpaqueIdSchema,
   outcome: z.enum(['completed', 'failed', 'cancelled']), text: z.string(),
-  queryRefs: z.array(z.strictObject({ queryId: PositiveIdSchema, resultHash: hash })).refine(refs => new Set(refs.map(r => r.queryId)).size === refs.length, 'Unique queries required'),
+  queryRefs: z.array(z.strictObject({ queryId: PositiveIdSchema })).refine(refs => new Set(refs.map(r => r.queryId)).size === refs.length, 'Unique queries required'),
   evidenceIds: z.array(PositiveIdSchema).refine(ids => new Set(ids).size === ids.length, 'Unique evidence required'),
   gaps: z.array(z.string().min(1).max(8192)).max(1000), truncated: z.boolean(),
-  originalReply: NativeAgentReplySchema, originalReplyHash: hash, finalLeafId: OpaqueIdSchema.nullable(),
+  originalReply: NativeAgentReplySchema, finalLeafId: OpaqueIdSchema.nullable(),
   storageVersion: PositiveIdSchema, committedAt: TimestampSchema,
 });
 export const ChildResultViewSchema = ChildResultSchema.omit({ originalReply: true });
 export type ChildResult = z.infer<typeof ChildResultSchema>;
 export type ChildResultView = z.infer<typeof ChildResultViewSchema>;
 export const FrozenChildConfigSchema = BoundChildIdentitySchema.safeExtend({
-  contract: z.literal('medclaw.subagent/v1'), originSnapshotId: PositiveIdSchema, parentInputId: PositiveIdSchema.nullable(), promptHash: hash,
+  contract: z.literal('medclaw.subagent/v1'), originSnapshotId: PositiveIdSchema, parentInputId: PositiveIdSchema.nullable(),
   pluginVersion: z.literal('0.19.0'), pluginGitHead: z.literal('4f572eaa04c09d3dbc16e4a5f13a16b295e84e14'),
   pluginIntegrity: z.string().startsWith('sha512-'), patchHash: hash,
   toolNames: z.array(z.string().min(1).max(256)).max(1000).refine(names => new Set(names).size === names.length && !names.some(n => ['Agent', 'edit', 'write', 'bash', 'powershell'].includes(n)), 'Only unique child tools allowed'),
@@ -89,5 +89,5 @@ export type FinalChildFact = {
 };
 export type CommittedChildResult = { identity: BoundChildIdentity; result: ChildResult; persistence: 'committed' };
 export type CommittedChildExecutionProof = Pick<BoundChildIdentity, 'parentRunId' | 'originToolCallId' | 'childRunId'> & {
-  childOutcome: 'completed'; originalReplyHash: string; finalLeafId: string | null; storageVersion: number;
+  childOutcome: 'completed'; originalReply: NativeAgentReply; finalLeafId: string | null; storageVersion: number;
 };

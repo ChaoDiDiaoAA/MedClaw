@@ -1,7 +1,6 @@
 import {electronTestWindowArgs} from '../fixtures/desktop-dev';
 import { test, expect, _electron as electron, type ElectronApplication, type Page } from '@playwright/test';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { nativeUserMessages } from '../fixtures/p1-provider';
@@ -35,23 +34,21 @@ async function savedNativeReply(inputText: string) {
 }
 function snapshotPackage(directory: string) {
   mkdirSync(directory, { recursive: true });
-  const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
   const csv = (values: string[]) => values.map(value => `"${value.replaceAll('"', '""')}"`).join(',');
   const masters = Array.from({ length: 105 }, (_, index) => ({ record_type: 'master', device_id: String(index + 1).padStart(5, '0'), device_name: index === 0 ? 'UI fixture device' : `UI fixture device ${index + 1}`, source_submission_id: '00009', source_applicant: 'Applicant', category: 'Category', manufacturer: 'Synthetic manufacturer' }));
-  const sourceLock = { schema: 'medclaw.source-lock/v1', sources: [{ source: 'fixture', path: 'original.csv', sha256: 'a'.repeat(64) }] };
-  const lockHash = hash(canonicalRequest(sourceLock)), cohortHash = hash(canonicalRequest(masters));
+  const sourceLock = { schema: 'medclaw.source-lock/v2', sources: [{ source: 'fixture', path: 'original.csv' }] };
   writeFileSync(join(directory, 'source-lock.json'), JSON.stringify(sourceLock));
   writeFileSync(join(directory, 'entity-lineage.csv'), `${csv(Object.keys(masters[0]!))}\n${masters.map(master => csv(Object.values(master))).join('\n')}\n`);
   for (const name of ['adjustment-lineage.csv', 'validation-report.json', 'selection-report.json', '使用说明.md']) writeFileSync(join(directory, name), name.endsWith('.json') ? '{}' : 'fixture');
   const columns = ['device_id', 'device_name', 'source_submission_id', 'source_applicant', 'category', 'region', 'snapshot_date', 'price_cents', 'currency', 'unit', 'status', 'manufacturer', 'distributor', 'source_refs_json', 'field_origins_json'];
   const origins = Object.fromEntries(columns.slice(0, 13).map(key => [key, { kind: 'synthetic', ruleId: 'ui-fixture' }]));
-  const refs = [{ sourceId: 'fixture', file: 'original.csv', row: 1, recordId: '00009', sha256: 'a'.repeat(64) }];
+  const refs = [{ sourceId: 'fixture', file: 'original.csv', row: 1, recordId: '00009' }];
   for (const [index, price] of [100, 80].entries()) {
     const date = `2026-01-0${index + 1}`, text = `${csv(columns)}\n${masters.map((master, ordinal) => csv([master.device_id, master.device_name, '00009', 'Applicant', 'Category', '浙江', date, String(price), 'CNY', '件', index === 1 && ordinal === 54 ? 'suspended' : 'active', 'Synthetic manufacturer', 'Distributor', JSON.stringify(refs), JSON.stringify(origins)])).join('\n')}\n`;
     writeFileSync(join(directory, `zhejiang_${date}.csv`), text);
-    writeFileSync(join(directory, `zhejiang_${date}.metadata.json`), JSON.stringify({ contract: 'medclaw.snapshot/v1', mappingVersion: 'medclaw.snapshot/v1', materialVersion: 'ui-fixture/v1', generatorVersion: 'ui-fixture/v1', seed: 1, sourceBundleId: 'ui-fixture', sourceLockHash: lockHash, scopeKey: 'ui-scope', region: '浙江', cohortHash, snapshotDate: date, coverage: 'full', expectedEntityCount: masters.length, observedEntityCount: masters.length, declaredMissingEntityIds: [], fileSha256: hash(text), referenceDate: '2026-01-02', timezone: 'Asia/Shanghai' }));
+    writeFileSync(join(directory, `zhejiang_${date}.metadata.json`), JSON.stringify({ contract: 'medclaw.snapshot/v2', mappingVersion: 'medclaw.snapshot/v1', materialVersion: 'ui-fixture/v1', generatorVersion: 'ui-fixture/v1', seed: 1, sourceBundleId: 'ui-fixture', scopeKey: 'ui-scope', region: '浙江', snapshotDate: date, coverage: 'full', expectedEntityCount: masters.length, observedEntityCount: masters.length, declaredMissingEntityIds: [], referenceDate: '2026-01-02', timezone: 'Asia/Shanghai' }));
   }
-  const files = readdirSync(directory).sort().map(path => { const bytes = readFileSync(join(directory, path)); return { path, bytes: bytes.length, sha256: hash(bytes) }; });
+  const files = readdirSync(directory).sort().map(path => { const bytes = readFileSync(join(directory, path)); return { path, bytes: bytes.length }; });
   writeFileSync(join(directory, 'manifest.json'), JSON.stringify({ status: 'complete', files, businessFiles: 2, businessRows: masters.length * 2, businessBytes: files.filter(file => /^zhejiang_.*\.csv$/.test(file.path)).reduce((sum, file) => sum + file.bytes, 0), totalPayloadBytes: files.reduce((sum, file) => sum + file.bytes, 0) }));
 }
 test.beforeAll(async () => {

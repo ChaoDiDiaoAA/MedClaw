@@ -28,7 +28,7 @@ async function fixture(barrier?:'final-before'|'final-after'|'checkpoint-after')
   const host=new HostController({dataRoot:root,hostEntry:barrier?entry:resolve('apps/host/src/main.ts'),bunExecutable:process.execPath,onCredentialRequest:async frame=>frame.method==='export.destination.settlePrevious'?{ok:true,data:{stopped:true}}:frame.method==='credential.list'?{ok:true,data:[{providerId:'p9-fixture',type:'api_key'}]}:frame.method==='credential.read'?{ok:true,data:frame.payload.providerId==='p9-fixture'?{type:'api_key',key:'ENGINEERING'}:null}:{ok:false,error:safeError('access_denied')}});
   const initial=new MainSettings(host.paths.settingsPath).read(),definition={providerId:'p9-fixture',name:'ENGINEERING',api:'openai-completions',baseUrl:`http://127.0.0.1:${server.port}/v1`,models:[{id:'fixture',name:'ENGINEERING',input:['text'],reasoning:false,contextWindow:32768,maxTokens:1024,outputLimitConfirmed:true,pricingKnown:false,cost:null}]};
   atomicWriteJson(host.paths.settingsPath,PublishedSettingsSchema.parse({...initial,model:{provider:'p9-fixture',modelId:'fixture'},customProviders:[{definition,credentialRef:null}]}));
-  expect(await host.start()).toMatchObject({state:'ready',schemaVersion:15});
+  expect(await host.start()).toMatchObject({state:'ready',schemaVersion:16});
   const sql=(query:string)=>{const db=new Database(host.paths.databasePath,{readonly:true});try{return db.query(query).all();}finally{db.close();}};
   const workspace=async()=>WorkspaceViewSchema.parse(unwrap(await host.request('workspace.read',{})));
   const create=async(op:string)=>NewSessionResultSchema.parse(unwrap(await host.request('session.create',{expectedWorkspaceRevision:(await workspace()).revision},op)));
@@ -68,7 +68,7 @@ test('p9 real Host restores same-model A/B after restart; checkpoint receipt, fu
     const a=await f.create('create-A'),b=await f.create('create-B');await f.select(a.session.id);const first=await f.send(a.session.id,'ENGINEERING A original','send-A');await f.idle();
     const points=SessionCheckpointPageSchema.parse(unwrap(await f.host.request('session.checkpoints.read',{sessionId:a.session.id})));expect(points.items).toHaveLength(1);
     await f.send(a.session.id,'ENGINEERING A correction','send-A2');await f.idle();await f.select(b.session.id);await f.send(b.session.id,'ENGINEERING B independent','send-B');await f.idle();
-    const old=f.host.read().instanceId!;expect(await f.host.restart(old)).toMatchObject({state:'ready',schemaVersion:15});
+    const old=f.host.read().instanceId!;expect(await f.host.restart(old)).toMatchObject({state:'ready',schemaVersion:16});
     const before=f.sql('SELECT * FROM memories ORDER BY id'),requests=f.requests.length,detail=SessionDetailSchema.parse(unwrap(await f.host.request('session.read',{sessionId:a.session.id})));
     expect(detail).toMatchObject({runtime:{availability:'unloaded'},history:{available:true}});expect(detail.history.messages).toHaveLength(4);
     expect(SessionMessagePageSchema.parse(unwrap(await f.host.request('session.messages.read',{sessionId:a.session.id}))).items.filter(item=>item.displayRole==='user')).toHaveLength(2);

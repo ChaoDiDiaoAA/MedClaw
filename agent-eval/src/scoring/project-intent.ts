@@ -5,7 +5,7 @@ import { projectObservation,type ObservationProjection } from './project-observa
 import type { CheckSpec,EvaluationContext } from './types.ts';
 import { canonicalRequest } from '../../../packages/contracts/src/run.ts';
 
-const PublicRule=z.strictObject(RuleEvaluationSchema.shape).omit({inputHash:true});
+const PublicRule=z.strictObject(RuleEvaluationSchema.shape);
 const PublicDecision=z.strictObject(IntentDecisionSchema.shape).extend({ruleEvaluation:PublicRule.nullable(),id:z.number().int().positive(),createdAt:z.iso.datetime()});
 const PublicIntent=z.object({protocolValidated:z.literal(true),contract:IntentReadResultSchema.shape.contract,runId:z.number().int().positive(),sessionId:z.number().int().positive(),inputId:z.number().int().positive(),decision:PublicDecision.nullable(),calls:z.array(z.object({callId:z.string(),intentCallId:z.string(),stage:z.enum(['classify','verify']),previousCallId:z.string().nullable(),state:z.enum(['started','completed','failed','cancelled']),prediction:IntentResultSchema.nullable(),rawOutput:z.object({text:z.string(),truncated:z.boolean()}).nullable(),validation:z.object({reviewRequired:z.boolean()}).nullable()})).max(2),execution:z.object({queryIds:z.array(z.number().int().positive()),requiredPersistenceComplete:z.boolean().nullable()})}).refine(value=>value.calls.every((call,index)=>call.callId===call.intentCallId&&(index===0?call.stage==='classify'&&call.previousCallId===null:call.stage==='verify'&&call.previousCallId===value.calls[0]!.callId))&&(!value.decision?.intentCallId||value.calls.some(call=>call.callId===value.decision!.intentCallId)));
 

@@ -2,7 +2,9 @@ import { expect,spyOn,test } from 'bun:test';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { contextFixture,contextAt } from '../../../tests/fixtures/p8-context.ts';
+import { contextFixture,contextAt,acceptContextInput } from '../../../tests/fixtures/p8-context.ts';
+import { openDatabase } from '../../../packages/storage/src/database.ts';
+import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { seedWorkspaceQueries } from '../../../tests/fixtures/p7-workspace.ts';
 import { packageFixture } from '../../../tests/fixtures/snapshot-package.ts';
 import { SqliteContextStore } from '../../../packages/storage/src/context-store.ts';
@@ -52,17 +54,17 @@ test('private Query inventory reads uncited original rows for exactly one owned 
     for (const queryIds of [[saved.current.id, saved.current.id], [0], [-1]]) {
       expect(QueryInventoryOriginalSchema.safeParse({ ...inventory, queryIds }).success).toBe(false);
     }
-    expect(QueryInventoryOriginalSchema.safeParse({ ...inventory, sha256: '0'.repeat(64) }).success).toBe(false);
+    expect(QueryInventoryOriginalSchema.safeParse({ ...inventory, sha256: 'obsolete' }).success).toBe(false);
     expect(PublicMethodSchema.safeParse('queries').success).toBe(false);
   } finally { f.dispose(); }
 });
 
 test('real Host private Query inventory finds an unaliased deterministic form Query without model execution or Workspace mutation', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'medclaw-query-inventory-')), paths: string[] = [], digest = `sha256:${'a'.repeat(64)}`;
+  const root = await mkdtemp(join(tmpdir(), 'medclaw-query-inventory-')), paths: string[] = [];
   const metadata = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
     const path = new URL(request.url).pathname; paths.push(path);
     if (path === '/api/version') return Response.json({ version: 'ENGINEERING metadata only' });
-    if (path === '/api/tags') return Response.json({ models: [{ name: 'qwen3.5:0.8b', digest }] });
+    if (path === '/api/tags') return Response.json({ models: [{ name: 'qwen3.5:0.8b' }] });
     if (path === '/api/show') return Response.json({ details: { family: 'ENGINEERING', parameter_size: 'fixture', quantization_level: 'fixture' } });
     return new Response('ENGINEERING inference prohibited', { status: 403 });
   } });
@@ -104,8 +106,13 @@ test('real Host private Query inventory finds an unaliased deterministic form Qu
 }, 30000);
 
 test('Host storage and Adapter round-trip a large SDK original with paging and original owner after restart',async()=>{
-  const f=contextFixture(),product=new ProductAdapter({dataRoot:tmpdir(),tracePath:join(tmpdir(),'unused-controller-trace')});product.instanceId='restarted-host';
+  const root=await mkdtemp(join(tmpdir(),'medclaw-controller-original-')),db=openDatabase(join(root,'app.sqlite')),manager=SessionManager.inMemory(root);
+  const header=manager.getHeader()!,f={db,...acceptContextInput(db,{nativeSessionId:header.id,initialHistory:{header,entries:[],activeLeafId:null}})};
+  const product=new ProductAdapter({dataRoot:root,tracePath:join(root,'unused-controller-trace')});product.instanceId='restarted-host';
   try {
+    const memory=new SqliteMemoryStore(f.db,validateNativeHistory),history=unwrap(await memory.load(f.input.sessionId));
+    unwrap(await memory.commit({sessionId:f.input.sessionId,runId:f.input.runId,expectedStorageVersion:history.storageVersion,header:history.header,
+      newEntries:[{id:f.input.nativeEntryId,parentId:history.activeLeafId,type:'message',timestamp:contextAt,message:{role:'user',content:f.content.text,timestamp:Date.parse(contextAt)}}],activeLeafId:f.input.nativeEntryId}));
     const contexts=new SqliteContextStore(f.db),snapshot=contexts.save(contexts.select(f.input));
     const recorder=new ModelCallRecorder(f.repos,f.input.runId,'main',contextAt,{snapshotId:snapshot.id,inputId:f.input.inputId});
     const payload={messages:[{role:'user',content:'完整原件'.repeat(40000)}],tools:[]};recorder.recordPayload(payload,contextAt);
@@ -117,17 +124,18 @@ test('Host storage and Adapter round-trip a large SDK original with paging and o
       expect(JSON.parse(original.original[0].body)).toEqual(payload);expect(original.original[0].boundary).toBe('sdk_onPayload');
       await expect(readControllerOriginal(product,selector,'other-host')).rejects.toThrow('access_denied');
       await expect(readControllerOriginal(product,{...selector,callId:'missing'},'host')).rejects.toThrow('evidence_not_found');
-      f.db.query('UPDATE model_calls SET model_json=json_set(model_json,?,?) WHERE call_id=?').run('$.requestOriginals[0].sha256','0'.repeat(64),recorder.callId);
+      f.db.query('UPDATE model_calls SET model_json=json_set(model_json,?,?) WHERE call_id=?').run('$.requestOriginals[0].callId','wrong-call',recorder.callId);
       await expect(readControllerOriginal(product,selector,'host')).rejects.toThrow('evidence_integrity_failed');
     } finally {spy.mockRestore();}
-  } finally {f.dispose();}
+  } finally {db.close();await rm(root,{recursive:true,force:true});}
 });
 
 test('controller transport rejects crossed identity, damaged bytes, truncation and cursors; public callers have no method',async()=>{
   const product=new ProductAdapter({dataRoot:tmpdir(),tracePath:join(tmpdir(),'unused-controller-trace')});product.instanceId='host';
   const selector={kind:'run' as const,runId:1,sessionId:1};
-  for(const corruption of ['owner','hash','truncated','cursor'] as const) {
-    const spy=spyOn(product,'request').mockImplementation(async()=>({ok:true,data:{instanceId:'host',ownerInstanceId:corruption==='owner'?'wrong':'host',selector,sha256:'0'.repeat(64),bytes:2,offset:0,nextOffset:corruption==='cursor'?1:null,encoding:'base64',data:Buffer.from(corruption==='truncated'?'{':'{}').toString('base64')}}) as never);
+  for(const corruption of ['owner','utf8','json','truncated','cursor','base64'] as const) {
+    const data=corruption==='base64'?'!!!!':(corruption==='utf8'?Buffer.from([0xff,0xff]):Buffer.from(corruption==='truncated'?'{':corruption==='json'?'}{':'{}')).toString('base64');
+    const spy=spyOn(product,'request').mockImplementation(async()=>({ok:true,data:{instanceId:'host',ownerInstanceId:corruption==='owner'?'wrong':'host',selector,bytes:2,offset:0,nextOffset:corruption==='cursor'?1:null,encoding:'base64',data}}) as never);
     try {await expect(readControllerOriginal(product,selector)).rejects.toThrow();}finally{spy.mockRestore();}
   }
   expect(PublicMethodSchema.safeParse('controller.evidence.read').success).toBe(false);

@@ -44,7 +44,7 @@ test('p9 actual desktop preserves A/B history and drafts, checks original restor
     const idle=async()=>{await expect.poll(async()=>{const r=await page.evaluate(()=>window.medclaw.request('run.control.read',{}));return r.ok&&r.data.acceptingNewRuns;}).toBe(true);};
     const send=async(text:string)=>{await page.getByLabel('Message text',{exact:true}).fill(text);await expect(page.getByRole('button',{name:'Send',exact:true})).toBeEnabled();await page.getByRole('button',{name:'Send',exact:true}).click();await expect.poll(()=>received.some(r=>JSON.stringify(r.messages).includes(text))).toBe(true);await idle();};
     await send('ENGINEERING A original');await send('ENGINEERING A correction Shanghai');
-    await page.getByRole('button',{name:'New Session',exact:true}).click();await send('ENGINEERING B independent');
+    await page.getByRole('button',{name:'New Session',exact:true}).click();await expect(page.getByTestId('current-session')).toContainText('Session 2');await send('ENGINEERING B independent');
     await page.locator('[data-session-id="1"] > button').first().click();await expect(page.getByTestId('current-session')).toContainText('Session 1');
     await page.getByRole('button',{name:'Settings',exact:true}).click();await page.getByRole('button',{name:'Restart Host',exact:true}).click();await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible({timeout:30000});
     await page.getByRole('button',{name:'Chat',exact:true}).click();await send('ENGINEERING A after restart');

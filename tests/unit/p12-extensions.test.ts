@@ -5,7 +5,6 @@ import { safeError } from '../../packages/contracts/src/error';
 import { ExtensionManifestSchema, ExtensionAssemblyProofSchema, FrozenRunExtensionsSchema, type FrozenRunExtensions, type ExtensionAssemblyProof } from '../../packages/contracts/src/extensions';
 import { createToolControlObservation, ToolControlObservationSchema } from '../../packages/contracts/src/model';
 import { canonicalRequest, type RunCleanupRecord } from '../../packages/contracts/src/run';
-import { createHash } from 'node:crypto';
 import { openDatabase } from '../../packages/storage/src/database';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -13,7 +12,7 @@ import { join } from 'node:path';
 import { acceptContextInput } from '../fixtures/p8-context';
 
 const settings = { schemaVersion: SETTINGS_SCHEMA_VERSION, configVersion: '1', model: null, customProviders: [], credentialRefs: {}, previous: null, rollbackFromVersion: null };
-const ref = { id: 'tool-audit' as const, version: 'v1' as const, treeHash: 'a'.repeat(64) };
+const ref = { id: 'tool-audit' as const, version: 'v1' as const};
 
 test('p12 old settings remain absent while explicit per-session selections survive normalization', () => {
   expect(PublishedSettingsSchema.parse(settings)).not.toHaveProperty('extensions');
@@ -37,7 +36,7 @@ test('p12 public strict methods preserve original owner and reject old host fram
   expect(PublicHostRequestSchema.safeParse(frame).success).toBe(true);
   expect(PublicHostRequestSchema.safeParse({ ...frame, protocolVersion: 'medclaw.host/p11-v1' }).success).toBe(false);
   expect(isReadOnlyMethod('extensions.command')).toBe(true); expect(isReadOnlyMethod('extensions.select')).toBe(false);
-  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p15-v3'); expect(DATABASE_SCHEMA_VERSION).toBe(15); expect(SDK_VERSION).toBe('0.87.1');
+  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p15-v4'); expect(DATABASE_SCHEMA_VERSION).toBe(16); expect(SDK_VERSION).toBe('0.87.1');
 });
 
 test('p12 extension failures are safe non-retryable errors with the original identity', () => {
@@ -52,10 +51,9 @@ function frozenExtension(): FrozenRunExtensions {
   const manifest = ExtensionManifestSchema.parse({ contract: 'medclaw.extension-manifest/v1', id: 'tool-audit', version: 'v1', sdkVersion: '0.87.1', entry: 'index.ts', files: ['manifest.json', 'index.ts'],
     hooks: { critical: ['session_start', 'tool_call'], observation: ['input', 'context', 'tool_result', 'agent_start', 'agent_end'] }, tools: ['extension_runtime_status'], commands: ['extension_status'] });
   const files = ([['manifest.json', JSON.stringify(manifest)], ['index.ts', 'export const createToolAudit=()=>{};']] as const)
-    .map(([file, content]) => ({ file, content, bytes: Buffer.byteLength(content), sha256: createHash('sha256').update(content).digest('hex') }));
-  const metadata = { id: manifest.id, version: manifest.version, sdkVersion: manifest.sdkVersion, files: files.map(({file,bytes,sha256}) => ({file,bytes,sha256})).sort((a,b) => a.file.localeCompare(b.file)) };
+    .map(([file, content]) => ({ file, content, bytes: Buffer.byteLength(content)}));
   return FrozenRunExtensionsSchema.parse({ contract: 'medclaw.run-extensions/v1', sdkVersion: '0.87.1', sessionId: 1, configVersion: '1',
-    selection: { extension: { ...ref, treeHash: createHash('sha256').update(canonicalRequest(metadata)).digest('hex') } }, source: { manifest, files } });
+    selection: { extension: { ...ref} }, source: { manifest, files } });
 }
 
 test('p12 assembly proof distinguishes loaded, failed and actually released facts', () => {
@@ -65,7 +63,7 @@ test('p12 assembly proof distinguishes loaded, failed and actually released fact
   for (const patch of [{ loadedAt: null }, { callableTools: [] }, { resourcesReleased: true }, { state: 'disposed' }]) expect(ExtensionAssemblyProofSchema.safeParse({ ...clean, ...patch }).success).toBe(false);
   expect(ExtensionAssemblyProofSchema.safeParse({ ...clean, state: 'disposed', resourcesReleased: true, disposedAt: '2026-10-06T00:00:01.000Z' }).success).toBe(true);
   const control = createToolControlObservation(); expect(ToolControlObservationSchema.parse(control)).not.toHaveProperty('hookInput');
-  expect(ToolControlObservationSchema.safeParse({ ...control, hookInput: { beforeSha256: ref.treeHash, afterSha256: ref.treeHash, changed: true } }).success).toBe(false);
+  expect(ToolControlObservationSchema.safeParse({ ...control, hookInput: { changed: 'yes' } }).success).toBe(false);
 });
 
 test('p12 run freeze is saved in the input transaction and corrupt original evidence fails closed', () => {
@@ -75,13 +73,13 @@ test('p12 run freeze is saved in the input transaction and corrupt original evid
     expect(repos.readRunExtensions(accepted.runId!)).toEqual(frozen);
     const row = db.query<{config_json:string},[number]>('SELECT config_json FROM runs WHERE id=?').get(accepted.runId!)!;
     const config = JSON.parse(row.config_json);
-    for (const corrupt of [{ ...frozen, sessionId: 2 }, { ...frozen, configVersion: '2' }, { ...frozen, selection: { extension: ref } },
-      { ...frozen, source: { ...frozen.source!, files: frozen.source!.files.map(file => file.file === 'index.ts' ? { ...file, content: 'x'.repeat(file.bytes) } : file) } }]) {
+    for (const corrupt of [{ ...frozen, sessionId: 2 }, { ...frozen, configVersion: '2' }, { ...frozen, selection: { extension: null } },
+      { ...frozen, source: { ...frozen.source!, files: frozen.source!.files.map(file => file.file === 'index.ts' ? { ...file, content: 'x'.repeat(file.bytes+1) } : file) } }]) {
       db.query('UPDATE runs SET config_json=? WHERE id=?').run(JSON.stringify({ ...config, agent: { ...config.agent, extensions: corrupt } }), accepted.runId!);
       expect(() => repos.readRunExtensions(accepted.runId!)).toThrow();
     }
     delete config.agent.extensions; db.query('UPDATE runs SET config_json=? WHERE id=?').run(JSON.stringify(config), accepted.runId!);
-    expect(repos.readRunExtensions(accepted.runId!)).toBeNull(); expect(db.query<{version:number},[]>('SELECT max(version) AS version FROM schema_migrations').get()?.version).toBe(15);
+    expect(repos.readRunExtensions(accepted.runId!)).toBeNull(); expect(db.query<{version:number},[]>('SELECT max(version) AS version FROM schema_migrations').get()?.version).toBe(16);
   } finally { db.close(); rmSync(root, {recursive:true,force:true}); }
 });
 
@@ -89,7 +87,7 @@ test('p12 invalid frozen evidence rolls back input acceptance and bounded source
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p12-rollback-')), db = openDatabase(join(root, 'app.sqlite'));
   try {
     const frozen = frozenExtension();
-    for (const value of [{ ...frozen, sessionId: 2 }, { ...frozen, configVersion: '2' }, { ...frozen, selection: { extension: ref } }]) {
+    for (const value of [{ ...frozen, sessionId: 2 }, { ...frozen, configVersion: '2' }, { ...frozen, selection: { extension: null } }]) {
       expect(() => acceptContextInput(db, { extensions: value })).toThrow();
       expect(db.query<{n:number},[]>('SELECT count(*) AS n FROM runs').get()?.n).toBe(0);
       expect(db.query<{n:number},[]>('SELECT count(*) AS n FROM session_inputs').get()?.n).toBe(0);
@@ -112,7 +110,7 @@ test('p12 cleanup retains original assembly and budget and rejects release or di
     const cleanup: RunCleanupRecord = { contract: 'medclaw.run-cleanup/v1', executionStarted: true, stopConfirmed: true, requiredPersistenceComplete: false,
       inputsSettled: false, resourcesReleased: false, unconfirmedItems: ['extension_cleanup'], secondaryErrors: [error], verifiedAt: at, extensions: proof,
       budgetSummary: {version:'medclaw.budget-summary/v1',toolCalls:1,modelCalls:1,toolAdmissionsRejected:0,modelAdmissionsRejected:0,convergenceRequested:false,recoveryAttempts:0,stopReason:null,unresolvedItems:[]} };
-    for (const patch of [{ instanceId: 'other' }, { sessionId: 2 }, { runId: runId + 1 }, { ref }]) expect(() => repos.saveRunCleanup(runId, { ...cleanup, extensions: { ...proof, ...patch } })).toThrow();
+    for (const patch of [{ instanceId: 'other' }, { sessionId: 2 }, { runId: runId + 1 }]) expect(() => repos.saveRunCleanup(runId, { ...cleanup, extensions: { ...proof, ...patch } })).toThrow();
     expect(() => repos.saveRunCleanup(runId, { ...cleanup, resourcesReleased: true })).toThrow();
     expect(() => repos.saveRunCleanup(runId,{...cleanup,extensionReleaseBasis:'not_loaded'})).toThrow();
     repos.saveRunCleanup(runId, cleanup);
@@ -146,7 +144,7 @@ test('p12 no-assembly release requires a valid monotonic basis and never fabrica
   }finally{db.close();rmSync(root,{recursive:true,force:true});}
 });
 
-test('p12 static source freezing and managed copies do not evaluate the module and reject changed author bytes', async () => {
+test('p12 static source freezing and managed copies do not evaluate the module and retain captured content when author bytes change', async () => {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p12-author-')), workdir = mkdtempSync(join(tmpdir(), 'medclaw-p12-copy-'));
   try {
     const frozen = frozenExtension(), version = join(root, 'tool-audit', 'v1'); mkdirSync(version, {recursive:true});
@@ -157,9 +155,11 @@ test('p12 static source freezing and managed copies do not evaluate the module a
     expect(await loader!.freezeRunExtensions(root,1,{...PublishedSettingsSchema.parse(settings),extensions:{bySession:{'1':frozen.selection}}})).toEqual(frozen);
     const off = await loader!.freezeRunExtensions(root,1,PublishedSettingsSchema.parse(settings)); expect(off.selection.extension).toBeNull(); expect(off.source).toBeNull();
     expect(await loader!.materializeRunExtension(workdir,off)).toBeNull();
-    const entry = await loader!.materializeRunExtension(workdir,frozen); expect(entry).toBe(join(workdir,'extensions','tool-audit','v1',descriptor.ref.treeHash,'index.ts'));
+    const entry = await loader!.materializeRunExtension(workdir,frozen); expect(entry).toBe(join(workdir,'extensions','tool-audit','v1','index.ts'));
     writeFileSync(join(version,'index.ts'),'CHANGED');
-    await expect(loader!.freezeRunExtensions(root,1,{...PublishedSettingsSchema.parse(settings),extensions:{bySession:{'1':frozen.selection}}})).rejects.toMatchObject({code:'extension_unavailable'});
+    const updated=await loader!.freezeRunExtensions(root,1,{...PublishedSettingsSchema.parse(settings),extensions:{bySession:{'1':frozen.selection}}});
+    expect(updated.source!.files.find(file=>file.file==='index.ts')?.content).toBe('CHANGED');
+    expect(frozen.source!.files.find(file=>file.file==='index.ts')?.content).toBe('export const createToolAudit=()=>{};');
     expect(await loader!.materializeRunExtension(workdir,frozen)).toBe(entry);
     writeFileSync(entry!,'TAMPERED'); await expect(loader!.materializeRunExtension(workdir,frozen)).rejects.toMatchObject({code:'extension_unavailable'});
   } finally { rmSync(root,{recursive:true,force:true}); rmSync(workdir,{recursive:true,force:true}); }

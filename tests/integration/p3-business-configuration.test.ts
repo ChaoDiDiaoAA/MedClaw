@@ -1,6 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { createHash } from 'node:crypto';
 import { canonicalRequest } from '../../packages/contracts/src/run';
 import { BUSINESS_RULES, BusinessDataSchema, CurrentQuerySchema, QueryPageSchema, QueryParamsSchema, QueryRecordSchema, TimeRangeSchema, createQuerySchemas, createStoredQuerySchemas } from '../../packages/contracts/src/query';
 import { businessToolSchemas } from '../../packages/contracts/src/business-tools';
@@ -24,7 +23,7 @@ function fixture(count = 3, region = 'region') {
   db.query("INSERT INTO runs VALUES(1,1,'running',?,?,?)").run(JSON.stringify(context.scope), context.referenceDate, context.timezone);
   initializeToolStorage(db);
   const batches = [1, 2].map(id => ({ id, scopeKey: 'scope', snapshotDate: `2026-01-0${id}`, region, coverage: 'full', previousBatchId: id === 1 ? null : 1,
-    materialVersion: 'v1', sourceBundleId: 'bundle', sourceLockHash: 'lock', contentHash: `hash${id}`, cohortHash: 'cohort', catalogRevision: 1, expectedEntityCount: count, observedEntityCount: count }));
+    materialVersion: 'v1', sourceBundleId: 'bundle', catalogRevision: 1, expectedEntityCount: count, observedEntityCount: count }));
   const devices = Array.from({ length: count }, (_, index) => ({ id: index + 1, sourceDeviceId: `device-${index + 1}`, sourceBundleId: 'bundle', sourceSubmissionId: `submission-${index + 1}`, sourceApplicant: null, sourceRefs: [] }));
   const snapshots = batches.flatMap(batch => devices.map(device => ({ id: (batch.id - 1) * count + device.id, batchId: batch.id, deviceId: device.id, deviceName: `name-${device.id}`, category: null,
     region, priceCents: 1, currency: 'CNY', unit: 'item', status: 'active', manufacturer: 'maker', distributor: null, sourceRowRef: `${batch.id}:${device.id}`, sourceRefs: [], fieldOrigins: {} })));
@@ -79,7 +78,7 @@ test('SQLite new submissions use fixed capacity and saved replays keep original 
   const input = {
     sessionId: 1, runId: 1, callRef: '1:query', kind: 'current' as const,
     params: CurrentQuerySchema.parse({ batchIds: [2] }), batchIds: [2], scopeDeviceIds: null,
-    rows: [{ deviceId: 1 }], snapshotIds: [], eventIds: [], warnings: [], calculationVersion: 'v1', resultHash: 'saved', createdAt: '2026-01-02T00:00:00.000Z',
+    rows: [{ deviceId: 1 }], snapshotIds: [], eventIds: [], warnings: [], calculationVersion: 'v1', createdAt: '2026-01-02T00:00:00.000Z',
   };
   const oversized = { ...input, rows: Array.from({ length: BUSINESS_RULES.maxSavedRows + 1 }, () => ({ deviceId: 1 })) };
   let failure: unknown;
@@ -87,7 +86,8 @@ test('SQLite new submissions use fixed capacity and saved replays keep original 
   expect(failure).toMatchObject({ code: 'query_result_too_large' });
   expect(db.query('SELECT COUNT(*) AS n FROM queries').get()).toEqual({ n: 0 });
   const saved = store.commitQuery(input, [], context);
-  expect(store.commitQuery(oversized, [], context).id).toBe(saved.id);
+  expect(() => store.commitQuery(oversized, [], context)).toThrow('state_conflict');
+  expect(store.commitQuery(input, [], context).id).toBe(saved.id);
   expect(store.readQuery(saved.id)?.rows).toHaveLength(1);
   expect(QueryRecordSchema.safeParse({ ...saved, rows: oversized.rows }).success).toBe(true);
 });
@@ -97,12 +97,12 @@ test('saved Query and Evidence remain readable when legacy params exceed current
   const page = queries.current(createQuerySchemas().CurrentQuerySchema.parse({ batchIds: [2] }), context);
   const saved = store.readQuery(page.queryId)!;
   const historical = { ...saved.params, pageSize: 501 };
-  const inserted = db.query(`INSERT INTO queries(session_id,run_id,call_ref,kind,params_hash,params_json,batch_ids_json,result_json,result_hash,created_at)
-    SELECT session_id,run_id,'1:historical',kind,?,?,batch_ids_json,result_json,result_hash,created_at FROM queries WHERE id=?`)
-    .run(createHash('sha256').update(canonicalRequest(historical)).digest('hex'), canonicalRequest(historical), page.queryId);
+  const inserted = db.query(`INSERT INTO queries(session_id,run_id,call_ref,kind,params_json,batch_ids_json,result_json,created_at)
+    SELECT session_id,run_id,'1:historical',kind,?,batch_ids_json,result_json,created_at FROM queries WHERE id=?`)
+    .run(canonicalRequest(historical), page.queryId);
   const historicalId = Number(inserted.lastInsertRowid);
-  const evidenceInsert = db.query(`INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,calculation_version,material_version,source_bundle_id,source_lock_hash,result_hash)
-    SELECT ?,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,calculation_version,material_version,source_bundle_id,source_lock_hash,result_hash FROM query_evidence WHERE id=?`)
+  const evidenceInsert = db.query(`INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,calculation_version,material_version,source_bundle_id)
+    SELECT ?,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,calculation_version,material_version,source_bundle_id FROM query_evidence WHERE id=?`)
     .run(historicalId, page.evidenceIds[0]!);
   expect(queries.read(historicalId, context).params.pageSize).toBe(501);
   expect(store.readEvidence(Number(evidenceInsert.lastInsertRowid))!.queryId).toBe(historicalId);

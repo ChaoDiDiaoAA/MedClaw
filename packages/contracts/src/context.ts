@@ -50,13 +50,12 @@ export function readIntentContext(rendered:string, frozenStage?:IntentStageInput
 }
 export const CONTEXT_HTTP_APIS = ['openai-completions', 'openai-responses', 'azure-openai-responses', 'anthropic-messages', 'bedrock-converse-stream', 'mistral-conversations', 'pi-messages', 'openai-codex-responses'] as const;
 export type ContextHttpApi = typeof CONTEXT_HTTP_APIS[number];
-export const ContextHashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 export const ContextSourceSchema = z.enum(['user_requirement', 'product_constraint', 'runtime_feedback', 'program_query_fact', 'source_data', 'model_prediction']);
 export type ContextSource = z.infer<typeof ContextSourceSchema>;
-export const ContextRefSchema = z.strictObject({ kind: z.enum(['input', 'batch', 'query', 'evidence', 'snapshot', 'change', 'tool_result']), id: z.string().min(1).max(256), version: z.string().min(1).max(256), hash: ContextHashSchema, channel: z.enum(['product_projection', 'native_history']) });
+export const ContextRefSchema = z.strictObject({ kind: z.enum(['input', 'batch', 'query', 'evidence', 'snapshot', 'change', 'tool_result']), id: z.string().min(1).max(256), version: z.string().min(1).max(256), channel: z.enum(['product_projection', 'native_history']) });
 export type ContextRef = z.infer<typeof ContextRefSchema>;
 export const ContextProjectionSchema = z.strictObject({contract:z.literal('medclaw.context-projection/v1'),executionScope:RunScopeSchema,materialScope:RunScopeSchema,referenceDate:ReferenceDateSchema,timezone:TimezoneSchema,adoptedQueryContext:QueryContextRecordSchema.nullable().optional(),materials:z.array(z.strictObject({ref:ContextRefSchema.omit({channel:true}),source:ContextSourceSchema,provenance:z.enum(['public','synthetic','synthetic-derived']).nullable(),fieldOrigins:FieldOriginsSchema,value:z.json()})),omitted:z.array(z.strictObject({kind:ContextRefSchema.shape.kind,id:z.string().min(1).max(256),reason:z.literal('capacity'),omittedRows:PositiveIdSchema}))});
-export const NativeContextRefSchema = z.strictObject({ kind: z.enum(['input', 'tool_result']), id: PositiveIdSchema, nativeEntryId: OpaqueIdSchema, contentHash: ContextHashSchema, nativeToolCallId: z.string().min(1).max(256).nullable(), originSnapshotId: PositiveIdSchema.nullable() }).refine(ref => ref.kind === 'input' ? ref.nativeToolCallId === null && ref.originSnapshotId === null : ref.nativeToolCallId !== null && ref.originSnapshotId !== null, 'Native reference origin mismatch');
+export const NativeContextRefSchema = z.strictObject({ kind: z.enum(['input', 'tool_result']), id: PositiveIdSchema, nativeEntryId: OpaqueIdSchema, nativeToolCallId: z.string().min(1).max(256).nullable(), originSnapshotId: PositiveIdSchema.nullable() }).refine(ref => ref.kind === 'input' ? ref.nativeToolCallId === null && ref.originSnapshotId === null : ref.nativeToolCallId !== null && ref.originSnapshotId !== null, 'Native reference origin mismatch');
 export type NativeContextRef = z.infer<typeof NativeContextRefSchema>;
 export const IntentContextSourceSchema = z.strictObject({ contract: z.literal('medclaw.intent-context/v1'), inputId: PositiveIdSchema,
   baseLeafId: OpaqueIdSchema.nullable(), baseStorageVersion: z.number().int().nonnegative().safe(), stageInput: IntentStageInputSchema.optional(),
@@ -71,7 +70,7 @@ export function intentContextSource(stage: IntentStageInput): z.infer<typeof Int
 }
 export const ContextSnapshotBodySchema = z.strictObject({
   contract: z.literal(CONTEXT_CONTRACT), workspaceContext: WorkspaceContextSchema.nullable(), selectedRefs: z.array(ContextRefSchema).max(10000),
-  projectionHash: ContextHashSchema, renderedProjection: z.string(), runtimeFeedback: z.string(), feedbackHash: ContextHashSchema,
+  renderedProjection: z.string(), runtimeFeedback: z.string(),
   resourceVersions: z.record(z.string().min(1).max(256), z.string().min(1).max(256)), nativeRefs: z.array(NativeContextRefSchema).max(1000),
   omitted: z.array(z.strictObject({ kind: ContextRefSchema.shape.kind, id: z.string().min(1).max(256), reason: z.literal('capacity'), omittedRows: PositiveIdSchema })).max(10000),
   projectionLimitBytes: PositiveIdSchema.max(CONTEXT_READ_BYTES / 2),
@@ -81,7 +80,7 @@ export const ContextSnapshotBodySchema = z.strictObject({
 export type ContextSnapshotBody = z.infer<typeof ContextSnapshotBodySchema>;
 export const ContextSnapshotSchema = ContextSnapshotBodySchema.safeExtend({ id: PositiveIdSchema, runId: PositiveIdSchema, sessionId: PositiveIdSchema, inputId: PositiveIdSchema.nullable(), sequence: PositiveIdSchema, createdAt: TimestampSchema, deliveredCallIds: z.array(OpaqueIdSchema).max(1000) }).refine(snapshot => snapshot.workspaceContext === null || snapshot.workspaceContext.sessionId === snapshot.sessionId, 'Snapshot session mismatch');
 export type ContextSnapshot = z.infer<typeof ContextSnapshotSchema>;
-const PiContextDeliveryObservationSchema = z.strictObject({ contract: z.literal('medclaw.context-observation/v1'), api: z.enum(CONTEXT_HTTP_APIS), transport: z.enum(['sse','aws-event-stream']), observedAt: TimestampSchema, httpStatus: z.number().int().min(200).max(299), projectionHash: ContextHashSchema, feedbackHash: ContextHashSchema, verifiedNativeRefs: z.array(z.strictObject({ kind: NativeContextRefSchema.shape.kind, id: PositiveIdSchema, contentHash: ContextHashSchema })).max(1000), resources: ResourcePayloadObservationSchema.optional() }).refine(observation => observation.transport === (observation.api === 'bedrock-converse-stream' ? 'aws-event-stream' : 'sse'), 'Transport must match the verified API');
+const PiContextDeliveryObservationSchema = z.strictObject({ contract: z.literal('medclaw.context-observation/v1'), api: z.enum(CONTEXT_HTTP_APIS), transport: z.enum(['sse','aws-event-stream']), observedAt: TimestampSchema, httpStatus: z.number().int().min(200).max(299), verifiedNativeRefs: z.array(z.strictObject({ kind: NativeContextRefSchema.shape.kind, id: PositiveIdSchema })).max(1000), resources: ResourcePayloadObservationSchema.optional() }).refine(observation => observation.transport === (observation.api === 'bedrock-converse-stream' ? 'aws-event-stream' : 'sse'), 'Transport must match the verified API');
 export const ContextDeliveryObservationSchema = z.union([PiContextDeliveryObservationSchema, z.lazy(() => IntentHttpObservationSchema)]);
 export type ContextDeliveryObservation = z.infer<typeof ContextDeliveryObservationSchema>;
 export const NativeHistoryContextSchema = z.strictObject({ contract: z.literal('medclaw.native-history-context/v1'), leafId: OpaqueIdSchema.nullable(), storageVersion: z.number().int().nonnegative().safe(),
@@ -120,7 +119,7 @@ export const PrepareIntentContextInputSchema = z.strictObject({ runId: PositiveI
   && value.projection.input.baseLeafId === value.baseLeafId && value.projection.input.baseStorageVersion === value.baseStorageVersion
   && JSON.stringify(value.projection.input.scope) === JSON.stringify(value.scope), 'Intent context must preserve the accepted owner, Scope and saved baseline');
 export type PrepareIntentContextInput = z.infer<typeof PrepareIntentContextInputSchema>;
-export type SaveContextSelection = { input: PrepareContextInput | PrepareChildContextInput | PrepareIntentContextInput; body: ContextSnapshotBody; sourceFingerprint: string };
+export type SaveContextSelection = { input: PrepareContextInput | PrepareChildContextInput | PrepareIntentContextInput; body: ContextSnapshotBody; source: unknown };
 const contextDeliveryFields = { runId: PositiveIdSchema, sessionId: PositiveIdSchema, callId: OpaqueIdSchema, snapshotId: PositiveIdSchema, observation: ContextDeliveryObservationSchema };
 export const RegisterContextDeliveryInputSchema = z.union([
   z.strictObject({ ...contextDeliveryFields, inputId: PositiveIdSchema, delegationSource: z.never().optional() }),

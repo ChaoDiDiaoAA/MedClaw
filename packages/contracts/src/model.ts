@@ -2,7 +2,6 @@ import { z } from "zod";
 import { AppErrorSchema, ConfigVersionSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } from "./error";
 import { ResourceSettingsSchema } from './resources';
 import { ExtensionSettingsSchema } from './extensions';
-import { ResourceHashSchema } from './resources';
 export { ConfigVersionSchema } from './error';
 import type { AppError } from "./error";
 import type { ProviderOutcome } from "./run";
@@ -43,13 +42,13 @@ export const IntentBaseUrlSchema = z.string().regex(/^http:\/\/(?:127\.0\.0\.1|\
   }, 'Only numeric HTTP loopback without URL components is allowed');
 export const IntentModelConfigurationSchema = z.strictObject({
   contract: z.literal('medclaw.intent-model/v2'), enabled: z.boolean(), baseUrl: IntentBaseUrlSchema,
-  modelTag: z.literal('qwen3.5:0.8b'), modelDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/).nullable(),
+  modelTag: z.literal('qwen3.5:0.8b'),
   sourceUrl: z.literal('https://ollama.com/library/qwen3.5:0.8b'), verifiedEvidenceRef: nonblank(256).nullable(),
   timeoutMs: z.number().int().min(1000).max(60000),
-}).refine(value => !value.enabled || value.modelDigest !== null && value.verifiedEvidenceRef !== null, 'Enabling requires verified model identity and protocol evidence');
+}).refine(value => !value.enabled || value.verifiedEvidenceRef !== null, 'Enabling requires protocol evidence');
 export type IntentModelConfiguration = z.infer<typeof IntentModelConfigurationSchema>;
 export const DEFAULT_INTENT_MODEL: Readonly<IntentModelConfiguration> = Object.freeze({
-  contract:'medclaw.intent-model/v2',enabled:false,baseUrl:'http://127.0.0.1:11434',modelTag:'qwen3.5:0.8b',modelDigest:null,
+  contract:'medclaw.intent-model/v2',enabled:false,baseUrl:'http://127.0.0.1:11434',modelTag:'qwen3.5:0.8b',
   sourceUrl:'https://ollama.com/library/qwen3.5:0.8b',verifiedEvidenceRef:null,timeoutMs:15000,
 });
 export const IntentModelSelectionSchema = IntentModelConfigurationSchema.safeExtend({
@@ -71,7 +70,7 @@ const safeCount = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const elapsedMs = z.number().finite().nonnegative();
 const controlCode = z.string().min(1).max(128).regex(/^[a-z][a-z0-9_.:-]*$/);
 export const MeasurementContextSchema = z.strictObject({
-  version: z.literal('medclaw.tool-measurement/v1'),
+  version: z.enum(['medclaw.tool-measurement/v1', 'medclaw.tool-measurement/v2']),
   sdkVersion: nonblank(128),
   environmentKey: nonblank(256),
   cutoffAt: TimestampSchema,
@@ -106,8 +105,7 @@ export const ToolProfileSnapshotSchema = z.strictObject({
 export const ToolValidationStatusSchema = z.enum(['passed', 'failed', 'not_applicable', 'not_reached', 'unknown']);
 export const ToolAdmissionStatusSchema = z.enum(['passed', 'blocked', 'failed', 'not_reached', 'unknown']);
 export const ToolControlObservationSchema = z.strictObject({
-  hookInput: z.strictObject({ beforeSha256: ResourceHashSchema, afterSha256: ResourceHashSchema, changed: z.boolean() })
-    .refine(value => value.changed === (value.beforeSha256 !== value.afterSha256)).optional(),
+  hookInput: z.strictObject({ changed: z.boolean() }).optional(),
   version: z.literal('medclaw.tool-control/v1'),
   admission: z.strictObject({
     status: ToolAdmissionStatusSchema,

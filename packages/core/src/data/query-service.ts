@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { z } from 'zod';
 import { BUSINESS_RULES, createQuerySchemas, QueryInterpretationSchema, QueryPageSchema, type Batch, type CatalogSummary, type ChangesQueryInput, type CurrentQueryInput, type Evidence, type QueryContext, type QueryParams, type QueryParamsInput, type QueryRecord, type QueryStore, type Snapshot } from "../../../contracts/src/query";
 import { AppErrorSchema, PositiveIdSchema, safeError, type Result } from "../../../contracts/src/error";
@@ -261,10 +260,9 @@ export class QueryService {
     const batches = this.catalog.batches(batchIds, context), groups = new Map<string, typeof batches>();
     const interpretation = this.interpretation(kind, params, batches, rows, context);
     this.assertRows({ kind, params, batchIds, scopeDeviceIds, snapshotIds, eventIds }, rows, batches);
-    const resultHash = createHash("sha256").update(canonicalRequest({ kind, params, batchIds, scopeDeviceIds, rows, interpretation, calculationVersion })).digest("hex");
     const evidence: Omit<Evidence, "id" | "queryId">[] = [];
     for (const batch of batches) {
-      const key = canonicalRequest([batch.sourceBundleId, batch.materialVersion, batch.sourceLockHash]);
+      const key = canonicalRequest([batch.sourceBundleId, batch.materialVersion]);
       const group = groups.get(key) ?? []; group.push(batch); groups.set(key, group);
     }
     const sourceEvents = new Map(eventIds.length ? this.catalog.changes(batchIds, context).map(event => [event.id, event]) : []);
@@ -276,7 +274,7 @@ export class QueryService {
       const groupEvents = eventIds.filter(id => ids.includes(sourceEvents.get(id)?.newBatchId ?? -1));
       evidence.push({ batchIds: ids, snapshotIds: groupSnapshots.map(row => row.id), eventIds: groupEvents,
         sourceRowRefs: [...new Set(groupSnapshots.map(row => row.sourceRowRef))], calculationVersion,
-        materialVersion: group[0]!.materialVersion, sourceBundleId: group[0]!.sourceBundleId, sourceLockHash: group[0]!.sourceLockHash, resultHash,
+        materialVersion: group[0]!.materialVersion, sourceBundleId: group[0]!.sourceBundleId,
         filters: params, provenance: 'synthetic-derived' });
     }
     this.catalog.checkActive(context);
@@ -284,7 +282,7 @@ export class QueryService {
     return this.store.commitQuery({ sessionId: context.sessionId, runId: context.runId, callRef: callRef(context),
       source: 'source' in context ? context.source : 'agent_tool', catalogRevision: this.catalog.revision(), materialVersion: materialVersions.join(','),
       basedOnQueryId: 'basedOnQueryId' in context ? context.basedOnQueryId ?? null : null,
-      kind, params, batchIds, scopeDeviceIds, rows, snapshotIds, eventIds, warnings, interpretation, calculationVersion, resultHash, createdAt: new Date().toISOString() }, evidence, context);
+      kind, params, batchIds, scopeDeviceIds, rows, snapshotIds, eventIds, warnings, interpretation, calculationVersion, createdAt: new Date().toISOString() }, evidence, context);
   }
   read(queryId: number, context: QueryContext): QueryRecord {
     this.catalog.assertContext(context); if (this.store.assertReadContext) this.store.assertReadContext(context); else this.store.assertContext(context);
@@ -313,7 +311,7 @@ export class QueryService {
         throw new Error('tool_output_inconsistent');
     }
     this.catalog.checkActive(context);
-    // Legacy queries retain their saved hash and leave an omitted original cutoff unknown.
+    // Legacy queries leave an omitted original cutoff unknown.
     return structuredClone({ ...record, interpretation: record.interpretation ?? this.interpretation(record.kind, record.params, batches, record.rows) });
   }
   page(input: { queryId: number; page: number; pageSize: number }, context: QueryContext) {
@@ -326,7 +324,7 @@ export class QueryService {
   private project(record: QueryRecord, input: { page: number; pageSize: number }, context: QueryContext) {
     const rows = record.rows.slice((input.page - 1) * input.pageSize, input.page * input.pageSize);
     const evidence = this.store.listEvidence(record.id);
-    if (evidence.some(item => item.queryId !== record.id || item.resultHash !== record.resultHash || item.calculationVersion !== record.calculationVersion)) throw new Error('tool_output_inconsistent');
+    if (evidence.some(item => item.queryId !== record.id || item.calculationVersion !== record.calculationVersion)) throw new Error('tool_output_inconsistent');
     const batches = this.catalog.batches(record.batchIds, context);
     this.assertRows(record, rows, batches);
     if (record.kind === 'current') {

@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase } from '../../packages/storage/src/database';
-import { ArtifactStore, PACKAGE_LIMITS, hashFile, listPackageFiles, permittedRelativePath } from '../../packages/storage/src/artifact-store';
+import { ArtifactStore, PACKAGE_LIMITS, filesEqual, listPackageFiles, permittedRelativePath } from '../../packages/storage/src/artifact-store';
 import { SqliteImportStore } from '../../packages/storage/src/import-store';
 import { ArtifactSchema } from '../../packages/contracts/src/data';
 
@@ -21,16 +21,17 @@ test('P3 managed package keeps original delivery manifest separate and cannot im
     expect(artifacts.manifestPath(id)).toBe(join(root, 'artifacts', String(id), 'manifest.json'));
     expect(artifacts.manifestPath(id)).not.toBe(join(artifacts.inputPath(id), 'manifest.json'));
     const read = await artifacts.read(id), artifact = read.ok ? ArtifactSchema.parse(read.data) : null;
-    expect(artifact?.status).toBe('reserved'); expect(artifact?.sourceLockHash).toBeNull();
+    expect(artifact?.status).toBe('reserved'); expect(artifact).not.toHaveProperty('sourceLockHash');
     expect(imports.read('reserved')?.operation.result).toBeNull(); expect(imports.revision()).toBe(0);
     await expect(artifacts.copy(id, 'other-operation', source, new AbortController().signal)).rejects.toThrow('state_conflict');
     await expect(artifacts.verifyManifest(id, 'reserved')).rejects.toThrow('artifact_not_ready');
   } finally { db.close(); }
 });
-test('P3 inventory and hashing enforce authorized membership, byte count and symlink boundary', async () => {
+test('P3 inventory and content comparison enforce authorized membership, byte count and symlink boundary', async () => {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p3-artifacts-')); roots.push(root);
   const source = join(root, 'source'), outside = join(root, 'outside'); mkdirSync(source); mkdirSync(outside); writeFileSync(join(source, 'one.csv'), 'a,b\n1,2\n'); writeFileSync(join(outside, 'private.csv'), 'outside');
-  expect(await listPackageFiles(source)).toEqual(['one.csv']); expect((await hashFile(join(source, 'one.csv'))).bytes).toBe(8);
+  expect(await listPackageFiles(source)).toEqual(['one.csv']); expect(await filesEqual(join(source,'one.csv'),join(source,'one.csv'))).toBe(true);
+  writeFileSync(join(outside,'copy.csv'),'a,b\n1,3\n');expect(await filesEqual(join(source,'one.csv'),join(outside,'copy.csv'))).toBe(false);
   for (const path of ['../outside', '/absolute', 'C:/absolute', 'folder\\escaped', 'a/../b', 'a//b']) expect(permittedRelativePath(path)).toBe(false);
   symlinkSync(outside, join(source, 'linked'), 'junction');
   await expect(listPackageFiles(source)).rejects.toThrow('import_invalid');

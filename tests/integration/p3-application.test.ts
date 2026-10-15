@@ -37,17 +37,17 @@ test('workspace selection uses trusted batch identities and compare-and-swap whi
       ALTER TABLE workspace ADD COLUMN active_view TEXT NOT NULL DEFAULT 'data';
       ALTER TABLE workspace ADD COLUMN selection_json TEXT;
       CREATE TABLE imports(id INTEGER PRIMARY KEY, artifact_id INTEGER);
-      CREATE TABLE batches(id INTEGER PRIMARY KEY, import_id INTEGER, content_hash TEXT, snapshot_date TEXT, scope_key TEXT, material_version TEXT);
+      CREATE TABLE batches(id INTEGER PRIMARY KEY, import_id INTEGER, snapshot_date TEXT, scope_key TEXT, material_version TEXT);
       CREATE TABLE snapshots(id INTEGER PRIMARY KEY, batch_id INTEGER, device_id INTEGER);
       CREATE TABLE queries(id INTEGER PRIMARY KEY,session_id INTEGER,batch_ids_json TEXT,result_json TEXT);
       INSERT INTO imports VALUES(1,5);
-      INSERT INTO batches VALUES(1,1,'hash-1','2026-01-01','scope','v1'),(2,1,'hash-2','2026-01-02','scope','v1');
+      INSERT INTO batches VALUES(1,1,'2026-01-01','scope','v1'),(2,1,'2026-01-02','scope','v1');
       INSERT INTO snapshots VALUES(1,1,11),(2,2,11);`);
     const repo = new Repositories(db);
     const initial = repo.readWorkspace();
     const selected = repo.updateWorkspace({ batchIds: [1, 2], deviceIds: [11] }, initial.revision, '2026-10-02T00:00:00.000Z');
     expect(selected.sessionId).toBeNull();
-    expect(selected.batchRefs.map(batch => batch.contentHash)).toEqual(['hash-1', 'hash-2']);
+    expect(selected.batchRefs.map(batch=>batch.id)).toEqual([1,2]);
     const frozen = repo.freezeAgentScope(selected, ['read_data_scope', 'write']);
     expect(frozen).toMatchObject({ batchIds: [1, 2], deviceIds: [11], artifactIds: [5], allowedToolNames: ['read_data_scope', 'write'], readOnly: false });
     expect(repo.freezeAgentScope({ ...selected, notices: [{ code: 'reference_cleared', kind: 'session', targetId: '1' }] }, ['read_data_scope', 'write'])).toEqual(frozen);
@@ -58,16 +58,16 @@ test('workspace selection uses trusted batch identities and compare-and-swap whi
     const narrowed = repo.updateWorkspace({ batchIds: [2], deviceIds: [] }, selected.revision, '2026-10-02T00:00:01.000Z');
     expect(narrowed.batchRefs.map(batch => batch.id)).toEqual([2]);
     expect(frozen.batchIds).toEqual([1, 2]);
-    expect(() => repo.freezeAgentScope({ ...selected, batchRefs: selected.batchRefs.map(batch => ({ ...batch, contentHash: 'forged' })) }, ['read_data_scope'])).toThrow('access_denied');
+    expect(() => repo.freezeAgentScope({ ...selected, batchRefs: selected.batchRefs.map(batch => ({ ...batch, scopeKey:'forged' })) }, ['read_data_scope'])).toThrow('access_denied');
   } finally { db.close(); }
 });
 
-test('P3 workspace keeps content identities while rejecting invented batch and entity identifiers', () => {
+test('P3 workspace keeps business identities while rejecting invented batch and entity identifiers', () => {
   const workspace = {
     revision: 1,
     sessionId: 1,
     materialVersion: 'material/v1',
-    batchRefs: [{ id: 1, contentHash: 'hash', snapshotDate: '2026-01-01', scopeKey: 'scope' }],
+    batchRefs: [{ id: 1, snapshotDate: '2026-01-01', scopeKey: 'scope' }],
     deviceIds: [],
     queryId: null,
     activeView: 'data',

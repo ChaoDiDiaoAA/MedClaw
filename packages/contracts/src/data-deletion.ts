@@ -8,11 +8,11 @@ export const DataDeleteTargetSchema=z.discriminatedUnion('kind',[
 ]);
 const revisionFields={expectedCatalogRevision:RevisionSchema,expectedWorkspaceRevision:RevisionSchema};
 export const DataDeletePreviewRequestSchema=z.strictObject({operationRef:OpaqueIdSchema,target:DataDeleteTargetSchema,...revisionFields});
-export const DataDeleteCommitRequestSchema=z.strictObject({operationRef:OpaqueIdSchema,previewHash:z.string().regex(/^[a-f0-9]{64}$/),...revisionFields});
+export const DataDeleteCommitRequestSchema=z.strictObject({operationRef:OpaqueIdSchema,...revisionFields});
 export const DataDeleteReferenceSchema=z.strictObject({operationRef:OpaqueIdSchema});
 const count=z.number().int().nonnegative();
 export const DataDeleteFileSchema=z.strictObject({artifactId:PositiveIdSchema,path:z.string().min(1)});
-export const DataDeletePreviewSchema=z.strictObject({operationRef:OpaqueIdSchema,previewHash:z.string().regex(/^[a-f0-9]{64}$/),
+export const DataDeletePreviewSchema=z.strictObject({operationRef:OpaqueIdSchema,
  catalogRevision:RevisionSchema,workspaceRevision:RevisionSchema,batches:z.array(z.strictObject({id:PositiveIdSchema,snapshotDate:z.string()})),
  snapshotCount:count,changeCount:count,deviceCount:count,queryCount:count,workspaceWillChange:z.boolean(),files:z.array(DataDeleteFileSchema)});
 export const DataDeleteReceiptSchema=z.strictObject({operationRef:OpaqueIdSchema,batchIds:z.array(PositiveIdSchema),snapshotCount:count,changeCount:count,deviceCount:count,

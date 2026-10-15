@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { AppErrorSchema, safeError, type AppError } from '@medclaw/contracts/error';
 import { IntentModelConfigurationSchema, IntentModelSelectionSchema, INTENT_VERSIONS,
@@ -9,9 +8,8 @@ import { IntentStageInputSchema, IntentHttpOutcomeSchema, IntentModelInspectionS
   type IntentModelClient, type IntentStageInput, type IntentHttpObservation, type IntentHttpOutcome } from '@medclaw/contracts/intent';
 
 const ENVELOPE_BYTES = 1024 * 1024, CONTENT_BYTES = 64 * 1024;
-const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const label = z.string().min(1).max(256), count = z.number().int().nonnegative().safe();
-const tagSchema = z.object({ name: label, digest: z.string().regex(/^(?:sha256:)?[a-f0-9]{64}$/), model: label.optional() });
+const tagSchema = z.object({ name: label, model: label.optional() });
 const tagsSchema = z.object({ models: z.array(tagSchema).max(10000) });
 const envelopeSchema = z.object({ model: label, done: z.boolean(), done_reason: label.nullable().optional(),
   message: z.object({ role: z.literal('assistant'), content: z.string() }),
@@ -56,7 +54,6 @@ async function readTag(baseUrl: string, modelTag: string, signal: AbortSignal) {
   const matches = tags.models.filter(tag => normalizeTag(tag.name) === normalizeTag(modelTag));
   if (!matches.length) fail('intent_model_unavailable');
   if (matches.length !== 1 || matches[0]!.model !== undefined && normalizeTag(matches[0]!.model!) !== normalizeTag(modelTag)) fail('intent_model_identity_mismatch');
-  return 'sha256:' + matches[0]!.digest.replace(/^sha256:/, '');
 }
 async function delivered(action: Promise<void>, signal: AbortSignal): Promise<void> {
   let abort!: () => void;
@@ -66,29 +63,28 @@ async function delivered(action: Promise<void>, signal: AbortSignal): Promise<vo
 }
 
 export class OllamaIntentClient implements IntentModelClient {
-  readonly prompts: Readonly<Record<'classify' | 'verify', Readonly<{ text: string; hash: string; version: string }>>>;
+  readonly prompts: Readonly<Record<'classify' | 'verify', Readonly<{ text: string; version: string }>>>;
   constructor(prompts: { classify: string; verify: string }) {
     for (const text of [prompts.classify, prompts.verify]) if (typeof text !== 'string' || !text.trim()) fail('invalid_argument');
-    this.prompts = Object.freeze({ classify: Object.freeze({ text: prompts.classify, hash: hash(prompts.classify), version: INTENT_VERSIONS.classifyPromptVersion }),
-      verify: Object.freeze({ text: prompts.verify, hash: hash(prompts.verify), version: INTENT_VERSIONS.verifyPromptVersion }) });
+    this.prompts = Object.freeze({ classify: Object.freeze({ text: prompts.classify, version: INTENT_VERSIONS.classifyPromptVersion }),
+      verify: Object.freeze({ text: prompts.verify, version: INTENT_VERSIONS.verifyPromptVersion }) });
   }
   async inspect(raw: IntentModelConfiguration, external = new AbortController().signal) {
-    let actualDigest: string | null = null, metadata = null, signal = external;
+    let metadata = null, signal = external;
     try {
       const config = checked(IntentModelConfigurationSchema, raw, 'invalid_argument');
       signal = AbortSignal.any([external, AbortSignal.timeout(Math.min(config.timeoutMs, 5000))]);
       const version = checked(z.object({ version: label }), await readJson(await request(config.baseUrl, '/api/version', signal)), 'intent_response_invalid');
-      actualDigest = await readTag(config.baseUrl, config.modelTag, signal);
+      await readTag(config.baseUrl, config.modelTag, signal);
       const show = checked(z.object({ details: z.object({ family: label.nullable().optional(), parameter_size: label.nullable().optional(),
         quantization_level: label.nullable().optional() }).optional() }), await readJson(await request(config.baseUrl, '/api/show', signal, { model: config.modelTag })), 'intent_response_invalid');
       metadata = { serviceVersion: version.version, family: show.details?.family ?? null, parameterSize: show.details?.parameter_size ?? null, quantization: show.details?.quantization_level ?? null };
-      return IntentModelInspectionSchema.parse({ contract: 'medclaw.intent-model-inspection/v1', checkedAt: new Date().toISOString(), available: true, actualDigest, metadata, error: null });
+      return IntentModelInspectionSchema.parse({ contract: 'medclaw.intent-model-inspection/v1', checkedAt: new Date().toISOString(), available: true, metadata, error: null });
     } catch (error) {
       const failed = signal.aborted && signal.reason instanceof DOMException && signal.reason.name === 'TimeoutError' ? safeError('intent_timeout') : safeFailure(error);
-      return IntentModelInspectionSchema.parse({ contract: 'medclaw.intent-model-inspection/v1', checkedAt: new Date().toISOString(), available: false, actualDigest, metadata, error: failed });
+      return IntentModelInspectionSchema.parse({ contract: 'medclaw.intent-model-inspection/v1', checkedAt: new Date().toISOString(), available: false, metadata, error: failed });
     }
   }
-  /** Runtime verifies the frozen digest before B1 registration; this method checks it again after the one POST. */
   async recognizeIntent(raw: IntentStageInput, rawSelection: IntentModelSelection, external: AbortSignal,
     onDelivered: (fact: IntentHttpObservation) => Promise<void>): Promise<IntentHttpOutcome> {
     const started = performance.now();
@@ -112,7 +108,7 @@ export class OllamaIntentClient implements IntentModelClient {
         options: { num_ctx: 65536, temperature: 0, repeat_penalty: 1, presence_penalty: 0, frequency_penalty: 0 } };
       response = await request(selection.baseUrl, '/api/chat', signal, body); outcome.httpStatus = response.status;
       outcome.observation = { contract: 'medclaw.context-observation/v1', api: 'ollama-chat', transport: 'json', observedAt: new Date().toISOString(),
-        httpStatus: response.status, payloadHash: hash(JSON.stringify(body)), projectionHash: hash(projection), feedbackHash: hash(''), verifiedNativeRefs: [] };
+        httpStatus: response.status, verifiedNativeRefs: [] };
       await delivered(onDelivered(outcome.observation), signal); signal.throwIfAborted();
       const envelope = checked(envelopeSchema, await readJson(response), 'intent_response_invalid');
       outcome.responseModel = envelope.model; outcome.doneReason = envelope.done_reason ?? null;
@@ -126,10 +122,6 @@ export class OllamaIntentClient implements IntentModelClient {
       if (normalizeTag(envelope.model) !== normalizeTag(selection.modelTag)) fail('intent_model_identity_mismatch');
       if (!envelope.done || outcome.rawOutputTruncated || [envelope.prompt_eval_count, envelope.eval_count, envelope.total_duration]
         .some(value => value !== undefined && value !== null && !count.safeParse(value).success)) fail('intent_response_invalid');
-      let actualDigest: string;
-      try { actualDigest = await readTag(selection.baseUrl, selection.modelTag, signal); }
-      catch (error) { if (error instanceof Error && error.message === 'intent_model_unavailable') fail('intent_model_identity_mismatch'); throw error; }
-      if (actualDigest !== selection.modelDigest) fail('intent_model_identity_mismatch');
       signal.throwIfAborted(); outcome.transportState = 'completed';
       try { const parsed = JSON.parse(outcome.rawOutput); if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) fail('intent_output_invalid'); }
       catch { outcome.error = safeError('intent_output_invalid'); }

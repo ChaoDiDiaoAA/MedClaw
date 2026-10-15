@@ -7,7 +7,7 @@ import * as badcaseDataset from './datasets/medclaw-badcase-v1.ts';
 import {goldDefinitions as badcaseGold,sourceReferences as badcaseReferences} from './datasets/medclaw-badcase-v1.gold.ts';
 import type { GoldDefinition } from './evaluation.ts';
 import { fixtureMaterials, loadFixtureFiles, loadProductResources, parseFixtureCatalog,fixtureConversation } from './dataset-fixtures.ts';
-import { assertNoDatasetHashes, importFiles } from './data-format.ts';
+import { assertNoDatasetHashes } from './data-format.ts';
 import { compileCase } from './dataset-compiler.ts';
 import {CommonRequiredMetrics} from './dataset-compiler.ts';
 import {scoringCriteria} from './scoring/registry.ts';
@@ -107,10 +107,7 @@ export async function loadDataset(location='medclaw-agent-v1'):Promise<LoadedDat
   if(declaration) {
     const fixtures=await loadFixtureFiles();
     const review=JSON.parse(await readFile(join(directory,declaration.info.id+'.review.json'),'utf8'));
-    // Preserve the pending admission's authored conditions when its primary parent evolves.
-    const frozen=declaration.info.id==='medclaw-badcase-v1'?review.verifiedData:undefined;
-    if(frozen)for(const [id,authoring] of Object.entries(frozen.authoring??{}))if(review.cases[id])review.cases[id]={...review.cases[id],authoring};
-    return loadSnapshot({contract:'medclaw-dataset-snapshot/v1',...declaration,...frozen?{cases:frozen.cases,gold:frozen.gold}:{},fixtures,productResources:await loadProductResources(fixtures),review},directory);
+    return loadSnapshot({contract:'medclaw-dataset-snapshot/v1',...declaration,fixtures,productResources:await loadProductResources(fixtures),review},directory);
   }
   const path=resolve(location),info=await lstat(path); if(info.isSymbolicLink())fail('linked_snapshot');
   const raw=JSON.parse(await readFile(info.isDirectory()?join(path,'snapshot.json'):path,'utf8'));
@@ -127,9 +124,8 @@ export function materialFiles(ref:string,materials:EvalCase['input']['materials'
 export async function materializeInputs(item:EvalCase,directory:string) {
   const root=resolve(directory),paths=new Set<string>(),files:{path:string;content:string}[]=[];
   for(const ref of item.materialRefs) {
-    materialFiles(ref,item.input.materials);const material=item.input.materials[ref]!;
-    for(const file of importFiles(material)) {
-      const path=material.kind==='file'?ref:ref+'/'+file.path;RelativePathSchema.parse(path);
+    for(const file of materialFiles(ref,item.input.materials)) {
+      const path=file.path;
       if(paths.has(path.toLowerCase()))fail('overlapping_materials');paths.add(path.toLowerCase());
       files.push({path,content:file.content});
     }

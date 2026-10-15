@@ -5,7 +5,6 @@ import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { ExecutionIdSchema, ResolvedRunConfigSchema, type EvaluationReport, type ExecutionSnapshot } from '../types.ts';
 import { loadSnapshot, RelativePathSchema } from '../datasets.ts';
-import { assertNoDatasetHashes } from '../data-format.ts';
 import { aggregate } from '../scoring/aggregate.ts';
 import {assertJudgeCallMatches,assertCountedJudgeResult} from '../scoring/judges/client.ts';
 import {reviewCandidates} from '../review/candidates.ts';
@@ -42,8 +41,8 @@ export async function evidencePath(root:string,path:string) {
 export async function writeFileExclusive(path:string,value:string|Uint8Array) {
   await mkdir(dirname(path),{recursive:true});await writeFile(path,value,{flag:'wx',mode:0o600});
 }
-export async function writeJsonExclusive(path:string,value:unknown) {assertNoDatasetHashes(value);await writeFileExclusive(path,JSON.stringify(value,null,2)+'\n');}
-export async function replaceJson(path:string,value:unknown) {assertNoDatasetHashes(value);const temporary=path+'.'+randomUUID()+'.tmp';await writeFileExclusive(temporary,JSON.stringify(value,null,2)+'\n');await rename(temporary,path);}
+export async function writeJsonExclusive(path:string,value:unknown) {await writeFileExclusive(path,JSON.stringify(value,null,2)+'\n');}
+export async function replaceJson(path:string,value:unknown) {const temporary=path+'.'+randomUUID()+'.tmp';await writeFileExclusive(temporary,JSON.stringify(value,null,2)+'\n');await rename(temporary,path);}
 export function hydrateReport(raw:Omit<EvaluationReport,'snapshot'|'config'>,snapshot:ExecutionSnapshot):EvaluationReport {
   Object.defineProperties(raw,{snapshot:{value:snapshot,enumerable:false},config:{value:snapshot.config,enumerable:false}});
   return raw as EvaluationReport;
@@ -62,7 +61,7 @@ export async function readReport(location:string):Promise<EvaluationReport> {
   const path=resolve(location),root=path.endsWith('.json')?dirname(path):path;
   const raw=JSON.parse(await readFile(await evidencePath(root,'report.json'),'utf8')) as Omit<EvaluationReport,'snapshot'|'config'>;
   const snapshot=JSON.parse(await readFile(await evidencePath(root,'snapshot.json'),'utf8')) as ExecutionSnapshot;
-  assertNoDatasetHashes(raw);assertNoDatasetHashes(snapshot);
+
   if(raw.contract!=='medclaw-evaluation-report/v1'||snapshot.contract!=='medclaw-execution-snapshot/v1'||raw.executionId!==snapshot.executionId||raw.snapshotRef!=='snapshot.json')throw new Error('report_snapshot_identity_mismatch');
   ExecutionIdSchema.parse(raw.executionId);ResolvedRunConfigSchema.parse(snapshot.config);
   if(snapshot.qualityMetricCatalogVersion!==undefined&&!['v1','v2'].includes(snapshot.qualityMetricCatalogVersion))throw new Error('quality_metric_catalog_invalid');
@@ -92,10 +91,10 @@ export async function readReport(location:string):Promise<EvaluationReport> {
     if(paths.has(file.path)||!['private','approved-summary'].includes(file.sensitivity))throw new Error('duplicate_or_invalid_evidence');
     paths.add(file.path);const bytes=await readFile(await evidencePath(root,file.path));
     if(bytes.length!==file.bytes)throw new Error('evidence_bytes_mismatch');
-    if(file.path.endsWith('.json'))assertNoDatasetHashes(JSON.parse(bytes.toString('utf8')));
+    if(file.path.endsWith('.json'))JSON.parse(bytes.toString('utf8'));
     if(file.path.endsWith('.jsonl')) {
       const records=bytes.toString('utf8').split('\n').filter(line=>line.trim()).map(line=>JSON.parse(line));
-      for(const event of records) {assertNoDatasetHashes(event);if(!event||typeof event!=='object'||Array.isArray(event)||typeof event.kind!=='string'||!event.kind.trim()||typeof event.at!=='string'||!Number.isFinite(Date.parse(event.at)))throw new Error('event_journal_record_invalid');}
+      for(const event of records) {if(!event||typeof event!=='object'||Array.isArray(event)||typeof event.kind!=='string'||!event.kind.trim()||typeof event.at!=='string'||!Number.isFinite(Date.parse(event.at)))throw new Error('event_journal_record_invalid');}
       journals.set(file.path,records);
     }
   }

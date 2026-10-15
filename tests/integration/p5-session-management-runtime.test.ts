@@ -1,7 +1,6 @@
 import { sqliteHistory } from '../fixtures/p9-memory';
 import { afterEach, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
@@ -250,18 +249,17 @@ test('unattributed recovery read failure stays globally blocked until a healthy 
   expect(c.http.requests).toHaveLength(1);
 });
 
-test.each(['rename', 'delete'] as const)('actual managed-file restore rejects its old Session fingerprint after concurrent %s', async method => {
+test.each(['rename', 'delete'] as const)('actual managed-file restore rejects its old Session dependencies after concurrent %s', async method => {
   const c = await fixture(), artifacts = new ArtifactStore(c.db, join(c.root, 'artifacts')), at = new Date().toISOString();
-  const hash = (value: string) => createHash('sha256').update(value).digest('hex');
-  c.db.query("INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_hash,preview_request_json,manifest_path,created_at,updated_at) VALUES(1,'managed-import','management-host','imported','hash','{}','1/manifest.json',?,?)").run(at, at);
+  c.db.query("INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_json,manifest_path,created_at,updated_at) VALUES(1,'managed-import','management-host','imported','{}','1/manifest.json',?,?)").run(at, at);
   mkdirSync(artifacts.inputPath(1), { recursive: true }); writeFileSync(join(artifacts.inputPath(1), 'data.csv'), 'data-1');
-  const files = [{ path: 'data.csv', bytes: 6, sha256: hash('data-1') }], sourceHash = hash(canonicalRequest(files));
+  const files=[{path:'data.csv',bytes:6}];
   const manifest = { schema: 'medclaw.artifact/import/v1', artifactId: 1, operationRef: 'managed-import', role: 'snapshot_package', files: files.map(file => ({ ...file, path: `input/${file.path}` })),
-    sourceHash, metadataHash: hash('metadata'), mappingVersion: 'mapping/v1', calculationVersion: 'diff/v1', sourceLockHash: 'lock', sourceBundleId: 'bundle', materialVersion: 'material/v1', verifiedAt: at };
+    mappingVersion: 'mapping/v1', calculationVersion: 'diff/v1', sourceBundleId: 'bundle', materialVersion: 'material/v1', verifiedAt: at };
   const text = canonicalRequest(manifest); writeFileSync(artifacts.manifestPath(1), text);
-  c.db.query("INSERT INTO artifacts(id,operation_ref,kind,import_id,format,relative_path,sha256,bytes,metadata_sha256,registered_at,mime_type,metadata_json,status) VALUES(1,'managed-import','import',1,'csv','1',?,6,?,?,'application/x-directory',?,'ready')").run(sourceHash, hash(text), at, text);
+  c.db.query("INSERT INTO artifacts(id,operation_ref,kind,import_id,format,relative_path,bytes,registered_at,mime_type,metadata_json,status) VALUES(1,'managed-import','import',1,'csv','1',6,?,'application/x-directory',?,'ready')").run(at,text);
   c.db.query('UPDATE imports SET artifact_id=1 WHERE id=1').run();
-  c.db.query("INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at) VALUES(1,1,'managed','2026-10-04','浙江','material/v1','bundle','lock',?,'full','cohort',0,0,'[]','{}',1,NULL,1,?)").run(hash('batch-1'), at);
+  c.db.query("INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,coverage,expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at) VALUES(1,1,'managed','2026-10-04','浙江','material/v1','bundle','full',0,0,'[]','{}',1,NULL,1,?)").run(at);
   c.repo.updateWorkspace({ batchIds: [1] }, c.repo.readWorkspace().revision, at);
   const entered = deferred(), resume = deferred(), inspect = artifacts.inspectManagedImport.bind(artifacts);
   const held = spyOn(artifacts, 'inspectManagedImport').mockImplementation(async id => { const result = await inspect(id); expect(result).toEqual({ status: 'valid' }); entered.release(); await resume.promise; return result; });

@@ -22,8 +22,8 @@ test.beforeAll(async()=>{
 test.afterAll(async()=>{await app?.close();if(server){server.closeAllConnections();await new Promise<void>(done=>server.close(()=>done()));}});
 const requests=(page:Page,method:string)=>page.evaluate(method=>Reflect.get(globalThis,'__pending').filter((item:{method:string})=>item.method===method).map(({input,done}:{input:unknown;done:boolean})=>({input,done})),method);
 async function reply(page:Page,method:string,value:unknown){await expect.poll(async()=>(await requests(page,method)).filter((item:{done:boolean})=>!item.done).length).toBeGreaterThan(0);await page.evaluate(({method,value})=>{const item=Reflect.get(globalThis,'__pending').find((item:{method:string;done:boolean})=>item.method===method&&!item.done);item.done=true;item.resolve(value);},{method,value});}
-const ref=(version='v1',kind='skill')=>({kind,id:'query',version,treeHash:'a'.repeat(64)});
-function list(sessionId=1,version='1',selected=false){return {source:'selection',sessionId,configVersion:version,selection:{prompt:null,skills:selected?[ref()]:[]},items:['v1','v2'].map(v=>({ref:ref(v),name:'query',description:'ENGINEERING query resources',keywords:['data'],enabled:selected&&v==='v1',availability:'ready',disableModelInvocation:v==='v2',files:[{file:'SKILL.md',bytes:10,sha256:'b'.repeat(64)}],requiredTools:['read_data_scope'],requiredExtensions:[],diagnostics:[]})),diagnostics:[],catalogError:null,evidence:[],evidenceInfo:{page:1,pageSize:50,totalRows:0,hasMore:false}};}
+const ref=(version='v1',kind='skill')=>({kind,id:'query',version});
+function list(sessionId=1,version='1',selected=false){return {source:'selection',sessionId,configVersion:version,selection:{prompt:null,skills:selected?[ref()]:[]},items:['v1','v2'].map(v=>({ref:ref(v),name:'query',description:'ENGINEERING query resources',keywords:['data'],enabled:selected&&v==='v1',availability:'ready',disableModelInvocation:v==='v2',files:[{file:'SKILL.md',bytes:10}],requiredTools:['read_data_scope'],requiredExtensions:[],diagnostics:[]})),diagnostics:[],catalogError:null,evidence:[],evidenceInfo:{page:1,pageSize:50,totalRows:0,hasMore:false}};}
 
 test('p11 English resource entrances, versions and confirmed publication stay distinct from availability and use',async({page})=>{
   await page.goto(url);await reply(page,'resources.list',{ok:true,data:list()});
@@ -45,7 +45,7 @@ test('p11 delayed source, Host and file replies cannot replace the current selec
   await reply(page,'resources.list',{ok:true,data:list(1,'old',true)});await reply(page,'resources.list',{ok:true,data:list(2,'2',true)});
   await expect(page.getByTestId('resource-panel')).toContainText('Session 2');await expect(page.getByTestId('resource-panel')).not.toContainText('old');
   await page.getByRole('button',{name:'Read query SKILL.md',exact:true}).click();await page.evaluate(()=>Reflect.get(globalThis,'__render')({source:'selection',sessionId:2},'HostB'));
-  await reply(page,'resources.read',{ok:true,data:{source:'selection',sessionId:2,configVersion:'2',resourceRef:ref(),file:'SKILL.md',content:'OLD HOST CONTENT',bytes:16,sha256:'b'.repeat(64)}});
+  await reply(page,'resources.read',{ok:true,data:{source:'selection',sessionId:2,configVersion:'2',resourceRef:ref(),file:'SKILL.md',content:'OLD HOST CONTENT',bytes:16}});
   await reply(page,'resources.list',{ok:true,data:list(2,'3',true)});await expect(page.getByTestId('resource-panel')).not.toContainText('OLD HOST CONTENT');
   const count=(await requests(page,'resources.list')).length;await page.evaluate(()=>Reflect.get(globalThis,'__render')(null));await expect(page.getByTestId('resource-panel')).toContainText('Select a Session');
   expect(await requests(page,'resources.list')).toHaveLength(count);expect(await requests(page,'session.create')).toHaveLength(0);
@@ -53,10 +53,10 @@ test('p11 delayed source, Host and file replies cannot replace the current selec
 
 test('p11 Run resources page reads historical origin bytes, pages proof and never publishes a selection',async({page})=>{
   await page.goto(url);await reply(page,'resources.list',{ok:true,data:list()});await page.evaluate(()=>Reflect.get(globalThis,'__render')({source:'run',runId:8},'HostA',undefined));
-  const frozen={...list(1,'2',true),source:'run',runId:8,evidence:[{resourceRef:ref(),originRunId:7,file:'SKILL.md',kind:'provider_delivery',inputId:null,nativeEntryId:'native',toolCallId:4,modelCallId:'call',payloadHash:'c'.repeat(64),contentHash:'b'.repeat(64),coverage:'partial',observedAt:'2026-10-06T00:00:00Z'}],evidenceInfo:{page:1,pageSize:50,totalRows:51,hasMore:true}};
+  const frozen={...list(1,'2',true),source:'run',runId:8,evidence:[{resourceRef:ref(),originRunId:7,file:'SKILL.md',kind:'provider_delivery',inputId:null,nativeEntryId:'native',toolCallId:4,modelCallId:'call',coverage:'partial',observedAt:'2026-10-06T00:00:00Z'}],evidenceInfo:{page:1,pageSize:50,totalRows:51,hasMore:true}};
   await reply(page,'resources.list',{ok:true,data:frozen});await expect(page.getByText('Historical content from run 7',{exact:true})).toBeVisible();
   await page.getByRole('button',{name:'Read historical query SKILL.md',exact:true}).click();expect((await requests(page,'resources.read'))[0]!.input).toMatchObject({source:'run',runId:7});
-  await reply(page,'resources.read',{ok:true,data:{source:'run',runId:7,sessionId:1,configVersion:'1',resourceRef:ref(),file:'SKILL.md',content:'<script>ENGINEERING old v1</script>',bytes:36,sha256:'b'.repeat(64)}});
+  await reply(page,'resources.read',{ok:true,data:{source:'run',runId:7,sessionId:1,configVersion:'1',resourceRef:ref(),file:'SKILL.md',content:'<script>ENGINEERING old v1</script>',bytes:36}});
   await expect(page.getByTestId('resource-body')).toContainText('<script>ENGINEERING old v1</script>');expect(await page.locator('[data-testid=resource-body] script').count()).toBe(0);
   await page.getByRole('button',{name:'Next evidence page',exact:true}).click();expect((await requests(page,'resources.list')).at(-1)!.input).toMatchObject({source:'run',runId:8,evidencePage:2});
   await reply(page,'resources.list',{ok:true,data:{...frozen,evidence:[],evidenceInfo:{page:2,pageSize:50,totalRows:51,hasMore:false}}});

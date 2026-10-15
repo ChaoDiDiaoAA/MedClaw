@@ -7,7 +7,6 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { createServer, type Server } from 'node:http';
 import type { SessionInput, SubmitResult } from '../../packages/contracts/src/session';
-import { createHash } from 'node:crypto';
 import { canonicalRequest } from '../../packages/contracts/src/run';
 import { safeError } from '../../packages/contracts/src/error';
 
@@ -44,22 +43,20 @@ function save(name: string, data: unknown) { mkdirSync(evidence, { recursive: tr
 
 function snapshotPackage(directory: string) {
   mkdirSync(directory, { recursive: true });
-  const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
   const csv = (values: string[]) => values.map(value => `"${value.replaceAll('"', '""')}"`).join(',');
   const names = ['A decrease one', 'A decrease two', 'Original manufacturer decrease', 'B unique increase device'];
   const masters = names.map((device_name, i) => ({ record_type: 'master', device_id: String(i + 1).padStart(5, '0'), device_name, source_submission_id: String(i + 1).padStart(5, '0'), source_applicant: 'Synthetic Applicant', category: 'Category', manufacturer: i === 2 ? '模拟厂家-02' : '模拟厂家-01' }));
-  const sourceLock = { schema: 'medclaw.source-lock/v1', sources: [{ source: 'fixture', path: 'original.csv', sha256: 'a'.repeat(64) }] };
-  const lockHash = hash(canonicalRequest(sourceLock)), cohortHash = hash(canonicalRequest(masters));
+  const sourceLock = { schema: 'medclaw.source-lock/v2', sources: [{ source: 'fixture', path: 'original.csv' }] };
   writeFileSync(join(directory, 'source-lock.json'), JSON.stringify(sourceLock)); writeFileSync(join(directory, 'entity-lineage.csv'), `${csv(Object.keys(masters[0]!))}\n${masters.map(master => csv(Object.values(master))).join('\n')}\n`);
   for (const name of ['adjustment-lineage.csv', 'validation-report.json', 'selection-report.json', '使用说明.md']) writeFileSync(join(directory, name), name.endsWith('.json') ? '{}' : 'fixture');
   const columns = ['device_id', 'device_name', 'source_submission_id', 'source_applicant', 'category', 'region', 'snapshot_date', 'price_cents', 'currency', 'unit', 'status', 'manufacturer', 'distributor', 'source_refs_json', 'field_origins_json'];
   const origins = Object.fromEntries(columns.slice(0, 13).map(key => [key, { kind: 'synthetic', ruleId: 'p4-fixture' }]));
   for (const [index, prices] of [[10000, 20000, 10000, 10000], [8000, 15000, 9000, 12000]].entries()) {
     const date = `2026-01-0${index + 1}`;
-    const text = `${csv(columns)}\n${masters.map((master, ordinal) => csv([master.device_id, master.device_name, master.source_submission_id, master.source_applicant, 'Category', '浙江', date, String(prices[ordinal]), 'CNY', '件', 'active', master.manufacturer, ordinal === 1 ? '模拟配送-02' : '模拟配送-01', JSON.stringify([{ sourceId: 'fixture', file: 'original.csv', row: ordinal + 1, recordId: master.source_submission_id, sha256: 'a'.repeat(64) }]), JSON.stringify(origins)])).join('\n')}\n`;
-    writeFileSync(join(directory, `zhejiang_${date}.csv`), text); writeFileSync(join(directory, `zhejiang_${date}.metadata.json`), JSON.stringify({ contract: 'medclaw.snapshot/v1', mappingVersion: 'medclaw.snapshot/v1', materialVersion: 'p4-fixture/v1', generatorVersion: 'p4-fixture/v1', seed: 1, sourceBundleId: 'p4-fixture', sourceLockHash: lockHash, scopeKey: 'p4-zhejiang', region: '浙江', cohortHash, snapshotDate: date, coverage: 'full', expectedEntityCount: 4, observedEntityCount: 4, declaredMissingEntityIds: [], fileSha256: hash(text), referenceDate: '2026-01-02', timezone: 'Asia/Shanghai' }));
+    const text = `${csv(columns)}\n${masters.map((master, ordinal) => csv([master.device_id, master.device_name, master.source_submission_id, master.source_applicant, 'Category', '浙江', date, String(prices[ordinal]), 'CNY', '件', 'active', master.manufacturer, ordinal === 1 ? '模拟配送-02' : '模拟配送-01', JSON.stringify([{ sourceId: 'fixture', file: 'original.csv', row: ordinal + 1, recordId: master.source_submission_id }]), JSON.stringify(origins)])).join('\n')}\n`;
+    writeFileSync(join(directory, `zhejiang_${date}.csv`), text); writeFileSync(join(directory, `zhejiang_${date}.metadata.json`), JSON.stringify({ contract: 'medclaw.snapshot/v2', mappingVersion: 'medclaw.snapshot/v1', materialVersion: 'p4-fixture/v1', generatorVersion: 'p4-fixture/v1', seed: 1, sourceBundleId: 'p4-fixture', scopeKey: 'p4-zhejiang', region: '浙江', snapshotDate: date, coverage: 'full', expectedEntityCount: 4, observedEntityCount: 4, declaredMissingEntityIds: [], referenceDate: '2026-01-02', timezone: 'Asia/Shanghai' }));
   }
-  const files = readdirSync(directory).filter(path => path !== 'manifest.json').sort().map(path => { const bytes = readFileSync(join(directory, path)); return { path, bytes: bytes.length, sha256: hash(bytes) }; });
+  const files = readdirSync(directory).filter(path => path !== 'manifest.json').sort().map(path => { const bytes = readFileSync(join(directory, path)); return { path, bytes: bytes.length }; });
   writeFileSync(join(directory, 'manifest.json'), JSON.stringify({ status: 'complete', files, businessFiles: 2, businessRows: 8, businessBytes: files.filter(file => /^zhejiang_.*\.csv$/.test(file.path)).reduce((sum, file) => sum + file.bytes, 0), totalPayloadBytes: files.reduce((sum, file) => sum + file.bytes, 0) }));
 }
 
@@ -142,7 +139,7 @@ test('medical_device_run_commits_timeline_with_authoritative_facts',async()=>{
  steps=[()=>({id:'p6-scope',name:'read_data_scope',args:{}}),wire=>{const scope=receipt(wire,'p6-scope').scope as {batchIds:number[]};return {id:'p6-query',name:'query_device_changes',args:{batchIds:scope.batchIds,time:{start:'2026-01-02',endExclusive:'2026-01-03'},region:'浙江',changeField:'price',direction:'decrease',threshold:{operator:'gt',value:0.05},page:1,pageSize:50}};},wire=>{const result=receipt(wire,'p6-query');queryId=result.queryId as number;expect(result.totalRows).toBe(3);return {id:'p6-read',name:'read_query',args:{queryId}};},wire=>{expect(receipt(wire,'p6-read').queryId).toBe(queryId);return {text:'浙江医疗器械共有3款价格下降超过5%，已依据原 Query 核实。'};}];
  const accepted=await clickSubmit('查询浙江价格下降超过5%的医疗器械，并补读同一Query');if(!accepted.runId)throw new Error('Missing Run');await idle();const run=await readRun(accepted.runId),facts=await assertTimeline(accepted.runId);
  expect(physical-before).toBe(4);expect(facts.events.filter(e=>e.type==='query_completed')).toHaveLength(1);expect(facts.events.filter(e=>e.type==='tool_started')).toHaveLength(3);expect(facts.events.filter(e=>e.type==='run_completed')).toHaveLength(1);
- const database=sql(`SELECT id,run_id,result_hash FROM queries WHERE run_id=${accepted.runId}`);expect(database).toHaveLength(1);expect(run.answerRef).not.toBeNull();save('medical-device',{sessionId:a,run,facts,database,physicalCalls:physical-before});
+ const database=sql(`SELECT id,run_id,result_json FROM queries WHERE run_id=${accepted.runId}`);expect(database).toHaveLength(1);expect(run.answerRef).not.toBeNull();save('medical-device',{sessionId:a,run,facts,database,physicalCalls:physical-before});
 });
 test('session_switch_keeps_a_events_out_of_b',async()=>{
  const a=await create(),b=await create();await select(a);const paused=gate();steps=[()=>({text:'P6 A持续生成的安全正文',endGate:paused})];const before=physical,origin=await clickSubmit('P6 A session switch');await paused.entered;

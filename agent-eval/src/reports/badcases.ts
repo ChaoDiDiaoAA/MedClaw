@@ -1,11 +1,10 @@
 import { readFile, lstat, open, unlink, rename } from 'node:fs/promises';
 import { dirname, basename, join, resolve } from 'node:path';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { ExecutionIdSchema, JudgeConfigurationSchema, type EvaluationReport } from '../types.ts';
 import { RelativePathSchema } from '../evaluation.ts';
-import { assertNoDatasetHashes } from '../data-format.ts';
 import { record } from '../scoring/rules.ts';
 import type { Aggregation } from '../scoring/types.ts';
 import { assertJudgeCallMatches } from '../scoring/judges/client.ts';
@@ -37,7 +36,7 @@ const rootOf = (path: string) => {
   return path.endsWith('.json') ? dirname(resolve(path)) : resolve(path);
 };
 const readJson = async (root: string, path: string): Promise<any> => {
-  const value = JSON.parse(await readFile(await evidencePath(root, path), 'utf8')); assertNoDatasetHashes(value); return value;
+  const value = JSON.parse(await readFile(await evidencePath(root, path), 'utf8'));  return value;
 };
 const unique = <T>(values: T[]) => [...new Set(values)];
 const addRef = (refs: BadcaseEvidenceRef[], ref: BadcaseEvidenceRef) => { if (!refs.some(existing => isDeepStrictEqual(existing, ref))) refs.push(ref); };
@@ -65,7 +64,7 @@ function finish(index: BadcaseIndex) {
   return index;
 }
 function balanceEvent(index: BadcaseIndex, candidate: BadcaseCandidate, ref: BadcaseEvidenceRef, provider: string, model: string) {
-  const id = 'provider-insufficient-balance-' + createHash('sha256').update(JSON.stringify([provider, model])).digest('hex').slice(0, 16);
+  const id = 'provider-insufficient-balance:' + JSON.stringify([provider, model]);
   let event = index.commonEvents.find(event => event.id === id);
   if (!event) { event = { id, kind: 'provider_balance', facts: ['Archived native assistant error records HTTP 402 and Insufficient Balance.', 'Occurrences are grouped by recorded provider/model identity; a shared request or causal chain is not established.'], evidenceRefs: [], candidateIds: [] }; index.commonEvents.push(event); }
   addRef(event.evidenceRefs, ref); event.candidateIds = unique([...event.candidateIds, candidate.id]);
@@ -239,7 +238,7 @@ async function calibration(root: string, raw: any, baselinePath?: string) {
     if (judged?.evidenceRefs.some(ref => !Object.hasOwn(sample.evidence, ref))) throw new Error('calibration_result_reference_invalid');
     assessed.push({ id: sample.id, sourceId: sample.sourceId, partition: sample.partition, reference, judgeValue: judged?.value ?? null, judgeEvidenceRefs: judged?.evidenceRefs ?? [] });
     try {
-      const journal = (await readFile(await evidencePath(root, `evidence/${sample.id}/events.jsonl`), 'utf8')).split('\n').filter(line => line.trim()).map(line => JSON.parse(line)); assertNoDatasetHashes(journal);
+      const journal = (await readFile(await evidencePath(root, `evidence/${sample.id}/events.jsonl`), 'utf8')).split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
       if (journal.length !== 2 || journal[0].kind !== 'judge.request' || journal[1].kind !== 'judge.result' || journal.some(event => !Number.isFinite(Date.parse(event.at))) || !isDeepStrictEqual(journal[0].request, state.request) || !isDeepStrictEqual(journal[1].result, observation.result)) throw new Error('calibration_journal_binding_invalid');
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; index.gaps.push(`Calibration sample ${sample.id} has no archived event journal.`); }
     const candidate = candidateFor(report.executionId, 'sample', sample.id, null), ref = { path: observationPath, pointer: '/result' };

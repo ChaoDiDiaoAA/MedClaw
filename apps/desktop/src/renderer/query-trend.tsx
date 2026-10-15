@@ -11,7 +11,7 @@ export async function loadTrendRows(query: QuerySummary, read: (page: number) =>
     if (!active()) throw new Error('Trend read cancelled.');
     const result = await read(page); if (!active()) throw new Error('Trend read cancelled.');
     const part = result.page;
-    if (result.query.id !== query.id || result.query.sessionId !== query.sessionId || result.query.resultHash !== query.resultHash || result.query.totalRows !== query.totalRows
+    if (result.query.id !== query.id || result.query.sessionId !== query.sessionId || result.query.calculationVersion !== query.calculationVersion || result.query.totalRows !== query.totalRows
       || part.queryId !== query.id || part.page !== page || part.pageSize !== BUSINESS_RULES.maxPageSize || part.totalRows !== query.totalRows
       || targetVersion !== null && targetVersion !== part.targetVersion || part.rows.length !== Math.min(BUSINESS_RULES.maxPageSize, query.totalRows - rows.length)
       || part.rows.some(row => typeof row.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(row.date) || row.value !== null && (typeof row.value !== 'number' || !Number.isFinite(row.value)))) throw new Error('Saved trend is inconsistent.');
@@ -57,7 +57,7 @@ export function QueryTrend(props: { query: QuerySummary; instanceId: string | nu
       if (!result.ok) throw new Error(errorMessage(result.error)); return result.data;
     }, prefix => { if (active) setRows(prefix); }, () => active).then(() => { if (active) setComplete(true); }).catch(reason => { if (active) setError(reason instanceof Error ? reason.message : 'The saved trend could not be read.'); });
     return () => { active = false; };
-  }, [props.query.id, props.query.resultHash, props.instanceId, props.visible, attempt]);
+  }, [props.query.id, props.query.calculationVersion, props.instanceId, props.visible, attempt]);
   return <section className="panel" aria-label="Saved daily trend"><h2>Saved daily trend</h2><p role="status">{complete ? 'Complete saved trend' : 'Incomplete saved trend'} · {rows.length} / {props.query.totalRows} points</p>
     <p className="tiny">Zero is a measured value. Missing prices and date gaps break the line. Each unit has its own scale. Read exact values in the result table for Query {props.query.id}.</p>
     {error && <p role="alert">{error}</p>}{error && <button onClick={() => setAttempt(value => value + 1)}>Read saved trend again</button>}

@@ -37,8 +37,7 @@ function fixture(fault?: 'query-timeout-once') {
   db.query("INSERT INTO runs VALUES(2,2,'running',?,'2026-10-12','Asia/Shanghai')").run(JSON.stringify({ ...scope, allowedToolNames: [] }));
   initializeToolStorage(db);
   const catalog = new CatalogService({ batches: [{ id: 1, scopeKey: 'empty-fixture', snapshotDate: '2026-10-12', region: 'fixture',
-    coverage: 'full', previousBatchId: null, materialVersion: 'fixture/v1', sourceBundleId: 'fixture', sourceLockHash: 'lock',
-    contentHash: 'content', cohortHash: 'cohort', catalogRevision: 1, expectedEntityCount: 0, observedEntityCount: 0,
+    coverage: 'full', previousBatchId: null, materialVersion: 'fixture/v1', sourceBundleId: 'fixture', catalogRevision: 1, expectedEntityCount: 0, observedEntityCount: 0,
     declaredMissingDeviceIds: [] }], devices: [], snapshots: [], changes: [] });
   const store = new SqliteToolStore(db), queries = new QueryService(catalog, store), evidence = new EvidenceReader(catalog, queries, store);
   const recorder = new ToolRecorder(store), wrap = createControlledToolFault(fault);

@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { MeasurementContextSchema, ToolProfileSnapshotSchema, type MeasurementContext, type ToolProfileSnapshot } from '@medclaw/contracts/model';
 import { canonicalRequest, type RunScope } from '@medclaw/contracts/run';
 import { ToolObservationSchema, type ToolObservation } from '@medclaw/contracts/tool';
@@ -119,10 +118,6 @@ export function buildToolProfiles(input: Observations | null, context: Measureme
       if (row.startedAt !== null && row.stoppedAt === null) reliability.originalResultUnknown!++;
       if (control.recoveryAction === 'recovered' && row.sdkReturned) {
         reliability.confirmedRecoveries!++;
-        if (row.modelKey) {
-          const key = `recovery_${createHash('sha256').update(row.modelKey).digest('hex').slice(0, 24)}`;
-          reliability[key] = (reliability[key] ?? 0) + 1;
-        }
       }
     }
     snapshot.profiles.push({

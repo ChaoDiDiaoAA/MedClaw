@@ -23,7 +23,7 @@ test('p14 condition card binds its Session, preserves date boundaries and render
   const { renderToStaticMarkup } = createRequire(new URL('../../apps/desktop/package.json', import.meta.url))('react-dom/server');
   const item = productIntent(), slots = { ...item.slots, region: '<script>inert</script>', time: { start: '2026-01-01', endExclusive: '2026-01-02' }, threshold: { operator: 'gte' as const, value: 0.1 } };
   const context = intentSchemas.QueryContextRecordSchema.parse({ sessionId: 1, nativeLeafId: 'leaf-1', version: 2, sourceInputId: 3, sourceRunId: 4,
-    taskIntents: [{ ...item, slots }], contextIntentId: 's1', adoptedSlots: slots, scopeBatchHashes: [], queryIds: [5], pendingClarification: null });
+    taskIntents: [{ ...item, slots }], contextIntentId: 's1', adoptedSlots: slots,  queryIds: [5], pendingClarification: null });
   expect(renderToStaticMarkup(QueryConditions({ sessionId: 2, context }))).toBe('');
   expect(renderToStaticMarkup(QueryConditions({ sessionId: 1, context: null }))).toBe('');
   const html = renderToStaticMarkup(QueryConditions({ sessionId: 1, context }));
@@ -105,8 +105,8 @@ test('p14 event replay verifies saved identities and facts before appending any 
 });
 
 test('p14 Host negotiates the P14 protocol and schema13 explicitly', () => {
-  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p15-v3');
-  expect(DATABASE_SCHEMA_VERSION).toBe(15);
+  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p15-v4');
+  expect(DATABASE_SCHEMA_VERSION).toBe(16);
 });
 
 test('p14 failures keep registered user-visible causes without authorizing automatic retry', () => {
@@ -180,14 +180,14 @@ test('p14 rule and route events are program facts without fabricated model or to
   expect(RegisteredEventDraftSchema.safeParse({ ...rule, source: 'intent' }).success).toBe(false);
   const route = { ...rule, sourceConnection: 'route:5', type: 'route_decided', payload: { contract: 'medclaw.event/v1',
     runId: 1, inputId: 3, decisionId: 5, intentCallId: null, route: 'agent', decisionSource: 'deterministic_rule',
-    matchedBy: 'rule', status: 'RESOLVED', queryParamsHash: null } };
+    matchedBy: 'rule', status: 'RESOLVED'} };
   expect(RegisteredEventDraftSchema.safeParse(route).success).toBe(true);
   expect(RegisteredEventDraftSchema.safeParse({ ...route, sourceConnection: 'route:other' }).success).toBe(false);
 });
 
 test('p14 nonstreaming Ollama delivery cannot masquerade as a Pi transport', () => {
   const observation = { contract: 'medclaw.context-observation/v1', api: 'ollama-chat', transport: 'json', observedAt: at,
-    httpStatus: 200, projectionHash: 'a'.repeat(64), feedbackHash: 'b'.repeat(64), payloadHash: 'c'.repeat(64), verifiedNativeRefs: [] };
+    httpStatus: 200,    verifiedNativeRefs: [] };
   expect(ContextDeliveryObservationSchema.safeParse(observation).success).toBe(true);
   expect(ContextDeliveryObservationSchema.safeParse({ ...observation, transport: 'sse' }).success).toBe(false);
   expect(ContextDeliveryObservationSchema.safeParse({ ...observation, api: 'openai-completions' }).success).toBe(false);
@@ -198,7 +198,7 @@ test('p14 nonstreaming Ollama delivery cannot masquerade as a Pi transport', () 
 test('p14 actual intent model calls carry their independent selection, exact attempt count and unknown cost', () => {
   const call = { id: 1, inputId: 3, callId: 'call-1', kind: 'intent', state: 'completed', contextSnapshotId: 4,
     granularity: 'logical_request', attempt: 1, attemptCountUnknown: false,
-    model: { ...disabledIntentModel(), enabled: true, modelDigest: 'sha256:' + 'a'.repeat(64), verifiedEvidenceRef: 'protocol-1',
+    model: { ...disabledIntentModel(), enabled: true,  verifiedEvidenceRef: 'protocol-1',
       configVersion: '1', api: 'ollama-chat', ...INTENT_VERSIONS },
     responseModel: 'qwen3.5:0.8b', sdkStopReason: null, startedAt: at, endedAt: at, durationMs: 1,
     inputTokens: 0, outputTokens: 1, cost: null, costCurrency: null, usageSource: 'ollama_reported', unavailableReason: null, error: null };

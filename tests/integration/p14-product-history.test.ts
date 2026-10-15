@@ -41,7 +41,7 @@ import { RunControl } from '../../packages/core/src/runtime/run-control';
 import { disabledIntentModel, resolvedIntent } from '../fixtures/p14-intent';
 import { FrozenIntentAdmissionSchema, IntentModelSelectionSchema, INTENT_VERSIONS, type IntentStageInput } from '../../packages/contracts/src/intent';
 
-async function fixture(withQuery = false, text?: string, sharedBatchHash = false) {
+async function fixture(withQuery = false, text?: string, multipleBatches = false) {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p14-product-')), db = openDatabase(join(root, 'app.sqlite'));
   const manager = SessionManager.inMemory(root), header = manager.getHeader()!;
   const store = new SqliteMemoryStore(db, validateNativeHistory), transactions = SqliteWriteTransactions.forDatabase(db);
@@ -49,10 +49,10 @@ async function fixture(withQuery = false, text?: string, sharedBatchHash = false
   const repos = new Repositories(db, () => { if (fault) throw new Error('ENGINEERING_FINAL_FAULT'); }, undefined, transactions, store);
   repos.createSession({ expectedWorkspaceRevision: 0 }, 'create-product', manager.getSessionId(), contextAt, { header, entries: [], activeLeafId: null });
   if (withQuery) seedWorkspaceQueries(db, repos);
-  if (sharedBatchHash) {
-    db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,
+  if (multipleBatches) {
+    db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,coverage,
       expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at,cohort_json)
-      SELECT 2,import_id,'ENGINEERING-second-scope',snapshot_date,'上海',material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,
+      SELECT 2,import_id,'ENGINEERING-second-scope',snapshot_date,'上海',material_version,source_bundle_id,coverage,
       0,0,'[]',json_set(metadata_json,'$.expectedEntityCount',0,'$.observedEntityCount',0),1,NULL,1,created_at,'[]' FROM batches WHERE id=1`).run();
     repos.updateWorkspace({ batchIds: [1, 2] }, repos.readWorkspace().revision, contextAt);
   }
@@ -76,11 +76,11 @@ async function fixture(withQuery = false, text?: string, sharedBatchHash = false
     dispose() { db.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
-async function queryFinalFixture(mode: 'rule' | 'classify' | 'verify' = 'rule', sharedBatchHash = false) {
-  const f = await fixture(true, mode === 'rule' ? undefined : '列出浙江2026-10-04的器械清单', sharedBatchHash), catalog = new CatalogService(new SqliteCatalogStore(f.db)), queryStore = new SqliteToolStore(f.db);
+async function queryFinalFixture(mode: 'rule' | 'classify' | 'verify' = 'rule', multipleBatches = false) {
+  const f = await fixture(true, mode === 'rule' ? undefined : '列出浙江2026-10-04的器械清单', multipleBatches), catalog = new CatalogService(new SqliteCatalogStore(f.db)), queryStore = new SqliteToolStore(f.db);
   const projection = IntentInputProjectionSchema.parse({ ...intentInput(), runId: f.input.runId, sessionId: f.input.sessionId, inputId: f.input.inputId,
     text: f.accepted.request.text, baseLeafId: null, baseStorageVersion: 1, referenceDate: f.accepted.request.referenceDate,
-    scope: f.accepted.input.scope, scopeBatchHashes: ['a'.repeat(64)], availableData: { regions: sharedBatchHash ? ['上海', '浙江'] : ['浙江'], dates: ['2026-10-04'], currencies: ['CNY'], units: ['台'] },
+    scope: f.accepted.input.scope,  availableData: { regions: multipleBatches ? ['上海', '浙江'] : ['浙江'], dates: ['2026-10-04'], currencies: ['CNY'], units: ['台'] },
     enabledL2: ['PRODUCT_SEARCH'], availableToolNames: ['query_current_devices'] });
   const events = new SqliteEventStore(f.db);
   const context = { runId: f.input.runId, sessionId: f.input.sessionId, inputId: f.input.inputId, source: 'intent' as const, callRef: 'ENGINEERING-preflight',
@@ -113,7 +113,7 @@ async function queryFinalFixture(mode: 'rule' | 'classify' | 'verify' = 'rule', 
       const service = new IntentService(f.repos, new ContextService(new SqliteContextStore(f.db), { async inspectManagedImport() { throw new Error('Unexpected artifact'); } }),
         new OllamaIntentClient({ classify: CLASSIFY_PROMPT, verify: VERIFY_PROMPT }), new IntentValidator(catalog), events, f.transactions);
       const selection = IntentModelSelectionSchema.parse({ ...disabledIntentModel(), enabled: true, baseUrl: `http://127.0.0.1:${server.port}`,
-        modelDigest: 'sha256:' + 'a'.repeat(64), verifiedEvidenceRef: 'ENGINEERING', configVersion: '1', api: 'ollama-chat', ...INTENT_VERSIONS });
+         verifiedEvidenceRef: 'ENGINEERING', configVersion: '1', api: 'ollama-chat', ...INTENT_VERSIONS });
       adopted = await service.recognize(projection, selection, { signal: context.signal, control, workspaceContext: f.accepted.input.workspaceContext,
         expectedCancelEpoch: 0, checkActive() { if (f.db.query<{ cancel_requested_at: string | null }, [number]>('SELECT cancel_requested_at FROM runs WHERE id=?').get(projection.runId)!.cancel_requested_at !== null) throw new Error('tool_cancelled'); } });
     } finally { control.dispose(); server.stop(true); }
@@ -126,10 +126,10 @@ async function queryFinalFixture(mode: 'rule' | 'classify' | 'verify' = 'rule', 
   const input = ProductTurnInputSchema.parse({ ...f.input, mode: 'program', text: f.accepted.request.text, decisionId,
     result: { kind: 'result', text: 'Program query result: 3 devices. Currency CNY; unit 台.', queryIds: [query.id], missingSlots: [] },
     execution: { contract: 'medclaw.intent-execution/v1', decisionId, taskIntents: decision.adoptedIntents,
-      stepResults: [{ stepId: step.id, queryRefs: [{ queryId: query.id, resultHash: query.resultHash }] }] },
+      stepResults: [{ stepId: step.id, queryRefs: [{ queryId: query.id}] }] },
     adoptedContext: { contract: 'medclaw.query-context-entry/v2', sourceRunId: f.input.runId, sourceInputId: f.input.inputId,
       taskIntents: decision.adoptedIntents, contextIntentId: decision.contextIntentId, adoptedSlots: decision.adoptedSlots,
-      scopeBatchHashes: projection.scopeBatchHashes, queryIds: [query.id], pendingClarification: null, decisionId } });
+       queryIds: [query.id], pendingClarification: null, decisionId } });
   if(input.mode!=='program')throw new Error('Expected the engineering query program fixture');
   const productTurn = appendProductTurn(f.manager, f.memory, input);
   const fact: FinalAgentFact = { status: 'completed', resultSource: 'program', productTurn, history: productTurn.history, calls: [],
@@ -184,7 +184,7 @@ test('p14 Agent task adds execution and adopted context inside the real final as
       baseLeafId: base.leafId, baseStorageVersion: base.storageVersion, occurredAt: contextAt, mode: 'agent_task', execution: f.input.execution,
       adoptedContext: { contract: 'medclaw.query-context-entry/v2', sourceInputId: f.input.inputId, sourceRunId: f.input.runId,
         taskIntents: f.input.execution.taskIntents, contextIntentId: 's1', adoptedSlots: productIntent().slots,
-        scopeBatchHashes: [], queryIds: [], pendingClarification: null, decisionId: 1 } });
+         queryIds: [], pendingClarification: null, decisionId: 1 } });
     const fact = appendProductTurn(f.manager, f.memory, input);
     expect(fact.userEntryId).toBeNull(); expect(fact.resultEntryId).toBeNull();
     expect(fact.history.newEntries.map((entry: any) => entry.type)).toEqual(['message', 'custom', 'custom']);
@@ -208,7 +208,7 @@ test('p14 product input rejects malformed identities and condition/execution/res
       { ...f.input, result: { kind: 'result', text: 'ENGINEERING', queryIds: [10], missingSlots: [] } },
       { ...f.input, adoptedContext: { contract: 'medclaw.query-context-entry/v2', sourceInputId: f.input.inputId + 1, sourceRunId: f.input.runId,
         taskIntents: f.input.execution.taskIntents, contextIntentId: 's1', adoptedSlots: productIntent().slots,
-        scopeBatchHashes: [], queryIds: [], pendingClarification: null, decisionId: 1 } },
+         queryIds: [], pendingClarification: null, decisionId: 1 } },
     ];
     for (const input of cases) expect(() => appendProductTurn(f.manager, f.memory, input as ProductTurnInput)).toThrow();
     expect(() => appendProductTurn(f.manager, f.memory, { ...f.input, baseStorageVersion: 2 })).toThrow();
@@ -380,13 +380,13 @@ test('p14 intent read exposes only committed verified native step results and th
   }finally{f.dispose();}
 });
 
-for(const damage of ['execution_hash','projection_slots','projection_before_condition','projection_schema','projection_missing','answer_text','history_receipt','off_branch'] as const)
+for(const damage of ['execution_query_id','projection_slots','projection_before_condition','projection_schema','projection_missing','answer_text','history_receipt','off_branch'] as const)
 test(`p14 intent read refuses damaged committed ${damage} instead of inventing adopted execution`,async()=>{
   const f=await queryFinalFixture();
   try{
     f.repos.finalizeAgent(f.input.runId,f.fact);f.memory.acknowledgeSaved(f.fact.history!,2);f.memory.releaseFinal(f.input.runId);f.memory.dispose();
-    if(damage==='execution_hash')f.db.query("UPDATE memories SET entry_json=json_set(entry_json,'$.data.stepResults[0].queryRefs[0].resultHash',?) WHERE native_entry_id=?")
-      .run('f'.repeat(64),f.fact.productTurn!.executionEntryId);
+    if(damage==='execution_query_id')f.db.query("UPDATE memories SET entry_json=json_set(entry_json,'$.data.stepResults[0].queryRefs[0].queryId',?) WHERE native_entry_id=?")
+      .run(999,f.fact.productTurn!.executionEntryId);
     if(damage==='projection_slots')f.db.query("UPDATE query_contexts SET adopted_slots_json=json_set(adopted_slots_json,'$.manufacturer','ENGINEERING forged'),task_intents_json=json_set(task_intents_json,'$[0].slots.manufacturer','ENGINEERING forged')").run();
     if(damage==='projection_before_condition')f.db.query('UPDATE query_contexts SET native_leaf_id=?').run(f.fact.productTurn!.userEntryId);
     if(damage==='projection_schema')f.db.query("UPDATE query_contexts SET schema_version='medclaw.intent/v99'").run();
@@ -415,7 +415,7 @@ test('p14 an unstarted intent read still verifies prior reachable conditions whe
     f.repos.finalizeAgent(f.input.runId,f.fact);f.memory.acknowledgeSaved(f.fact.history!,2);f.memory.releaseFinal(f.input.runId);f.memory.dispose();
     const snapshot=f.repos.readHistorySnapshot(f.input.sessionId);
     const intentAdmission=FrozenIntentAdmissionSchema.parse({contract:'medclaw.intent-admission/v1',baseLeafId:snapshot.activeLeafId,baseStorageVersion:snapshot.storageVersion,
-      selection:{...disabledIntentModel(),enabled:true,modelDigest:'sha256:'+'a'.repeat(64),verifiedEvidenceRef:'ENGINEERING',configVersion:'1',api:'ollama-chat',...INTENT_VERSIONS},
+      selection:{...disabledIntentModel(),enabled:true,verifiedEvidenceRef:'ENGINEERING',configVersion:'1',api:'ollama-chat',...INTENT_VERSIONS},
       prompts:new OllamaIntentClient({classify:CLASSIFY_PROMPT,verify:VERIFY_PROMPT}).prompts});
     const next=acceptContextInput(f.db,{consume:false,repositories:f.repos,history:true,text:'ENGINEERING next intent',intentAdmission});
     f.db.query('DELETE FROM query_contexts').run();
@@ -440,12 +440,12 @@ test('p14 B5 failure rolls back every final fact while retaining the previously 
   } finally { f.dispose(); }
 });
 
-test('p14 program B5 rejects Stop, false result text, missing decision and false execution Query hashes without writing final facts', async () => {
+test('p14 program B5 rejects Stop, false result text, missing decision and false execution Query identities without writing final facts', async () => {
   const f = await queryFinalFixture();
   try {
     expect(() => f.repos.finalizeAgent(f.input.runId, { ...f.fact, outputText: 'ENGINEERING forged output' })).toThrow();
     const bad = structuredClone(f.fact), execution = bad.history!.newEntries.find((entry: any) => entry.customType === 'medclaw-intent-execution') as any;
-    execution.data.stepResults[0].queryRefs[0].resultHash = 'f'.repeat(64); bad.productTurn!.history = bad.history!;
+    execution.data.stepResults[0].queryRefs[0].queryId = 999; bad.productTurn!.history = bad.history!;
     expect(() => f.repos.finalizeAgent(f.input.runId, bad)).toThrow();
     f.db.query('UPDATE runs SET cancel_requested_at=? WHERE id=?').run(contextAt, f.input.runId);
     expect(() => f.repos.finalizeAgent(f.input.runId, f.fact)).toThrow();
@@ -519,28 +519,24 @@ test('p14 a program completion cannot bypass unresolved cleanup with a declared 
   }
 });
 
-test('p14 program B5 deduplicates shared batch hashes while preserving every frozen batch identity', async () => {
+test('p14 program B5 preserves every frozen batch identity when scopes share source metadata', async () => {
   const f = await queryFinalFixture('rule', true);
   try {
     expect(f.accepted.input.scope.batchIds).toEqual([1, 2]);
     const run = f.repos.finalizeAgent(f.input.runId, f.fact);
     expect(run.status).toBe('completed'); expect(f.repos.isFinalSaved(f.input.runId, f.fact)).toBe(true);
-    expect(f.db.query('SELECT scope_batch_hashes_json FROM query_contexts WHERE session_id=?').get(f.input.sessionId))
-      .toEqual({ scope_batch_hashes_json: JSON.stringify(['a'.repeat(64)]) });
+    expect(f.repos.readQueryContext(f.input.sessionId)?.sourceRunId).toBe(f.input.runId);
+    expect(JSON.parse(f.db.query<{scope_json:string},[number]>('SELECT scope_json FROM runs WHERE id=?').get(f.input.runId)!.scope_json).batchIds).toEqual([1,2]);
   } finally { f.dispose(); }
 });
 
-for (const field of ['content_hash', 'snapshot_date', 'scope_key'] as const) {
-  test(`p14 program B5 rejects ${field} changed after the original accepted Scope even when current condition hashes match`, async () => {
+for (const field of ['snapshot_date', 'scope_key'] as const) {
+  test(`p14 program B5 rejects ${field} changed after the original accepted Scope while retaining the original saved condition`, async () => {
     const f = await queryFinalFixture();
     try {
-      const value = field === 'content_hash' ? 'f'.repeat(64) : field === 'snapshot_date' ? '2026-10-03' : 'ENGINEERING-altered-scope';
+      const value = field === 'snapshot_date' ? '2026-10-03' : 'ENGINEERING-altered-scope';
       f.db.query(`UPDATE batches SET ${field}=? WHERE id=1`).run(value);
       const fact = structuredClone(f.fact);
-      if (field === 'content_hash') {
-        const condition = fact.history!.newEntries.find((entry: any) => entry.customType === 'medclaw-query-context') as any;
-        condition.data.scopeBatchHashes = [value]; fact.productTurn!.history = fact.history!;
-      }
       expect(() => f.repos.finalizeAgent(f.input.runId, fact)).toThrow();
       expect((await f.snapshot()).entries).toEqual([]); expect(f.db.query('SELECT id FROM answers').all()).toEqual([]);
       expect(f.db.query('SELECT id FROM queries WHERE id=?').get(f.query.id)).toEqual({ id: f.query.id });

@@ -14,6 +14,9 @@ import { ContextService } from '../../packages/core/src/context/context-service'
 import { canonicalRequest } from '../../packages/contracts/src/run';
 import { SqliteWriteTransactions } from '../../packages/storage/src/write-transactions';
 
+const retiredBusinessColumns=new Set(["preview_request_hash", "commit_request_hash", "fingerprint", "source_lock_hash", "content_hash", "cohort_hash", "params_hash", "result_hash", "scope_batch_hashes_json", "request_hash", "published_hash", "sha256"]);
+const retainedFields=(row:Record<string,unknown>)=>Object.fromEntries(Object.entries(row).filter(([key])=>!retiredBusinessColumns.has(key)));
+
 test('p8 tool origin stays on the original model call when a later call already exists', () => {
   const f = contextFixture();
   try {
@@ -57,9 +60,9 @@ async function store(db: Database) {
   const { SqliteContextStore } = await import('../../packages/storage/src/context-store');
   return new SqliteContextStore(db);
 }
-const observation = (snapshot: { projectionHash: string; feedbackHash: string }) => ({ contract: 'medclaw.context-observation/v1' as const, api: 'openai-completions' as const, transport: 'sse' as const, observedAt: contextAt, httpStatus: 200, projectionHash: snapshot.projectionHash, feedbackHash: snapshot.feedbackHash, verifiedNativeRefs: [] });
+const observation = (_snapshot: unknown) => ({ contract: 'medclaw.context-observation/v1' as const, api: 'openai-completions' as const, transport: 'sse' as const, observedAt: contextAt, httpStatus: 200,   verifiedNativeRefs: [] });
 
-for (const corruption of ['api','projectionHash','feedbackHash','foreign_native_ref','native_hash','missing_pair'] as const) test(`p8 stored ${corruption} inconsistency rejects public reads and recovery`, async () => {
+for (const corruption of ['api','input_owner','foreign_native_ref','foreign_input_ref','missing_pair'] as const) test(`p8 stored ${corruption} inconsistency rejects public reads and recovery`, async () => {
   const f = contextFixture();
   try {
     const contexts = new SqliteContextStore(f.db), snapshot = contexts.save(contexts.select(f.input)), callId = 'corrupt-observation';
@@ -70,9 +73,9 @@ for (const corruption of ['api','projectionHash','feedbackHash','foreign_native_
     const model = JSON.parse(row.model_json);
     model.context = {...model.context,observation:receipt.observation,payloadVerified:true,responseStatus:200};
     if (corruption === 'api') model.context.observation.api = 'openai-responses';
-    else if (corruption === 'projectionHash' || corruption === 'feedbackHash') model.context.observation[corruption] = 'b'.repeat(64);
-    else if (corruption === 'foreign_native_ref') model.context.observation.verifiedNativeRefs = [{kind:'tool_result',id:99999,contentHash:'b'.repeat(64)}];
-    else if (corruption === 'native_hash') model.context.observation.verifiedNativeRefs = [{kind:'input',id:f.input.inputId,contentHash:'b'.repeat(64)}];
+    else if (corruption === 'input_owner') model.context.inputId = f.input.inputId+100;
+    else if (corruption === 'foreign_native_ref') model.context.observation.verifiedNativeRefs = [{kind:'tool_result',id:99999}];
+    else if (corruption === 'foreign_input_ref') model.context.observation.verifiedNativeRefs = [{kind:'input',id:f.input.inputId+100}];
     expect(ModelCallContextSchema.safeParse(model.context).success).toBe(true);
     // Simulate valid-schema corruption of persisted evidence; never reconstruct from Workspace.
     f.db.query('UPDATE model_calls SET model_json=? WHERE call_id=?').run(JSON.stringify(model),callId);
@@ -101,16 +104,19 @@ test('p8 migration preserves legacy facts and never invents deliveries', async (
     db.query("INSERT INTO tool_calls(run_id,session_id,native_tool_call_id,model_call_id,tool_name,tool_version,effect,execution_mode,args_json,status,requested_at) VALUES(?,?,'legacy-tool',1,'read','v','READ','sequential','{ \"legacy\": true }','requested',?)").run(input.runId, input.sessionId, contextAt);
     const names = ['runs', 'sessions', 'session_inputs', 'model_calls', 'tool_calls', 'runtime_events', 'schema_migrations'];
     const before = Object.fromEntries(names.map(name => [name, db.query<Record<string, unknown>, []>(`SELECT * FROM ${name}`).all()]));
+    const schema = db.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all();
     db.close();
     expect(() => openDatabase(path,phase => {if(phase === 'p8_context_marker') throw new Error('fixture migration interruption');})).toThrow('storage_migration_failed');
     db = new Database(path,{strict:true});
     expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(7);
+    for (const name of names) expect(db.query(`SELECT * FROM ${name}`).all()).toEqual(before[name]);
+    expect(db.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all()).toEqual(schema);
     expect(db.query("SELECT name FROM sqlite_schema WHERE name='context_snapshots'").get()).toBeNull();
     expect(db.query("SELECT name FROM pragma_table_info('tool_calls') WHERE name='context_snapshot_id'").get()).toBeNull();
     db.close(); db = openDatabase(path);
     for (const name of names) {
       const after = db.query<Record<string, unknown>, []>(`SELECT * FROM ${name}`).all().slice(0, before[name]!.length);
-      expect(after.map(row => Object.fromEntries(Object.keys(before[name]![0]!).map(key => [key, row[key]])))).toEqual(before[name]);
+      expect(after.map(row => Object.fromEntries(Object.keys(retainedFields(before[name]![0]!)).map(key => [key, row[key]])))).toEqual(before[name]!.map(retainedFields));
     }
     expect(db.query('SELECT context_snapshot_id FROM tool_calls').all()).toEqual([{ context_snapshot_id: null }]);
     expect(db.query('SELECT * FROM context_snapshots').all()).toEqual([]);
@@ -125,12 +131,12 @@ function selectedFixture(field:string|null = 'priceCents', options:{noSelection?
   const facts = seedWorkspaceQueries(db);
   db.exec("UPDATE batches SET metadata_json=json_set(metadata_json,'$.referenceDate','2026-10-04','$.timezone','Asia/Shanghai')");
   if(options.artifact) db.exec("INSERT INTO artifacts(id,operation_ref,kind,import_id,format,mime_type) VALUES(1,'p8-artifact','import',1,'csv','text/csv'); UPDATE imports SET artifact_id=1;");
-  facts.repos.updateWorkspace({queryId:facts.current.id,selection:options.noSelection ? null : {formatVersion:1,kind:'query-row',targetId:String(facts.current.id),targetVersion:facts.current.resultHash,rowKey:'snapshot:1',field}},facts.repos.readWorkspace().revision,contextAt);
+  facts.repos.updateWorkspace({queryId:facts.current.id,selection:options.noSelection ? null : {formatVersion:1,kind:'query-row',targetId:String(facts.current.id),targetVersion:`query:${facts.current.id}:${facts.current.calculationVersion}`,rowKey:'snapshot:1',field}},facts.repos.readWorkspace().revision,contextAt);
   return {db,facts,...acceptContextInput(db),dispose(){db.close();rmSync(root,{recursive:true,force:true});}};
 }
 for(const [name,sql] of [
-  ['batch hash',"UPDATE batches SET content_hash='changed'"],['material version',"UPDATE batches SET material_version='changed'"],
-  ['query hash',"UPDATE queries SET result_hash='changed'"],['missing query','PRAGMA foreign_keys=OFF; DELETE FROM query_evidence; DELETE FROM queries; PRAGMA foreign_keys=ON'],
+  ['batch date',"UPDATE batches SET snapshot_date='2026-10-03'"],['material version',"UPDATE batches SET material_version='changed'"],
+  ['query version',"UPDATE queries SET result_json=json_set(result_json,'$.calculationVersion','other')"],['missing query','PRAGMA foreign_keys=OFF; DELETE FROM query_evidence; DELETE FROM queries; PRAGMA foreign_keys=ON'],
   ['entity conflict','DELETE FROM snapshots WHERE id=1'],['input scope',"UPDATE session_inputs SET content_json=json_set(content_json,'$.scope.batchIds',json('[]'))"],
 ] as const) test(`p8 refuses frozen ${name} conflict without saving a snapshot`,() => {
   const f = selectedFixture();try {
@@ -165,7 +171,7 @@ test('p8 managed artifact validation is awaited outside the write transaction an
   const f = selectedFixture('priceCents',{artifact:true});try {
     const contexts = new SqliteContextStore(f.db);let inspected=0;
     for(const status of ['invalid','unavailable'] as const) {
-      const service = new ContextService(contexts,{inspectManagedImport:async id => {expect(id).toBe(1);expect(f.db.inTransaction).toBe(false);inspected++;return status === 'invalid' ? {status,reason:'hash_mismatch'} : {status,reason:'storage_unavailable'};}});
+      const service = new ContextService(contexts,{inspectManagedImport:async id => {expect(id).toBe(1);expect(f.db.inTransaction).toBe(false);inspected++;return status === 'invalid' ? {status,reason:'content_mismatch'} : {status,reason:'storage_unavailable'};}});
       await expect(service.prepare(f.input)).rejects.toMatchObject({code:status === 'invalid' ? 'access_denied':'storage_read_failed'});
     }
     await Bun.sleep(0);expect(inspected).toBe(2);expect(f.db.query('SELECT * FROM context_snapshots').all()).toEqual([]);
@@ -254,7 +260,7 @@ test('p8 rejects cross-run cross-session and wrong-snapshot deliveries', async (
     const contexts = await store(f.db), one = contexts.save(contexts.select(f.input)), two = contexts.save(contexts.select(f.input));
     f.repos.startCall(f.input.runId, 'call-1', 'main', contextAt, { snapshotId: one.id, inputId: f.input.inputId });
     const receipt = { runId: f.input.runId, sessionId: f.input.sessionId, inputId: f.input.inputId, callId: 'call-1', snapshotId: one.id, observation: observation(one) };
-    for (const patch of [{ snapshotId: two.id }, { runId: 999 }, { sessionId: 999 }, { inputId: 999 }, { observation: { ...receipt.observation, projectionHash: 'b'.repeat(64) } }]) expect(() => contexts.recordDelivery({ ...receipt, ...patch })).toThrow();
+    for (const patch of [{ snapshotId: two.id }, { runId: 999 }, { sessionId: 999 }, { inputId: 999 }, { observation: { ...receipt.observation,api:'openai-responses' as const} }]) expect(() => contexts.recordDelivery({ ...receipt, ...patch })).toThrow();
     expect(f.db.query('SELECT * FROM context_deliveries').all()).toEqual([]);
     f.db.query("UPDATE runs SET status='failed',ended_at=? WHERE id=?").run(contextAt,f.input.runId);
     f.repos.createSession({expectedWorkspaceRevision:f.repos.readWorkspace().revision},'other-owner','native-other-owner',contextAt);
@@ -280,12 +286,12 @@ test('p8 delivery and event rollback together', async () => {
   } finally { f.dispose(); }
 });
 
-test('p8 uses original consumed input instead of live workspace and refuses changed source fingerprints', () => {
+test('p8 uses original consumed input instead of live workspace and refuses changed source contents', () => {
   const root = mkdtempSync(join(tmpdir(),'medclaw-p8-selection-')), db = openDatabase(join(root,'app.sqlite'));
   try {
     const facts = seedWorkspaceQueries(db);
     db.exec("UPDATE batches SET metadata_json=json_set(metadata_json,'$.referenceDate','2026-10-04','$.timezone','Asia/Shanghai')");
-    const selected = {formatVersion:1 as const,kind:'query-row' as const,targetId:String(facts.current.id),targetVersion:facts.current.resultHash,rowKey:'snapshot:1' as const,field:'priceCents'};
+    const selected = {formatVersion:1 as const,kind:'query-row' as const,targetId:String(facts.current.id),targetVersion:`query:${facts.current.id}:${facts.current.calculationVersion}`,rowKey:'snapshot:1' as const,field:'priceCents'};
     facts.repos.updateWorkspace({queryId:facts.current.id,selection:selected},facts.repos.readWorkspace().revision,contextAt);
     const f = acceptContextInput(db), contexts = new SqliteContextStore(db), chosen = contexts.select(f.input);
     facts.repos.updateWorkspace({selection:null,queryId:null},facts.repos.readWorkspace().revision,contextAt);

@@ -42,6 +42,9 @@ import {encodeHostFrame,HOST_PROTOCOL_VERSION,MAX_FRAME_BYTES} from '../../packa
 import {Application} from '../../packages/core/src/application';
 import {safeError} from '../../packages/contracts/src/error';
 
+const retiredBusinessColumns=new Set(["preview_request_hash", "commit_request_hash", "fingerprint", "source_lock_hash", "content_hash", "cohort_hash", "params_hash", "result_hash", "scope_batch_hashes_json", "request_hash", "published_hash", "sha256"]);
+const retainedFields=(row:Record<string,unknown>)=>Object.fromEntries(Object.entries(row).filter(([key])=>!retiredBusinessColumns.has(key)));
+
 test('p13 child recent pages omit full results and a maximum 50-item page fits the Host frame',async()=>{
   const text='中'.repeat(32768),f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'large-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:{role:'assistant',content:index===2?text:'ENGINEERING parent answer'});
   try{
@@ -183,9 +186,9 @@ test('p13 real child business Query and history retain child ownership without c
     const result=await f.app.runs.submitAgent(f.request('ENGINEERING read-only query'),{instanceId:'host',operationRef:'p13-query-owned'});
     expect(result.ok).toBe(true);await f.settle();expect(f.errors).toEqual([]);expect(f.requests).toHaveLength(5);
     const child=f.db.query<{id:number;session_id:number;child_result_json:string},[]>("SELECT id,session_id,child_result_json FROM runs WHERE kind='child'").get()!;
-    const query=f.db.query<{id:number;result_hash:string;run_id:number;session_id:number;input_id:null},[number]>('SELECT id,result_hash,run_id,session_id,input_id FROM queries WHERE run_id=?').get(child.id)!;
+    const query=f.db.query<{id:number;run_id:number;session_id:number;input_id:null},[number]>('SELECT id,run_id,session_id,input_id FROM queries WHERE run_id=?').get(child.id)!;
     expect(query).toMatchObject({run_id:child.id,session_id:child.session_id,input_id:null});
-    expect(JSON.parse(child.child_result_json)).toMatchObject({outcome:'completed',queryRefs:[{queryId:query.id,resultHash:query.result_hash}]});
+    expect(JSON.parse(child.child_result_json)).toMatchObject({outcome:'completed',queryRefs:[{queryId:query.id}]});
     expect(f.db.query('SELECT run_id,session_id FROM tool_calls WHERE native_tool_call_id=?').get('owned-3')).toEqual({run_id:child.id,session_id:child.session_id});
     expect(f.db.query("SELECT id FROM memories WHERE run_id=? AND entry_type='message'").all(child.id).length).toBeGreaterThan(0);
     const publicContext={runId:child.id,sessionId:child.session_id,inputId:null,source:'user_form' as const,callRef:'read-child',scope:JSON.parse(f.db.query<{scope_json:string},[number]>('SELECT scope_json FROM runs WHERE id=?').get(child.id)!.scope_json),referenceDate:f.request('read').referenceDate,timezone:'Asia/Shanghai',signal:new AbortController().signal};
@@ -227,7 +230,7 @@ for(const mode of ['summary','read','unverified-read'] as const)test('p13 parent
     expect(canReadRelatedQuery(f.db,result.data.runId,1,query)).toBe(true);
     expect(canReadRelatedQuery(f.db,10,1,query)).toBe(false);
     expect(canReadRelatedQuery(f.db,result.data.runId,query.sessionId,query)).toBe(false);
-    expect(canReadRelatedQuery(f.db,result.data.runId,1,{...query,resultHash:'a'.repeat(64)})).toBe(false);
+    expect(canReadRelatedQuery(f.db,result.data.runId,1,{...query,id:query.id+999})).toBe(false);
     for(const sql of [
       "UPDATE tool_calls SET delivery_json=json_set(delivery_json,'$.sdkReturned',json('false')) WHERE tool_name='Agent'",
       "UPDATE tool_calls SET delivery_json=json_set(delivery_json,'$.message.isError',json('true')) WHERE tool_name='Agent'",
@@ -432,7 +435,7 @@ for(const read of ['none','read_query','read_query_evidence','list_query_evidenc
     const result=await f.app.runs.submitAgent(f.request('ENGINEERING frozen parent Query verification'),{instanceId:'host',operationRef:'p13-frozen-read'});
     expect(result.ok).toBe(true);await f.settle();expect(f.requests).toHaveLength(read==='none'?3:4);
     const child=f.db.query<{id:number;child_result_json:string},[]>("SELECT id,child_result_json FROM runs WHERE kind='child'").get()!;
-    expect(JSON.parse(child.child_result_json).queryRefs).toEqual(read==='none'?[]:[{queryId:parentQueryId,resultHash:seeded.current.resultHash}]);
+    expect(JSON.parse(child.child_result_json).queryRefs).toEqual(read==='none'?[]:[{queryId:parentQueryId}]);
     expect(JSON.parse(child.child_result_json).evidenceIds).toEqual(['read_query_evidence','list_query_evidence'].includes(read)?[evidenceId]:[]);
     expect(f.db.query('SELECT id FROM queries WHERE run_id=?').all(child.id)).toEqual([]);
     expect(f.db.query('SELECT session_id,run_id FROM queries WHERE id=?').get(parentQueryId)).toEqual({session_id:1,run_id:10});
@@ -467,7 +470,7 @@ test('p13 oversized child result rejects the whole final transaction without rep
   try{
     f.repos.finalizeChild=(id,fact)=>{
       const originalReply={...fact.childResult.originalReply,content:[{type:'text' as const,text:'x'.repeat(300000)}]},before=f.db.query('SELECT * FROM memories WHERE run_id=?').all(id);
-      expect(()=>finalize(id,{...fact,childResult:{...fact.childResult,originalReply,originalReplyHash:createHash('sha256').update(canonicalRequest(originalReply)).digest('hex')}})).toThrow('tool_result_too_large');
+      expect(()=>finalize(id,{...fact,childResult:{...fact.childResult,originalReply}})).toThrow('tool_result_too_large');
       expect(f.db.query('SELECT * FROM memories WHERE run_id=?').all(id)).toEqual(before);
       expect(f.db.query('SELECT child_result_json,status FROM runs WHERE id=?').get(id)).toEqual({child_result_json:null,status:'running'});checked=true;
       return finalize(id,fact);
@@ -693,7 +696,7 @@ function frozenFixture(f: ReturnType<typeof acceptContextInput>, origin: { id: n
   return FrozenChildConfigSchema.parse({
     contract: 'medclaw.subagent/v1', instanceId: 'host', parentRunId: f.input.runId, parentSessionId: f.input.sessionId,
     originToolCallId: origin.id, originNativeToolCallId: origin.nativeToolCallId, pluginAgentId, nativeSessionId: native.header.id, childRunId, childSessionId,
-    originSnapshotId: snapshotId, parentInputId: f.input.inputId, promptHash: createHash('sha256').update(p13AgentInput.prompt).digest('hex'), pluginVersion: '0.19.0', pluginGitHead: '4f572eaa04c09d3dbc16e4a5f13a16b295e84e14', pluginIntegrity: 'sha512-fixture', patchHash: 'b'.repeat(64),
+    originSnapshotId: snapshotId, parentInputId: f.input.inputId,  pluginVersion: '0.19.0', pluginGitHead: '4f572eaa04c09d3dbc16e4a5f13a16b295e84e14', pluginIntegrity: 'sha512-fixture', patchHash: 'b'.repeat(64),
     toolNames: f.input.scope.allowedToolNames, depth: 1, foreground: true, scope: { ...f.input.scope, readOnly: true }, model: f.run.model, policy: f.run.policy, agentPolicy: DEFAULT_AGENT_POLICY,
     runtimeConfiguration: normalizeRuntimeConfiguration(), toolConfiguration: normalizeToolConfiguration(),
   });
@@ -717,7 +720,7 @@ test('p13 child Query access uses only frozen parent references or its own commi
       initialHistory:{header:native.header,entries:[],activeLeafId:null},frozen,createdAt:contextAt});
     const promptEntry={id:'delegated-query-prompt',type:'message',parentId:null,timestamp:contextAt,message:{role:'user',content:p13AgentInput.prompt,timestamp:Date.parse(contextAt)}};
     history.commitSync({sessionId:identity.childSessionId,runId:identity.childRunId,expectedStorageVersion:1,header:native.header,newEntries:[promptEntry],activeLeafId:promptEntry.id});
-    const delegationSource={parentRunId:f.input.runId,originToolCallId:origin.id,parentSnapshotId:snapshot.id,parentInputId:f.input.inputId,promptHash:frozen.promptHash,nativeEntryId:promptEntry.id};
+    const delegationSource={parentRunId:f.input.runId,originToolCallId:origin.id,parentSnapshotId:snapshot.id,parentInputId:f.input.inputId,nativeEntryId:promptEntry.id};
     const childSnapshot=contexts.save(contexts.selectChild({runId:identity.childRunId,sessionId:identity.childSessionId,inputId:null,delegationSource,scope:frozen.scope,runtimeFeedback:'ENGINEERING',nativeRefs:[],createdAt:contextAt}));
     repos.startCall(identity.childRunId,'query-child','main',contextAt,{inputId:null,snapshotId:childSnapshot.id,delegationSource});
     const context={runId:identity.childRunId,sessionId:identity.childSessionId,nativeToolCallId:'child-query',scope:frozen.scope,referenceDate:f.request.referenceDate,timezone:f.request.timezone,signal,
@@ -760,11 +763,11 @@ test('p13 schema11 migration preserves original data and rejects partial upgrade
       db.close();
     }
     db = openDatabase(path);
-    expect(SCHEMA_VERSION).toBe(15);
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(15);
+    expect(SCHEMA_VERSION).toBe(16);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(16);
     for (const name of tables.filter(n => n !== 'schema_migrations')) {
       const rows = db.query<Record<string, unknown>, []>(`SELECT * FROM ${name} ORDER BY id`).all();
-      expect(rows.map((row, i) => Object.fromEntries(Object.keys(before.get(name)![i]!).map(key => [key, row[key]])))).toEqual(before.get(name)!);
+      expect(rows.map((row, i) => Object.fromEntries(Object.keys(retainedFields(before.get(name)![i]!)).map(key => [key, row[key]])))).toEqual(before.get(name)!.map(retainedFields));
     }
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.query('PRAGMA integrity_check').get()).toEqual({ integrity_check: 'ok' });
@@ -846,8 +849,7 @@ test('p13 child DDL binds an original parent Agent call, freezes identity and is
     const { childRunId: _run, childSessionId: _session, ...configuration } = frozen;
     const registration = { parentRunId: f.input.runId, originToolCallId: thirdOrigin.id, pluginAgentId: 'plugin-child-3', nativeSessionId: thirdNative.header.id,
       prompt: p13AgentInput.prompt, initialHistory: { header: thirdNative.header, entries: initialEntries, activeLeafId: initialLeaf }, createdAt: contextAt,
-      frozen: { ...configuration, pluginAgentId: 'plugin-child-3', nativeSessionId: thirdNative.header.id, originToolCallId: thirdOrigin.id, originNativeToolCallId: thirdOrigin.nativeToolCallId,
-        promptHash: createHash('sha256').update(p13AgentInput.prompt).digest('hex') } };
+      frozen: { ...configuration, pluginAgentId: 'plugin-child-3', nativeSessionId: thirdNative.header.id, originToolCallId: thirdOrigin.id, originNativeToolCallId: thirdOrigin.nativeToolCallId} };
     const counts = () => ['sessions', 'runs', 'memories', 'runtime_events'].map(table => db.query(`SELECT COUNT(*) n FROM ${table}`).get());
     const beforeRegistration = counts();
     const childRepos = new Repositories(db, undefined, undefined, undefined, history.store);
@@ -864,7 +866,7 @@ test('p13 child DDL binds an original parent Agent call, freezes identity and is
     expect(db.query('SELECT id FROM answers').all()).toEqual([]);
     expect(db.query('SELECT type,sequence FROM runtime_events WHERE run_id=? ORDER BY sequence').all(identity.childRunId)).toEqual([{ type: 'run_created', sequence: 1 }]);
     const delegationSource = { parentRunId: f.input.runId, originToolCallId: thirdOrigin.id, parentSnapshotId: snapshot.id, parentInputId: f.input.inputId,
-      promptHash: registration.frozen.promptHash, nativeEntryId: 'child-prompt' };
+       nativeEntryId: 'child-prompt' };
     const promptEntry = { id: delegationSource.nativeEntryId, type: 'message', parentId: initialLeaf, timestamp: contextAt,
       message: { role: 'user', content: p13AgentInput.prompt, timestamp: Date.parse(contextAt) } };
     history.commitSync({ sessionId: identity.childSessionId, runId: identity.childRunId, expectedStorageVersion: 1, header: thirdNative.header, newEntries: [promptEntry], activeLeafId: promptEntry.id });
@@ -880,7 +882,7 @@ test('p13 child DDL binds an original parent Agent call, freezes identity and is
       { session_id: identity.childSessionId, input_id: null }, { session_id: identity.childSessionId, input_id: null }]);
     const childDelivery = contexts.recordDelivery({ runId: identity.childRunId, sessionId: identity.childSessionId, callId: 'child-model-1', inputId: null, snapshotId: childSnapshot.id, delegationSource,
       observation: { contract: 'medclaw.context-observation/v1', api: 'openai-completions', transport: 'sse', httpStatus: 200, observedAt: contextAt,
-        projectionHash: childSnapshot.projectionHash, feedbackHash: childSnapshot.feedbackHash, verifiedNativeRefs: [] } });
+          verifiedNativeRefs: [] } });
     expect(contexts.read({ callId: 'child-model-1' })).toMatchObject({ kind: 'snapshot', snapshot: { inputId: null, delegationSource }, evidence: 'saved', deliveries: [childDelivery] });
     const childContext = { runId: identity.childRunId, sessionId: identity.childSessionId, nativeToolCallId: 'parent-Agent', scope: registration.frozen.scope,
       referenceDate: f.request.referenceDate, timezone: f.request.timezone, signal: controller.signal, contextSnapshotId: childSnapshot.id, modelCallId: 'child-model-1',

@@ -7,24 +7,24 @@ import { WorkspaceStateSchema, type WorkspaceState, type WorkspaceView } from '.
 import { businessToolSchemas } from '../../contracts/src/business-tools';
 function fail(code: string): never { throw new Error(code); }
 function checked<T>(schema: z.ZodType<T>, value: unknown): T { const parsed = schema.safeParse(value); return parsed.success ? parsed.data : fail('invalid_argument'); }
-import { createHash } from 'node:crypto';
-import { canonicalRequest } from '../../contracts/src/run';
 import type { Batch, Change, QueryRecord, Snapshot } from '../../contracts/src/query';
 import { WorkspaceSelectionSchema, type WorkspaceSelection } from '../../contracts/src/workspace';
 
-const digest = (value: unknown) => createHash('sha256').update(canonicalRequest(value)).digest('hex');
 function identity(value: unknown): string {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) throw new Error('storage_read_failed');
   return String(value);
 }
 /** Resolve against the entire saved result, before a caller applies pagination. */
 export function queryRowKeys(record: QueryRecord): (string | null)[] {
-  const keys = record.rows.map(row => record.kind === 'current' ? `snapshot:${identity(row.snapshotId)}`
-    : record.kind === 'changes' ? `change:${identity(row.eventId)}` : `row:${digest(row)}`);
+  const keys = record.rows.map((row,index) => record.kind === 'current' ? `snapshot:${identity(row.snapshotId)}`
+    : record.kind === 'changes' ? `change:${identity(row.eventId)}` : `row:${identity(record.id)}:${index}`);
   const counts = new Map<string, number>();
   for (const key of keys) counts.set(key, (counts.get(key) ?? 0) + 1);
   return keys.map(key => counts.get(key) === 1 ? key : null);
 }
+export const queryTargetVersion=(record:Pick<QueryRecord,'id'|'calculationVersion'>)=>`query:${identity(record.id)}:${record.calculationVersion}`;
+export const batchTargetVersion=(batch:Pick<Batch,'id'|'materialVersion'>)=>`batch:${identity(batch.id)}:${batch.materialVersion}`;
+export const changeTargetVersion=(change:Pick<Change,'id'|'calculationVersion'>)=>`change:${identity(change.id)}:${change.calculationVersion}`;
 export function resolveQueryRow(record: QueryRecord, key: string): QueryRecord['rows'][number] {
   const index = queryRowKeys(record).findIndex(candidate => candidate === key);
   if (index < 0) throw new Error('access_denied');
@@ -35,11 +35,11 @@ export function describeDataSelection(item: Snapshot | Change, batches: readonly
   const batch = (id: number) => {
     const found = batches.find(value => value.id === id);
     if (!found) throw new Error('access_denied');
-    return { id: found.id, contentHash: found.contentHash };
+    return found;
   };
-  return WorkspaceSelectionSchema.parse('batchId' in item
-    ? {formatVersion:1,kind:'device',targetId:identity(item.deviceId),targetVersion:batch(item.batchId).contentHash,rowKey:`snapshot:${identity(item.id)}`,field:null}
-    : {formatVersion:1,kind:'change',targetId:identity(item.id),targetVersion:digest({oldBatch:batch(item.oldBatchId),newBatch:batch(item.newBatchId),calculationVersion:item.calculationVersion}),rowKey:`change:${identity(item.id)}`,field:null});
+  if('batchId' in item)return WorkspaceSelectionSchema.parse({formatVersion:1,kind:'device',targetId:identity(item.deviceId),targetVersion:batchTargetVersion(batch(item.batchId)),rowKey:`snapshot:${identity(item.id)}`,field:null});
+  batch(item.oldBatchId);batch(item.newBatchId);
+  return WorkspaceSelectionSchema.parse({formatVersion:1,kind:'change',targetId:identity(item.id),targetVersion:changeTargetVersion(item),rowKey:`change:${identity(item.id)}`,field:null});
 }
 
 export function assertSelectionField(object: Record<string, unknown>, field: string | null): void {
@@ -51,14 +51,14 @@ export function assertSelectionField(object: Record<string, unknown>, field: str
 
 export function readWorkspaceBatchReferences(db: Database, ids: number[]) {
     const rows = ids.map(batchId => {
-      const row = db.query<{ id: number; content_hash: string; snapshot_date: string; scope_key: string; material_version: string }, [number]>(
-        `SELECT id,content_hash,snapshot_date,scope_key,material_version FROM batches WHERE id=?${(!!db.query("SELECT name FROM pragma_table_info('batches') WHERE name='status'").get())?" AND status='active'":""}`).get(batchId);
+      const row = db.query<{ id: number; snapshot_date: string; scope_key: string; material_version: string }, [number]>(
+        `SELECT id,snapshot_date,scope_key,material_version FROM batches WHERE id=?${(!!db.query("SELECT name FROM pragma_table_info('batches') WHERE name='status'").get())?" AND status='active'":""}`).get(batchId);
       if (!row) fail("access_denied");
       return row;
     });
     const versions = new Set(rows.map(row => row.material_version));
     if (versions.size > 1) fail("invalid_argument");
-    return { refs: rows.map(row => ({ id: row.id, contentHash: row.content_hash, snapshotDate: row.snapshot_date, scopeKey: row.scope_key })),
+    return { refs: rows.map(row => ({ id: row.id, snapshotDate: row.snapshot_date, scopeKey: row.scope_key })),
       materialVersion: rows[0]?.material_version ?? null };
 }
 
@@ -82,7 +82,7 @@ export function validateWorkspaceSelection(db: Database, selection: WorkspaceSel
       return item;
     };
     if (selection.kind === 'device') {
-      const item = snapshot(selection.rowKey), version = state.batchRefs.find(batch => batch.id === item.batchId)!.contentHash;
+      const item = snapshot(selection.rowKey), version = batchTargetVersion({id:item.batchId,materialVersion:state.materialVersion!});
       if (item.deviceId !== Number(selection.targetId) || version !== selection.targetVersion) fail('access_denied');
       assertSelectionField(item, selection.field);
     } else if (selection.kind === 'change') {
@@ -94,7 +94,7 @@ export function validateWorkspaceSelection(db: Database, selection: WorkspaceSel
     } else {
       if (state.queryId === null) fail('access_denied');
       const query = readWorkspaceQuery(db, state.queryId, state);
-      if (selection.targetVersion !== query.resultHash) fail('access_denied');
+      if (selection.targetVersion !== queryTargetVersion(query)) fail('access_denied');
       if (selection.kind === 'query-row') {
         if (Number(selection.targetId) !== query.id) fail('access_denied');
         const row = resolveQueryRow(query, selection.rowKey);
@@ -108,7 +108,7 @@ export function validateWorkspaceSelection(db: Database, selection: WorkspaceSel
         assertSelectionField(row, selection.field);
       } else {
         const evidence = store.readEvidence(Number(selection.targetId));
-        if (!evidence || evidence.queryId !== query.id || evidence.resultHash !== query.resultHash || evidence.batchIds.some(id => !batchIds.includes(id))) fail('access_denied');
+        if (!evidence || evidence.queryId !== query.id || evidence.calculationVersion!==query.calculationVersion||evidence.batchIds.some(id => !batchIds.includes(id))) fail('access_denied');
         if (selection.rowKey === null) { if (selection.field !== null) fail('invalid_argument'); }
         else {
           const item = snapshot(selection.rowKey);

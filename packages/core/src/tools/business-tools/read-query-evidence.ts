@@ -11,7 +11,7 @@ export const createReadQueryEvidenceTool = (dependencies: {
     name: 'read_query_evidence',
     version: '1.0.0',
     label: 'Read query evidence',
-    description: 'Read the frozen snapshot, change event, source row, version, and hash references from evidence in the current session.',
+    description: 'Read the frozen snapshot, change event, source row, version references from evidence in the current session.',
     inputSchema: schemas.read_query_evidence.input,
     outputSchema: schemas.read_query_evidence.output,
     effect: 'READ',

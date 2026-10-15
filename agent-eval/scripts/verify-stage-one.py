@@ -415,8 +415,6 @@ def verify_origins(snapshot):
 
 
 def verify_badcase(snapshot, original):
-    # Admission retains its historical authored parent while the primary dataset evolves.
-    original = snapshot['review'].get('verifiedData') or original
     count, stages = verify_cases(snapshot, 3, 3, False)
     members = ['mc-bc-intent-zh-name', 'mc-v1-intent-resolve', 'mc-v1-intent-clarify-region']
     check(snapshot['info']['id'] == 'medclaw-badcase-v1' and [case['id'] for case in snapshot['cases']] == members, 'First supplementary membership')

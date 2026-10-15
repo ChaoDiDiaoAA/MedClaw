@@ -19,7 +19,7 @@ test('p11 actual desktop discovers selects reads queries and restores original r
       const time={start:'2026-01-01',endExclusive:'2026-01-02'},args=step===1?{path:location}:step===2?{path:location.replace('SKILL.md','references/facts-and-assumptions.md')}:step===3?{}:step===4?{time}:step===5?{batchIds:[1],time}:step===6?{queryId:result('query_current_devices').queryId}:{evidenceId:result('list_query_evidence').items[0].id};
       businessNames.push(name);delta={role:'assistant',tool_calls:[{index:0,id:`p11-desktop-${step}`,type:'function',function:{name,arguments:JSON.stringify(args)}}]};
     }else if(step===8){const query=result('query_current_devices'),evidence=result('read_query_evidence');
-      delta={role:'assistant',content:`Facts: Query ${query.queryId}, ${query.totalRows} snapshot record(s), price ${query.rows[0].priceCents} cents. Evidence ${evidence.id}, hash ${evidence.resultHash}. Assumptions: ENGINEERING synthetic date 2026-01-01. Missing evidence: physical stock quantity is unknown.`};
+      delta={role:'assistant',content:`Facts: Query ${query.queryId}, ${query.totalRows} snapshot record(s), price ${query.rows[0].priceCents} cents. Evidence ${evidence.id}. Assumptions: ENGINEERING synthetic date 2026-01-01. Missing evidence: physical stock quantity is unknown.`};
     }else delta={role:'assistant',content:'ENGINEERING next run plain response; no new calculation.'};
     response.writeHead(200,{'content-type':'text/event-stream'});response.end(`data: ${JSON.stringify({id:'ENGINEERING',model:'fixture',choices:[{index:0,delta,finish_reason:'tool_calls' in delta?'tool_calls':'stop'}]})}\n\ndata: [DONE]\n\n`);
   });

@@ -16,10 +16,10 @@ import { createPiToolDefinitions } from "../../packages/runtime-pi/src/pi-tool-a
 const handles: Database[] = [];
 afterEach(() => { for (const db of handles.splice(0)) db.close(); });
 function data() {
-  const sourceRefs = [{ sourceId: "fda", file: "original-file-now-missing.csv", recordId: "row-1", row: 1, sha256: "a".repeat(64) }];
+  const sourceRefs = [{ sourceId: "fda", file: "original-file-now-missing.csv", recordId: "row-1", row: 1 }];
   const batches = [1, 2].map(id => ({ id, scopeKey: "浙江:器械", snapshotDate: `2026-01-0${id}`, region: "浙江", coverage: "full" as const,
-    previousBatchId: id === 1 ? null : 1, materialVersion: "data/v1", sourceBundleId: "bundle", sourceLockHash: "lock", contentHash: `hash-${id}`,
-    cohortHash: "cohort", catalogRevision: 1, expectedEntityCount: 3, observedEntityCount: 3 }));
+    previousBatchId: id === 1 ? null : 1, materialVersion: "data/v1", sourceBundleId: "bundle",
+    catalogRevision: 1, expectedEntityCount: 3, observedEntityCount: 3 }));
   const devices = [1, 2, 3].map(id => ({ id, sourceDeviceId: `device-${id}`, sourceBundleId: "bundle", sourceSubmissionId: `submission-${id}`,
     sourceApplicant: "公开申报企业", sourceRefs }));
   const prices = [[10000, 0, null], [8000, 50, 10]];
@@ -178,7 +178,7 @@ test("an empty historical query cannot be read after its entity scope narrows", 
 test("catalog rejects broken cohort counts, source bindings and nonadjacent predecessors", () => {
   const count = data(); count.batches[1]!.expectedEntityCount = 4;
   expect(() => new CatalogService(count)).toThrow("input_invalid");
-  const binding = data(); binding.batches[1]!.cohortHash = "changed-cohort";
+  const binding = data(); binding.batches[1]!.sourceBundleId = "different-source";
   expect(() => new CatalogService(binding)).toThrow("input_invalid");
   const predecessor = data(); predecessor.batches[1]!.previousBatchId = null; predecessor.changes = [];
   expect(() => new CatalogService(predecessor)).toThrow("input_invalid");

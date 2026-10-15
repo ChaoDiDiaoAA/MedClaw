@@ -59,7 +59,7 @@ export class IntentValidator {
     const batches = input.scope.batchIds.length ? this.catalog.batches(input.scope.batchIds, context) : [];
     const rows = batches.length ? this.catalog.intentSnapshots(input.scope.batchIds, context) : [];
     if(input.grounding&&!same(input.grounding,groundIntentInput(input,rows).grounding))throw safeError('state_conflict');
-    if (!same(distinct(batches.map(batch => batch.contentHash)), input.scopeBatchHashes)
+    if (batches.length !== input.scope.batchIds.length || batches.some(batch => !input.scope.batchIds.includes(batch.id))
       || !same(distinct(batches.map(batch => batch.region)), distinct(input.availableData.regions))
       || !same(distinct(batches.map(batch => batch.snapshotDate)), distinct(input.availableData.dates))
       || !same(distinct(rows.map(row => row.currency)), distinct(input.availableData.currencies))

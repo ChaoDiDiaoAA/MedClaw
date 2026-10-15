@@ -1,9 +1,9 @@
 import { z } from 'zod';
 import { AppErrorSchema, ConfigVersionSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } from './error';
-import { ResourceHashSchema, ResourceSettingsSchema } from './resources';
+import { ResourceSettingsSchema } from './resources';
 
 export const EXTENSION_LIMITS = Object.freeze({ manifestBytes: 8 * 1024, entryBytes: 64 * 1024, statusBytes: 8 * 1024, closeMs: 3000 });
-export const ExtensionRefSchema = z.strictObject({ id: z.literal('tool-audit'), version: z.literal('v1'), treeHash: ResourceHashSchema });
+export const ExtensionRefSchema = z.strictObject({ id: z.literal('tool-audit'), version: z.literal('v1') });
 export const ExtensionSelectionSchema = z.strictObject({ extension: ExtensionRefSchema.nullable() });
 export const ExtensionSettingsSchema = z.strictObject({ bySession: z.record(ResourceSettingsSchema.shape.bySession.keyType, ExtensionSelectionSchema) });
 export const ExtensionOwnerSchema = z.strictObject({ instanceId: OpaqueIdSchema, sessionId: PositiveIdSchema, runId: PositiveIdSchema, assemblyId: OpaqueIdSchema });
@@ -27,7 +27,7 @@ export const ExtensionAssemblyProofSchema = ExtensionOwnerSchema.extend({
 }).refine(proof => proof.resourcesReleased === (proof.state === 'disposed') && (proof.state === 'disposed') === (proof.disposedAt !== null)
   && (proof.state !== 'active' || proof.loadedAt !== null && proof.callableTools.length === 1 && proof.callableCommands.length === 1)
   && (proof.loadedAt === null || proof.disposedAt === null || Date.parse(proof.disposedAt) >= Date.parse(proof.loadedAt)), 'Assembly facts disagree');
-export const ExtensionFileMetadataSchema = z.strictObject({ file: z.enum(['manifest.json', 'index.ts']), bytes: count.max(EXTENSION_LIMITS.entryBytes), sha256: ResourceHashSchema })
+export const ExtensionFileMetadataSchema = z.strictObject({ file: z.enum(['manifest.json', 'index.ts']), bytes: count.max(EXTENSION_LIMITS.entryBytes) })
   .refine(file => file.bytes <= (file.file === 'manifest.json' ? EXTENSION_LIMITS.manifestBytes : EXTENSION_LIMITS.entryBytes));
 export const ExtensionFileSnapshotSchema = ExtensionFileMetadataSchema.extend({ content: z.string().refine(text => text.isWellFormed()) })
   .refine(file => new TextEncoder().encode(file.content).byteLength === file.bytes, 'Extension byte count mismatch');

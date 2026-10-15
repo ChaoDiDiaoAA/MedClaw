@@ -8,8 +8,8 @@ export function queryProductData(deviceCount = 502) {
     sourceDeviceId: String(index + 1), sourceSubmissionId: `ENGINEERING-${index + 1}` }));
   const batches = [
     ...seed.batches.map(batch => ({ ...batch, snapshotDate: batch.id === 3 ? '2026-10-11' : batch.snapshotDate })),
-    { ...seed.batches[0]!, id: 4, scopeKey: 'ENGINEERING-jiangsu', region: '江苏', previousBatchId: null, contentHash: '4'.repeat(64) },
-    { ...seed.batches[2]!, id: 5, scopeKey: 'ENGINEERING-jiangsu', region: '江苏', snapshotDate: '2026-10-11', previousBatchId: 4, contentHash: '5'.repeat(64) },
+    { ...seed.batches[0]!, id: 4, scopeKey: 'ENGINEERING-jiangsu', region: '江苏', previousBatchId: null },
+    { ...seed.batches[2]!, id: 5, scopeKey: 'ENGINEERING-jiangsu', region: '江苏', snapshotDate: '2026-10-11', previousBatchId: 4 },
   ].map(batch => ({ ...batch, expectedEntityCount: deviceCount, observedEntityCount: deviceCount - (batch.id === 2 ? 1 : 0),
     declaredMissingDeviceIds: batch.id === 2 ? [deviceCount] : [] }));
   const snapshots = batches.flatMap(batch => devices.filter(device => batch.id !== 2 || device.id !== deviceCount).map(device => ({

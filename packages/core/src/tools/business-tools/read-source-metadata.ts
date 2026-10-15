@@ -11,7 +11,7 @@ export const createReadSourceMetadataTool = (dependencies: {
     name: 'read_source_metadata',
     version: '1.0.0',
     label: 'Read source metadata',
-    description: 'Read source files, records, row numbers, hashes, and per-field public/synthetic/synthetic-derived provenance from evidence snapshots with pagination. Only read imported metadata; do not open arbitrary files or network resources.',
+    description: 'Read source files, records, row numbers and per-field public/synthetic/synthetic-derived provenance from evidence snapshots with pagination. Only read imported metadata; do not open arbitrary files or network resources.',
     inputSchema: schemas.read_source_metadata.input,
     outputSchema: schemas.read_source_metadata.output,
     effect: 'READ',

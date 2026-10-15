@@ -5,7 +5,6 @@ import { z } from 'zod';
 import { JudgeClient,readJudgeConfig } from './client.ts';
 import { ANSWER_QUALITY_RUBRIC } from './answer-quality.ts';
 import { evidencePath,writeJsonExclusive } from '../../reports/write.ts';
-import { assertNoDatasetHashes } from '../../data-format.ts';
 import { ExecutionIdSchema } from '../../types.ts';
 export interface CalibrationSample {
   id: string; partition: 'tune' | 'validation'; sourceId: string;
@@ -46,7 +45,7 @@ export const VerifiedReferenceSchema=z.strictObject({contract:z.literal('medclaw
 export async function calibrateReferences(args:{referencesPath:string;executionId:string;outputPath:string;env:Record<string,string|undefined>;signal?:AbortSignal;controlledFixture?:boolean}) {
   ExecutionIdSchema.parse(args.executionId);
   const referencePath=resolve(args.referencesPath),base=dirname(referencePath),references=ReferenceSchema.parse(JSON.parse(await readFile(referencePath,'utf8')));
-  assertNoDatasetHashes(references);
+
   const prepared=[];
   for(const item of references.samples) {
     if(new Set(item.evidence.map(entry=>entry.ref)).size!==item.evidence.length)throw new Error('duplicate_calibration_evidence');
@@ -55,7 +54,7 @@ export async function calibrateReferences(args:{referencesPath:string;executionI
     const reference=VerifiedReferenceSchema.parse(JSON.parse(await readFile(await evidencePath(base,item.reference.path),'utf8')));
     const sample={id:item.id,sourceId:item.sourceId,answer:item.answer,rubric:item.rubric,evidence};
     if(!isDeepStrictEqual(reference.sample,sample)||reference.sampleId!==item.id||reference.sourceId!==item.sourceId||!item.evidence.some(entry=>entry.ref===reference.sourceRef)||reference.evidenceRefs.some(ref=>!Object.hasOwn(evidence,ref)))throw new Error('calibration_review_content_mismatch');
-    assertNoDatasetHashes(reference);assertNoDatasetHashes(evidence);
+
     prepared.push({sample:{...sample,partition:item.partition},reference:{...reference.verification,recordRef:'evidence/'+item.id+'/trial.json',sourceRef:reference.sourceRef,value:reference.value,severe:reference.severe,evidenceRefs:reference.evidenceRefs}});
   }
   const contentSources=new Set(prepared.filter(item=>item.sample.partition==='tune').flatMap(item=>Object.values(item.sample.evidence)));

@@ -21,7 +21,6 @@ import { toWorkspaceContext } from '../../../contracts/src/workspace';
 import type { ResourceService } from '../resources/resource-service';
 import { RESOURCE_LIMITS, resourceRefKey } from '../../../contracts/src/resources';
 import { ChildResultSchema, NativeAgentReplySchema, type BoundChildIdentity, type ChildRuntimeCallbacks, type FinalChildFact, type RegisterChildInput } from '../../../contracts/src/subagent';
-import { createHash } from 'node:crypto';
 import { RunControl } from './run-control';
 import { IntentModelSelectionSchema, INTENT_VERSIONS } from '../../../contracts/src/model';
 import { IntentAgentTaskSchema, IntentQueryStepInputSchema, type IntentDecision, type IntentInputProjection, type FrozenIntentAdmission, type ProductSettlement, type IntentStepResult } from '../../../contracts/src/intent';
@@ -636,13 +635,13 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         });
         const childResult=ChildResultSchema.parse({contract:'medclaw.child-result/v1',childRunId:identity.childRunId,childSessionId:identity.childSessionId,parentRunId:identity.parentRunId,
           originToolCallId:identity.originToolCallId,pluginAgentId:identity.pluginAgentId,nativeSessionId:identity.nativeSessionId,outcome:status,text:outcome?.text??'',
-          ...refs,gaps:[...new Set([...(error?[error.code]:[]),...(outcome?.sdkStopReason==='length'?['sdk_output_length']:[]),...refs.gaps,...nativeErrors])],truncated:outcome?.sdkStopReason==='length',originalReply,originalReplyHash:createHash('sha256').update(canonicalRequest(originalReply)).digest('hex'),
+          ...refs,gaps:[...new Set([...(error?[error.code]:[]),...(outcome?.sdkStopReason==='length'?['sdk_output_length']:[]),...refs.gaps,...nativeErrors])],truncated:outcome?.sdkStopReason==='length',originalReply,
           finalLeafId:observation.history.activeLeafId,storageVersion:observation.history.expectedStorageVersion+(observation.history.newEntries.length||observation.history.activeLeafId!==base.leafId?1:0),committedAt:endedAt});
         const candidate:FinalChildFact={status,endedAt,outputText:childResult.text,error,calls:observation.calls,history:observation.history,compactions:observation.compactions,childResult,
           cleanup:{...observation.cleanup,stopConfirmed:true,requiredPersistenceComplete:true,inputsSettled:true,resourcesReleased:false,unconfirmedItems:['resources'],verifiedAt:null}};
         if(cancellationWon&&slot.pendingFinal?.status==='completed')slot.pendingFinal=candidate;
         const fact=slot.pendingFinal??candidate;
-        if(slot.pendingFinal&&(fact.childResult.originalReplyHash!==childResult.originalReplyHash||!isDeepStrictEqual(fact.calls,observation.calls)||!isDeepStrictEqual(fact.history,observation.history)))throw safeError('state_conflict');
+        if(slot.pendingFinal&&(!isDeepStrictEqual(fact.childResult.originalReply,childResult.originalReply)||!isDeepStrictEqual(fact.calls,observation.calls)||!isDeepStrictEqual(fact.history,observation.history)))throw safeError('state_conflict');
         slot.pendingFinal??=structuredClone(fact);
         try{this.store.finalizeChild(identity.childRunId,fact);}
         catch(cause){let saved=false;try{saved=this.store.isChildFinalSaved?.(identity.childRunId,fact)??false;}catch{}
@@ -701,9 +700,9 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       const turn=await this.agent!.appendProductTurn!({mode:'user_form',runId:execution.handle.runId,sessionId:input.sessionId,inputId:input.inputId!,
         baseLeafId:form.baseLeafId,baseStorageVersion:form.baseStorageVersion,occurredAt:now(),text:input.text,decisionId:decision.id,
         result:{kind:'result',text,queryIds:[record.id],missingSlots:[]},
-        execution:{contract:'medclaw.query-form-execution/v1',decisionId:decision.id,queryId:record.id,resultHash:record.resultHash},
+        execution:{contract:'medclaw.query-form-execution/v1',decisionId:decision.id,queryId:record.id},
         adoptedContext:{contract:'medclaw.query-form-context/v1',decisionId:decision.id,sourceRunId:execution.handle.runId,sourceInputId:input.inputId!,
-          params:QueryParamsSchema.parse(record.params),queryIds:[record.id],scopeBatchHashes:[...new Set(input.workspace.batchRefs.map(batch=>batch.contentHash))].sort()}});
+          params:QueryParamsSchema.parse(record.params),queryIds:[record.id]}});
       active();execution.acceptingInputs=false;execution.stopped=true;execution.executionStarted=false;execution.extensionReleaseBasis='not_loaded';
       execution.budgetSummary=control.summary();
       execution.productSettlement={contract:'medclaw.product-settlement/v1',basis:'product_history',nativeUserEntryId:turn.userEntryId,
@@ -762,7 +761,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
           for(const [part,params] of step.queries.entries()){
             active();const result=await this.intents!.queries.execute(params,{...queryContext,callRef:`intent:${execution.handle.runId}:${decisionId}:${step.stepId}:${part}`});
             if(!result.ok)throw result.error;
-            committedQueries.push(result.data);refs.push({queryId:result.data.id,resultHash:result.data.resultHash});active();
+            committedQueries.push(result.data);refs.push({queryId:result.data.id});active();
           }
           const metadata=step.metadata?{stepId:step.stepId,part:0 as const,basis:'snapshot_date' as const,
             batches:this.intents!.service.readFreshness(decision.adoptedIntents.find(item=>item.id===step.stepId)!,queryContext)}:undefined;
@@ -783,10 +782,10 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         result:{kind:plannedResult||record?'result':decision.route==='reject'?'out_of_scope':decision.status==='UNSUPPORTED_DATA'?'insufficient_evidence':'clarification',
           text,queryIds,missingSlots:decision.missingSlots},
         execution:{contract:'medclaw.intent-execution/v1',decisionId,taskIntents:decision.adoptedIntents,
-          stepResults:decision.executionPlan?stepResults:record?[{stepId:decision.adoptedIntents[0]!.id,queryRefs:[{queryId:record.id,resultHash:record.resultHash}]}]:[]},
+          stepResults:decision.executionPlan?stepResults:record?[{stepId:decision.adoptedIntents[0]!.id,queryRefs:[{queryId:record.id}]}]:[]},
         adoptedContext:decision.contextIntentId&&decision.adoptedSlots?{contract:'medclaw.query-context-entry/v2',decisionId,
           sourceRunId:execution.handle.runId,sourceInputId:input.inputId!,taskIntents:decision.adoptedIntents,contextIntentId:decision.contextIntentId,
-          adoptedSlots:decision.adoptedSlots,scopeBatchHashes:projection.scopeBatchHashes,
+          adoptedSlots:decision.adoptedSlots,
           queryIds:decision.executionPlan?stepResults.find(step=>step.stepId===decision.contextIntentId)?.queryRefs.map(ref=>ref.queryId)??[]:queryIds,
           pendingClarification:decision.route==='clarify'?{taskText:projection.pendingClarification?.taskText??input.text,missingSlots:decision.missingSlots}:null}:null});
       active();
@@ -882,10 +881,10 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
             const turn=await this.agent!.appendProductTurn!({mode:'agent_task',runId:execution.handle.runId,sessionId:input.sessionId,inputId:input.inputId!,
               baseLeafId:baseline.activeLeafId,baseStorageVersion:baseline.storageVersion,occurredAt:now(),
               execution:{contract:'medclaw.intent-execution/v1',decisionId:task.decisionId,taskIntents:task.taskIntents,
-                stepResults:task.taskIntents.map(item=>({stepId:item.id,queryRefs:[...(stepQueries.get(item.id)?.values()??[])].map(query=>({queryId:query.id,resultHash:query.resultHash}))}))},
+                stepResults:task.taskIntents.map(item=>({stepId:item.id,queryRefs:[...(stepQueries.get(item.id)?.values()??[])].map(query=>({queryId:query.id}))}))},
               adoptedContext:intent!.decision.contextIntentId&&intent!.decision.adoptedSlots?{contract:'medclaw.query-context-entry/v2',decisionId:task.decisionId,
                 sourceRunId:execution.handle.runId,sourceInputId:input.inputId!,taskIntents:task.taskIntents,contextIntentId:intent!.decision.contextIntentId,
-                adoptedSlots:intent!.decision.adoptedSlots,scopeBatchHashes:intent!.projection.scopeBatchHashes,queryIds:contextQueries.map(query=>query.id),pendingClarification:null}:null});
+                adoptedSlots:intent!.decision.adoptedSlots,queryIds:contextQueries.map(query=>query.id),pendingClarification:null}:null});
             this.checkActive(execution,true);return turn;
           },
         }:{}),

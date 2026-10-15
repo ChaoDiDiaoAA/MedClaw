@@ -29,7 +29,7 @@ import { seedWorkspaceQueries } from '../fixtures/p7-workspace';
 import { acceptContextInput } from '../fixtures/p8-context';
 import { disabledIntentModel, intentInput, resolvedIntent } from '../fixtures/p14-intent';
 
-type Mode = 'rule' | 'classify' | 'verify' | 'http' | 'json' | 'digest' | 'b2_failure' | 'delivery_failure' | 'stop_rule' | 'stop_classify'
+type Mode = 'rule' | 'classify' | 'verify' | 'http' | 'json' | 'wrong_tag' | 'b2_failure' | 'delivery_failure' | 'stop_rule' | 'stop_classify'
   | 'ambiguous' | 'missing' | 'unsupported' | 'ood' | 'multi' | 'verify_expand' | 'verify_unresolved';
 function fixture(mode: Mode | 'slow_preflight' | 'b1_failure' | 'b3_failure', maxModelCalls = 5, timeoutMs = 10000) {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p14-service-')), db = openDatabase(join(root, 'app.sqlite'));
@@ -50,13 +50,13 @@ function fixture(mode: Mode | 'slow_preflight' | 'b1_failure' | 'b3_failure', ma
   const session = repos.readSession(accepted.input.sessionId)!;
   const input = IntentInputProjectionSchema.parse({ ...intentInput(), runId: accepted.input.runId, sessionId: accepted.input.sessionId,
     inputId: accepted.input.inputId, text: accepted.request.text, referenceDate: accepted.request.referenceDate,
-    baseLeafId: session.leafId, baseStorageVersion: session.storageVersion, scope: accepted.input.scope, scopeBatchHashes: ['a'.repeat(64)],
+    baseLeafId: session.leafId, baseStorageVersion: session.storageVersion, scope: accepted.input.scope,
     availableData: { regions: ['浙江'], dates: ['2026-10-04'], currencies: ['CNY'], units: ['台'] },
     enabledL2: ['PRODUCT_SEARCH', 'NEW_RECORDS'], availableToolNames: toolNames });
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     const path = new URL(request.url).pathname;
     if (path === '/api/version') { if (mode === 'slow_preflight') await Bun.sleep(150); return Response.json({ version: 'ENGINEERING-0.40.2' }); }
-    if (path === '/api/tags') return Response.json({ models: [{ name: 'qwen3.5:0.8b', digest: (mode === 'digest' ? 'b' : 'a').repeat(64) }] });
+    if (path === '/api/tags') return Response.json({ models: [{ name: 'qwen3.5:0.8b', model:'qwen3.5:0.8b' }] });
     if (path === '/api/show') return Response.json({ details: { family: 'qwen35', parameter_size: '752.39M', quantization_level: 'Q8_0' } });
     if (path !== '/api/chat') return new Response('Unexpected endpoint', { status: 404 });
     chats++;
@@ -79,12 +79,12 @@ function fixture(mode: Mode | 'slow_preflight' | 'b1_failure' | 'b3_failure', ma
       id: `s${index + 1}`, slots: { ...resolvedIntent().intents[0]!.slots, status } })) };
     if (mode === 'b2_failure') failSave = true;
     if (mode === 'delivery_failure') db.query(`CREATE TRIGGER engineering_fail_delivery BEFORE INSERT ON context_deliveries BEGIN SELECT RAISE(ABORT,'ENGINEERING'); END`).run();
-    return Response.json({ model: 'qwen3.5:0.8b', done: true, done_reason: 'stop',
+    return Response.json({ model: mode==='wrong_tag'?'qwen3.5:latest':'qwen3.5:0.8b', done: true, done_reason: 'stop',
       message: { role: 'assistant', content: mode === 'json' ? 'broken JSON' : JSON.stringify(result) },
       prompt_eval_count: 44, eval_count: 35, total_duration: 1000000 });
   } });
   const selection = IntentModelSelectionSchema.parse({ ...disabledIntentModel(), enabled: true, baseUrl: `http://127.0.0.1:${server.port}`,
-    modelDigest: 'sha256:' + 'a'.repeat(64), verifiedEvidenceRef: 'ENGINEERING', configVersion: '1', api: 'ollama-chat', ...INTENT_VERSIONS });
+     verifiedEvidenceRef: 'ENGINEERING', configVersion: '1', api: 'ollama-chat', ...INTENT_VERSIONS });
   const contexts = new ContextService(new SqliteContextStore(db), { async inspectManagedImport() { throw new Error('Unexpected artifact'); } });
   const service = new IntentService(repos, contexts, new OllamaIntentClient({ classify: CLASSIFY_PROMPT, verify: VERIFY_PROMPT }),
     new IntentValidator(new CatalogService(new SqliteCatalogStore(db))), events, transactions);
@@ -133,7 +133,7 @@ for (const [mode, calls, matchedBy] of [['rule', 0, 'rule'], ['classify', 1, 'qw
   });
 }
 
-for (const [mode, error, calls] of [['http', 'intent_response_invalid', 1], ['json', 'intent_output_invalid', 1], ['digest', 'intent_model_identity_mismatch', 0],
+for (const [mode, error, calls] of [['http', 'intent_response_invalid', 1], ['json', 'intent_output_invalid', 1], ['wrong_tag', 'intent_model_identity_mismatch', 1],
   ['stop_rule', 'tool_cancelled', 0], ['stop_classify', 'tool_cancelled', 1]] as const) {
   test(`p14 ${mode} retains actual facts and never continues to verify or route`, async () => {
     const f = fixture(mode);

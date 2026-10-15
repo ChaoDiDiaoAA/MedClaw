@@ -31,8 +31,8 @@ import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, Even
 import { IntentBaseUrlSchema, IntentModelConfigurationSchema, IntentModelInspectionSchema, IntentReadResultSchema, ReadIntentInputSchema } from './intent';
 import { ExportDestinationSchema, ExportDestinationCopySchema, ExportCopyReceiptSchema, ExportReferenceSchema, ExportRequestSchema, ExportOperationSchema, ExportArtifactSchema, ExportListInputSchema, ExportListSchema, ActivityListInputSchema, ActivityListSchema } from './export';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p15-v3" as const;
-export const DATABASE_SCHEMA_VERSION = 15 as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p15-v4" as const;
+export const DATABASE_SCHEMA_VERSION = 16 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
@@ -273,7 +273,10 @@ export const HostReadySchema = z.strictObject({
 });
 export const HostShutdownRequestSchema = instanceControl;
 export const HostShutdownResultSchema = z.strictObject({ executionStopped: z.boolean(), databaseClosed: z.boolean() });
+export const ExportCopyVerificationSchema = z.strictObject({ operationRef: OpaqueIdSchema, exportId: PositiveIdSchema,
+  artifactId: PositiveIdSchema, temporaryPath: AbsolutePathSchema });
 export const hostPrivateMethodSchemas = {
+  'export.copy.verify': { input: ExportCopyVerificationSchema, output: z.strictObject({ verified: z.literal(true) }) },
   'controller.evidence.read': {input:ControllerEvidenceInputSchema,output:ControllerEvidenceOutputSchema},
   "host.shutdown": { input: HostShutdownRequestSchema, output: HostShutdownResultSchema },
   "settings.prepare": { input: z.strictObject({ token: OpaqueIdSchema, candidate: PublishedSettingsSchema }), output: z.strictObject({ prepared: z.literal(true), selection: ModelSelectionSchema.nullable() }) },
@@ -372,6 +375,7 @@ export const PublicHostRequestSchema = z.discriminatedUnion("method", [
   hostRequest("host.restart", publicMethodSchemas["host.restart"].input),
 ]);
 export const HostPrivateRequestSchema = z.discriminatedUnion("method", [
+  hostRequest('export.copy.verify',hostPrivateMethodSchemas['export.copy.verify'].input),
   hostRequest('controller.evidence.read',hostPrivateMethodSchemas['controller.evidence.read'].input),
   hostRequest("host.shutdown", hostPrivateMethodSchemas["host.shutdown"].input),
   hostRequest("settings.prepare", hostPrivateMethodSchemas["settings.prepare"].input),
@@ -423,7 +427,7 @@ const credentialCommit = z.discriminatedUnion("changed", [
 ]);
 export const privateCredentialMethodSchemas = {
   "file.resolve": { input: z.strictObject({ fileToken: OpaqueIdSchema, operationRef: OpaqueIdSchema }), output: AbsolutePathSchema },
-  'export.destination.describe': { input: ExportDestinationSchema, output: ExportDestinationSchema.pick({ destinationIdentity: true }) },
+  'export.destination.describe': { input: ExportDestinationSchema, output: z.object({ valid: z.literal(true) }).strict() },
   'export.destination.copy': { input: ExportDestinationCopySchema, output: ExportCopyReceiptSchema },
   'export.destination.cancel': { input: z.strictObject({ operationRef: OpaqueIdSchema }), output: z.strictObject({ stopped: z.boolean() }) },
   'export.destination.settlePrevious': { input: EmptyPayloadSchema, output: z.strictObject({ stopped: z.literal(true) }) },

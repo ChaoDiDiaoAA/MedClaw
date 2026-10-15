@@ -73,8 +73,8 @@ export class CatalogService {
       group.sort((a, b) => a.snapshotDate.localeCompare(b.snapshotDate));
       const first = group[0]!, cohort = this.data.devices.filter(device => device.sourceBundleId === first.sourceBundleId).map(device => device.id);
       for (const [index, batch] of group.entries()) {
-        if (batch.sourceBundleId !== first.sourceBundleId || batch.sourceLockHash !== first.sourceLockHash || batch.region !== first.region
-          || batch.cohortHash !== first.cohortHash || batch.expectedEntityCount !== cohort.length || batch.observedEntityCount > batch.expectedEntityCount
+        if (batch.sourceBundleId !== first.sourceBundleId || batch.region !== first.region
+          || batch.expectedEntityCount !== cohort.length || batch.observedEntityCount > batch.expectedEntityCount
           || batch.previousBatchId !== (index === 0 ? null : group[index - 1]!.id)) throw new Error("input_invalid");
         const observed = snapshotDevices.get(batch.id) ?? [], missing = batch.declaredMissingDeviceIds;
         if (new Set(missing).size !== missing.length || missing.some(id => !cohort.includes(id) || observed.includes(id))

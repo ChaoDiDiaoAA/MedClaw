@@ -1,5 +1,5 @@
 import {test,expect,spyOn} from 'bun:test';
-import {mkdtempSync,mkdirSync,writeFileSync,rmSync,renameSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,existsSync,rmSync,renameSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve,basename} from 'node:path';
 import {createRequire} from 'node:module';
@@ -45,7 +45,15 @@ test.each([
     const header=`import {test,expect} from ${JSON.stringify(playwright)};`;
     const bodies={pass:'test("controlled pass",()=>expect(1).toBe(1));',fail:'test("controlled failure",()=>expect(1).toBe(2));',skip:'test.skip("required missing",()=>{});',empty:''};
     for(const [name,kind] of scenario.files)writeFileSync(join(root,'tests/e2e',name),header+bodies[kind]);
-    expect(await runStage('desktop','all',{root})).toMatchObject(scenario.expected);
+    const first=await runStage('desktop','all',{root});expect(first).toMatchObject(scenario.expected);
+    if(scenario.name==='pass'){
+      const report=join(first.reportDirectory!,'results.json'),original=readFileSync(report,'utf8');
+      const next=await runStage('desktop','all',{root});expect(next).toMatchObject(scenario.expected);
+      expect(next.reportDirectory).not.toBe(first.reportDirectory);
+      expect(readFileSync(report,'utf8')).toBe(original);
+      expect(existsSync(join(first.reportDirectory!,'stdout.log'))).toBe(true);
+      expect(existsSync(join(first.reportDirectory!,'stderr.log'))).toBe(true);
+    }
   } finally {rmSync(root,{recursive:true,force:true});}
 },30000);
 

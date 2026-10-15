@@ -99,13 +99,13 @@ test('p8 stale cancelled expired and foreign previews never consume model budget
 });
 
 test('p8 strict context contracts reject over-budget bytes and unproven observations', () => {
-  const body = {contract:'medclaw.context/v1',workspaceContext:null,selectedRefs:[],projectionHash:'a'.repeat(64),renderedProjection:'器械',runtimeFeedback:'',feedbackHash:'b'.repeat(64),resourceVersions:{},nativeRefs:[],omitted:[],projectionLimitBytes:6};
+  const body = {contract:'medclaw.context/v1',workspaceContext:null,selectedRefs:[],renderedProjection:'器械',runtimeFeedback:'',resourceVersions:{},nativeRefs:[],omitted:[],projectionLimitBytes:6};
   expect(ContextSnapshotBodySchema.safeParse(body).success).toBe(true);
   expect(ContextSnapshotBodySchema.safeParse({...body,projectionLimitBytes:5}).success).toBe(false);
   expect(ContextSnapshotBodySchema.safeParse({...body,id:1}).success).toBe(false);
-  const observed = {contract:'medclaw.context-observation/v1',api:'openai-completions',transport:'sse',observedAt:at,httpStatus:200,projectionHash:body.projectionHash,feedbackHash:body.feedbackHash,verifiedNativeRefs:[]};
+  const observed = {contract:'medclaw.context-observation/v1',api:'openai-completions',transport:'sse',observedAt:at,httpStatus:200,verifiedNativeRefs:[]};
   expect(ContextDeliveryObservationSchema.safeParse(observed).success).toBe(true);
   expect(ContextDeliveryObservationSchema.safeParse({...observed,api:'bedrock-converse-stream',transport:'aws-event-stream'}).success).toBe(true);
   expect(ContextDeliveryObservationSchema.safeParse({...observed,api:'bedrock-converse-stream'}).success).toBe(false);
-  for (const patch of [{httpStatus:500},{api:'google-generative-ai'},{transport:'websocket'},{projectionHash:'A'.repeat(64)}]) expect(ContextDeliveryObservationSchema.safeParse({...observed,...patch}).success).toBe(false);
+  for (const patch of [{httpStatus:500},{api:'google-generative-ai'},{transport:'websocket'},{verifiedNativeRefs:[{kind:'input',id:0}]}]) expect(ContextDeliveryObservationSchema.safeParse({...observed,...patch}).success).toBe(false);
 });

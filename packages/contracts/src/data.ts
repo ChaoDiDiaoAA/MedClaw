@@ -11,7 +11,6 @@ export const ImportPreviewRequestSchema = z.strictObject({
 });
 export const ImportCommitRequestSchema = z.strictObject({
   operationRef: OpaqueIdSchema,
-  previewHash: z.string().regex(/^[a-f0-9]{64}$/),
   fileToken: OpaqueIdSchema,
 });
 export const ImportIssueSchema = z.strictObject({
@@ -23,9 +22,6 @@ export const ImportIssueSchema = z.strictObject({
 });
 export const ImportPreviewSchema = z.strictObject({
   operationRef: OpaqueIdSchema,
-  previewHash: z.string(),
-  sourceHash: z.string(),
-  metadataHash: z.string(),
   inputKind: z.literal('snapshot_package'),
   fileCount: z.number().int().nonnegative(),
   totalBytes: z.number().int().nonnegative(),
@@ -78,8 +74,6 @@ export const ArtifactSchema = z.strictObject({
   format: z.literal('csv'),
   mimeType: z.literal('application/x-directory'),
   bytes: z.number().int().nonnegative().nullable(),
-  sha256: z.string().nullable(),
-  sourceLockHash: z.string().nullable(),
   metadata: z.record(z.string(), z.unknown()),
   sourceAvailability:z.enum(['available','deleted']).optional(),
   deletedBatchIds:z.array(PositiveIdSchema).optional(),
@@ -111,23 +105,20 @@ export const DataRowsSchema = z.discriminatedUnion('kind', [
   && item.kind === (page.kind === 'devices' ? 'device' : 'change')), 'Selections must align with data rows');
 
 export const SnapshotMetadataSchema = z.object({
-  contract: z.literal('medclaw.snapshot/v1'),
+  contract: z.enum(['medclaw.snapshot/v1', 'medclaw.snapshot/v2']),
   mappingVersion: z.literal('medclaw.snapshot/v1'),
   materialVersion: z.string().min(1),
   generatorVersion: z.string().min(1),
   seed: z.number().int(),
   sourceBundleId: z.string().min(1),
-  sourceLockHash: z.string().regex(/^[a-f0-9]{64}$/),
   scopeKey: z.string().min(1),
   region: z.string().min(1),
-  cohortHash: z.string().regex(/^[a-f0-9]{64}$/),
   snapshotDate: BusinessDateSchema,
   coverage: z.literal('full'),
   expectedEntityCount: z.number().int().positive(),
   observedEntityCount: z.number().int().nonnegative(),
   declaredMissingEntityIds: z.array(z.string().min(1)),
   missingReason: z.string().min(1).optional(),
-  fileSha256: z.string().regex(/^[a-f0-9]{64}$/),
   referenceDate: BusinessDateSchema,
   timezone: z.string().min(1),
 }).passthrough();
@@ -153,11 +144,9 @@ export const ImportRowSchema = z.strictObject({
 export type ImportRow = z.infer<typeof ImportRowSchema>;
 export type CheckedPackage = {
   root: string;
-  files: { path: string; bytes: number; sha256: string }[];
+  files: { path: string; bytes: number }[];
   masters: Record<string, string>[];
-  days: { file: string; metadata: SnapshotMetadata; contentHash: string }[];
-  sourceHash: string;
-  metadataHash: string;
+  days: { file: string; metadata: SnapshotMetadata }[];
   fileCount: number;
   totalBytes: number;
   rowCount: number;
@@ -176,7 +165,7 @@ export interface ImportStore {
   begin(request: ImportPreviewRequest, instanceId: string): ImportRecord;
   update(operationRef: string, patch: { state: ImportOperation['state']; preview?: ImportPreview; error?: ImportOperation['error']; result?: ImportResult; commitRequest?: ImportCommitRequest }): ImportOperation;
   revision(): number;
-  classify(pkg: CheckedPackage): { newBatchCount: number; duplicateBatchCount: number };
+  classify(pkg: CheckedPackage, rows: (file: string, metadata: SnapshotMetadata) => Iterable<ImportRow>): { newBatchCount: number; duplicateBatchCount: number };
   verifyCommitted(operationRef: string): void;
   commit(operationRef: string, pkg: CheckedPackage, preview: ImportPreview, rows: (file: string, metadata: SnapshotMetadata) => Iterable<ImportRow>, diff: (oldRows: Snapshot[], newRows: Snapshot[], oldBatchId: number, newBatchId: number) => DiffEvent[]): ImportOperation;
 }

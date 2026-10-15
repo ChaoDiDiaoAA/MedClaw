@@ -28,7 +28,7 @@ test('p14 renderer rejects late Run, Host and same-owner intent reads without in
   let app:Awaited<ReturnType<typeof electron.launch>>|undefined;
   type Fixture=typeof window&{renderIntent:(runId:number,sessionId:number,instanceId:string,refreshToken:string)=>void;intentPending:{method:string;payload:{runId:number};resolve:(value:{ok:true;data:IntentReadResult|null})=>void}[]};
   const facts=(runId:number,sessionId:number,reasonCode:string)=>IntentReadResultSchema.parse({contract:'medclaw.intent-read/v2',runId,sessionId,inputId:runId,
-    ruleEvaluation:{ruleVersion:INTENT_VERSIONS.ruleVersion,ruleId:null,inputHash:'a'.repeat(64),outcome:'miss',reasonCode,checkedAt:'2026-10-10T00:00:00.000Z'},calls:[],decision:null,
+    ruleEvaluation:{ruleVersion:INTENT_VERSIONS.ruleVersion,ruleId:null,outcome:'miss',reasonCode,checkedAt:'2026-10-10T00:00:00.000Z'},calls:[],decision:null,
     execution:{runStatus:'running',queryIds:[],stepResults:[],answerId:null,finalHistorySaved:false,requiredPersistenceComplete:null},effectiveContext:null});
   try{
     app=await electron.launch({executablePath:require('electron'),args:[main],env});const page=await app.firstWindow(),panel=page.getByRole('region',{name:'Intent recognition',exact:true});
@@ -87,7 +87,7 @@ test('p14 actual Models verifies and independently publishes the stock local int
     const panel=page.getByRole('region',{name:'Intent model',exact:true});await expect(panel).toBeVisible();
     await panel.getByLabel('Ollama URL',{exact:true}).fill(`http://127.0.0.1:${(server.address() as {port:number}).port}`);
     await panel.getByRole('button',{name:'Verify local model',exact:true}).click();
-    await expect(panel.getByText('sha256:'+digest,{exact:true}).first()).toBeVisible();
+    await expect(panel.getByText('Observed model:',{exact:false})).toContainText('qwen3.5:0.8b');
     await panel.getByLabel('Verification record',{exact:true}).fill('ENGINEERING controlled local protocol reference; not model quality evidence');
     await panel.getByLabel('Enable intent routing',{exact:true}).check();
     await panel.getByRole('button',{name:'Apply configuration',exact:true}).click();
@@ -95,23 +95,24 @@ test('p14 actual Models verifies and independently publishes the stock local int
     const saved=await page.evaluate(()=>window.medclaw.request('model.config.read',{}));expect(saved.ok).toBe(true);
     if(!saved.ok||!before.ok)throw new Error('ENGINEERING config unavailable');
     const after=await page.evaluate(()=>window.medclaw.request('model.read',{}));expect(after.ok).toBe(true);if(!after.ok)throw new Error('ENGINEERING model directory unavailable');
-    expect(after.data.selection).toEqual(before.data.selection);expect(saved.data.intentModel).toMatchObject({modelTag:'qwen3.5:0.8b',modelDigest:'sha256:'+digest,timeoutMs:15000});
+    expect(after.data.selection).toEqual(before.data.selection);expect(saved.data.intentModel).toMatchObject({modelTag:'qwen3.5:0.8b',timeoutMs:15000});
     const artifacts=join('.build','p14-desktop-artifacts');mkdirSync(artifacts,{recursive:true});await panel.screenshot({path:join(artifacts,'intent-model.png')});
     await page.setViewportSize({width:760,height:900});
     expect(await panel.evaluate(element=>element.scrollWidth>element.clientWidth)).toBe(false);
     await panel.screenshot({path:join(artifacts,'intent-model-narrow.png')});
     digest='b'.repeat(64);await panel.getByLabel('Intent timeout (ms)',{exact:true}).fill('16000');
-    await panel.getByRole('button',{name:'Apply configuration',exact:true}).click();await expect(panel.getByRole('alert')).toContainText('no longer matches the verified model identity');
-    const rejected=await page.evaluate(()=>window.medclaw.request('model.config.read',{}));expect(rejected).toEqual(saved);
+    await panel.getByRole('button',{name:'Apply configuration',exact:true}).click();
+    await expect.poll(async()=>{const result=await page.evaluate(()=>window.medclaw.request('model.config.read',{}));return result.ok?result.data.intentModel?.timeoutMs:null;}).toBe(16000);
+    await expect(panel.getByRole('alert')).toHaveCount(0);
     offline=true;await panel.getByLabel('Enable intent routing',{exact:true}).uncheck();await panel.getByRole('button',{name:'Apply configuration',exact:true}).click();
     await expect.poll(async()=>{const result=await page.evaluate(()=>window.medclaw.request('model.config.read',{}));return result.ok&&result.data.intentModel?.enabled;}).toBe(false);
     offline=false;digest='a'.repeat(64);await panel.getByRole('button',{name:'Verify local model',exact:true}).click();
-    await expect(panel.getByText('Actual identity:',{exact:false})).toBeVisible();
+    await expect(panel.getByText('Observed model:',{exact:false})).toBeVisible();
     const restarted=await page.evaluate(async()=>{
       const host=await window.medclaw.request('host.read',{});if(!host.ok||!host.data.instanceId)throw new Error('ENGINEERING Host unavailable');
       return window.medclaw.request('host.restart',{expectedInstanceId:host.data.instanceId});
     });expect(restarted).toMatchObject({ok:true,data:{state:'ready'}});
-    await expect(panel.getByText('Actual identity:',{exact:false})).toHaveCount(0);
+    await expect(panel.getByText('Observed model:',{exact:false})).toHaveCount(0);
     const runs=await page.evaluate(()=>window.medclaw.request('run.read',{recent:true}));expect(runs).toMatchObject({ok:true,data:{kind:'recent',runs:[]}});
     expect(paths).not.toContain('/api/chat');expect(paths).not.toContain('/api/generate');
   }finally{
@@ -130,7 +131,10 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
     ipcMain.handle=(channel,listener)=>handle(channel,async(event,envelope)=>{
       const result=await listener(event,envelope);if(channel!=='medclaw:request')return result;const input=envelope.payload,c=control();
       if(envelope.method==='run.read'&&input.runId===c.sourceId&&input.inputLimit===65536){
-        pages.push(input.inputOffset);fs.writeFileSync(${JSON.stringify(replayPages)},JSON.stringify(pages));
+        const part=result.ok&&result.data?.kind==='one'?result.data.run?.inputPage:null;
+        pages.push({at:new Date().toISOString(),offset:input.inputOffset,ok:result.ok,errorCode:result.ok?null:result.error?.code,
+          inputPage:part?{offset:part.offset,totalChars:part.totalChars,nextOffset:part.nextOffset,textLength:part.text.length}:null});
+        fs.writeFileSync(${JSON.stringify(replayPages)},JSON.stringify(pages));
         if(c.hold)await new Promise(resolve=>{const timer=setInterval(()=>{if(!control().hold){clearInterval(timer);resolve();}},5);timer.unref();});
       }
       if(!lost&&envelope.method==='session.submit'&&input.text===c.loseSubmitText&&result.ok){lost=true;throw new Error('ENGINEERING lost acceptance reply');}
@@ -177,7 +181,7 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
     const routing=page.getByLabel('Message routing',{exact:true});await expect(routing).toHaveValue('main_agent');
     const enabled=await page.evaluate(async({url,model})=>{
       const config=await window.medclaw.request('model.config.read',{});if(!config.ok)throw new Error(config.error.code);
-      return window.medclaw.request('model.intent.configure',{expectedConfigVersion:config.data.configVersion,intentModel:{...model,enabled:true,baseUrl:url,modelDigest:'sha256:'+'a'.repeat(64),verifiedEvidenceRef:'ENGINEERING controlled protocol reference'}});
+      return window.medclaw.request('model.intent.configure',{expectedConfigVersion:config.data.configVersion,intentModel:{...model,enabled:true,baseUrl:url,verifiedEvidenceRef:'ENGINEERING controlled protocol reference'}});
     },{url,model:DEFAULT_INTENT_MODEL});expect(enabled.ok).toBe(true);
     await page.getByRole('button',{name:'Models',exact:true}).click();await page.getByRole('button',{name:'Reload published directory',exact:true}).click();
     await expect(page.getByLabel('Enable intent routing',{exact:true})).toBeChecked();await page.getByRole('button',{name:'Chat',exact:true}).click();
@@ -285,21 +289,30 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
     expect(preview).toMatchObject({ok:true,data:{textInfo:{truncated:true,totalChars:longTask.length}}});
     await page.getByRole('button',{name:'View run details',exact:true}).click();await page.getByRole('tab',{name:'Conditions',exact:true}).click();
     await expect(intentPanel.getByRole('button',{name:'Retry recognition',exact:true})).toBeEnabled();
-    writeFileSync(replayControl,JSON.stringify({sourceId:longSource.id,hold:true,loseSubmitText:null}));
-    await intentPanel.getByRole('button',{name:'Retry recognition',exact:true}).click();
-    await expect.poll(()=>JSON.parse(readFileSync(replayPages,'utf8')).length).toBeGreaterThanOrEqual(1);
-    await message.fill('A draft edited while the original task is being read.');
-    writeFileSync(replayControl,JSON.stringify({sourceId:longSource.id,hold:false,loseSubmitText:null}));
-    await expect(intentPanel.getByRole('button',{name:'Retry recognition',exact:true})).toBeEnabled();await expect(send).toBeDisabled();
-    await expect(page.getByRole('button',{name:'Read original submission',exact:true})).toBeVisible();expect((await recent())!.id).toBe(longSource.id);
-    await expect(message).toHaveValue('A draft edited while the original task is being read.');
-    await message.fill('');
-    await intentPanel.getByRole('button',{name:'Retry recognition',exact:true}).click();
-    await expect.poll(async()=>{const run=await recent();return run&&run.id!==longSource.id&&run.status==='failed';},{timeout:30000}).toBe(true);
-    const longRetry=(await recent())!;
-    const observedPages:number[]=JSON.parse(readFileSync(replayPages,'utf8'));
-    expect(observedPages).toContain(0);expect(observedPages.filter(offset=>offset===65536)).toEqual([65536]);
-    expect(observedPages.every(offset=>offset===0||offset===65536)).toBe(true);
+    await test.step('Original task first page: editing the draft cancels the reread',async()=>{
+      writeFileSync(replayControl,JSON.stringify({sourceId:longSource.id,hold:true,loseSubmitText:null}));
+      try{
+        await intentPanel.getByRole('button',{name:'Retry recognition',exact:true}).click();
+        await expect.poll(()=>JSON.parse(readFileSync(replayPages,'utf8')).length).toBeGreaterThanOrEqual(1);
+        await message.fill('A draft edited while the original task is being read.');
+      }finally{writeFileSync(replayControl,JSON.stringify({sourceId:longSource.id,hold:false,loseSubmitText:null}));}
+      await expect(intentPanel.getByRole('button',{name:'Retry recognition',exact:true})).toBeEnabled();await expect(send).toBeDisabled();
+      await expect(page.getByRole('button',{name:'Read original submission',exact:true})).toBeVisible();expect((await recent())!.id).toBe(longSource.id);
+      await expect(message).toHaveValue('A draft edited while the original task is being read.');
+    });
+    await test.step('Original task pagination: the retry reads the final page',async()=>{
+      await message.fill('');
+      await intentPanel.getByRole('button',{name:'Retry recognition',exact:true}).click();
+      const offsets=()=>JSON.parse(readFileSync(replayPages,'utf8')).map((item:{offset:number})=>item.offset) as number[];
+      await expect.poll(offsets,{timeout:30000}).toContain(65536);
+      const observedPages=offsets();
+      expect(observedPages).toContain(0);expect(observedPages.filter(offset=>offset===65536)).toEqual([65536]);
+      expect(observedPages.every(offset=>offset===0||offset===65536)).toBe(true);
+    });
+    const longRetry=await test.step('Original task retry: a new attempt is saved',async()=>{
+      await expect.poll(async()=>{const run=await recent();return run&&run.id!==longSource.id&&run.status==='failed';},{timeout:30000}).toBe(true);
+      return (await recent())!;
+    });
     const tail=await page.evaluate(runId=>window.medclaw.request('run.read',{runId,inputOffset:65536,inputLimit:65536}),longRetry.id);
     expect(tail).toMatchObject({ok:true,data:{kind:'one',run:{inputPage:{text:longTask.slice(65536),totalChars:longTask.length,nextOffset:null}}}});
     expect(intentRequests).toHaveLength(beforeIntent);expect(mainRequests).toHaveLength(1);

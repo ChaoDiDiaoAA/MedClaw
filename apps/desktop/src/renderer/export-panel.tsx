@@ -80,7 +80,7 @@ export function ExportPanel(props: { visible: boolean; host: HostView; query: Pu
       if (!owns(key)) return;
       if (!chosen.ok) { setError(errorMessage(chosen.error)); return; }
       if (!chosen.data) return;
-      await send({ request: { ...source, ...(prior ? { priorOperationRef: prior.operationRef } : {}), destinationToken: chosen.data.destinationToken, destinationIdentity: chosen.data.destinationIdentity }, instanceId: props.host.instanceId, confirmedAbsent: false });
+      await send({ request: { ...source, ...(prior ? { priorOperationRef: prior.operationRef } : {}), destinationToken: chosen.data.destinationToken }, instanceId: props.host.instanceId, confirmedAbsent: false });
     } catch { if (owns(key)) setError('The export destination could not be selected.'); }
     finally { work.current = false; if (owns(key)) { restoreFocus.current=true;setBusy(false); } }
   }
@@ -120,7 +120,7 @@ export function ExportPanel(props: { visible: boolean; host: HostView; query: Pu
     <button disabled={busy || props.host.state !== 'ready'} onClick={() => void refresh()}>Refresh exports</button>
     {operations?.items.map(operation => <article key={operation.operationRef}><p><strong>{exportDeliveryLabel(operation)}</strong> · {operation.format} · {operation.state} · Copy {operation.copyState}</p>
       <p className="tiny">Operation <code>{operation.operationRef}</code>{operation.priorOperationRef && <> · Prior <code>{operation.priorOperationRef}</code></>}</p>
-      {operation.artifact && <p>Artifact {operation.artifact.id} registered · <code>{operation.artifact.sha256}</code></p>}
+      {operation.artifact && <p>Artifact {operation.artifact.id} registered</p>}
       {operation.error && <p role="status">{errorMessage(operation.error)}</p>}
       <div className="actions"><button disabled={busy || props.host.state !== 'ready'} onClick={() => void action('export.read', operation)}>Read export result</button>
         {!terminal(operation.state) ? <button disabled={busy || props.host.state !== 'ready'} onClick={() => void action('export.cancel', operation)}>Cancel export</button> : <>

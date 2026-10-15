@@ -1,5 +1,4 @@
 import type { Database } from 'bun:sqlite';
-import { createHash } from 'node:crypto';
 import { Repositories } from '../../packages/storage/src/repositories';
 import { SqliteCatalogStore } from '../../packages/storage/src/catalog-store';
 import { SqliteToolStore } from '../../packages/storage/src/tool-store';
@@ -15,14 +14,15 @@ export function seedWorkspaceQueries(db: Database, repositories?:Repositories, o
   deviceCount?: number; deviceName?: (id: number) => string; priceCents?: (id: number) => number | null;
 } = {}) {
   const repos = repositories??new Repositories(db);
+  const legacy=!!db.query("SELECT name FROM pragma_table_info('queries') WHERE name='params_hash'").get();
   const deviceCount = options.deviceCount ?? 3;
   if(repos.readWorkspace().sessionId===null)repos.createSession({ expectedWorkspaceRevision: 0 }, 'create-a', 'native-a', at);
-  db.query(`INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_hash,preview_request_json,created_at,updated_at)
-    VALUES(1,'import','host','imported','hash','{}',?,?)`).run(at, at);
-  db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,
+  db.query(`INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_json,created_at,updated_at${legacy?',preview_request_hash':''})
+    VALUES(1,'import','host','imported','{}',?,?${legacy?",'hash'":''})`).run(at, at);
+  db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,coverage${legacy?',source_lock_hash,content_hash,cohort_hash':''},
     expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at)
-    VALUES(1,1,'scope','2026-10-04','浙江','material/v1','bundle','lock',?,'full','cohort',?,?,'[]',?,1,NULL,1,?)`)
-    .run('a'.repeat(64), deviceCount, deviceCount, JSON.stringify({ expectedEntityCount: deviceCount, observedEntityCount: deviceCount, declaredMissingEntityIds: [] }), at);
+    VALUES(1,1,'scope','2026-10-04','浙江','material/v1','bundle','full'${legacy?",'lock','legacy-content','cohort'":''},?,?,'[]',?,1,NULL,1,?)`)
+    .run(deviceCount, deviceCount, JSON.stringify({ expectedEntityCount: deviceCount, observedEntityCount: deviceCount, declaredMissingEntityIds: [] }), at);
   for (let id = 1; id <= deviceCount; id++) {
     db.query(`INSERT INTO devices(id,source_device_id,source_bundle_id,source_submission_id,source_refs_json,created_at)
       VALUES(?,?,'bundle','submission','[]',?)`).run(id, `device-${id}`, at);
@@ -36,6 +36,16 @@ export function seedWorkspaceQueries(db: Database, repositories?:Repositories, o
   db.query(`INSERT INTO runs(id,session_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at)
     VALUES(10,1,'agent','host','query-submit',1,'{"sessionId":1,"clientSequence":1}','running','answer','query','{"agent":{"nativeSessionId":"native-a"}}',?,'{}','2026-10-04','Asia/Shanghai',?)`).run(JSON.stringify(scope), at);
   const store = new SqliteToolStore(db), queries = new QueryService(new CatalogService(new SqliteCatalogStore(db)), store);
+  if(legacy)store.commitQuery=(input,evidence)=>{
+    // Migration fixtures retain old columns with historical literals; current databases use the real store path.
+    const {sessionId,runId,callRef,kind,params,batchIds,createdAt,inputId:_inputId,...result}=input;
+    const inserted=db.query(`INSERT INTO queries(session_id,run_id,call_ref,kind,params_hash,params_json,batch_ids_json,result_json,result_hash,created_at)
+      VALUES(?,?,?,?,'legacy',?,?,?,'legacy',?)`).run(sessionId,runId,callRef,kind,canonicalRequest(params),JSON.stringify(batchIds),canonicalRequest(result),createdAt);
+    const queryId=Number(inserted.lastInsertRowid);
+    for(const item of evidence)db.query(`INSERT INTO query_evidence(query_id,batch_ids_json,snapshot_ids_json,event_ids_json,source_row_refs_json,calculation_version,material_version,source_bundle_id,filters_json,provenance,source_lock_hash,result_hash)
+      VALUES(?,?,?,?,?,?,?,?,?,?,'lock','legacy')`).run(queryId,JSON.stringify(item.batchIds),JSON.stringify(item.snapshotIds),JSON.stringify(item.eventIds),JSON.stringify(item.sourceRowRefs),item.calculationVersion,item.materialVersion,item.sourceBundleId,canonicalRequest(item.filters??params),item.provenance??'synthetic-derived');
+    return store.readQuery(queryId)!;
+  };
   const context = { sessionId: 1, runId: 10, inputId: null, source: 'agent_tool' as const, callRef: 'saved-current', scope,
     referenceDate: '2026-10-04', timezone: 'Asia/Shanghai', signal: new AbortController().signal };
   const params = CurrentQuerySchema.parse({ batchIds: [1], time: { start: '2026-10-04', endExclusive: '2026-10-05' } });
@@ -48,9 +58,8 @@ export function seedWorkspaceQueries(db: Database, repositories?:Repositories, o
   // the real store; do not fabricate Host output or recompute the saved result on read.
   const aggregateParams = QueryParamsSchema.parse({ kind: 'aggregate', population: 'snapshot', snapshotMode: 'exact_date', batchIds: [1], metric: 'count', groupBy: 'region' });
   const rows = [{ value: 4, region: '浙江' }, { region: '浙江', value: 4 }, { value: 7, region: '浙江' }];
-  const resultHash = createHash('sha256').update(canonicalRequest({ kind: 'aggregate', params: aggregateParams, batchIds: [1], scopeDeviceIds: null, rows, calculationVersion: 'legacy/v1' })).digest('hex');
   const duplicate = store.commitQuery({ sessionId: 1, runId: 10, inputId: null, callRef: 'legacy-duplicates', kind: 'aggregate', params: aggregateParams,
-    batchIds: [1], scopeDeviceIds: null, rows, snapshotIds: [], eventIds: [], warnings: [], calculationVersion: 'legacy/v1', resultHash, createdAt: at }, [],
+    batchIds: [1], scopeDeviceIds: null, rows, snapshotIds: [], eventIds: [], warnings: [], calculationVersion: 'legacy/v1', createdAt: at }, [],
     { ...context, callRef: 'legacy-duplicates' });
   db.query("UPDATE runs SET status='completed',ended_at=? WHERE id=10").run(at);
   return { repos, store, queries, context, current, secondQueryId: secondPage.queryId, evidenceId: currentPage.evidenceIds[0]!, secondEvidenceId: secondPage.evidenceIds[0]!, duplicate };

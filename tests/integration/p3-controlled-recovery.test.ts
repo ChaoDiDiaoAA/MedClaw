@@ -82,13 +82,13 @@ async function setup(steps: Step[], originalHooks?: (session: AgentSession) => v
       '{"agent":{"nativeSessionId":"native"}}',?,'{}','2026-01-01','Asia/Shanghai',?)`).run(JSON.stringify(scope), createdAt);
   db.query('UPDATE runs SET config_json=? WHERE id=1').run(JSON.stringify({ agent: { nativeSessionId: 'native' },
     agentPolicy: policy, measurementContext }));
-  db.query(`INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_hash,preview_request_json,created_at,updated_at)
-    VALUES(1,'import','fixture','imported','hash','{}',?,?)`).run(createdAt, createdAt);
+  db.query(`INSERT INTO imports(id,operation_ref,instance_id,state,preview_request_json,created_at,updated_at)
+    VALUES(1,'import','fixture','imported','{}',?,?)`).run(createdAt, createdAt);
   db.query('UPDATE catalog_state SET revision=1,updated_at=?').run(createdAt);
-  db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,source_lock_hash,content_hash,coverage,cohort_hash,
+  db.query(`INSERT INTO batches(id,import_id,scope_key,snapshot_date,region,material_version,source_bundle_id,coverage,
     expected_entity_count,observed_entity_count,declared_missing_json,metadata_json,is_baseline,previous_batch_id,catalog_revision,created_at)
-    VALUES(1,1,'scope','2026-01-01','浙江','fixture/v1','bundle','lock','content','full','cohort',1,1,'[]','{}',1,NULL,1,?)`).run(createdAt);
-  const sources = JSON.stringify([{ sourceId: 'fixture', file: 'saved-source.csv', recordId: 'device-1', row: 1, sha256: 'a'.repeat(64) }]);
+    VALUES(1,1,'scope','2026-01-01','浙江','fixture/v1','bundle','full',1,1,'[]','{}',1,NULL,1,?)`).run(createdAt);
+  const sources = JSON.stringify([{ sourceId: 'fixture', file: 'saved-source.csv', recordId: 'device-1', row: 1 }]);
   db.query(`INSERT INTO devices(id,source_device_id,source_bundle_id,source_submission_id,source_refs_json,created_at)
     VALUES(1,'device-1','bundle','submission',?,?)`).run(sources, createdAt);
   db.query(`INSERT INTO snapshots(id,batch_id,device_id,device_name,category,region,price_cents,currency,unit,status,manufacturer,distributor,
@@ -224,8 +224,8 @@ for (const afterFailure of ['throw', 'malformed result']) test(`committed Query 
   expect(read.sdkDelivery?.isError).toBe(false);
   const savedEvidence = fixture.evidence.readQuery(queryId(fixture), fixture.getContext('query-read'));
   expect(savedEvidence).toHaveLength(1);
-  expect(fixture.evidence.read(savedEvidence[0]!.id, fixture.getContext('query-read')).resultHash)
-    .toBe(fixture.queries.read(queryId(fixture), fixture.getContext('query-read')).resultHash);
+  expect(fixture.evidence.read(savedEvidence[0]!.id, fixture.getContext('query-read')).queryId)
+    .toBe(fixture.queries.read(queryId(fixture), fixture.getContext('query-read')).id);
   expect(fixture.control.readBudget().recovery.episodeId).toBeNull();
 });
 

@@ -4,18 +4,16 @@ import type {Api,Model,Message} from '@earendil-works/pi-ai';
 import {CONTEXT_HTTP_APIS} from '../../packages/contracts/src/context';
 import {matchProviderResources,type ExpectedResource} from '../../packages/runtime-pi/src/messages';
 import {zstdDecompressSync} from 'node:zlib';
-import {createHash} from 'node:crypto';
 
 // Real SDK wire/HTTP evidence; empty SSE/AWS streams deliberately make no quality or inference-completion claim.
 for (const api of CONTEXT_HTTP_APIS) for (const mode of ['success','missing_input','missing_index','missing_read','http_rejection','cancel'] as const)
 test(`p11 real ${api} resource proof ${mode}`,async()=>{
   const index = '  <skill>\n    <name>query</name>\n    <description>ENGINEERING</description>\n    <location>/fixture/SKILL.md</location>\n  </skill>', input = 'ENGINEERING identical expanded input', read = 'ENGINEERING reference body\n';
-  const hash = (s:string)=>createHash('sha256').update(s).digest('hex');
-  const ref = {kind:'skill' as const,id:'query',version:'v1',treeHash:hash('fixture')};
+  const ref = {kind:'skill' as const,id:'query',version:'v1'};
   const expected:ExpectedResource[] = [
-    ...[0,1].map(i=>({text:input,userIndex:i,fact:{resourceRef:ref,originRunId:i+1,file:'SKILL.md',inputId:i+1,nativeEntryId:`entry-${i}`,toolCallId:null,contentHash:hash(input),coverage:'complete' as const,kind:'skill_expansion' as const}})),
-    {text:read,toolIndex:0,fact:{resourceRef:ref,originRunId:1,file:'references/example.md',inputId:null,nativeEntryId:'tool-entry',toolCallId:1,contentHash:hash(read),coverage:'complete',kind:'native_read'}},
-    {text:index,fact:{resourceRef:ref,originRunId:2,file:null,inputId:null,nativeEntryId:null,toolCallId:null,contentHash:hash(index),coverage:'index',kind:'skill_index'}}];
+    ...[0,1].map(i=>({text:input,userIndex:i,fact:{resourceRef:ref,originRunId:i+1,file:'SKILL.md',inputId:i+1,nativeEntryId:`entry-${i}`,toolCallId:null,coverage:'complete' as const,kind:'skill_expansion' as const}})),
+    {text:read,toolIndex:0,fact:{resourceRef:ref,originRunId:1,file:'references/example.md',inputId:null,nativeEntryId:'tool-entry',toolCallId:1,coverage:'complete',kind:'native_read'}},
+    {text:index,fact:{resourceRef:ref,originRunId:2,file:null,inputId:null,nativeEntryId:null,toolCallId:null,coverage:'index',kind:'skill_index'}}];
   const model:Model<Api> = {id:'fixture',name:'Fixture',api,provider:'p11-local-fixture',baseUrl:'',reasoning:false,input:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:32768,maxTokens:1024};
   const received:unknown[] = [], order:string[] = [], delivered:unknown[] = [], controller = new AbortController();
   const server = Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){const bytes = Buffer.from(await request.arrayBuffer());
@@ -43,7 +41,7 @@ test(`p11 real ${api} resource proof ${mode}`,async()=>{
 },10000);
 
 test('p11 resource wire matching rejects nested decoys, swapped Tool IDs, repeated results and unsupported APIs',()=>{
-  const ref={kind:'skill' as const,id:'query',version:'v1',treeHash:'a'.repeat(64)}, expected:ExpectedResource[]=[{text:'read body',toolIndex:0,fact:{resourceRef:ref,originRunId:1,file:'SKILL.md',inputId:null,nativeEntryId:'entry',toolCallId:1,contentHash:'b'.repeat(64),coverage:'complete',kind:'native_read'}}];
+  const ref={kind:'skill' as const,id:'query',version:'v1'}, expected:ExpectedResource[]=[{text:'read body',toolIndex:0,fact:{resourceRef:ref,originRunId:1,file:'SKILL.md',inputId:null,nativeEntryId:'entry',toolCallId:1,coverage:'complete',kind:'native_read'}}];
   const call={role:'assistant',tool_calls:[{id:'original',function:{name:'read'}}]}, result={role:'tool',tool_call_id:'original',content:'read body'};
   for(const payload of [{messages:[call,{...result,content:'wrong'}],decoy:'read body'},{messages:[call,{...result,tool_call_id:'other'}]},{messages:[call,result,result]}])
     expect(()=>matchProviderResources(payload,'openai-completions',expected)).toThrow();

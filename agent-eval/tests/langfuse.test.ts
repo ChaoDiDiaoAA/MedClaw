@@ -6,7 +6,6 @@ import { mapReport, assertSafeExport } from '../src/langfuse/map.ts';
 import { exportReport,platformConfig } from '../src/langfuse/export.ts';
 import { reportFixture,saveReportFixture } from './report-fixture.ts';
 import { writeReport } from '../src/reports/write.ts';
-import { hashValue } from '../src/adapters/product-checksums.ts';
 import { aggregate } from '../src/scoring/aggregate.ts';
 import { evaluate } from '../src/scoring/evaluate.ts';
 import type { JudgeResult, CheckSpec } from '../src/scoring/types.ts';

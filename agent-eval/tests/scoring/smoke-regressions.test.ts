@@ -112,7 +112,7 @@ test('parent query scoring accepts only its verified, delivered child query',asy
   facts.providerRequests=[{...original('request',[request]),selector:{kind:'request',runId:1,sessionId:1,callId:'after'}}];
   const params=QueryParamsSchema.parse({kind:'aggregate',population:'snapshot',snapshotMode:'exact_date',metric:'count',batchIds:[1],region:'浙江',time:{start:'2026-10-02',endExclusive:'2026-10-03'}});
   const query={id:11,runId:2,sessionId:2,kind:'aggregate',params,batchIds:[1],scopeDeviceIds:null,callRef:'2:count',warnings:[],calculationVersion:'v1',createdAt:'2026-10-14T00:00:00.000Z',totalRows:1};
-  facts.queryPages=[{query,page:{queryId:11,rows:[{value:6}],totalRows:1,page:1,pageSize:10,warnings:[],calculationVersion:'v1',evidenceIds:[],rowKeys:[null]},evidence:[]}];
+  facts.queryPages=[{query,page:{queryId:11,rows:[{value:6}],totalRows:1,page:1,pageSize:10,warnings:[],calculationVersion:'v1',evidenceIds:[],targetVersion:'query:11:v1',rowKeys:['row:11:0']},evidence:[]}];
   expect((await projectObservation(c.task.checks[0]!,c))?.actual).toEqual([{key:'all',count:6}]);
   facts.providerRequests=[];
   expect((await projectObservation(c.task.checks[0]!,c))?.actual).toBeUndefined();

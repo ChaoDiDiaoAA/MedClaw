@@ -19,10 +19,10 @@ test('p8 real Host reads original Context across navigation without requests or 
   new MainSettings(host.paths.settingsPath).read();
   const db = openDatabase(host.paths.databasePath), f = acceptContextInput(db), contexts = new SqliteContextStore(db), snapshot = contexts.save(contexts.select(f.input));
   f.repos.startCall(f.input.runId,'host-call','main',contextAt,{snapshotId:snapshot.id,inputId:f.input.inputId});
-  contexts.recordDelivery({runId:f.input.runId,sessionId:f.input.sessionId,inputId:f.input.inputId,callId:'host-call',snapshotId:snapshot.id,observation:{contract:'medclaw.context-observation/v1',api:'openai-completions',transport:'sse',httpStatus:200,observedAt:contextAt,projectionHash:snapshot.projectionHash,feedbackHash:snapshot.feedbackHash,verifiedNativeRefs:[]}}); db.close();
+  contexts.recordDelivery({runId:f.input.runId,sessionId:f.input.sessionId,inputId:f.input.inputId,callId:'host-call',snapshotId:snapshot.id,observation:{contract:'medclaw.context-observation/v1',api:'openai-completions',transport:'sse',httpStatus:200,observedAt:contextAt,verifiedNativeRefs:[]}}); db.close();
   const sql = (query:string) => {const read = new Database(host.paths.databasePath,{readonly:true});try{return read.query(query).all();}finally{read.close();}};
   try {
-    expect(await host.start()).toMatchObject({state:'ready',schemaVersion:15});
+    expect(await host.start()).toMatchObject({state:'ready',schemaVersion:16});
     const workspace = unwrap(await host.request('workspace.read',{})) as {revision:number};
     unwrap(await host.request('session.create',{expectedWorkspaceRevision:workspace.revision},'browse-other'));
     const before = {runs:sql('SELECT * FROM runs'),calls:sql('SELECT * FROM model_calls'),snapshots:sql('SELECT * FROM context_snapshots'),deliveries:sql('SELECT * FROM context_deliveries'),events:sql('SELECT * FROM runtime_events')};
@@ -42,7 +42,7 @@ for(const saved of [false,true]) test(`p8 abrupt real Host restart preserves ori
   const db=openDatabase(host.paths.databasePath),f=acceptContextInput(db),contexts=new SqliteContextStore(db),snapshot=contexts.save(contexts.select(f.input));
   f.repos.startCall(f.input.runId,'restart-host-call','main',contextAt,{snapshotId:snapshot.id,inputId:f.input.inputId});
   // Seed exact persisted restart states. Network observation itself is proved by the Runtime/desktop receiver tests.
-  if(saved)contexts.recordDelivery({runId:f.input.runId,sessionId:f.input.sessionId,inputId:f.input.inputId,callId:'restart-host-call',snapshotId:snapshot.id,observation:{contract:'medclaw.context-observation/v1',api:'openai-completions',transport:'sse',httpStatus:200,observedAt:contextAt,projectionHash:snapshot.projectionHash,feedbackHash:snapshot.feedbackHash,verifiedNativeRefs:[]}});
+  if(saved)contexts.recordDelivery({runId:f.input.runId,sessionId:f.input.sessionId,inputId:f.input.inputId,callId:'restart-host-call',snapshotId:snapshot.id,observation:{contract:'medclaw.context-observation/v1',api:'openai-completions',transport:'sse',httpStatus:200,observedAt:contextAt,verifiedNativeRefs:[]}});
   const factsBefore=db.query('SELECT * FROM model_calls').all();db.close();
   try{
     expect(await host.start()).toMatchObject({state:'ready'});

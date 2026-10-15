@@ -148,12 +148,12 @@ export type CatalogFilters = {
   direction?: z.infer<typeof ChangesQuerySchema>['direction'] | null;
   threshold?: z.infer<typeof ChangesQuerySchema>['threshold'] | null;
 };
-export const SourceRefSchema = z.strictObject({ sourceId: z.string(), file: z.string(), recordId: z.string(), row: PositiveIdSchema, sha256: z.string() });
+export const SourceRefSchema = z.strictObject({ sourceId: z.string(), file: z.string(), recordId: z.string(), row: PositiveIdSchema });
 export const FieldOriginSchema = z.strictObject({ kind: z.enum(["public", "synthetic", "synthetic-derived"]), ruleId: z.string().min(1), lastAdjustmentDate: BusinessDateSchema.optional() });
 export const FieldOriginsSchema = z.record(z.string(), FieldOriginSchema);
 export const BatchSchema = z.strictObject({ id: PositiveIdSchema, scopeKey: z.string(), snapshotDate: BusinessDateSchema,
   region: z.string(), coverage: z.literal("full"), previousBatchId: PositiveIdSchema.nullable(), materialVersion: z.string(),
-  sourceBundleId: z.string(), sourceLockHash: z.string(), contentHash: z.string(), cohortHash: z.string(), catalogRevision: z.number().int().nonnegative(),
+  sourceBundleId: z.string(), catalogRevision: z.number().int().nonnegative(),
   expectedEntityCount: z.number().int().nonnegative(), observedEntityCount: z.number().int().nonnegative(),
   declaredMissingDeviceIds: z.array(PositiveIdSchema).default([]) });
 export const DeviceSchema = z.strictObject({ id: PositiveIdSchema, sourceDeviceId: z.string(), sourceBundleId: z.string(),
@@ -200,7 +200,7 @@ export const QueryRecordSchema = z.strictObject({ id: PositiveIdSchema, sessionI
   interpretation: QueryInterpretationSchema.optional(),
   scopeDeviceIds: z.array(PositiveIdSchema).nullable(),
   rows: z.array(QueryRowSchema), snapshotIds: z.array(PositiveIdSchema), eventIds: z.array(PositiveIdSchema),
-  warnings: z.array(z.string()), calculationVersion: z.string(), resultHash: z.string(), createdAt: TimestampSchema });
+  warnings: z.array(z.string()), calculationVersion: z.string(), createdAt: TimestampSchema });
 export type QueryRecord = z.infer<typeof QueryRecordSchema>;
 export const QuerySummarySchema = QueryRecordSchema.omit({ rows: true, snapshotIds: true, eventIds: true }).extend({
   totalRows: z.number().int().nonnegative(),
@@ -216,7 +216,7 @@ export const DesktopQueryPageSchema = QueryPageSchema.extend({ targetVersion: Wo
 export type DesktopQueryPage = z.infer<typeof DesktopQueryPageSchema>;
 export const EvidenceSchema = z.strictObject({ id: PositiveIdSchema, queryId: PositiveIdSchema, batchIds: BatchIdsSchema,
   snapshotIds: z.array(PositiveIdSchema), eventIds: z.array(PositiveIdSchema), sourceRowRefs: z.array(z.string()),
-  calculationVersion: z.string(), materialVersion: z.string(), sourceBundleId: z.string(), sourceLockHash: z.string(), resultHash: z.string(),
+  calculationVersion: z.string(), materialVersion: z.string(), sourceBundleId: z.string(),
   filters: z.union([QueryParamsSchema, ChangesQuerySchema, CurrentQuerySchema]).optional(),
   provenance: z.enum(['public', 'synthetic', 'synthetic-derived']).optional() });
 export type Evidence = z.infer<typeof EvidenceSchema>;

@@ -148,7 +148,7 @@ test('p12 command capture survives the real input adapter without creating an un
   }, false);
 });
 
-test('p12 a single type-only SDK module imports from an external managed hash copy', async () => {
+test('p12 a single type-only SDK module imports from an external managed Run copy', async () => {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p12-module-'));
   try {
     const dir = join(root, 'extensions', 'tool-audit', 'v1', 'a'.repeat(64)); mkdirSync(dir, { recursive: true });

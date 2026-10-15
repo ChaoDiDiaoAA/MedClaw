@@ -10,7 +10,6 @@ import { CLASSIFY_PROMPT } from '../../packages/core/src/intent/prompts/classify
 import { VERIFY_PROMPT } from '../../packages/core/src/intent/prompts/verify';
 import { INTENT_TAXONOMY, IntentResultSchema, type IntentResult, type IntentStageInput, type IntentItem } from '../../packages/contracts/src/intent';
 import { IntentModelConfigurationSchema } from '../../packages/contracts/src/model';
-import { createHash } from 'node:crypto';
 import { safeError } from '../../packages/contracts/src/error';
 import { SessionService } from '../../packages/core/src/session/session-service';
 import { SqliteWriteTransactions } from '../../packages/storage/src/write-transactions';
@@ -68,7 +67,7 @@ async function routedFixture(mode: 'rule' | 'classify' | 'verify' | 'http' | 'js
   } });
   const f = await agentRuntimeFixture(options?.respond??(mode==='multi'?(index=>index===1?{role:'assistant',tool_calls:['s1','s2'].map((stepId,index)=>({index,id:`intent-step-${stepId}`,type:'function',
     function:{name:'query_intent_step',arguments:JSON.stringify({stepId,part:0})}}))}:{role:'assistant',content:'ENGINEERING completed both validated steps.'}):undefined), false, undefined, { client: new OllamaIntentClient({ classify: CLASSIFY_PROMPT, verify: VERIFY_PROMPT }),
-    configuration: IntentModelConfigurationSchema.parse({ ...disabledIntentModel(), enabled: true, baseUrl: `http://127.0.0.1:${server.port}`, modelDigest: 'sha256:' + 'a'.repeat(64), verifiedEvidenceRef: 'ENGINEERING' }) });
+    configuration: IntentModelConfigurationSchema.parse({ ...disabledIntentModel(), enabled: true, baseUrl: `http://127.0.0.1:${server.port}`,  verifiedEvidenceRef: 'ENGINEERING' }) });
   // Exercise the retained v3 Agent path; P15 tests independently exercise new v4 program execution.
   const freeze=f.intentService!.freeze.bind(f.intentService);
   f.intentService!.freeze=(selection,...args)=>freeze({...selection,policyVersion:'medclaw.intent-policy/v3'},...args);
@@ -454,7 +453,7 @@ for (const [mode, calls] of [['rule', 0], ['classify', 1], ['verify', 2]] as con
       expect(f.chats()).toBe(calls); expect(f.requests).toHaveLength(0); expect(f.authentications).toEqual([false]);
       const content = f.content(accepted.data.inputId!);
       expect(content.intentAdmission?.selection.modelTag).toBe('qwen3.5:0.8b');
-      expect(content.intentAdmission?.prompts.classify.hash).toBe(createHash('sha256').update(CLASSIFY_PROMPT).digest('hex'));
+      expect(content.intentAdmission?.prompts.classify).toMatchObject({text:CLASSIFY_PROMPT,version:content.intentAdmission!.selection.classifyPromptVersion});
       expect(content.intentAdmission?.prompts.verify.text).toBe(VERIFY_PROMPT);
       expect(f.repos.readInput({ inputId: accepted.data.inputId! })).toMatchObject({ status: 'consumed', processingStatus: 'completed' });
       expect(f.db.query('SELECT id FROM queries WHERE run_id=?').all(read.run.id)).toHaveLength(1);
@@ -492,12 +491,12 @@ for(const stop of [false,true])test(`p14 actual root B5 retry ${stop?'honors Sto
     expect(accepted.ok).toBe(true);if(!accepted.ok)throw accepted.error;
     for(let i=0;i<1000&&!f.app.runs.persistencePending;i++)await Bun.sleep(2);
     expect(f.app.runs.persistencePending).toBe(true);expect(appends).toBe(1);
-    const queries=f.db.query('SELECT id,result_hash FROM queries WHERE run_id=?').all(accepted.data.runId!);expect(queries).toHaveLength(1);
+    const queries=f.db.query('SELECT id FROM queries WHERE run_id=?').all(accepted.data.runId!);expect(queries).toHaveLength(1);
     expect(f.db.query('SELECT id FROM memories WHERE run_id=?').all(accepted.data.runId!)).toHaveLength(0);
     if(stop){const cancelled=await f.app.runs.cancel(accepted.data.runId!);expect(cancelled.ok&&cancelled.data.cancelRequested).toBe(true);}
     fail=false;const retried=await f.app.runs.retrySave(accepted.data.runId!);expect(retried.ok).toBe(true);
     await f.settle();expect(f.chats()).toBe(1);expect(appends).toBe(1);expect(f.requests).toHaveLength(0);
-    expect(f.db.query('SELECT id,result_hash FROM queries WHERE run_id=?').all(accepted.data.runId!)).toEqual(queries);
+    expect(f.db.query('SELECT id FROM queries WHERE run_id=?').all(accepted.data.runId!)).toEqual(queries);
     expect(f.repos.readInput({inputId:accepted.data.inputId!})).toMatchObject(stop?{status:'cancelled',processingStatus:'cancelled'}:{status:'consumed',processingStatus:'completed'});
     expect(f.db.query('SELECT id FROM memories WHERE run_id=?').all(accepted.data.runId!)).toHaveLength(stop?0:4);
     expect(f.db.query('SELECT id FROM answers WHERE run_id=?').all(accepted.data.runId!)).toHaveLength(stop?0:1);
@@ -556,12 +555,12 @@ test('p14 actual multi-intent root uses one Agent, bound step queries and a nati
     const tools=f.requests[0]!.tools as {function:{name:string}}[];
     expect(tools.some(tool=>tool.function.name==='query_intent_step')).toBe(true);expect(tools.some(tool=>tool.function.name==='Agent')).toBe(false);
     expect(f.db.query('SELECT id FROM runs WHERE parent_run_id=?').all(read.run.id)).toHaveLength(0);
-    const queries=f.db.query<{id:number;result_hash:string},[number]>('SELECT id,result_hash FROM queries WHERE run_id=? ORDER BY id').all(read.run.id);
+    const queries=f.db.query<{id:number},[number]>('SELECT id FROM queries WHERE run_id=? ORDER BY id').all(read.run.id);
     expect(queries).toHaveLength(2);
     const saved=f.db.query<{entry_json:string},[number]>("SELECT entry_json FROM memories WHERE run_id=? AND json_extract(entry_json,'$.customType')='medclaw-intent-execution'").get(read.run.id);
     expect(saved).not.toBeNull();const execution=JSON.parse(saved!.entry_json).data;
     expect(execution.taskIntents.map((item:{id:string})=>item.id)).toEqual(['s1','s2']);
-    expect(execution.stepResults).toEqual(queries.map((query,index)=>({stepId:`s${index+1}`,queryRefs:[{queryId:query.id,resultHash:query.result_hash}]})));
+    expect(execution.stepResults).toEqual(queries.map((query,index)=>({stepId:`s${index+1}`,queryRefs:[{queryId:query.id}]})));
     const detail=f.repos.readIntent({runId:read.run.id});
     expect(detail?.execution).toMatchObject({stepResults:execution.stepResults,finalHistorySaved:true});expect(detail?.effectiveContext).toBeNull();
     expect(f.db.query('SELECT query_ids_json FROM answers WHERE run_id=?').get(read.run.id)).toEqual({query_ids_json:JSON.stringify(queries.map(query=>query.id))});
@@ -612,10 +611,10 @@ for(const tamper of ['swap_steps','missing_turn'] as const)test(`p14 multi-inten
     for(let i=0;i<1000&&!f.app.runs.persistencePending;i++)await Bun.sleep(2);
     expect(f.app.runs.persistencePending).toBe(true);
     expect(f.db.query('SELECT id FROM answers WHERE run_id=?').all(accepted.data.runId!)).toHaveLength(0);
-    const queries=f.db.query('SELECT id,result_hash FROM queries WHERE run_id=?').all(accepted.data.runId!);expect(queries).toHaveLength(2);
+    const queries=f.db.query('SELECT id FROM queries WHERE run_id=?').all(accepted.data.runId!);expect(queries).toHaveLength(2);
     corrupt=false;expect((await f.app.runs.retrySave(accepted.data.runId!)).ok).toBe(true);await f.settle();
     expect(f.db.query('SELECT id FROM answers WHERE run_id=?').all(accepted.data.runId!)).toHaveLength(1);
-    expect(f.db.query('SELECT id,result_hash FROM queries WHERE run_id=?').all(accepted.data.runId!)).toEqual(queries);
+    expect(f.db.query('SELECT id FROM queries WHERE run_id=?').all(accepted.data.runId!)).toEqual(queries);
     expect(f.chats()).toBe(1);expect(f.requests).toHaveLength(2);expect(appends).toBe(1);
   }finally{corrupt=false;const active=f.app.runs.activeHandle;if(active&&f.app.runs.persistencePending)await f.app.runs.retrySave(active.runId);await f.close();}
 });

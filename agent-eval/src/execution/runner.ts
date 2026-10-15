@@ -12,7 +12,6 @@ import { writeJsonExclusive,writeReport,hydrateReport } from '../reports/write.t
 import {writeBadcases} from '../reports/badcases.ts';
 import { sourceInventory,runBlockers } from '../doctor.ts';
 import { assertSafeExport } from '../langfuse/map.ts';
-import { projectPublicEvidence } from '../data-format.ts';
 import {assertJudgeMatches} from '../scoring/judges/client.ts';
 import {trialProgress,type ProgressEvent} from './progress.ts';
 import {qualityMetricCatalog} from '../scoring/registry.ts';
@@ -83,14 +82,14 @@ export async function runExperiment(options:RunOptions):Promise<EvaluationReport
       const directory=join(executionRoot,'evidence',trial.trialId);await mkdir(directory,{recursive:true});
       const events=await open(join(directory,'events.jsonl'),'a',0o600);await events.close();
       let journalFailed=false;
-      const journal=async(kind:string,value:unknown)=>{try{const event=projectPublicEvidence({kind,at:new Date().toISOString(),value});await appendFile(join(directory,'events.jsonl'),JSON.stringify(event)+'\n',{mode:0o600});}catch(error){journalFailed=true;throw error;}};
+      const journal=async(kind:string,value:unknown)=>{try{const event={kind,at:new Date().toISOString(),value};await appendFile(join(directory,'events.jsonl'),JSON.stringify(event)+'\n',{mode:0o600});}catch(error){journalFailed=true;throw error;}};
       const trialScores=await evaluate({trialId:trial.trialId,caseId:trial.caseId,task:{checks:task.expected.checks},input:task,result:trial,gold:dataset.gold[trial.caseId]!,observation:trial.observation,trialStatus:trial.status,judge:options.judgeMode==='off'?undefined:options.judge,signal:options.signal,onJudgeRequest:request=>journal('judge.request',request),onJudgeResult:async result=>{await journal('judge.result',result);judgeCalls.push({trialId:trial.trialId,result});}});
       if(journalFailed)throw new Error('necessary_save_unconfirmed');
       scores.push(...trialScores);
       const status=aggregate([trial],[trial],trialScores).trials[0]!.status;
       current.emit({kind:'score',status,executionStatus:trial.status,checks:trialScores});current.phase('save');
       try{await stat(join(directory,'trial.json'));}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;const {observation,...state}=trial;await writeJsonExclusive(join(directory,'trial.json'),{...state,observationRef:observation?'observation.json':null,lifecycle:{}});}
-      if(trial.observation)try{await stat(join(directory,'observation.json'));}catch{await writeJsonExclusive(join(directory,'observation.json'),projectPublicEvidence(trial.observation));}
+      if(trial.observation)try{await stat(join(directory,'observation.json'));}catch{await writeJsonExclusive(join(directory,'observation.json'),trial.observation);}
       await journal('scoring.completed',{trialId:trial.trialId,status,scores:trialScores});
       const walk=async(dir:string)=>{for(const item of await readdir(dir,{withFileTypes:true})){const path=join(dir,item.name);if(item.isSymbolicLink())throw new Error('linked_trial_evidence');if(item.isDirectory()){if(item.name==='product'||item.name==='inputs'||item.name==='projection')continue;await walk(path);}else if(item.isFile())evidenceFiles.push({path:relative(executionRoot,path).replaceAll('\\','/'),sensitivity:'private'});}};
       await walk(directory);
@@ -106,7 +105,7 @@ export async function runExperiment(options:RunOptions):Promise<EvaluationReport
     const aggregation=aggregate(plan,trials,scores,cases);
     const archivedTrials=trials.map(({observation,...trial})=>({...trial,observationRef:observation?'evidence/'+trial.trialId+'/observation.json':null}));
     const candidates=reviewCandidates(dataset.snapshot.info.reviewPolicy,trials.map(trial=>({trialId:trial.trialId,caseId:trial.caseId,risks:dataset.cases.find(item=>item.id===trial.caseId)!.risks,scores:scores.filter(score=>score.trialId===trial.trialId)})));
-    const report=hydrateReport({contract:'medclaw-evaluation-report/v1',executionId:options.executionId,snapshotRef:'snapshot.json',dataset:{id:dataset.manifest.id,version:1},cases,modules:dataset.modules,plan,trials:archivedTrials,scores:projectPublicEvidence(scores),judgeCalls:projectPublicEvidence(judgeCalls),evidenceManifest:[],totals:aggregation.totals,aggregation,reviewCandidates:candidates,createdAt:new Date().toISOString()},snapshot);
+    const report=hydrateReport({contract:'medclaw-evaluation-report/v1',executionId:options.executionId,snapshotRef:'snapshot.json',dataset:{id:dataset.manifest.id,version:1},cases,modules:dataset.modules,plan,trials:archivedTrials,scores,judgeCalls,evidenceManifest:[],totals:aggregation.totals,aggregation,reviewCandidates:candidates,createdAt:new Date().toISOString()},snapshot);
     const saved=await writeReport(executionRoot,report,evidenceFiles);keepLock=trials.some(unsafeTrial);
     try{await writeBadcases(join(executionRoot,'report.json'));}catch{console.error('[诊断] 分析文件保存失败；原报告和成绩已保留');throw new Error('badcase_artifacts_failed');}
     return saved;

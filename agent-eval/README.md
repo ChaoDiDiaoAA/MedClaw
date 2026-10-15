@@ -1,5 +1,7 @@
 # MedClaw Agent 评测 v1
 
+当前 Loader 只读取并核验当前 Case、Gold 与 authoring 内容；review.verifiedData 仅保留旧审核历史，不覆盖当前定义，也不作为隐藏的内容替换入口。独立来源、independentGold 或可复算记录缺失/不一致时保持 draft/pending；修改输入、真值、资源或判据后重新独立核验，旧运行快照和分数保留。
+
 归档与数据准入状态： 用户已删除`agent-eval/runs`和`agent-eval/records`下的历史文件；历史来源保持删除状态，不补造替代原件或问题台账。下文旧执行ID、成绩及工程计数仅为历史记录，不能作为当前仍可读的原件。主集的数据准入以当前实际审核为准；专项仍保留3个声明成员，但共享判据变化且原issues与admission-evidence缺失，当前review为pending、执行准入阻断，不能沿用旧审核宣称已核验。
 
 2026-10-14历史批次为`smoke-20261014T034659018Z-665ab02e`，原报告为0 PASS／6 FAIL／4 ERROR，原五态、分母按历史记载说明，证据已删除；设施影响未排除，质量结果尚未验收。完整节点诊断、共因、候选确认、修复和当时实际验证记于issues.md（历史引用，文件已由用户删除），不另建09运行报告。此前21项检查属于先前诊断，后文工程验证及NOT_RUN均保留各自历史语境，不能冒充当前通过或新的真实质量结果。
@@ -213,7 +215,7 @@ snapshot保存实际Case、Gold、sourceReferences、fixtures、产品资源正�
 
 被测主模型独立配置在 `configs/agent.json`，`model` 只接受 `url`、`key`、`model` 三项。`url` 填与模型原生 API 协议兼容的服务地址；`model` 精确匹配 Pi SDK 0.87.1 的原生模型目录，支持唯一的模型 ID，有同名项时用 `provider/modelId` 消除歧义（例如 `openai/gpt-4o-mini`，实际请求仍使用 `gpt-4o-mini`）。输入 contextWindow 和输出 maxTokens 均由原生目录解析，不填写 provider、maxTokens 或 contextWindow，不另设评测输出上限；目录缺失或歧义在预检拒绝，不猜测能力。运行时通过产品已有自定义 Provider 入口装载公开端点和原生能力，通过私有凭据通道只提供对应 Provider 的 API Key。快照只保存解析后的公开配置和原生上限；`agent.json` 含密钥，已加入 Git 忽略，不复制到报告或 Trial 工作区。本地原生工具使用当前 Windows 账户权限。Runner 创建独立临时工作区，只向 Host 提供必要环境与公开材料，不把 Gold、Hint、未来输入、审核和 Judge/Langfuse 密钥作为 Agent 输入。独立目录不构成系统权限沙箱；采证核对实际泄漏、所有权、停止和保存，不生成 OS 隔离通过结论。
 
-Dataset/归档基础版本沿用 **v1/1**，正式目录独立采用 **v2**，历史39项目录及原Scorer/Rubric版本冻结，不保存哈希、摘要 ID 或修订号。比较核对实际数据、判据、来源及配置内容。平台 ID 随机生成一次并在 export.json 中复用，反馈和补传不重跑评测。产品协议要求的校验仅在适配器及临时导入文件中执行；归档移除这些字段，保留实际内容、对象身份和引用。源代码投影明确排除产品构建摘要声明；归档不提供密码学防篡改证明。
+Dataset/归档基础版本沿用 **v1/1**，正式目录独立采用 **v2**，历史39项目录及原Scorer/Rubric版本冻结，不保存哈希、摘要 ID 或修订号。比较核对实际数据、判据、来源及配置内容。平台 ID 随机生成一次并在 export.json 中复用，反馈和补传不重跑评测。产品和评测公共 DTO 均不含业务哈希；适配器直接绑定实际内容、对象身份和引用，不注入或剥离校验字段。归档不提供密码学防篡改证明。
 
 结果、过程、安全分别评分，基础设施作为准入门槛。可程序判断的事实、单位、集合、日期网格、参数、能力和调用预算使用确定性检查；开放回答及实际采用交给有明确 Rubric 的 Judge。公共reviewPolicy派生report.reviewCandidates：隐私/资金/删除/外发/提示注入等高风险或实际违规、Judge partial/null、真实争议；permission单标签不自动入选。completedReviewRequired:false。第三阶段review enqueue只入选这些候选；入队不等于已审核，review.json只在真实反馈后创建，反馈不覆盖自动分数。公共组合不限制完整调用顺序，也不把可选能力当白名单。
 

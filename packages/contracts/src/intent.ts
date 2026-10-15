@@ -3,7 +3,6 @@ import { AppErrorSchema, ConfigVersionSchema, OpaqueIdSchema, PositiveIdSchema, 
 import { INTENT_VERSIONS, IntentModelSelectionSchema, IntentClassifyPromptVersionSchema, IntentVerifyPromptVersionSchema, IntentPolicyVersionSchema, ReferenceDateSchema, TimezoneSchema, type IntentModelSelection } from './model';
 import { BatchSchema, QueryParamsSchema } from './query';
 import { RunScopeSchema, RunStatusSchema } from './run';
-import { ResourceHashSchema } from './resources';
 export { INTENT_VERSIONS, IntentBaseUrlSchema, IntentModelConfigurationSchema, IntentModelSelectionSchema } from './model';
 export type { IntentModelConfiguration, IntentModelSelection } from './model';
 
@@ -129,14 +128,12 @@ export const ReadIntentInputSchema = z.union([
 ]);
 export type ReadIntentInput = z.infer<typeof ReadIntentInputSchema>;
 
-const hashes = z.array(ResourceHashSchema).max(10000).refine(values =>
-  new Set(values).size === values.length && values.every((value, index) => index === 0 || values[index - 1]! < value), 'Hashes must be unique and sorted');
 const queryIds = z.array(PositiveIdSchema).refine(values => new Set(values).size === values.length, 'Duplicate Query IDs');
 export const PendingClarificationSchema = z.strictObject({ taskText: z.string().min(1).max(65536), missingSlots: uniqueSlots });
 const adoptedFields = {
   sourceInputId: PositiveIdSchema, sourceRunId: PositiveIdSchema,
   taskIntents: IntentItemsSchema, contextIntentId: stepId, adoptedSlots: IntentSlotsSchema,
-  scopeBatchHashes: hashes, queryIds, pendingClarification: PendingClarificationSchema.nullable(),
+  queryIds, pendingClarification: PendingClarificationSchema.nullable(),
 };
 function hasAdoptedQuery(value: { taskIntents: IntentItem[]; contextIntentId: string; adoptedSlots: IntentSlots }): boolean {
   const item = value.taskIntents.find(item => item.id === value.contextIntentId);
@@ -152,11 +149,11 @@ export type AdoptedContextFact = z.infer<typeof AdoptedContextFactSchema>;
 export const FormContextFactSchema = z.strictObject({
   contract: z.literal('medclaw.query-form-context/v1'), decisionId: PositiveIdSchema,
   sourceRunId: PositiveIdSchema, sourceInputId: PositiveIdSchema, params: QueryParamsSchema,
-  queryIds: queryIds.length(1), scopeBatchHashes: hashes,
+  queryIds: queryIds.length(1),
 });
 export type FormContextFact = z.infer<typeof FormContextFactSchema>;
 export const FormExecutionFactSchema = z.strictObject({ contract: z.literal('medclaw.query-form-execution/v1'),
-  decisionId: PositiveIdSchema, queryId: PositiveIdSchema, resultHash: ResourceHashSchema });
+  decisionId: PositiveIdSchema, queryId: PositiveIdSchema });
 export type FormExecutionFact = z.infer<typeof FormExecutionFactSchema>;
 export const FormQueryContextRecordSchema = FormContextFactSchema.extend({
   sessionId: PositiveIdSchema, nativeLeafId: OpaqueIdSchema, version: PositiveIdSchema, pendingClarification: z.null(),
@@ -195,7 +192,7 @@ export const IntentValidationSchema = z.strictObject({
 });
 export type IntentValidation = z.infer<typeof IntentValidationSchema>;
 export const RuleEvaluationSchema = z.strictObject({
-  ruleVersion: z.literal(INTENT_VERSIONS.ruleVersion), ruleId: label.nullable(), inputHash: ResourceHashSchema,
+  ruleVersion: z.literal(INTENT_VERSIONS.ruleVersion), ruleId: label.nullable(),
   outcome: z.enum(['hit', 'miss', 'conflict']), reasonCode: label, checkedAt: TimestampSchema,
 }).refine(value => value.outcome !== 'hit' || value.ruleId !== null, 'A complete rule hit needs its registered identity');
 export type RuleEvaluation = z.infer<typeof RuleEvaluationSchema>;
@@ -252,7 +249,7 @@ export const IntentDecisionSchema = z.strictObject({
 });
 export type IntentDecision = z.infer<typeof IntentDecisionSchema>;
 export const IntentStepResultSchema = z.strictObject({
-  stepId, queryRefs: z.array(z.strictObject({ queryId: PositiveIdSchema, resultHash: ResourceHashSchema }))
+  stepId, queryRefs: z.array(z.strictObject({ queryId: PositiveIdSchema }))
     .refine(refs => new Set(refs.map(ref => ref.queryId)).size === refs.length, 'Duplicate Query references'),
   metadata: z.lazy(() => IntentStepMetadataSchema).optional(),
 });
@@ -289,12 +286,12 @@ export const IntentGroundingFactSchema = z.discriminatedUnion('kind', [
 ]);
 export type IntentGroundingFact = z.infer<typeof IntentGroundingFactSchema>;
 export const IntentGroundingSchema = z.strictObject({contract:z.literal('medclaw.intent-grounding/v1'),
-  textHash:ResourceHashSchema,pendingTaskHash:ResourceHashSchema.nullable(),facts:z.array(IntentGroundingFactSchema).max(128)});
+  facts:z.array(IntentGroundingFactSchema).max(128)});
 export const IntentInputProjectionSchema = z.strictObject({
   contract: z.literal('medclaw.intent-input/v2'), sessionId: PositiveIdSchema, inputId: PositiveIdSchema, runId: PositiveIdSchema,
   baseLeafId: OpaqueIdSchema.nullable(), baseStorageVersion: z.number().int().nonnegative().safe(),
   text: z.string().min(1).max(65536), referenceDate: ReferenceDateSchema, timezone: TimezoneSchema,
-  scope: z.lazy(() => RunScopeSchema), scopeBatchHashes: hashes, previousQueryContext: QueryContextRecordSchema.nullable(),
+  scope: z.lazy(() => RunScopeSchema), previousQueryContext: QueryContextRecordSchema.nullable(),
   pendingClarification: PendingClarificationSchema.nullable(),
   recentTurns: z.array(z.strictObject({ nativeEntryId: OpaqueIdSchema, source: z.enum(['user', 'program', 'model']), text: z.string().max(4096) })).max(4),
   selectedEntities: z.array(z.strictObject({ deviceId: PositiveIdSchema, label })).max(10000),
@@ -316,8 +313,8 @@ export const FrozenIntentAdmissionSchema = z.strictObject({
   contract: z.literal('medclaw.intent-admission/v1'), selection: z.lazy(() => IntentModelSelectionSchema),
   baseLeafId: OpaqueIdSchema.nullable(), baseStorageVersion: z.number().int().nonnegative().safe(),
   prompts: z.strictObject({
-    classify: z.strictObject({ text: z.string().min(1).max(65536), hash: ResourceHashSchema, version: IntentClassifyPromptVersionSchema }),
-    verify: z.strictObject({ text: z.string().min(1).max(65536), hash: ResourceHashSchema, version: IntentVerifyPromptVersionSchema }),
+    classify: z.strictObject({ text: z.string().min(1).max(65536), version: IntentClassifyPromptVersionSchema }),
+    verify: z.strictObject({ text: z.string().min(1).max(65536), version: IntentVerifyPromptVersionSchema }),
   }),
 }).refine(value => value.selection.enabled, 'Intent admission requires enabled verified model configuration');
 export type FrozenIntentAdmission = z.infer<typeof FrozenIntentAdmissionSchema>;
@@ -327,7 +324,7 @@ export type PrepareIntentInput = z.infer<typeof PrepareIntentInputSchema>;
 export const INTENT_STAGE_INPUT_BYTES = 24 * 1024;
 export const IntentStageInputSchema = z.strictObject({
   input: IntentInputProjectionSchema, stage: IntentStageSchema,
-  review: z.strictObject({ previousCallId: OpaqueIdSchema, prediction: IntentResultSchema.nullable(), rawHash: ResourceHashSchema,
+  review: z.strictObject({ previousCallId: OpaqueIdSchema, prediction: IntentResultSchema.nullable(),
     rawPreview: z.string().max(4096), issues: z.array(ValidationIssueSchema).max(64), candidates: z.array(IntentCandidateSchema).max(3),
     mode: z.enum(['candidate_selection', 'semantic_correction']).optional() }).nullable(),
 }).refine(value => (value.stage === 'classify') === (value.review === null), 'Only verify contains a review')
@@ -340,7 +337,6 @@ export const IntentStageInputSchema = z.strictObject({
 export type IntentStageInput = z.infer<typeof IntentStageInputSchema>;
 export const IntentModelInspectionSchema = z.strictObject({
   contract: z.literal('medclaw.intent-model-inspection/v1'), checkedAt: TimestampSchema, available: z.boolean(),
-  actualDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/).nullable(),
   metadata: z.strictObject({ serviceVersion: label.nullable(), family: label.nullable(), parameterSize: label.nullable(), quantization: label.nullable() }).nullable(),
   error: AppErrorSchema.nullable(),
 });
@@ -348,8 +344,7 @@ export type IntentModelInspection = z.infer<typeof IntentModelInspectionSchema>;
 export const IntentHttpObservationSchema = z.strictObject({
   contract: z.literal('medclaw.context-observation/v1'), api: z.literal('ollama-chat'), transport: z.literal('json'),
   observedAt: TimestampSchema, httpStatus: z.number().int().min(200).max(299),
-  payloadHash: ResourceHashSchema, projectionHash: ResourceHashSchema, feedbackHash: ResourceHashSchema,
-  verifiedNativeRefs: z.array(z.strictObject({ kind: z.enum(['input', 'tool_result']), id: PositiveIdSchema, contentHash: ResourceHashSchema })).max(1000),
+  verifiedNativeRefs: z.array(z.strictObject({ kind: z.enum(['input', 'tool_result']), id: PositiveIdSchema })).max(1000),
 });
 export type IntentHttpObservation = z.infer<typeof IntentHttpObservationSchema>;
 const tokens = z.number().int().nonnegative().safe().nullable();
@@ -361,7 +356,7 @@ export const IntentHttpOutcomeSchema = z.strictObject({
 });
 export type IntentHttpOutcome = z.infer<typeof IntentHttpOutcomeSchema>;
 export interface IntentModelClient {
-  readonly prompts: Readonly<Record<'classify' | 'verify', Readonly<{ text: string; hash: string; version: string }>>>;
+  readonly prompts: Readonly<Record<'classify' | 'verify', Readonly<{ text: string; version: string }>>>;
   inspect(configuration: import('./model').IntentModelConfiguration, signal?: AbortSignal): Promise<IntentModelInspection>;
   recognizeIntent(input: IntentStageInput, selection: IntentModelSelection, signal: AbortSignal,
     onDelivered: (fact: IntentHttpObservation) => Promise<void>): Promise<IntentHttpOutcome>;

@@ -1,3 +1,4 @@
+import {ExportOperationSchema} from '../../../packages/contracts/src/export.ts';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { mkdir, realpath,readFile } from 'node:fs/promises';
@@ -195,8 +196,8 @@ export class ActionExecutor {
         product.record('material_projection', { materialRef: action.materialRef, files });
         const { fileToken } = product.fileTokens.issue(1, product.instanceId, operationRef, projection);
         bind(this.aliases.operations, action.alias, { kind: 'import', operationRef });
-        const preview = unwrap(await product.request('import.preview', { operationRef, fileToken, mappingVersion: 'medclaw.snapshot/v1' }, operationRef));
-        const result = unwrap(await product.request('import.commit', { operationRef, fileToken, previewHash: preview.previewHash }, operationRef));
+        unwrap(await product.request('import.preview', { operationRef, fileToken, mappingVersion: 'medclaw.snapshot/v1' }, operationRef));
+        const result = unwrap(await product.request('import.commit', { operationRef, fileToken }, operationRef));
         result.result?.batchIds.forEach((id, index) => bind(this.aliases.batches, `${action.alias}:batch:${index + 1}`, id)); return result;
       }
       case 'read_control': return unwrap(await product.request('run.control.read', {}));
@@ -251,7 +252,7 @@ export class ActionExecutor {
         const destinationRoot = join(dirname(product.paths.dataRoot), 'delivery'); await mkdir(destinationRoot, { recursive: true });
         const grant = product.destinations.issue(1, product.instanceId, source, join(destinationRoot, operationRef));
         bind(this.aliases.operations, action.operationAlias, { kind: 'export', operationRef, requestedAt: new Date().toISOString() });
-        let operation = unwrap(await product.request('export.create', { ...source, destinationToken: grant.destinationToken, destinationIdentity: grant.destinationIdentity }, operationRef));
+        let operation = ExportOperationSchema.parse(unwrap(await product.request('export.create', { ...source, destinationToken: grant.destinationToken }, operationRef)));
         const deadline = product.deadlineAt ?? Date.now() + 30000;
         while (!['completed', 'failed', 'cancelled', 'interrupted'].includes(operation.state)) {
           if (Date.now() >= deadline) throw new Error('export_endpoint_timeout');

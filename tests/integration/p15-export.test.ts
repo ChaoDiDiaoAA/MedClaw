@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import {expect,test,spyOn} from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -32,31 +32,52 @@ async function exportServiceFixture() {
   let describeGate: Promise<void> | null = null, copyGate: Promise<void> | null = null;
   let describeError: string | null = null, copyError: string | null = null, stopped = true;
   const service = new ExportService('host-p15', { store, artifacts, assertWritable() {}, destination: {
-    async describe(input) { counts.describe++; if (describeGate) await describeGate; if (describeError) throw safeError(describeError); return { destinationIdentity: input.destinationIdentity }; },
-    async copy(input) { counts.copy++; copied.resolve(); if (copyGate) await copyGate; if (copyError) throw safeError(copyError); return { contract: 'medclaw.export-receipt/v1' as const,
-      operationRef: input.operationRef, artifactId: input.artifactId, destinationIdentity: input.destinationIdentity,
-      contentHash: createHash('sha256').update(canonicalRequest([...input.manifest.files].sort((a, b) => a.path.localeCompare(b.path)))).digest('hex'), verifiedAt: at,
-      files: input.manifest.files.map(file => ({ name: file.path, bytes: file.bytes, sha256: file.sha256 })) }; },
+    async describe(input) { counts.describe++; if (describeGate) await describeGate; if (describeError) throw safeError(describeError); return {valid:true as const}; },
+    async copy(input) { counts.copy++; copied.resolve(); if (copyGate) await copyGate; if (copyError) throw safeError(copyError); return { contract: 'medclaw.export-receipt/v2' as const,
+      operationRef: input.operationRef, artifactId: input.artifactId, verifiedAt: at,
+      exportId:input.exportId, files: input.manifest.files.map(file => ({ name: file.path, bytes: file.bytes })) }; },
     async cancel() { counts.cancel++; return { stopped }; }, async settlePrevious() { counts.settle++; return { stopped: true as const }; },
   } });
   const request = (operationRef = 'service:original', overrides: Partial<ExportRequest> = {}): ExportRequest => ({ operationRef, queryId: seeded.current.id,
-    answerId: null, format: 'json', destinationToken: 'grant', destinationIdentity: 'a'.repeat(64), ...overrides });
+    answerId: null, format: 'json', destinationToken: 'grant', ...overrides });
   return { root, db, store, artifacts, service, counts, copied, request,
     setDescribeGate(value: Promise<void>) { describeGate = value; }, setCopyGate(value: Promise<void>) { copyGate = value; },
     setDescribeError(value: string | null) { describeError = value; }, setCopyError(value: string | null) { copyError = value; }, setStopped(value: boolean) { stopped = value; },
     async close() { await service.shutdown(); db.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 async function settleExport(f: Awaited<ReturnType<typeof exportServiceFixture>>, operationRef: string) {
-  for (let n = 0; n < 200; n++) { const result = await f.service.read(operationRef); if (result.ok && result.data && ['completed', 'failed', 'cancelled', 'interrupted'].includes(result.data.state)) return result.data; await Bun.sleep(10); }
+  const deadline = performance.now() + 15000;
+  while (performance.now() < deadline) { const result = await f.service.read(operationRef); if (result.ok && result.data && ['completed', 'failed', 'cancelled', 'interrupted'].includes(result.data.state)) return result.data; await Bun.sleep(10); }
   throw new Error('ENGINEERING export did not settle');
 }
+
+test('p15 private copy verification binds the active operation and directly checks candidate content', async () => {
+  const f = await exportServiceFixture(), gate = deferred<void>();
+  try {
+    f.setCopyGate(gate.promise);
+    expect((await f.service.export(f.request())).ok).toBe(true); await f.copied.promise;
+    const record = f.store.find('service:original')!, temporaryPath = join(f.root, 'candidate.json');
+    const original = readFileSync(join(f.root, 'artifacts', String(record.reservedArtifactId), 'result.json'));
+    writeFileSync(temporaryPath, original);
+    const input = { operationRef: record.operationRef, exportId: record.id, artifactId: record.reservedArtifactId!, temporaryPath };
+    await expect(f.service.verifyCopy({ ...input, operationRef: 'other-operation' })).rejects.toThrow('operation_not_found');
+    await expect(f.service.verifyCopy({ ...input, exportId: record.id + 1 })).rejects.toThrow('state_conflict');
+    await expect(f.service.verifyCopy({ ...input, artifactId: record.reservedArtifactId! + 1 })).rejects.toThrow('state_conflict');
+    expect(await f.service.verifyCopy(input)).toEqual({ verified: true });
+    const changed = Buffer.from(original); changed[0] = changed[0] === 33 ? 35 : 33; writeFileSync(temporaryPath, changed);
+    await expect(f.service.verifyCopy(input)).rejects.toThrow('artifact_not_ready');
+    writeFileSync(temporaryPath, original); gate.resolve();
+    expect(await settleExport(f, record.operationRef)).toMatchObject({ state: 'completed', copyState: 'verified' });
+    await expect(f.service.verifyCopy(input)).rejects.toThrow('state_conflict');
+  } finally { gate.resolve(); await f.close(); }
+}, 30000);
 
 test('p15 service reserves before describe, joins identical submissions and completes with one real artifact', async () => {
   const f = await exportServiceFixture(), gate = deferred<void>();
   try {
     f.setDescribeGate(gate.promise); const pending = f.service.export(f.request());
     expect(f.service.busy).toBe(true);
-    const replay = f.service.export(f.request(undefined, { destinationToken: 'renewed-grant' }));
+    const replay = f.service.export(f.request());
     expect(await f.service.export(f.request('service:second'))).toMatchObject({ ok: false, error: { code: 'runtime_busy' } });
     expect(await f.service.export(f.request(undefined, { format: 'csv' }))).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
     expect(f.counts.describe).toBe(1); gate.resolve();
@@ -64,7 +85,7 @@ test('p15 service reserves before describe, joins identical submissions and comp
     const result = await settleExport(f, 'service:original'); expect(result).toMatchObject({ state: 'completed', copyState: 'verified', error: null });
     expect(f.service.busy).toBe(false); expect(f.counts.copy).toBe(1);
     f.setDescribeError('export_destination_invalid');
-    expect(await f.service.export(f.request(undefined, { destinationToken: 'expired' }))).toEqual({ ok: true, data: result });
+    expect(await f.service.export(f.request(undefined, { destinationToken: 'expired' }))).toMatchObject({ok:false,error:{code:'state_conflict'}});
     expect(f.counts.describe).toBe(1); expect(f.counts.copy).toBe(1);
     expect(f.db.query('SELECT * FROM model_calls').all()).toHaveLength(0); expect(f.db.query('SELECT id FROM queries').all()).toHaveLength(3);
     expect((await f.service.list({ queryId: f.request().queryId })).ok).toBe(true);
@@ -111,10 +132,10 @@ test('p15 service keeps a persistence barrier after registration failure and exp
     expect((await f.service.export(f.request())).ok).toBe(true);
     const original = await settleExport(f, 'service:original');
     expect(original).toMatchObject({ state: 'failed', artifact: null, copyState: 'not_started', error: { code: 'export_registration_failed' } });
-    expect(original.publishedHash).toBeString(); expect(f.counts.copy).toBe(0); expect(f.service.busy).toBe(false);
+    expect(original).not.toHaveProperty('publishedHash'); expect(f.counts.copy).toBe(0); expect(f.service.busy).toBe(false);
     f.db.exec('DROP TRIGGER engineering_register_failure');
     const recovered = await f.service.recover(original.operationRef);
-    expect(recovered).toMatchObject({ ok: true, data: { state: 'failed', copyState: 'not_started', error: original.error, publishedHash: original.publishedHash, artifact: { queryId: original.queryId } } });
+    expect(recovered).toMatchObject({ ok: true, data: { state: 'failed', copyState: 'not_started', error: original.error, artifact: { queryId: original.queryId } } });
     expect(f.counts.copy).toBe(0); expect(f.db.query("SELECT id FROM business_events WHERE type='export_registered'").all()).toHaveLength(1);
     expect(f.db.query('SELECT * FROM model_calls').all()).toHaveLength(0);
   } finally { await f.close(); }
@@ -186,7 +207,7 @@ test('p15 service and activity reads deny deleted sessions and never expose arbi
     f.db.query("INSERT INTO business_events(operation_ref,type,actor,session_id,details_json,occurred_at) VALUES('legacy:unsafe','legacy_event','system',1,?,?)")
       .run(JSON.stringify({ path: 'D:/secret', destinationToken: 'private-grant', source: 'private-grant' }), at);
     const first = repos.listActivity({ sessionId: 1, limit: 1 }); expect(first.items).toHaveLength(1); expect(first.nextBeforeEventId).toBe(first.items[0]!.id);
-    expect(first.items[0]!.details).toEqual({ source: null, answerId: null, rowCount: null, batchCount: null, resultHash: null, copyState: null });
+    expect(first.items[0]!.details).toEqual({ source: null, answerId: null, rowCount: null, batchCount: null, copyState: null });
     expect(JSON.stringify(first)).not.toContain('secret'); expect(JSON.stringify(first)).not.toContain('private-grant');
     const later = repos.listActivity({ sessionId: 1, beforeEventId: first.nextBeforeEventId! }); expect(later.items.some(item => item.id === first.items[0]!.id)).toBe(false);
     expect(repos.listActivity({ sessionId: null }).items.every(item => item.sessionId === null)).toBe(true);
@@ -211,7 +232,7 @@ test('p15 restart waits for Main stop proof, preserves interrupted stages and on
   try {
     const source = f.store.readSource(f.request().queryId, null);
     for (const stage of ['preparing', 'published', 'copying']) {
-      const accepted = f.store.accept({ operationRef: `restart:${stage}`, requestHash: 'b'.repeat(64), instanceId: 'host-old', sessionId: 1, queryId: source.query.id, answerId: null, format: 'json', priorExportId: null, reuseArtifactId: null, createdAt: at });
+      const accepted = f.store.accept({ operationRef: `restart:${stage}`, request:f.request(`restart:${stage}`), instanceId: 'host-old', sessionId: 1, queryId: source.query.id, answerId: null, format: 'json', priorExportId: null, reuseArtifactId: null, createdAt: at });
       if (stage !== 'preparing') { const proof = await f.artifacts.publishExport({ artifactId: accepted.reservedArtifactId!, originOperationRef: accepted.operationRef, format: 'json', source }, new AbortController().signal); f.store.publish(accepted.operationRef, proof); if (stage === 'copying') { f.store.register(accepted.operationRef, proof); f.store.beginCopy(accepted.operationRef); } }
     }
     const recovery = restarted.recoverInterrupted(); await Bun.sleep(10); expect(f.store.unfinished()).toHaveLength(3);
@@ -229,11 +250,11 @@ test('p15 destination grants bind every identity, expire and reject protected ro
   mkdirSync(dataRoot); mkdirSync(parent); let clock = 1000;
   try {
     const tokens = new DestinationTokens(dataRoot, () => clock), source = { operationRef: 'grant:original', queryId: 1, answerId: null, format: 'json' as const };
-    const grant = tokens.issue(7, 'host', source, join(parent, '汉字 $.json')), input = { ...source, destinationToken: grant.destinationToken, destinationIdentity: grant.destinationIdentity };
-    expect(await tokens.describe(7, 'host', input)).toEqual({ destinationIdentity: grant.destinationIdentity });
+    const grant = tokens.issue(7, 'host', source, join(parent, '汉字 $.json')), input = { ...source, destinationToken: grant.destinationToken, };
+    expect(await tokens.describe(7,'host',input)).toEqual({valid:true});
     expect(JSON.stringify(grant)).not.toContain(parent); expect(grant.displayName).toBe('汉字 $.json');
     for (const [windowId, instanceId, override] of [[8, 'host', {}], [7, 'other-host', {}], [7, 'host', { operationRef: 'other' }],
-      [7, 'host', { queryId: 2 }], [7, 'host', { answerId: 1 }], [7, 'host', { format: 'csv' }], [7, 'host', { destinationIdentity: 'b'.repeat(64) }]] as const) {
+      [7, 'host', { queryId: 2 }], [7, 'host', { answerId: 1 }], [7, 'host', { format: 'csv' }], [7, 'host', { destinationToken: 'invalid-token' }]] as const) {
       await expect(tokens.describe(windowId, instanceId, { ...input, ...override } as typeof input)).rejects.toThrow('export_destination_invalid');
     }
     expect(() => tokens.issue(7, 'host', source, join(dataRoot, 'protected.json'))).toThrow('export_destination_invalid');
@@ -241,10 +262,10 @@ test('p15 destination grants bind every identity, expire and reject protected ro
     clock += 15 * 60 * 1000;
     await expect(tokens.describe(7, 'host', input)).rejects.toThrow('export_destination_invalid');
     const current = tokens.issue(7, 'host', source, join(parent, 'current.json'));
-    tokens.closeWindow(7); await expect(tokens.describe(7, 'host', { ...source, destinationToken: current.destinationToken, destinationIdentity: current.destinationIdentity })).rejects.toThrow('export_destination_invalid');
+    tokens.closeWindow(7); await expect(tokens.describe(7, 'host', { ...source, destinationToken: current.destinationToken, })).rejects.toThrow('export_destination_invalid');
     const replaced = tokens.issue(7, 'host', source, join(parent, 'parent.json'));
     renameSync(parent, join(root, 'original-parent')); mkdirSync(parent);
-    await expect(tokens.describe(7, 'host', { ...source, destinationToken: replaced.destinationToken, destinationIdentity: replaced.destinationIdentity })).rejects.toThrow('export_destination_invalid');
+    await expect(tokens.describe(7, 'host', { ...source, destinationToken: replaced.destinationToken, })).rejects.toThrow('export_destination_invalid');
     const link = join(root, 'linked-parent'); symlinkSync(parent, link, 'junction');
     expect(() => tokens.issue(7, 'host', source, join(link, 'linked.json'))).toThrow('export_destination_invalid');
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -254,50 +275,60 @@ test('p15 destination copies the complete real bundle, persists path-free proof 
   const f = await exportServiceFixture(), parent = join(f.root, 'external'); mkdirSync(parent);
   try {
     expect((await f.service.export(f.request())).ok).toBe(true); const first = await settleExport(f, 'service:original');
-    const proof = await f.artifacts.verifyExport(first.artifact!.id), tokens = new DestinationTokens(f.root), source = {
+    const proof = await f.artifacts.verifyExport(first.artifact!.id), tokens = new DestinationTokens(f.root, Date.now, async (_instanceId, input) => { await f.artifacts.verifyExport(input.artifactId, input.temporaryPath); }), source = {
       operationRef: 'destination:copy', queryId: first.queryId, answerId: null, format: 'json' as const };
     // The external destination must live outside the managed data root.
     const external = mkdtempSync(join(tmpdir(), 'medclaw-p15-external-'));
     try {
       const target = join(external, '用户 $(literal).json'), grant = tokens.issue(7, 'host', source, target);
-      const input = { ...source, destinationToken: grant.destinationToken, destinationIdentity: grant.destinationIdentity, artifactId: proof.artifactId, manifest: proof.manifest, priorOperationRefs: [] };
+      const input = { ...source, destinationToken: grant.destinationToken, exportId:101, artifactId: proof.artifactId, manifest: proof.manifest, priorOperationRefs: [] };
       const receipt = await tokens.copy(7, 'host', input);
-      expect(receipt).toMatchObject({ operationRef: source.operationRef, artifactId: proof.artifactId, destinationIdentity: grant.destinationIdentity, contentHash: proof.sha256 });
+      expect(receipt).toMatchObject({ operationRef: source.operationRef, artifactId: proof.artifactId });
       expect(readFileSync(target)).toEqual(readFileSync(join(f.root, 'artifacts', String(proof.artifactId), 'result.json')));
-      const stored = readFileSync(join(f.root, 'runtime/export-copies', createHash('sha256').update(source.operationRef).digest('hex') + '.json'), 'utf8');
+      const stored = readFileSync(join(f.root, 'runtime/export-copies', String(input.exportId)+'.json'), 'utf8');
       expect(stored).not.toContain(external); expect(stored).not.toContain(grant.destinationToken);
       expect(await tokens.copy(7, 'host', input)).toEqual(receipt);
       const retrySource = { ...source, operationRef: 'destination:retry' }, retry = tokens.issue(7, 'host', retrySource, target);
-      expect(await tokens.copy(7, 'host', { ...input, ...retrySource, destinationToken: retry.destinationToken, destinationIdentity: retry.destinationIdentity, priorOperationRefs: [source.operationRef] }))
-        .toMatchObject({ operationRef: retrySource.operationRef, artifactId: proof.artifactId, contentHash: proof.sha256 });
+      expect(await tokens.copy(7, 'host', { ...input, ...retrySource, destinationToken: retry.destinationToken, exportId:102, priorOperationRefs: [source.operationRef] }))
+        .toMatchObject({ operationRef: retrySource.operationRef, artifactId: proof.artifactId });
+      const originalBytes = readFileSync(target), changedBytes = Buffer.from(originalBytes);
+      changedBytes[0] = changedBytes[0] === 65 ? 66 : 65; writeFileSync(target, changedBytes);
+      await expect(tokens.copy(7, 'host', input)).rejects.toThrow('artifact_not_ready');
+      writeFileSync(target, originalBytes);
       const unproved = join(external, 'same-but-unproved.json'); writeFileSync(unproved, readFileSync(target));
       const other = { ...source, operationRef: 'destination:unproved' }, unprovedGrant = tokens.issue(7, 'host', other, unproved);
-      await expect(tokens.copy(7, 'host', { ...input, ...other, destinationToken: unprovedGrant.destinationToken, destinationIdentity: unprovedGrant.destinationIdentity })).rejects.toThrow('destination_conflict');
+      await expect(tokens.copy(7, 'host', { ...input, ...other, destinationToken: unprovedGrant.destinationToken, exportId:103 })).rejects.toThrow('destination_conflict');
+      const legacyProof = JSON.parse(stored);
+      delete legacyProof.parentIdentity; delete legacyProof.targetName; delete legacyProof.receipt.exportId;
+      legacyProof.receipt.contract = 'medclaw.export-receipt/v1';
+      renameSync(join(f.root, 'runtime/export-copies', String(input.exportId) + '.json'), join(f.root, 'runtime/export-copies', 'legacy-operation.json'));
+      writeFileSync(join(f.root, 'runtime/export-copies', 'legacy-operation.json'), JSON.stringify(legacyProof));
+      await expect(tokens.copy(7, 'host', input)).rejects.toThrow('state_conflict');
       expect((await tokens.cancel(source.operationRef)).stopped).toBe(true);
       expect(await tokens.settlePrevious()).toEqual({ stopped: true });
     } finally { await tokens.settlePrevious(); rmSync(external, { recursive: true, force: true }); }
   } finally { await f.close(); }
-}, 30000);
+}, 45000);
 
 test('p15 destination delivers CSV metadata and Markdown, rejects tampering and settles cancellation before publication', async () => {
-  const f = await exportServiceFixture(), external = mkdtempSync(join(tmpdir(), 'medclaw-p15-destination-formats-')), tokens = new DestinationTokens(f.root);
+  const f = await exportServiceFixture(), external = mkdtempSync(join(tmpdir(), 'medclaw-p15-destination-formats-')), tokens = new DestinationTokens(f.root, Date.now, async (_instanceId, input) => { await f.artifacts.verifyExport(input.artifactId, input.temporaryPath); });
   try {
     for (const format of ['csv', 'markdown'] as const) {
       const operationRef = `service:${format}`; expect((await f.service.export(f.request(operationRef, { format }))).ok).toBe(true);
       const original = await settleExport(f, operationRef), proof = await f.artifacts.verifyExport(original.artifact!.id);
       const source = { operationRef: `destination:${format}`, queryId: original.queryId, answerId: null, format }, target = join(external, format === 'csv' ? '完整包' : '回答.md');
-      const grant = tokens.issue(7, 'host', source, target), input = { ...source, destinationToken: grant.destinationToken, destinationIdentity: grant.destinationIdentity, artifactId: proof.artifactId, manifest: proof.manifest, priorOperationRefs: [] };
+      const grant = tokens.issue(7, 'host', source, target), input = { ...source, destinationToken: grant.destinationToken, exportId:format === 'csv' ? 201 : 202, artifactId: proof.artifactId, manifest: proof.manifest, priorOperationRefs: [] };
       const receipt = await tokens.copy(7, 'host', input); expect(receipt.files).toHaveLength(format === 'csv' ? 2 : 1);
       if (format === 'csv') expect(readdirSync(target).sort()).toEqual(['metadata.json', 'result.csv']);
       for (const file of proof.manifest.files) expect(readFileSync(format === 'csv' ? join(target, file.path) : target)).toEqual(readFileSync(join(f.root, 'artifacts', String(proof.artifactId), file.path)));
       const cancelled = { ...source, operationRef: `destination:cancel-${format}` }, cancelTarget = join(external, `cancel-${format}`), cancelGrant = tokens.issue(7, 'host', cancelled, cancelTarget);
-      const pending = tokens.copy(7, 'host', { ...input, ...cancelled, destinationToken: cancelGrant.destinationToken, destinationIdentity: cancelGrant.destinationIdentity });
+      const pending = tokens.copy(7, 'host', { ...input, ...cancelled, destinationToken: cancelGrant.destinationToken, exportId:format === 'csv' ? 301 : 302 });
       const outcome = pending.then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
       expect(await tokens.cancel(cancelled.operationRef)).toEqual({ stopped: true }); expect(await outcome).toMatchObject({ ok: false });
       expect(existsSync(cancelTarget)).toBe(false);
       const tampered = { ...source, operationRef: `destination:tamper-${format}` }, tamperTarget = join(external, `tamper-${format}`), tamperGrant = tokens.issue(7, 'host', tampered, tamperTarget);
       const payload = join(f.root, 'artifacts', String(proof.artifactId), proof.manifest.files[0]!.path); writeFileSync(payload, 'ENGINEERING tampered');
-      await expect(tokens.copy(7, 'host', { ...input, ...tampered, destinationToken: tamperGrant.destinationToken, destinationIdentity: tamperGrant.destinationIdentity })).rejects.toThrow('artifact_not_ready');
+      await expect(tokens.copy(7, 'host', { ...input, ...tampered, destinationToken: tamperGrant.destinationToken, exportId:format === 'csv' ? 401 : 402 })).rejects.toThrow('artifact_not_ready');
       expect(existsSync(tamperTarget)).toBe(false);
     }
     expect(readdirSync(external).filter(name => name.endsWith('.tmp'))).toEqual([]);
@@ -306,7 +337,7 @@ test('p15 destination delivers CSV metadata and Markdown, rejects tampering and 
 
 test('p15 destination pins the granted parent before a junction replacement can receive query bytes', async () => {
   const f = await exportServiceFixture(), external = mkdtempSync(join(tmpdir(), 'medclaw-p15-parent-race-')), parent = join(external, 'selected'), unauthorized = join(external, 'unauthorized');
-  mkdirSync(parent); mkdirSync(unauthorized); const tokens = new DestinationTokens(f.root);
+  mkdirSync(parent); mkdirSync(unauthorized); const tokens = new DestinationTokens(f.root, Date.now, async (_instanceId, input) => { await f.artifacts.verifyExport(input.artifactId, input.temporaryPath); });
   try {
     expect((await f.service.export(f.request())).ok).toBe(true); const operation = await settleExport(f, 'service:original'), proof = await f.artifacts.verifyExport(operation.artifact!.id);
     const source = { operationRef: 'destination:parent-race', queryId: operation.queryId, answerId: null, format: 'json' as const }, target = join(parent, 'result.json'), grant = tokens.issue(7, 'host', source, target);
@@ -316,18 +347,21 @@ test('p15 destination pins the granted parent before a junction replacement can 
       try { renameSync(parent, join(external, 'replaced')); symlinkSync(unauthorized, parent, 'junction'); } catch { blocked = true; }
       await original(...args);
     };
-    expect(await tokens.copy(7, 'host', { ...source, destinationToken: grant.destinationToken, destinationIdentity: grant.destinationIdentity, artifactId: proof.artifactId, manifest: proof.manifest, priorOperationRefs: [] })).toMatchObject({ operationRef: source.operationRef });
+    expect(await tokens.copy(7, 'host', { ...source, destinationToken: grant.destinationToken, exportId:101, artifactId: proof.artifactId, manifest: proof.manifest, priorOperationRefs: [] })).toMatchObject({ operationRef: source.operationRef });
     expect(blocked).toBe(true); expect(readdirSync(unauthorized)).toEqual([]); expect(readFileSync(target)).toEqual(readFileSync(join(f.root, 'artifacts', String(proof.artifactId), 'result.json')));
   } finally { await tokens.settlePrevious(); await f.close(); rmSync(external, { recursive: true, force: true }); }
 }, 30000);
 
 test('p15 destination cancellation during a single file copy removes only its owned temporary file', async () => {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p15-partial-')), external = mkdtempSync(join(tmpdir(), 'medclaw-p15-partial-external-'));
-  const tokens = new DestinationTokens(root), sourceDirectory = join(root, 'artifacts/1'); mkdirSync(sourceDirectory, { recursive: true });
+  const sourceDirectory = join(root, 'artifacts/1'); mkdirSync(sourceDirectory, { recursive: true });
+  let expected = Buffer.alloc(0);
+  const tokens = new DestinationTokens(root, Date.now, async (_instanceId, input) => { if (!readFileSync(input.temporaryPath).equals(expected)) throw new Error('artifact_not_ready'); });
   try {
-    const payload = Buffer.from('ENGINEERING-' + 'x'.repeat(32 * 1024 * 1024)), manifest: ExportManifest = { contract: 'medclaw.export-manifest/v1',
-      artifactId: 1, originOperationRef: 'artifact:engineering', queryId: 1, resultHash: 'a'.repeat(64), answerId: null, format: 'json', exportVersion: 'medclaw.export/v1',
-      metadataHash: 'b'.repeat(64), files: [{ path: 'result.json', bytes: payload.length, sha256: createHash('sha256').update(payload).digest('hex') }] };
+    const payload = Buffer.from('ENGINEERING-' + 'x'.repeat(32 * 1024 * 1024)), manifest: ExportManifest = { contract: 'medclaw.export-manifest/v2',
+      artifactId: 1, originOperationRef: 'artifact:engineering', queryId: 1, answerId: null, format: 'json', exportVersion: 'medclaw.export/v2',
+      files: [{ path: 'result.json', bytes: payload.length }] };
+    expected = payload;
     writeFileSync(join(sourceDirectory, 'result.json'), payload); writeFileSync(join(sourceDirectory, 'manifest.json'), canonicalRequest(manifest));
     const source = { operationRef: 'destination:partial', queryId: 1, answerId: null, format: 'json' as const }, target = join(external, 'result.json');
     const grant = tokens.issue(7, 'host', source, target);
@@ -335,7 +369,7 @@ test('p15 destination cancellation during a single file copy removes only its ow
     const opened = deferred<void>(), internal = tokens as unknown as { copyFile(source: string, target: string, signal: AbortSignal, created: (identity: string) => void): Promise<void> };
     const original = internal.copyFile.bind(tokens);
     internal.copyFile = (source, target, signal, created) => original(source, target, signal, identity => { created(identity); opened.resolve(); });
-    const outcome = tokens.copy(7, 'host', { ...source, destinationToken: grant.destinationToken, destinationIdentity: grant.destinationIdentity, artifactId: 1, manifest, priorOperationRefs: [] })
+    const outcome = tokens.copy(7, 'host', { ...source, destinationToken: grant.destinationToken, exportId:101, artifactId: 1, manifest, priorOperationRefs: [] })
       .then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
     await opened.promise;
     expect(readdirSync(external).some(name => name.endsWith('.tmp'))).toBe(true);
@@ -344,9 +378,38 @@ test('p15 destination cancellation during a single file copy removes only its ow
   } finally { await tokens.settlePrevious(); rmSync(root, { recursive: true, force: true }); rmSync(external, { recursive: true, force: true }); }
 }, 30000);
 
+test('p15 destination rejects unverified or restored-source copies before publishing user files', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'medclaw-p15-trusted-copy-')), external = mkdtempSync(join(tmpdir(), 'medclaw-p15-trusted-copy-external-'));
+  const directory = join(root, 'artifacts/1'); mkdirSync(directory, { recursive: true });
+  const expected = Buffer.from('ENGINEERING original'), changed = Buffer.from(expected); changed[0] = 88;
+  const manifest: ExportManifest = { contract: 'medclaw.export-manifest/v2', artifactId: 1, originOperationRef: 'artifact:original',
+    queryId: 1, answerId: null, format: 'json', exportVersion: 'medclaw.export/v2', files: [{ path: 'result.json', bytes: expected.length }] };
+  const source = { operationRef: 'destination:trusted-copy', queryId: 1, answerId: null, format: 'json' as const }, path = join(directory, 'result.json'), target = join(external, 'result.json');
+  writeFileSync(path, expected); writeFileSync(join(directory, 'manifest.json'), canonicalRequest(manifest));
+  let checks = 0;
+  const tokens = new DestinationTokens(root, Date.now, async (instanceId, input) => {
+    expect(instanceId).toBe('host'); expect(input).toMatchObject({ operationRef: source.operationRef, exportId: 101, artifactId: 1 }); checks++;
+    writeFileSync(path, expected); // Restore the source after Main copied its equal-length replacement.
+    if (!readFileSync(input.temporaryPath).equals(expected)) throw new Error('artifact_not_ready');
+  });
+  try {
+    const unavailable = new DestinationTokens(root), noVerifier = unavailable.issue(7, 'host', source, target);
+    expect(await unavailable.describe(7, 'host', { ...source, destinationToken: noVerifier.destinationToken })).toEqual({ valid: true });
+    await expect(unavailable.copy(7, 'host', { ...source, destinationToken: noVerifier.destinationToken, exportId: 101, artifactId: 1, manifest, priorOperationRefs: [] })).rejects.toThrow('export_copy_failed');
+    expect(readdirSync(external)).toEqual([]);
+    const grant = tokens.issue(7, 'host', source, target); writeFileSync(path, changed);
+    await expect(tokens.copy(7, 'host', { ...source, destinationToken: grant.destinationToken, exportId: 101, artifactId: 1, manifest, priorOperationRefs: [] })).rejects.toThrow('artifact_not_ready');
+    expect(checks).toBe(1); expect(readFileSync(path)).toEqual(expected); expect(existsSync(target)).toBe(false); expect(readdirSync(external)).toEqual([]);
+    expect(existsSync(join(root, 'runtime/export-copies/101.json'))).toBe(false);
+  } finally { await tokens.settlePrevious(); rmSync(root, { recursive: true, force: true }); rmSync(external, { recursive: true, force: true }); }
+}, 30000);
+
 test('p15 Host exports through the private Main capability, blocks concurrent writes and exposes read-only original facts', async () => {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p15-host-export-')), external = mkdtempSync(join(tmpdir(), 'medclaw-p15-host-external-'));
-  const destinations = new DestinationTokens(root), copying = deferred<void>(), release = deferred<void>();
+  const destinations = new DestinationTokens(root, Date.now, async (instanceId, input) => {
+    const result = await host.request('export.copy.verify', input, input.operationRef, undefined, instanceId);
+    if (!result.ok) throw new Error(result.error.code);
+  }), copying = deferred<void>(), release = deferred<void>();
   const counts = { describe: 0, copy: 0, settle: 0 };
   let holdShutdown = false; const shutdownCopy = deferred<void>(), shutdownRelease = deferred<void>();
   const host = new HostController({ dataRoot: root, hostEntry: resolve('apps/host/src/main.ts'), bunExecutable: process.execPath, onCredentialRequest: async frame => {
@@ -370,10 +433,10 @@ test('p15 Host exports through the private Main capability, blocks concurrent wr
   db.close();
   const data = <T>(result: import('../../packages/contracts/src/error').Result<T>) => { if (!result.ok) throw result.error; return result.data; };
   try {
-    expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion: 15 });
+    expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion: 16 });
     const source = { operationRef: 'host:export', queryId: seeded.current.id, answerId: null, format: 'csv' as const };
     const target = join(external, 'query-bundle'), grant = destinations.issue(7, host.read().instanceId!, source, target);
-    const request = { ...source, destinationToken: grant.destinationToken, destinationIdentity: grant.destinationIdentity };
+    const request = { ...source, destinationToken: grant.destinationToken, };
     expect(data(await host.request('export.create', request, source.operationRef))).toMatchObject({ state: 'preparing', artifact: null });
     await copying.promise;
     expect(data(await host.request('run.control.read', {}))).toMatchObject({ acceptingNewRuns: false });
@@ -395,14 +458,14 @@ test('p15 Host exports through the private Main capability, blocks concurrent wr
     const activity = data(await host.request('activity.list', { sessionId: 1 })) as { items: { type: string }[] };
     expect(activity.items.filter(item => item.type.startsWith('export_'))).toHaveLength(2);
     expect(JSON.stringify(activity)).not.toContain(grant.destinationToken); expect(JSON.stringify(activity)).not.toContain(external);
-    expect(data(await host.request('export.create', { ...request, destinationToken: 'expired' }, source.operationRef))).toEqual(original);
+    expect(await host.request('export.create',{...request,destinationToken:'expired'},source.operationRef)).toMatchObject({ok:false,error:{code:'state_conflict'}});
     expect(counts).toEqual({ describe: 1, copy: 1, settle: 1 });
     const saved = new Database(host.paths.databasePath, { readonly: true });
     try { expect(saved.query('SELECT id FROM model_calls').all()).toHaveLength(0); expect(saved.query('SELECT id FROM queries').all()).toHaveLength(3); }
     finally { saved.close(); }
     holdShutdown = true;
     const pendingSource = { ...source, operationRef: 'host:shutdown-copy' }, pendingGrant = destinations.issue(7, host.read().instanceId!, pendingSource, join(external, 'shutdown-bundle'));
-    expect(data(await host.request('export.create', { ...pendingSource, destinationToken: pendingGrant.destinationToken, destinationIdentity: pendingGrant.destinationIdentity }, pendingSource.operationRef))).toMatchObject({ state: 'preparing' });
+    expect(data(await host.request('export.create', { ...pendingSource, destinationToken: pendingGrant.destinationToken, }, pendingSource.operationRef))).toMatchObject({ state: 'preparing' });
     await shutdownCopy.promise;
     expect(await host.stop(host.read().instanceId!)).toMatchObject({ state: 'stopped' });
     expect(counts.settle).toBe(2);
@@ -424,7 +487,7 @@ function schema13() {
     db.query('INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(?,?,?)').run(index + 1, createHash('sha256').update(sql).digest('hex'), at);
   }
   db.exec('PRAGMA foreign_keys=ON');
-  const seeded = seedWorkspaceQueries(db);
+  const seeded=seedWorkspaceQueries(db);
   db.query(`INSERT INTO artifacts(id,operation_ref,kind,import_id,format,relative_path,sha256,bytes,metadata_sha256,published_at,registered_at,mime_type,metadata_json,status)
     VALUES(51,'legacy-artifact','import',1,'csv','artifacts/51','sha-preserve',17,'metadata-preserve',?,?,'application/json','{ "raw": "工程😀", "null": null }','ready')`).run(at, at);
   db.query('UPDATE imports SET artifact_id=51 WHERE id=1').run();
@@ -440,7 +503,8 @@ function preserved(db: Database, f: ReturnType<typeof schema13>) {
   for (const [table, rows] of f.before) {
     if (table === 'schema_migrations') continue;
     const after = db.query<Record<string, unknown>, []>(`SELECT * FROM ${table} ORDER BY id`).all();
-    expect(after.map(row => Object.fromEntries(Object.keys(rows[0] ?? row).map(key => [key, row[key]])))).toEqual(rows);
+    const fields=Object.keys(rows[0]??{}).filter(key=>!['preview_request_hash','commit_request_hash','fingerprint','source_lock_hash','content_hash','cohort_hash','params_hash','result_hash','scope_batch_hashes_json','sha256','metadata_sha256','request_hash','published_hash'].includes(key));
+    expect(after.map(row=>Object.fromEntries(fields.map(key=>[key,row[key]])))).toEqual(rows.map(row=>Object.fromEntries(fields.map(key=>[key,row[key]]))));
   }
 }
 
@@ -448,7 +512,7 @@ test('p15 migration preserves all schema13 facts and import artifact bytes with 
   const f = schema13();
   let db = openDatabase(f.path);
   try {
-    expect(db.query('SELECT MAX(version) AS n FROM schema_migrations').get()).toEqual({ n: 15 });
+    expect(db.query('SELECT MAX(version) AS n FROM schema_migrations').get()).toEqual({ n: 16 });
     preserved(db, f);
     expect(db.query('SELECT export_id,query_id FROM artifacts WHERE id=51').get()).toEqual({ export_id: null, query_id: null });
     expect(db.query('SELECT export_id FROM business_events WHERE export_id IS NOT NULL').all()).toEqual([]);
@@ -474,7 +538,7 @@ for (const phase of ['p15_copy', 'p15_rename', 'p15_marker']) test(`p15 migratio
       for (const [table, rows] of f.before) expect(raw.query(`SELECT * FROM ${table} ORDER BY id`).all()).toEqual(rows);
     } finally { raw.close(); }
     const recovered = openDatabase(f.path);
-    try { preserved(recovered, f); expect(recovered.query('SELECT MAX(version) AS n FROM schema_migrations').get()).toEqual({ n: 15 }); }
+    try { preserved(recovered, f); expect(recovered.query('SELECT MAX(version) AS n FROM schema_migrations').get()).toEqual({ n: 16 }); }
     finally { recovered.close(); }
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
@@ -483,10 +547,10 @@ test('p15 export DDL rejects cross-session references, invalid artifact owners a
   const f = schema13(), db = openDatabase(f.path);
   try {
     expect(db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name='exports'").get()).not.toBeNull();
-    const insert = db.query(`INSERT INTO exports(operation_ref,instance_id,session_id,query_id,answer_id,format,request_hash,state,created_at,updated_at)
+    const insert = db.query(`INSERT INTO exports(operation_ref,instance_id,session_id,query_id,answer_id,format,request_json,state,created_at,updated_at)
       VALUES(?,'host',?,?,?,'json',?,'preparing',?,?)`);
-    expect(() => insert.run('cross-session', 999, f.queryId, 61, 'a'.repeat(64), at, at)).toThrow();
-    insert.run('export:original', 1, f.queryId, 61, 'a'.repeat(64), at, at);
+    expect(() => insert.run('cross-session', 999, f.queryId, 61, '{}', at, at)).toThrow();
+    insert.run('export:original', 1, f.queryId, 61, '{}', at, at);
     expect(() => db.query("UPDATE exports SET state='completed',copy_state='verified' WHERE operation_ref='export:original'").run()).toThrow();
     expect(() => db.query("UPDATE exports SET query_id=999 WHERE operation_ref='export:original'").run()).toThrow('export_identity_immutable');
     expect(() => db.query(`INSERT INTO artifacts(operation_ref,kind,import_id,export_id,query_id,format,mime_type)
@@ -499,12 +563,8 @@ test('p15 export DDL rejects cross-session references, invalid artifact owners a
   } finally { db.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
-const hash = (value: unknown) => createHash('sha256').update(canonicalRequest(value)).digest('hex');
-const destination = 'd'.repeat(64);
-function requestHash(source: FrozenExportSource, priorOperationRef: string | null = null) {
-  return hash({ queryId: source.query.id, resultHash: source.query.resultHash, answerId: source.answer?.id ?? null,
-    answerTextHash: source.answer ? createHash('sha256').update(source.answer.text).digest('hex') : null,
-    format: 'json', exportVersion: 'medclaw.export/v1', priorOperationRef, destinationIdentity: destination });
+function savedRequest(source:FrozenExportSource,operationRef='export:one',priorOperationRef?:string):ExportRequest {
+ return {operationRef,queryId:source.query.id,answerId:source.answer?.id??null,format:'json',destinationToken:'grant',...(priorOperationRef?{priorOperationRef}:{})};
 }
 async function storageFixture() {
   expect(await Bun.file(new URL('../../packages/storage/src/export-store.ts', import.meta.url)).exists()).toBe(true);
@@ -512,31 +572,55 @@ async function storageFixture() {
   const f = schema13(), db = openDatabase(f.path), store = new SqliteExportStore(db);
   return { ...f, db, store, close() { db.close(); rmSync(f.root, { recursive: true, force: true }); } };
 }
+test('schema16 keeps a legacy export queryable but cannot resume an attempt missing its original request',async()=>{
+  const f=schema13(),markersDb=openDatabase(join(f.root,'markers.sqlite'));
+  const markers=markersDb.query<{version:number;checksum:string;applied_at:string},[]>('SELECT version,checksum,applied_at FROM schema_migrations WHERE version IN (14,15)').all();markersDb.close();
+  const old=new Database(f.path);
+  try {
+    old.exec('PRAGMA foreign_keys=OFF');
+    for(const [index,name] of ['014_p15.sql','015_p15_query_plan.sql'].entries()) old.transaction(()=>{
+      old.exec(readFileSync(new URL(`../../packages/storage/src/migrations/${name}`,import.meta.url),'utf8'));
+      const marker=markers[index]!;old.query('INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(?,?,?)').run(marker.version,marker.checksum,marker.applied_at);
+    }).immediate();
+    old.query(`INSERT INTO exports(id,operation_ref,instance_id,session_id,query_id,answer_id,format,request_hash,state,artifact_id,error_json,created_at,updated_at)
+      VALUES(1,'legacy:export','old-host',1,?,NULL,'json','archived-value','failed',52,?,?,?)`).run(f.queryId,canonicalRequest(safeError('host_interrupted')),at,at);
+    old.query(`INSERT INTO artifacts(id,operation_ref,kind,export_id,query_id,format,relative_path,mime_type) VALUES(52,'legacy:export','export',1,?,'json','artifacts/52','application/json')`).run(f.queryId);
+  }finally{old.close();}
+  const db=openDatabase(f.path),store=new SqliteExportStore(db);
+  const {ExportService}=await import('../../packages/core/src/data/export-service');
+  const service=new ExportService('new-host',{store,artifacts:new ArtifactStore(db,join(f.root,'artifacts')),assertWritable(){},destination:{async describe(){throw Error('Unexpected grant');},async copy(){throw Error('Unexpected copy');},async cancel(){return{stopped:true};},async settlePrevious(){return{stopped:true};}}});
+  try {
+    expect(store.find('legacy:export')?.request).toBeNull();
+    expect(await service.read('legacy:export')).toMatchObject({ok:true,data:{state:'failed',queryId:f.queryId}});
+    expect(await service.recover('legacy:export')).toMatchObject({ok:false,error:{code:'state_conflict'}});
+    expect(store.find('legacy:export')?.state).toBe('failed');
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+  }finally{await service.shutdown();db.close();rmSync(f.root,{recursive:true,force:true});}
+});
 function proof(source: FrozenExportSource, artifactId: number): PublishedExport {
-  const files = [{ path: 'result.json' as const, bytes: 7, sha256: 'f'.repeat(64) }];
-  return { artifactId, relativePath: `artifacts/${artifactId}`, manifest: { contract: 'medclaw.export-manifest/v1', artifactId,
-    originOperationRef: 'export:one', queryId: source.query.id, resultHash: source.query.resultHash, answerId: source.answer?.id ?? null,
-    format: 'json', exportVersion: 'medclaw.export/v1', metadataHash: 'e'.repeat(64), files },
-    sha256: hash(files), sizeBytes: 7, metadataSha256: 'e'.repeat(64), publishedAt: at };
+  const files = [{path:'result.json' as const,bytes:7}];
+  return { artifactId, relativePath: `artifacts/${artifactId}`, manifest: { contract: 'medclaw.export-manifest/v2', artifactId,
+    originOperationRef: 'export:one', queryId: source.query.id, answerId: source.answer?.id ?? null,
+    format: 'json', exportVersion: 'medclaw.export/v2', files },
+    sizeBytes:7, publishedAt: at };
 }
-function receipt(published: PublishedExport, operationRef = 'export:one'): ExportCopyReceipt {
-  return { contract: 'medclaw.export-receipt/v1', operationRef, artifactId: published.artifactId, destinationIdentity: destination,
-    contentHash: published.sha256, verifiedAt: at, files: published.manifest.files.map(file => ({ name: file.path, bytes: file.bytes, sha256: file.sha256 })) };
+function receipt(published: PublishedExport, operationRef = 'export:one',exportId=1): ExportCopyReceipt {
+  return { contract: 'medclaw.export-receipt/v2', operationRef, exportId, artifactId: published.artifactId, verifiedAt: at, files: published.manifest.files.map(file => ({ name: file.path, bytes: file.bytes })) };
 }
 
 test('p15 storage accepts once, checks original source and commits registration and delivery atomically', async () => {
   const f = await storageFixture();
   try {
-    const source = f.store.readSource(f.queryId, 61), input = { operationRef: 'export:one', requestHash: requestHash(source), instanceId: 'host',
+    const source = f.store.readSource(f.queryId, 61), input = { operationRef: 'export:one', request:savedRequest(source), instanceId: 'host',
       sessionId: 1, queryId: f.queryId, answerId: 61, format: 'json' as const, priorExportId: null, reuseArtifactId: null, createdAt: at };
     const original = f.store.accept(input);
     expect(original).toMatchObject({ state: 'preparing', artifact: null, copyState: 'not_started' });
     expect(f.store.accept(input)).toEqual(original);
-    expect(() => f.store.accept({ ...input, requestHash: 'b'.repeat(64) })).toThrow('state_conflict');
+    expect(() => f.store.accept({ ...input, request:{...input.request,destinationToken:'other'} })).toThrow('state_conflict');
     expect(f.db.query('SELECT id FROM exports').all()).toHaveLength(1);
     const published = proof(source, original.reservedArtifactId!);
     f.store.publish(input.operationRef, published);
-    expect(f.store.find(input.operationRef)).toMatchObject({ state: 'published', artifact: null, publishedHash: published.sha256 });
+    expect(f.store.find(input.operationRef)).toMatchObject({ state: 'published', artifact: null });
     f.db.exec("CREATE TEMP TRIGGER fail_registration BEFORE INSERT ON business_events WHEN NEW.type='export_registered' BEGIN SELECT RAISE(ABORT,'ENGINEERING register fault'); END");
     expect(() => f.store.register(input.operationRef, published)).toThrow();
     expect(f.store.find(input.operationRef)?.state).toBe('published');
@@ -546,8 +630,8 @@ test('p15 storage accepts once, checks original source and commits registration 
     expect(f.store.find(input.operationRef)).toMatchObject({ state: 'registered', artifact: { id: published.artifactId } });
     expect(f.db.query("SELECT id FROM business_events WHERE type='export_registered'").all()).toHaveLength(1);
     f.store.beginCopy(input.operationRef);
-    expect(() => f.store.complete(input.operationRef, { ...receipt(published), destinationIdentity: 'c'.repeat(64) })).toThrow('state_conflict');
-    expect(() => f.store.complete(input.operationRef, { ...receipt(published), contentHash: 'c'.repeat(64) })).toThrow('state_conflict');
+    expect(() => f.store.complete(input.operationRef, { ...receipt(published), exportId: 999 })).toThrow('state_conflict');
+    expect(() => f.store.complete(input.operationRef, {...receipt(published),files:[{name:'result.json',bytes:8}]})).toThrow('state_conflict');
     f.db.exec("CREATE TEMP TRIGGER fail_copy BEFORE INSERT ON business_events WHEN NEW.type='export_copied' BEGIN SELECT RAISE(ABORT,'ENGINEERING receipt fault'); END");
     expect(() => f.store.complete(input.operationRef, receipt(published))).toThrow();
     expect(f.store.find(input.operationRef)).toMatchObject({ state: 'copying', copyReceipt: null });
@@ -561,7 +645,7 @@ test('p15 storage accepts once, checks original source and commits registration 
 test('p15 storage recovery preserves old failure and new attempts reuse the original registered artifact', async () => {
   const f = await storageFixture();
   try {
-    const source = f.store.readSource(f.queryId, null), input = { operationRef: 'export:one', requestHash: requestHash(source), instanceId: 'host',
+    const source = f.store.readSource(f.queryId, null), input = { operationRef: 'export:one', request:savedRequest(source), instanceId: 'host',
       sessionId: 1, queryId: f.queryId, answerId: null, format: 'json' as const, priorExportId: null, reuseArtifactId: null, createdAt: at };
     const original = f.store.accept(input), published = proof(source, original.reservedArtifactId!);
     f.store.terminate(input.operationRef, 'failed', safeError('storage_write_failed'), 'unknown');
@@ -569,10 +653,10 @@ test('p15 storage recovery preserves old failure and new attempts reuse the orig
     expect(f.store.find(input.operationRef)).toMatchObject({ state: 'failed', copyState: 'unknown', error: { code: 'storage_write_failed' },
       artifact: { id: published.artifactId, publishedAt: null } });
     expect(() => f.store.beginCopy(input.operationRef)).toThrow('state_conflict');
-    const retry = f.store.accept({ ...input, operationRef: 'export:retry', requestHash: requestHash(source, input.operationRef),
+    const retry = f.store.accept({ ...input, operationRef: 'export:retry', request:savedRequest(source,'export:retry',input.operationRef),
       priorExportId: original.id, reuseArtifactId: published.artifactId });
     f.store.register(retry.operationRef, { ...published, publishedAt: null });
-    f.store.beginCopy(retry.operationRef); f.store.complete(retry.operationRef, receipt(published, retry.operationRef));
+    f.store.beginCopy(retry.operationRef); f.store.complete(retry.operationRef, receipt(published,retry.operationRef,retry.id));
     expect(f.store.find(retry.operationRef)).toMatchObject({ state: 'completed', priorOperationRef: input.operationRef, artifact: { operationRef: input.operationRef } });
     expect(f.db.query("SELECT id FROM artifacts WHERE kind='export'").all()).toHaveLength(1);
     expect(f.db.query("SELECT id FROM business_events WHERE type='export_registered'").all()).toHaveLength(1);
@@ -586,10 +670,12 @@ test('p15 storage refuses invalid answer links, deleted sessions and corrupt sav
     expect(f.store.readSource(f.queryId, 61).answer?.queryIds).toContain(f.queryId);
     f.db.query("UPDATE answers SET query_ids_json='[]' WHERE id=61").run();
     expect(() => f.store.readSource(f.queryId, 61)).toThrow('access_denied');
-    expect(() => f.db.query('UPDATE queries SET result_hash=? WHERE id=?').run('b'.repeat(64), f.queryId)).toThrow('query_immutable');
+    const originalResult=f.db.query<{result_json:string},[number]>('SELECT result_json FROM queries WHERE id=?').get(f.queryId)!.result_json;
+    expect(() => f.db.query('UPDATE queries SET result_json=? WHERE id=?').run('{"rows":[{}]}', f.queryId)).toThrow('query_immutable');
     f.db.exec('DROP TRIGGER queries_update_immutable'); // Simulate disk corruption beyond normal write admission.
-    f.db.query('UPDATE queries SET result_hash=? WHERE id=?').run('b'.repeat(64), f.queryId);
+    f.db.query('UPDATE queries SET result_json=? WHERE id=?').run('{"rows":[{}]}', f.queryId);
     expect(() => f.store.readSource(f.queryId, null)).toThrow();
+    f.db.query('UPDATE queries SET result_json=? WHERE id=?').run(originalResult,f.queryId);
     f.db.query("UPDATE sessions SET status='deleted',deleted_at=? WHERE id=1").run(at);
     expect(() => f.store.readSource(f.queryId, null)).toThrow('access_denied');
     f.db.close();
@@ -600,7 +686,7 @@ test('p15 storage refuses invalid answer links, deleted sessions and corrupt sav
 test('p15 storage reserves atomically, pages attempts without effects and retains known publication time on recovery', async () => {
   const f = await storageFixture();
   try {
-    const source = f.store.readSource(f.queryId, null), input = { operationRef: 'export:one', requestHash: requestHash(source), instanceId: 'host',
+    const source = f.store.readSource(f.queryId, null), input = { operationRef: 'export:one', request:savedRequest(source), instanceId: 'host',
       sessionId: 1, queryId: f.queryId, answerId: null, format: 'json' as const, priorExportId: null, reuseArtifactId: null, createdAt: at };
     f.db.exec("CREATE TEMP TRIGGER fail_reservation BEFORE INSERT ON artifacts WHEN NEW.kind='export' BEGIN SELECT RAISE(ABORT,'ENGINEERING reservation fault'); END");
     expect(() => f.store.accept(input)).toThrow();
@@ -612,7 +698,7 @@ test('p15 storage reserves atomically, pages attempts without effects and retain
     f.store.terminate(input.operationRef, 'failed', safeError('storage_write_failed'), 'not_started');
     f.store.register(input.operationRef, { ...published, publishedAt: null });
     expect(f.store.find(input.operationRef)?.artifact?.publishedAt).toBe(at);
-    const next = f.store.accept({ ...input, operationRef: 'export:retry', requestHash: requestHash(source, input.operationRef),
+    const next = f.store.accept({ ...input, operationRef: 'export:retry', request:savedRequest(source,'export:retry',input.operationRef),
       priorExportId: original.id, reuseArtifactId: published.artifactId });
     const events = f.db.query('SELECT * FROM business_events').all();
     const page = f.store.list({ queryId: f.queryId, limit: 1 });
@@ -630,8 +716,7 @@ test('p15 storage exports frozen rows after batch deletion and distinguishes mis
     const repositories = new Repositories(f.db), deletion = new SqliteDataDeletionStore(f.db, repositories);
     const preview = deletion.preview({ operationRef: 'ENGINEERING-delete', target: { kind: 'batches', batchIds: [1] },
       expectedCatalogRevision: 0, expectedWorkspaceRevision: repositories.readWorkspace().revision }, 'host', at, []);
-    deletion.commit({ operationRef: preview.operationRef, previewHash: preview.preview.previewHash,
-      expectedCatalogRevision: preview.preview.catalogRevision, expectedWorkspaceRevision: preview.preview.workspaceRevision }, at);
+    deletion.commit({ operationRef: preview.operationRef, expectedCatalogRevision: preview.preview.catalogRevision, expectedWorkspaceRevision: preview.preview.workspaceRevision }, at);
     expect(f.db.query('SELECT * FROM snapshots').all()).toEqual([]);
     const after = f.store.readSource(f.queryId, null);
     expect(after.query).toEqual(before.query);
@@ -644,7 +729,7 @@ test('p15 storage exports frozen rows after batch deletion and distinguishes mis
 test('p15 storage persists cancellation requests while verified completion can win and terminal delivery cannot restart', async () => {
   const f = await storageFixture();
   try {
-    const source = f.store.readSource(f.queryId, null), original = f.store.accept({ operationRef: 'export:one', requestHash: requestHash(source), instanceId: 'host',
+    const source = f.store.readSource(f.queryId, null), original = f.store.accept({ operationRef: 'export:one', request:savedRequest(source), instanceId: 'host',
       sessionId: 1, queryId: f.queryId, answerId: null, format: 'json', priorExportId: null, reuseArtifactId: null, createdAt: at });
     const published = proof(source, original.reservedArtifactId!);
     f.store.publish(original.operationRef, published); f.store.register(original.operationRef, published); f.store.beginCopy(original.operationRef);
@@ -697,3 +782,65 @@ test('p15 destination concurrent publication admits exactly one whole directory 
     expect(readFileSync(join(root, loser, 'payload'), 'utf8')).toBe(loser);
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 20000);
+
+test('legacy v1 export files remain readable byte for byte and actual payload changes are rejected',async()=>{
+  const f=await exportServiceFixture();
+  try {
+    for(const format of ['csv','json','markdown'] as const) {
+      const operationRef=`legacy-files:${format}`;expect((await f.service.export(f.request(operationRef,{format}))).ok).toBe(true);
+      const operation=await settleExport(f,operationRef),id=operation.artifact!.id,directory=join(f.root,'artifacts',String(id));
+      const manifest=JSON.parse(readFileSync(join(directory,'manifest.json'),'utf8'));
+      const payloadPath=join(directory,manifest.files[0].path);
+      let metadata:Record<string,any>,document:any;
+      if(format==='csv') metadata=JSON.parse(readFileSync(join(directory,'metadata.json'),'utf8'));
+      else if(format==='json'){document=JSON.parse(readFileSync(payloadPath,'utf8'));metadata=document.metadata;}
+      else {const text=readFileSync(payloadPath,'utf8');metadata=JSON.parse(text.slice(text.lastIndexOf('```json\n')+8,-5));}
+      metadata.exportVersion='medclaw.export/v1';metadata.query.resultHash='historical-value';
+      for(const item of metadata.evidence){item.resultHash='historical-value';item.sourceLockHash='historical-source';}
+      if(format==='csv') writeFileSync(join(directory,'metadata.json'),canonicalRequest(metadata));
+      else if(format==='json') writeFileSync(payloadPath,canonicalRequest(document));
+      else {const text=readFileSync(payloadPath,'utf8'),encoded=canonicalRequest(metadata).replaceAll('`','\\u0060').replaceAll('<','\\u003c').replaceAll('>','\\u003e').replaceAll('&','\\u0026');writeFileSync(payloadPath,text.slice(0,text.lastIndexOf('```json\n')+8)+encoded+'\n```\n');}
+      manifest.contract='medclaw.export-manifest/v1';manifest.exportVersion='medclaw.export/v1';manifest.resultHash='historical-value';manifest.metadataHash='historical-metadata';
+      for(const file of manifest.files){file.bytes=readFileSync(join(directory,file.path)).length;file.sha256='historical-value';}
+      const originalManifest=canonicalRequest(manifest);writeFileSync(join(directory,'manifest.json'),originalManifest);
+      f.db.query('UPDATE artifacts SET metadata_json=?,bytes=? WHERE id=?').run(originalManifest,manifest.files.reduce((sum:number,file:{bytes:number})=>sum+file.bytes,0),id);
+      const originals=manifest.files.map((file:{path:string})=>readFileSync(join(directory,file.path)));
+      expect((await f.artifacts.read(id)).ok).toBe(true);await f.artifacts.verifyExport(id);
+      expect(readFileSync(join(directory,'manifest.json'),'utf8')).toBe(originalManifest);
+      expect(f.db.query<{metadata_json:string},[number]>('SELECT metadata_json FROM artifacts WHERE id=?').get(id)!.metadata_json).toBe(originalManifest);
+      expect(manifest.files.map((file:{path:string})=>readFileSync(join(directory,file.path)))).toEqual(originals);
+      const dataName=format==='csv'?'result.csv':format==='json'?'result.json':'result.md',path=join(directory,dataName),changed=readFileSync(path);
+      changed[format==='csv'?3:0]=changed[format==='csv'?3:0]===33?35:33;writeFileSync(path,changed);
+      await expect(f.artifacts.verifyExport(id)).rejects.toThrow('artifact_not_ready');
+    }
+  }finally{await f.close();}
+},30000);
+
+test('p15 source changed between publication verification and copy receipt cannot become verified delivery',async()=>{
+  const f=await exportServiceFixture();
+  try {
+    const internal=f.service as unknown as {dependencies:{destination:{copy(input:Parameters<DestinationTokens['copy']>[2]):Promise<ExportCopyReceipt>}}};
+    const original=internal.dependencies.destination.copy;
+    internal.dependencies.destination.copy=async input=>{
+      const receipt=await original(input),path=join(f.root,'artifacts',String(input.artifactId),'result.json');
+      const content=readFileSync(path),at=content.indexOf('"rows"');expect(at).toBeGreaterThan(-1);
+      content[at+4]=122;writeFileSync(path,content);return receipt;
+    };
+    expect((await f.service.export(f.request())).ok).toBe(true);
+    expect(await settleExport(f,'service:original')).toMatchObject({state:'failed',copyState:'unknown',error:{code:'export_copy_failed'}});
+    expect(f.db.query('SELECT copy_receipt_json FROM exports').get()).toEqual({copy_receipt_json:null});
+    expect(f.db.query("SELECT id FROM business_events WHERE type='export_copied'").all()).toEqual([]);
+  }finally{await f.close();}
+},30000);
+
+test('export metadata cannot claim an active batch was deleted while retaining historical availability',async()=>{
+  const f=await exportServiceFixture(),source=f.store.readSource(f.request().queryId,null);
+  const historical={...source,query:{...source.query,batchIds:[1,2],params:{...source.query.params,batchIds:[1,2]}},sourceAvailability:'deleted' as const,deletedBatchIds:[1]};
+  const read=spyOn(SqliteExportStore.prototype,'readSource').mockImplementation(()=>historical);
+  try {
+    expect((await f.service.export(f.request())).ok).toBe(true);const operation=await settleExport(f,'service:original');
+    const id=operation.artifact!.id,path=join(f.root,'artifacts',String(id),'result.json'),document=JSON.parse(readFileSync(path,'utf8'));
+    document.metadata.deletedBatchIds=[2];writeFileSync(path,canonicalRequest(document));
+    await expect(f.artifacts.verifyExport(id)).rejects.toThrow('artifact_not_ready');
+  }finally{read.mockRestore();await f.close();}
+},30000);

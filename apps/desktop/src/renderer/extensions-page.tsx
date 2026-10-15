@@ -58,7 +58,7 @@ export function ExtensionsPage(props:{host:HostView;sessionId:number|null;runId:
       <button disabled={busy} onClick={()=>void refresh()}>Refresh extensions</button>
       {data&&<>
         <p>Selection: {data.selection.selection.extension?'Enabled for next assembly':'Disabled'}</p>
-        {data.selection.available&&<p>First party · {data.selection.available.ref.id}@{data.selection.available.ref.version} · Pi {data.selection.available.sdkVersion} · Hash <code>{data.selection.available.ref.treeHash}</code></p>}
+        {data.selection.available&&<p>First party · {data.selection.available.ref.id}@{data.selection.available.ref.version} · Pi {data.selection.available.sdkVersion}</p>}
         <p>Extensions run as trusted host code with OS permissions. This version provides a tool audit and a read-only status command.</p>
         <label><input type="checkbox" aria-label="Enable tool-audit" checked={draft??!!data.selection.selection.extension} disabled={busy||!data.selection.available&&!(draft??!!data.selection.selection.extension)} onChange={event=>setDraft(event.target.checked)}/> Enable tool-audit</label>
         <button disabled={busy||draft===null||props.activeRunId!==null} onClick={()=>void publish()}>Save extension selection</button>

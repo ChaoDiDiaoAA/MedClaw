@@ -124,7 +124,8 @@ export async function runStage(category: TestCategory, stage: string, options: {
     const cli = desktop
       // Desktop specs build the same ordinary dev output; serialize files so
       // an active Electron cannot load another spec's in-progress build.
-      ? ["node", join(dirname(createRequire(import.meta.url).resolve("@playwright/test/package.json")), "cli.js"), "test", ...files.map(file => relative(root, file).replaceAll("\\", "/")), "--workers=1", "--reporter=json"]
+      // Keep Playwright cleanup inside this run so prior reports and open logs survive.
+      ? ["node", join(dirname(createRequire(import.meta.url).resolve("@playwright/test/package.json")), "cli.js"), "test", ...files.map(file => relative(root, file).replaceAll("\\", "/")), "--workers=1", "--reporter=json", `--output=${join(directory, "artifacts")}`]
       : [process.execPath, ...(category === 'e2e' ? ['--no-env-file'] : []), "test", ...files, "--reporter=junit", `--reporter-outfile=${report}`];
     const child = Bun.spawn(cli, {
       cwd: root,

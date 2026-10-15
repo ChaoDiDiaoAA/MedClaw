@@ -2,7 +2,6 @@ import { parseSkillBlock, type AgentSession, type SessionManager } from '@earend
 import { AppErrorSchema, safeError, type AppError } from '../../contracts/src/error';
 import type { InputAdapterPort, InputBinding, InputCancelProof, InputControl, InputSettlementProof, InputStore } from '../../contracts/src/session';
 import type { WorkspaceContext } from '../../contracts/src/workspace';
-import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { NativeInputReceiptSchema, RESOURCE_LIMITS, resourceRefKey, type FrozenRunResources, type NativeInputReceipt } from '../../contracts/src/resources';
 import { contextMessageText } from './messages';
@@ -156,7 +155,7 @@ export class PiInputAdapter implements InputAdapterPort {
         if (plan.kind === 'skill') { const block = parseSkillBlock(text!); if (!block || block.name !== snapshot!.name || block.location !== location) reject(); }
         else if (!this.session.promptTemplates.some(p => p.name === snapshot!.name && p.filePath === location) || text === plan.dispatchText) reject();
       }
-      const receipt = NativeInputReceiptSchema.safeParse({ text, sha256: createHash('sha256').update(text!).digest('hex') });
+      const receipt = NativeInputReceiptSchema.safeParse({ text });
       const limit = record.input.nativeReceiptLimitBytes ?? RESOURCE_LIMITS.nativeReceiptBytes;
       if (!receipt.success || !Number.isSafeInteger(limit) || limit < 0 || Buffer.byteLength(JSON.stringify(receipt.data), 'utf8') > limit) throw safeError('resource_unavailable', undefined, { reason: 'resource_too_large' });
       record.nativeInput = receipt.data;

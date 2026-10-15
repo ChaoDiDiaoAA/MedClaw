@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os';
 import { join, resolve, relative } from 'node:path';
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { createHash } from 'node:crypto';
 import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
 import { PiModelRuntime } from '../../packages/runtime-pi/src/model-runtime';
 import { PiAgentRuntime } from '../../packages/runtime-pi/src/agent-runtime';
@@ -63,7 +62,7 @@ export async function agentRuntimeFixture(respond?: (index: number, payload: Rec
   const agent = new PiAgentRuntime(runtime, root, history, { registry, recorder, executor: new ToolExecutor(registry, recorder), configure }, contextService,join(author,'extensions'));
   const allocated = agent.allocate(); repos.createSession({ expectedWorkspaceRevision: 0 }, 'create-a', allocated.nativeSessionId, new Date().toISOString(), allocated.history); allocated.bind(1);
   const catalogue = ResourceCatalogueSchema.parse(JSON.parse(readFileSync(join(author, 'catalog.json'), 'utf8'))), prompt = catalogue.definitions.find(r => r.kind === 'prompt')!, skill = catalogue.definitions.find(r => r.kind === 'skill')!;
-  const ref = ({ kind, id, version, treeHash }: typeof prompt) => ({ kind, id, version, treeHash });
+  const ref = ({ kind, id, version }: typeof prompt) => ({ kind, id, version });
   const descriptor=extensions?await agent.readExtensionDescriptor():null;
   const config = PublishedSettingsSchema.parse({ schemaVersion: 'medclaw.settings/p1-v1', configVersion: '1', model: { provider: 'p11-fixture', modelId: 'fixture' }, customProviders: [{ definition, credentialRef: null }], credentialRefs: {}, previous: null, rollbackFromVersion: null,
     ...(intents ? { intentModel: intents.configuration } : {}),

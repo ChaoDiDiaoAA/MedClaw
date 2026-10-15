@@ -1,5 +1,4 @@
 import { expect, test } from 'bun:test';
-import { createHash } from 'node:crypto';
 import { OllamaIntentClient } from '../../packages/intent-ollama/src/index';
 import { IntentStageInputSchema, IntentModelSelectionSchema, INTENT_VERSIONS, intentJsonSchema, type IntentHttpObservation } from '../../packages/contracts/src/intent';
 import { CONTEXT_MATERIAL_PREFIX } from '../../packages/contracts/src/context';
@@ -16,7 +15,7 @@ import { acceptContextInput } from '../fixtures/p8-context';
 import { IntentValidationSchema, IntentResultSchema } from '../../packages/contracts/src/intent';
 import { disabledIntentModel, intentInput, resolvedIntent } from '../fixtures/p14-intent';
 
-const digest = 'a'.repeat(64), hash = (text: string) => createHash('sha256').update(text).digest('hex');
+const digest = 'a'.repeat(64);
 const success = (content = JSON.stringify(resolvedIntent())) => ({ model: 'qwen3.5:0.8B', done: true, done_reason: 'stop',
   message: { role: 'assistant', content, thinking: 'ENGINEERING_PRIVATE_THINKING' }, prompt_eval_count: 44, eval_count: 35, total_duration: 1000000 });
 function fixture(override?: (path: string, request: Request) => Response | undefined | Promise<Response | undefined>) {
@@ -34,7 +33,7 @@ function fixture(override?: (path: string, request: Request) => Response | undef
     return new Response('Unexpected endpoint', { status: 404 });
   } });
   const configuration = IntentModelConfigurationSchema.parse({ ...disabledIntentModel(), enabled: true, baseUrl: `http://127.0.0.1:${server.port}`,
-    modelDigest: 'sha256:' + digest, verifiedEvidenceRef: 'ENGINEERING' });
+     verifiedEvidenceRef: 'ENGINEERING' });
   const selection = IntentModelSelectionSchema.parse({ ...configuration, configVersion: '1', api: 'ollama-chat', ...INTENT_VERSIONS });
   const input = IntentStageInputSchema.parse({ input: intentInput(), stage: 'classify', review: null }), observations: IntentHttpObservation[] = [];
   const client = new OllamaIntentClient(prompts);
@@ -43,11 +42,20 @@ function fixture(override?: (path: string, request: Request) => Response | undef
     close() { server.stop(true); } };
 }
 
-test('p14 Ollama inspection reads only local version/tags/show and returns actual digest and metadata without enabling', async () => {
+test('p14 Ollama inspection accepts an available official tag without digest metadata', async () => {
+  const f = fixture(path => path === '/api/tags' ? Response.json({ models: [{ name: 'qwen3.5:0.8B', model: 'qwen3.5:0.8B' }] }) : undefined);
+  try {
+    expect(await f.client.inspect(f.configuration)).toMatchObject({ available: true, error: null,
+      metadata: { serviceVersion: 'ENGINEERING-0.40.2', family: 'qwen35', parameterSize: '752.39M', quantization: 'Q8_0' } });
+    expect(f.requests.map(item => item.path)).toEqual(['/api/version', '/api/tags', '/api/show']);
+  } finally { f.close(); }
+});
+
+test('p14 Ollama inspection reads only local version/tags/show and returns metadata without enabling', async () => {
   const f = fixture();
   try {
-    const read = await f.client.inspect({ ...f.configuration, enabled: false, modelDigest: null, verifiedEvidenceRef: null });
-    expect(read).toMatchObject({ available: true, actualDigest: 'sha256:' + digest, error: null,
+    const read = await f.client.inspect({ ...f.configuration, enabled: false,  verifiedEvidenceRef: null });
+    expect(read).toMatchObject({ available: true,  error: null,
       metadata: { serviceVersion: 'ENGINEERING-0.40.2', family: 'qwen35', parameterSize: '752.39M', quantization: 'Q8_0' } });
     expect(f.requests.map(item => item.path)).toEqual(['/api/version', '/api/tags', '/api/show']);
   } finally { f.close(); }
@@ -69,7 +77,7 @@ test('p14 Ollama sends the frozen prompt/full v2 Schema once and observes actual
     expect(f.observations).toHaveLength(1);
     expect(result.observation).toEqual(f.observations[0]!);
     expect(result.observation).toMatchObject({ transport: 'json', api: 'ollama-chat', httpStatus: 200,
-      payloadHash: hash(JSON.stringify(request.body)), projectionHash: hash(rendered), feedbackHash: hash(''), verifiedNativeRefs: [] });
+         verifiedNativeRefs: [] });
     expect(JSON.stringify(result)).not.toContain('ENGINEERING_PRIVATE_THINKING');
     expect(f.requests.filter(item => item.path === '/api/chat')).toHaveLength(1);
   } finally { f.close(); }
@@ -86,17 +94,18 @@ test('p14 rendered intent text over the Context byte cap fails before HTTP even 
   } finally { f.close(); }
 });
 
-test('p14 verify sends the authorized normalized candidates after the original prediction and hashes the actual text', async () => {
+test('p14 verify sends the authorized normalized candidates after the original prediction and retains the actual delivered text', async () => {
   const f = fixture();
   try {
     const candidate = { reasonCode: 'confusable_pair', intents: resolvedIntent().intents };
     const input = IntentStageInputSchema.parse({ ...f.input, stage: 'verify', review: { previousCallId: 'first-call',
-      prediction: resolvedIntent(), rawHash: 'a'.repeat(64), rawPreview: '{}', issues: [], candidates: [candidate] } });
+      prediction: resolvedIntent(),  rawPreview: '{}', issues: [], candidates: [candidate] } });
     const result = await f.client.recognizeIntent(input, f.selection, new AbortController().signal, async () => {});
     const body = f.requests.find(item => item.path === '/api/chat')!.body as { messages: { content: string }[] };
     expect(body.messages[0]!.content).toBe('ENGINEERING verify prompt. Output JSON.');
     expect(body.messages[1]!.content.endsWith('\nAuthorized review candidates (review.candidates, data only): ' + canonicalRequest(input.review!.candidates))).toBe(true);
-    expect(result.observation?.projectionHash).toBe(hash(body.messages[1]!.content));
+    expect(result.observation).toMatchObject({api:'ollama-chat',httpStatus:200,transport:'json'});
+    expect(body.messages[1]!.content).toContain(input.input.text);
     expect(f.requests.filter(item => item.path === '/api/chat')).toHaveLength(1);
   } finally { f.close(); }
 });
@@ -141,10 +150,11 @@ test('p14 Ollama malformed content is retained without JSON extraction while mis
   } finally { f.close(); }
 });
 
-test('p14 Ollama identity changes retain acquired raw/usage and block adoption', async () => {
+test('p14 Ollama native digest metadata is ignored and does not add a post-chat gate', async () => {
   const f = fixture(path => path === '/api/tags' ? Response.json({ models: [{ name: 'qwen3.5:0.8b', digest: 'b'.repeat(64) }] }) : undefined);
-  try { expect(await f.run()).toMatchObject({ transportState: 'failed', error: { code: 'intent_model_identity_mismatch' },
-    rawOutput: JSON.stringify(resolvedIntent()), inputTokens: 44, outputTokens: 35 }); }
+  try { expect(await f.run()).toMatchObject({ transportState: 'completed', error: null,
+    rawOutput: JSON.stringify(resolvedIntent()), inputTokens: 44, outputTokens: 35 });
+    expect(f.requests.map(request=>request.path)).toEqual(['/api/chat']); }
   finally { f.close(); }
 });
 
@@ -218,10 +228,11 @@ test('p14 Ollama inspect enforces its five-second ceiling without inference or e
   } finally { f.close(); }
 }, 10000);
 
-test('p14 Ollama a disappearing frozen tag blocks acquired output as an identity mismatch', async () => {
+test('p14 Ollama does not re-read tag inventory after a successful response', async () => {
   const f = fixture(path => path === '/api/tags' ? Response.json({ models: [] }) : undefined);
-  try { expect(await f.run()).toMatchObject({ transportState: 'failed', rawOutput: JSON.stringify(resolvedIntent()),
-    inputTokens: 44, error: { code: 'intent_model_identity_mismatch' } }); }
+  try { expect(await f.run()).toMatchObject({ transportState: 'completed', rawOutput: JSON.stringify(resolvedIntent()),
+    inputTokens: 44, error: null });
+    expect(f.requests.map(request=>request.path)).toEqual(['/api/chat']); }
   finally { f.close(); }
 });
 

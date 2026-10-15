@@ -1,17 +1,16 @@
 import { readFile } from 'node:fs/promises';
 import { resolve,join } from 'node:path';
 import { loadDataset,type LoadedDataset } from './datasets.ts';
-import { projectPublicEvidence } from './data-format.ts';
 import type { ResolvedRunConfig } from './types.ts';
 const root=resolve(import.meta.dir,'../..');
 export async function sourceInventory():Promise<Record<string,unknown>> {
   const packageText=await readFile(join(root,'package.json'),'utf8'),manifest=JSON.parse(packageText);
   const installed=JSON.parse(await readFile(join(root,'node_modules/@earendil-works/pi-coding-agent/package.json'),'utf8'));
   const patch=Object.values(manifest.patchedDependencies??{})[0] as string|undefined;
-  const resources=Object.fromEntries(await Promise.all([...new Bun.Glob('**/*').scanSync({cwd:join(root,'resources'),onlyFiles:true})].sort().map(async path=>{const content=await readFile(join(root,'resources',path),'utf8');return [path.replaceAll('\\','/'),path.endsWith('.json')?JSON.stringify(projectPublicEvidence(JSON.parse(content))):content];})));
+  const resources=Object.fromEntries(await Promise.all([...new Bun.Glob('**/*').scanSync({cwd:join(root,'resources'),onlyFiles:true})].sort().map(async path=>{const content=await readFile(join(root,'resources',path),'utf8');return [path.replaceAll('\\','/'),content];})));
   let patchContent='missing';if(patch)try{patchContent=await readFile(join(root,patch),'utf8');}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
   const paths=['apps/host/src','apps/desktop/src/main','packages','agent-eval/src'].flatMap(folder=>[...new Bun.Glob('**/*.{ts,py}').scanSync({cwd:join(root,folder),onlyFiles:true})].map(path=>folder+'/'+path.replaceAll('\\','/'))).sort();
-  const files=Object.fromEntries(await Promise.all(paths.map(async path=>{const content=await readFile(join(root,path),'utf8');return [path,path.endsWith('/subagent-adapter.ts')?content.split('\n').filter(line=>!/^\s*(pluginVersion:|pluginIntegrity:|patchHash:)/.test(line)).join('\n'):content];})));
+  const files=Object.fromEntries(await Promise.all(paths.map(async path=>{const content=await readFile(join(root,path),'utf8');return [path,content];})));
   return {sdk:installed.version,patch:patchContent,packageJson:packageText,resources,files};
 }
 export function runBlockers(dataset:LoadedDataset,source:Record<string,unknown>,config?:ResolvedRunConfig,judge?:{required:boolean;configured:boolean}) {

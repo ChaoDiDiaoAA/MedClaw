@@ -4,7 +4,6 @@ import { assessCalibration, calibrateReferences } from '../../src/scoring/judges
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { hashBytes, hashValue } from '../../src/adapters/product-checksums.ts';
 import { judgeFacility } from '../../src/scoring/judges/facility.ts';
 import type { CheckSpec } from '../../src/scoring/types.ts';
 
