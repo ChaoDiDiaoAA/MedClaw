@@ -10,7 +10,7 @@ export interface ProgressEvent extends TrialPlan {
 export function trialProgress(item:TrialPlan,index:number,total:number,notify?:(event:ProgressEvent)=>void) {
   const started=Date.now();let phase:TrialPhase='prepare_input',phaseStarted=started,timer:ReturnType<typeof setInterval>|undefined;
   const close=()=>{if(timer!==undefined){clearInterval(timer);timer=undefined;}};
-  const emit=(value:Omit<ProgressEvent,keyof TrialPlan|'index'|'total'|'elapsedMs'|'phase'>)=>notify?.({...item,index,total,phase,elapsedMs:Date.now()-started,...value});
+  const emit=(value:Omit<ProgressEvent,keyof TrialPlan|'index'|'total'|'elapsedMs'|'phase'>)=>notify?.({trialId:item.trialId,caseId:item.caseId,repetition:item.repetition,index,total,phase,elapsedMs:Date.now()-started,...value});
   return {close,emit,phase(next:TrialPhase){
     close();phase=next;phaseStarted=Date.now();emit({kind:'phase'});
     if(notify){timer=setInterval(()=>emit({kind:'heartbeat',phaseElapsedMs:Date.now()-phaseStarted}),60000);timer.unref();}

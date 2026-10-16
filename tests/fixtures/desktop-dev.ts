@@ -40,7 +40,8 @@ export async function launchActualDev(temporary: string, dataRoot: string, impor
       }return value;
     };
   }`);
-  const env: NodeJS.ProcessEnv = { ...process.env, NODE_OPTIONS: `--require=${JSON.stringify(observer)}` };
+  const env: NodeJS.ProcessEnv = { ...process.env, NODE_OPTIONS: `--require=${JSON.stringify(observer)}`,
+    MEDCLAW_EVALUATION_CONFIGS_ROOT: join(temporary, 'evaluation-configs'), MEDCLAW_EVALUATION_RUNS_ROOT: join(temporary, 'evaluation-runs') };
   // A clean root must not inherit the engineer's model credentials.
   for (const name of Object.keys(env)) if (/(?:API_KEY|ACCESS_KEY|SECRET|TOKEN|CREDENTIAL|AWS_|AZURE_|GOOGLE_)/i.test(name)) delete env[name];
   delete env.ELECTRON_RUN_AS_NODE;
@@ -74,11 +75,11 @@ export async function launchActualDev(temporary: string, dataRoot: string, impor
     if (!page) page = await context.waitForEvent('page', { timeout: 15000 });
     await page.waitForLoadState('domcontentloaded');
     return { page, browser, child, async close() {
-      try { await confirmExit(); } finally { await browser!.close(); }
+      await confirmExit(); await browser!.close();
       if (child.exitCode !== 0) throw new Error(`Actual dev launcher exited ${child.exitCode}`);
     } };
   } catch (error) {
-    try { await confirmExit(); } finally { await browser?.close(); }
+    await confirmExit(); await browser?.close();
     throw error;
   }
 }

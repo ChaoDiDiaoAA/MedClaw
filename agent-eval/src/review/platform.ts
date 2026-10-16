@@ -1,6 +1,8 @@
 import { z } from 'zod';
-import { readReport } from '../reports/write.ts';
-import { platformRequest,ensureExport,type PlatformConfig } from '../langfuse/export.ts';
+import { readReport,evidencePath } from '../reports/write.ts';
+import { dirname,resolve } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { platformRequest,ensureExport,PlatformReceiptSaveError,type PlatformConfig } from '../langfuse/export.ts';
 import { assertSafeExport } from '../langfuse/map.ts';
 import { readReview,updateReview,listFeedback,recordFeedback } from './store.ts';
 
@@ -62,13 +64,56 @@ export async function importReview(reportPath:string,queueId:string,config:Platf
   }while(cursor);
   return {imported:results};
 }
-export async function syncReview(reportPath:string,config:PlatformConfig):Promise<unknown> {
-  const report=await readReport(reportPath),{document}=await ensureExport(reportPath),feedback=await listFeedback(reportPath),receipts:{id:string;state:string;receivedAt:string}[]=[];
-  for(const item of feedback.filter(item=>item.source==='local')) {
-    const traceId=document.envelope.identities[JSON.stringify(['medclaw-trace/v1',[report.executionId,item.trialId]])];if(!traceId)throw new Error('review_trace_binding_missing');
-    const id=(await readReview(reportPath)).feedback.find(record=>record.value.source===item.source&&record.value.sourceId===item.sourceId)!.id;
-    const payload={id,traceId,name:'human.review',value:item.status,dataType:'CATEGORICAL',comment:item.comment,environment:report.config.environment,metadata:{executionId:report.executionId,trialId:item.trialId,caseId:item.caseId,reviewer:item.reviewer,reviewedAt:item.reviewedAt}};
-    assertSafeExport(payload);const response=await platformRequest(config,'/api/public/scores','POST',payload) as any;if(response.id!==id)throw new Error('review_sync_receipt_invalid');receipts.push({id,state:'accepted',receivedAt:new Date().toISOString()});
+const SyncReceiptSchema=z.object({id:z.string().min(1),state:z.enum(['accepted','rejected','unknown']),receivedAt:z.iso.datetime().nullable(),safeError:z.string().nullable().optional().default(null)});
+export type ReviewSyncReceipt=z.infer<typeof SyncReceiptSchema>;
+export async function readSyncState(reportPath:string) {
+  await listFeedback(reportPath);
+  const review=await readReview(reportPath),local=review.feedback.filter(record=>record.value.source==='local'),ids=new Set(local.map(record=>record.id)),receipts=new Map<string,ReviewSyncReceipt>();
+  for(const attempt of review.receipts) {
+    if(!attempt||typeof attempt!=='object'||!('kind' in attempt)||attempt.kind!=='sync')continue;
+    const parsed=z.object({receipts:z.array(SyncReceiptSchema)}).safeParse(attempt);if(!parsed.success)throw new Error('review_sync_receipt_invalid');
+    for(const receipt of parsed.data.receipts)if(ids.has(receipt.id)&&receipts.get(receipt.id)?.state!=='accepted')receipts.set(receipt.id,receipt);
   }
-  await updateReview(reportPath,review=>{review.receipts.push({kind:'sync',receipts});});return {receipts};
+  const values=local.flatMap(record=>receipts.has(record.id)?[receipts.get(record.id)!]:[]);
+  const state=values.length===0?'disabled' as const:values.filter(receipt=>receipt.state==='accepted').length===local.length?'complete' as const:'error' as const;
+  return {state,receipts:values,remaining:local.length-values.length};
+}
+export async function syncReview(reportPath:string,config:PlatformConfig,signal?:AbortSignal) {
+  const report=await readReport(reportPath),feedback=await listFeedback(reportPath),review=await readReview(reportPath),prior=await readSyncState(reportPath);
+  const local=feedback.filter(item=>item.source==='local');if(!local.length)return prior;
+  signal?.throwIfAborted();
+  if(prior.receipts.length)await evidencePath(reportPath.endsWith('.json')?dirname(resolve(reportPath)):resolve(reportPath),'export.json');
+  const {document}=await ensureExport(reportPath),at=new Date().toISOString();let attemptIndex:number|null=null;
+  for(const item of local) {
+    const id=review.feedback.find(record=>record.value.source===item.source&&record.value.sourceId===item.sourceId)!.id;
+    if(prior.receipts.some(receipt=>receipt.id===id&&receipt.state==='accepted'))continue;
+    if(signal?.aborted)break;
+    const traceId=document.envelope.identities[JSON.stringify(['medclaw-trace/v1',[report.executionId,item.trialId]])];if(!traceId)throw new Error('review_trace_binding_missing');
+    const payload={id,traceId,name:'human.review',value:item.status,dataType:'CATEGORICAL',comment:item.comment,environment:report.config.environment,metadata:{executionId:report.executionId,trialId:item.trialId,caseId:item.caseId,reviewer:item.reviewer,reviewedAt:item.reviewedAt}};
+    assertSafeExport(payload);
+    const pending:ReviewSyncReceipt={id,state:'unknown',receivedAt:null,safeError:'review_sync_unconfirmed'};
+    let position:number;
+    try{position=await updateReview(reportPath,current=>{
+      if(attemptIndex===null){attemptIndex=current.receipts.length;current.receipts.push({kind:'sync',at,receipts:[]});}
+      const attempt=current.receipts[attemptIndex] as {kind:string;at:string;receipts:ReviewSyncReceipt[]};
+      if(attempt?.kind!=='sync'||attempt.at!==at||!Array.isArray(attempt.receipts))throw new Error('state_conflict');
+      attempt.receipts.push(pending);return attempt.receipts.length-1;
+    });}catch(cause){throw new Error('storage_write_failed',{cause});}
+    let receipt:ReviewSyncReceipt,failure:unknown=null;
+    try {
+      const response=await platformRequest(config,'/api/public/scores','POST',payload,signal) as {id?:unknown};
+      if(response?.id!==id)throw new Error('review_sync_receipt_invalid');
+      receipt={id,state:'accepted',receivedAt:new Date().toISOString(),safeError:null};
+    }catch(error){failure=error;receipt={...pending,safeError:error instanceof Error&&/^(?:langfuse|review)_[a-z0-9_]+$/.test(error.message)?error.message:'review_sync_transport_failed'};}
+    const save=()=>updateReview(reportPath,current=>{
+      const attempt=current.receipts[attemptIndex!] as {kind:string;at:string;receipts:ReviewSyncReceipt[]};
+      if(attempt?.kind!=='sync'||attempt.at!==at||!Array.isArray(attempt.receipts))throw new Error('state_conflict');
+      if(isDeepStrictEqual(attempt.receipts[position],receipt))return;
+      if(!isDeepStrictEqual(attempt.receipts[position],pending))throw new Error('state_conflict');
+      attempt.receipts[position]=receipt;
+    });
+    try{await save();}catch(error){const recovery=error instanceof PlatformReceiptSaveError?error.retrySave:undefined;throw new PlatformReceiptSaveError(async()=>{await recovery?.();await save();});}
+    if(failure)throw failure;
+  }
+  return readSyncState(reportPath);
 }

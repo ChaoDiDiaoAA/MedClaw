@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
-import { DesktopNoticeSchema, publicMethodSchemas, PublicMethodSchema, DesktopSecretInputSchema, DesktopSecretInputResultSchema, DesktopImportDirectorySchema, DesktopImportDirectoryResultSchema, isReadOnlyMethod, type PublicMethod, type PublicPayload, type PublicReturn, type DesktopNotice, type DesktopSecretInput } from "../../../../packages/contracts/src/protocol.ts";
+import { DesktopNoticeSchema, desktopMethodSchemas, DesktopMethodSchema, DesktopSecretInputSchema, DesktopSecretInputResultSchema, DesktopImportDirectorySchema, DesktopImportDirectoryResultSchema, isDesktopReadOnlyMethod, type DesktopMethod, type DesktopPayload, type DesktopReturn, type DesktopNotice, type DesktopSecretInput } from "../../../../packages/contracts/src/protocol.ts";
+import { EvaluationOperationRefSchema } from '../../../../packages/contracts/src/evaluation';
 import { resultSchema, OpaqueIdSchema, safeError, type Result } from "../../../../packages/contracts/src/error.ts";
 import { AuthLinkUrlSchema } from "../../../../packages/contracts/src/model.ts";
 import { DesktopExportDestinationSchema, DesktopExportDestinationResultSchema } from '../../../../packages/contracts/src/export';
@@ -10,6 +11,7 @@ ipcRenderer.on("medclaw:notice", (_event, raw: unknown) => {
   const { instanceId, ...notice } = raw as Record<string, unknown>;
   const parsed = DesktopNoticeSchema.safeParse(notice);
   if (!parsed.success || (instanceId !== null && !OpaqueIdSchema.safeParse(instanceId).success)) return;
+  if (parsed.data.type.startsWith('eval.') && instanceId !== null) return;
   listeners.forEach(listener => { try { listener(structuredClone({ ...parsed.data, instanceId: instanceId as string | null })); } catch {
     // Send only a fixed signal. User content, stack traces and provider errors
     // never enter this diagnostic channel.
@@ -17,19 +19,19 @@ ipcRenderer.on("medclaw:notice", (_event, raw: unknown) => {
   } });
 });
 const bridge = {
-  async request<M extends PublicMethod>(method: M, payload: PublicPayload<M>, operationRef?: string): Promise<Result<PublicReturn<M>>> {
-    let name: PublicMethod, body: unknown, identity: string, parsingPayload = false;
+  async request<M extends DesktopMethod>(method: M, payload: DesktopPayload<M>, operationRef?: string): Promise<Result<DesktopReturn<M>>> {
+    let name: DesktopMethod, body: unknown, identity: string, parsingPayload = false;
     try {
-      name = PublicMethodSchema.parse(method);
-      identity = OpaqueIdSchema.parse(operationRef ?? crypto.randomUUID());
+      name = DesktopMethodSchema.parse(method);
+      identity = (name.startsWith('eval.') ? EvaluationOperationRefSchema : OpaqueIdSchema).parse(operationRef ?? crypto.randomUUID());
       parsingPayload = true;
-      body = publicMethodSchemas[name].input.parse(payload);
+      body = desktopMethodSchemas[name].input.parse(payload);
       parsingPayload = false;
     } catch { return { ok: false, error: safeError(parsingPayload && method === "session.messages.read" ? "input_invalid" : "invalid_argument") }; }
     try {
       const result: unknown = await ipcRenderer.invoke("medclaw:request", { method: name, payload: body, operationRef: identity });
-      return resultSchema(publicMethodSchemas[name].output).parse(result) as Result<PublicReturn<M>>;
-    } catch { return { ok: false, error: safeError(isReadOnlyMethod(name) ? "host_protocol_mismatch" : "operation_result_unknown", undefined, { operationRef: identity }) }; }
+      return resultSchema(desktopMethodSchemas[name].output).parse(result) as Result<DesktopReturn<M>>;
+    } catch { return { ok: false, error: safeError(isDesktopReadOnlyMethod(name) ? "host_protocol_mismatch" : "operation_result_unknown", undefined, { operationRef: identity }) }; }
   },
   subscribe(listener: (notice: DesktopNotice & { instanceId: string | null }) => void) { listeners.add(listener); ipcRenderer.send("medclaw:subscribe"); return () => listeners.delete(listener); },
   async secretInput(input: DesktopSecretInput) { return resultSchema(DesktopSecretInputResultSchema).parse(await ipcRenderer.invoke("medclaw:secret-input", DesktopSecretInputSchema.parse(input))); },

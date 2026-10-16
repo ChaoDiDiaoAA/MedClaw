@@ -4,7 +4,7 @@ import type {HostView} from '../../../../packages/contracts/src/model';
 import type {ExtensionsReadResult} from '../../../../packages/contracts/src/protocol';
 import type {ExtensionStatus} from '../../../../packages/contracts/src/extensions';
 
-export function ExtensionsPage(props:{host:HostView;sessionId:number|null;runId:number|null;activeRunId:number|null;stopping:boolean;onStop:()=>void;onDetails:()=>void;onPublished:()=>void}) {
+export function ExtensionsPage(props:{executionBlockReason?:string|null;host:HostView;sessionId:number|null;runId:number|null;activeRunId:number|null;stopping:boolean;onStop:()=>void;onDetails:()=>void;onPublished:()=>void}) {
   const key=JSON.stringify([props.host.instanceId,props.host.state,props.sessionId,props.runId]),current=useRef(key);current.current=key;
   const order=useRef(0),writing=useRef(false);
   const [view,setView]=useState<{key:string;selection:Extract<ExtensionsReadResult,{source:'selection'}>;run:Extract<ExtensionsReadResult,{source:'run'}>|null}|null>(null);
@@ -42,6 +42,7 @@ export function ExtensionsPage(props:{host:HostView;sessionId:number|null;runId:
   }
   const live=data?.selection.live,proof=live??data?.run?.assembly;
   async function command() {
+    if(props.executionBlockReason){setNotice(props.executionBlockReason);return;}
     if(!live||busy)return;const owner=key,assemblyId=live.assemblyId;setBusy(true);setNotice(null);
     try {
       const result=await window.medclaw.request('extensions.command',{instanceId:live.instanceId,sessionId:live.sessionId,runId:live.runId,assemblyId,command:'extension_status'});
@@ -72,7 +73,7 @@ export function ExtensionsPage(props:{host:HostView;sessionId:number|null;runId:
         </>}
         {data.run&&<p>Run {data.run.runId} evidence: {data.run.evidence} · Required facts saved: {String(data.run.cleanup?.requiredPersistenceComplete??'Unconfirmed')}</p>}
         {props.runId!==null&&<button onClick={props.onDetails}>View original run facts</button>}
-        <button disabled={busy||!live||live.state!=='active'||live.resourcesReleased||props.stopping||props.activeRunId!==live.runId} onClick={()=>void command()}>Read extension status</button>
+        <button disabled={!!props.executionBlockReason||busy||!live||live.state!=='active'||live.resourcesReleased||props.stopping||props.activeRunId!==live.runId} onClick={()=>void command()}>Read extension status</button>{props.executionBlockReason&&<p role="status">{props.executionBlockReason}</p>}
         {status&&live?.assemblyId===status.assemblyId&&<pre data-testid="extension-command">{JSON.stringify(status,null,2)}</pre>}
         {data.selection.diagnostics.map((error,index)=><p role="alert" key={index}>{errorMessage(error)}</p>)}
       </>}

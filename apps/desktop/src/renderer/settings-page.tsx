@@ -15,7 +15,7 @@ const budgetLabels: Record<keyof RuntimeConfiguration['runBudget'], string> = {
   maxRecoveryAttempts: 'Recovery round budget',
 };
 
-export function SettingsPage(props: { ui: DesktopDisplayPreferences; host: HostView; configVersion: string; onUi: (patch: Partial<DesktopDisplayPreferences>) => Promise<boolean>; onChanged: () => Promise<void>; onError: (message: string | null) => void; onHost: (host: HostView) => void }) {
+export function SettingsPage(props: { executionBlockReason?:string|null;ui: DesktopDisplayPreferences; host: HostView; configVersion: string; onUi: (patch: Partial<DesktopDisplayPreferences>) => Promise<boolean>; onChanged: () => Promise<void>; onError: (message: string | null) => void; onHost: (host: HostView) => void }) {
   const [draft, setDraft] = useState(props.ui);
   const [runtimeConfiguration, setRuntimeConfiguration] = useState<RuntimeConfiguration>(() => structuredClone(RUNTIME_CONFIG));
   const [toolConfiguration, setToolConfiguration] = useState<ToolConfiguration>(() => structuredClone(TOOL_CONFIG));
@@ -52,6 +52,7 @@ export function SettingsPage(props: { ui: DesktopDisplayPreferences; host: HostV
     setBusy(false);
   }
   async function control(action: "start" | "stop" | "restart") {
+    if(action==='restart'&&props.executionBlockReason){props.onError(props.executionBlockReason);return;}
     setBusy(true); setMessage(null);
     const result = action === "start" ? await window.medclaw.request("host.start", {}) : props.host.instanceId ? await window.medclaw.request(action === "stop" ? "host.stop" : "host.restart", { expectedInstanceId: props.host.instanceId }) : null;
     if (result?.ok) props.onHost(result.data); else if (result && !result.ok) props.onError(errorMessage(result.error));
@@ -66,7 +67,7 @@ export function SettingsPage(props: { ui: DesktopDisplayPreferences; host: HostV
       <fieldset><legend>Tool result</legend><label>Result text limit (UTF-8 bytes)<input type="number" min="1024" max={Number.MAX_SAFE_INTEGER} step="1" required value={toolConfiguration.maxResultBytes} onChange={event => { policyDirty.current = true; setToolConfiguration({ maxResultBytes: Number(event.target.value) }); }} /></label></fieldset>
       <p className="tiny muted">Tool attempts include SDK parameter rejections. Recovery rounds share the same Run budget. Each Run saves its accepted configuration.</p><button className="primary" type="submit" disabled={busy || props.host.state !== "ready" || !config}>Publish request policy</button></form></section>
     <section className="panel"><h2>Previous configuration</h2><p>{config ? config.previousConfigVersion ? "Previous configuration available for rollback" : "No configuration available for rollback" : "Reading configuration"}</p><p className="muted">Verify the previous models, definitions and credentials before publishing a rollback. Saved runs keep their original configuration.</p><button disabled={busy || props.host.state !== "ready" || !config?.previousConfigVersion} onClick={() => setRollbackConfirm(true)}>Roll back to previous configuration</button>{rollbackConfirm && <div className="confirmation" role="alertdialog" aria-label="Confirm configuration rollback"><p>Verify the previous configuration and publish a rollback?</p><button onClick={() => setRollbackConfirm(false)}>Keep current configuration</button><button className="danger" onClick={() => void rollback()}>Confirm rollback publication</button></div>}</section>
-    <section className="panel"><div className="section-heading"><h2>Host</h2><span>{hostLabel(props.host)}</span></div><p className="muted">Instance {props.host.instanceId ?? "None"}</p>{props.host.error && <p role="alert" className="error-text">{errorMessage(props.host.error)}</p>}<div className="actions"><button disabled={busy || !props.host.canStart} onClick={() => void control("start")}>Start Host</button><button disabled={busy || !props.host.instanceId || ["stopped", "stopping"].includes(props.host.state)} onClick={() => void control("stop")}>Stop Host</button><button disabled={busy || !props.host.instanceId || props.host.state !== "ready"} onClick={() => void control("restart")}>Restart Host</button></div></section>
+    <section className="panel"><div className="section-heading"><h2>Host</h2><span>{hostLabel(props.host)}</span></div><p className="muted">Instance {props.host.instanceId ?? "None"}</p>{props.host.error && <p role="alert" className="error-text">{errorMessage(props.host.error)}</p>}<div className="actions"><button disabled={busy || !props.host.canStart} onClick={() => void control("start")}>Start Host</button><button disabled={busy || !props.host.instanceId || ["stopped", "stopping"].includes(props.host.state)} onClick={() => void control("stop")}>Stop Host</button><button disabled={!!props.executionBlockReason || busy || !props.host.instanceId || props.host.state !== "ready"} onClick={() => void control("restart")}>Restart Host</button></div>{props.executionBlockReason&&<p role="status">{props.executionBlockReason}</p>}</section>
     <Diagnostics onError={props.onError} />
   </div>;
 }

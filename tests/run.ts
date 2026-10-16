@@ -21,7 +21,7 @@ export interface StageReport {
   reportDirectory: string | null;
 }
 const projectRoot = resolve(import.meta.dir, "..");
-const stagePrefixes = { P1: "p1", P2: "p2", P3: "p3", P4: "p4", P5: "p5", P6: "p6", P7: "p7", P8: "p8", P9: "p9", P10: "p10", P11: "p11", P12: "p12", P13: "p13", P14: "p14", P15: "p15" } as const;
+const stagePrefixes = { P1: "p1", P2: "p2", P3: "p3", P4: "p4", P5: "p5", P6: "p6", P7: "p7", P8: "p8", P9: "p9", P10: "p10", P11: "p11", P12: "p12", P13: "p13", P14: "p14", P15: "p15", P16: "p16" } as const;
 
 export function discoverTests(category: TestCategory, stage: string, root = projectRoot): string[] {
   if (!["unit", "integration", "e2e", "desktop"].includes(category)) throw new Error(`Unknown test category: ${category}`);
@@ -194,7 +194,7 @@ export async function runStage(category: TestCategory, stage: string, options: {
   result.executed = result.pass + result.fail;
   result.discovered = result.executed + result.skip;
   if(result.executed===0)issue('test_execution_empty');
-  if(['P12','P13','P14','P15'].includes(stage)&&result.skip>0)issue('test_coverage_incomplete');
+  if(['P12','P13','P14','P15','P16'].includes(stage)&&result.skip>0)issue('test_coverage_incomplete');
   result.reportComplete=result.reportErrors.length===0;
   result.exitCode=childExit||(result.fail>0||!result.reportComplete?1:0);
   try{

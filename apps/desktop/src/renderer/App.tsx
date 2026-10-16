@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import { errorMessage, safeError, type Result } from "../../../../packages/contracts/src/error";
 import type {DataDeleteCommitRequest,DataDeleteOperation} from '../../../../packages/contracts/src/data-deletion';
 import type { AuthAttemptView, AuthNotifyView, AuthPromptView, DesktopDisplayPreferences, HostView, ModelChoice, ModelDirectoryView, ProviderAccepted } from "../../../../packages/contracts/src/model";
-import type { DesktopNotice, DesktopSecretInput, DesktopSecretInputResult, PublicMethod, PublicPayload, PublicReturn } from "../../../../packages/contracts/src/protocol";
+import type { DesktopNotice, DesktopSecretInput, DesktopSecretInputResult, DesktopMethod, DesktopPayload, DesktopReturn, PublicReturn } from "../../../../packages/contracts/src/protocol";
 import type { ActiveRunView, RunView, RuntimeControlView } from "../../../../packages/contracts/src/run";
 import { RenameSessionInputSchema, DeleteSessionInputSchema, type NewSessionInput, type SessionDetail, type SessionInput, type SessionView, type SubmitInput, type SubmitResult, type SessionManagementReceipt, type SessionMetadataView, type RenameSessionInput, type DeleteSessionInput } from "../../../../packages/contracts/src/session";
 import type { WorkspaceChange, WorkspaceView } from "../../../../packages/contracts/src/workspace";
@@ -20,6 +20,7 @@ import { ResourcePanel } from './resource-panel';
 import { ExtensionsPage } from './extensions-page';
 import { DataWorkspace } from "./data-workspace";
 import { QueryHistory } from "./query-history";
+import { EvaluationPage, evaluationExecutionBlockReason, useEvaluationControl } from './evaluation';
 import { useRunEvents } from "./use-run-events";
 import { canonicalRequest } from '../../../../packages/contracts/src/run';
 import type { QueryParams } from '../../../../packages/contracts/src/query';
@@ -27,7 +28,7 @@ import type { DesktopExportDestinationSchema, DesktopExportDestinationResultSche
 import "./styles.css";
 
 export interface DesktopBridge {
-  request<M extends PublicMethod>(method: M, payload: PublicPayload<M>, operationRef?: string): Promise<Result<PublicReturn<M>>>;
+  request<M extends DesktopMethod>(method: M, payload: DesktopPayload<M>, operationRef?: string): Promise<Result<DesktopReturn<M>>>;
   subscribe(listener: (notice: DesktopNotice & { instanceId: string | null }) => void): () => void;
   secretInput(input: DesktopSecretInput): Promise<Result<DesktopSecretInputResult>>;
   discardSecret(token: string): Promise<void>;
@@ -36,7 +37,7 @@ export interface DesktopBridge {
   chooseExportDestination(input: import('zod').z.infer<typeof DesktopExportDestinationSchema>): Promise<Result<import('zod').z.infer<typeof DesktopExportDestinationResultSchema>>>;
 }
 declare global { interface Window { medclaw: DesktopBridge } }
-export type ViewPage = "chat" | "data" | "queries" | "models" | "prompt" | "skills" | "extensions" | "settings";
+export type ViewPage = "chat" | "data" | "queries" | "models" | "prompt" | "skills" | "extensions" | "evaluation" | "settings";
 const initialUi: DesktopDisplayPreferences = { navCollapsed: false, detailOpen: false, detailTab: "conditions" };
 const initialHost: HostView = { instanceId: null, state: "starting", canStart: false, sdkVersion: null, schemaVersion: null, error: null };
 const released = (run: RunView) => ["completed", "failed", "cancelled"].includes(run.status) && !!run.cleanup
@@ -56,6 +57,9 @@ export function App() {
   return <ConnectedApp onBridgeFailure={fail} />;
 }
 function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
+  const evaluation = useEvaluationControl();
+  const executionBlockReason = evaluationExecutionBlockReason(evaluation.control), executionBlockRef = useRef(executionBlockReason);
+  executionBlockRef.current = executionBlockReason;
   const [page, setPage] = useState<ViewPage>("chat"), [ui, setUi] = useState(initialUi), [uiVersion, setUiVersion] = useState("0");
   const uiConfigVersion = useRef('0'), uiReadOrder = useRef(0), uiUpdates = useRef(Promise.resolve(true));
   const [host, setHost] = useState(initialHost), [directory, setDirectory] = useState<ModelDirectoryView | null>(null), [directoryCurrent, setDirectoryCurrent] = useState(false);
@@ -294,6 +298,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     if(instance===hostRef.current.instanceId&&workspaceMutation.current?.kind==='checkpoint'&&workspaceMutation.current.operationRef===operationRef){workspaceMutation.current=null;setSelecting(false);}
   }
   async function resumeCheckpoint(input:RestoreSessionCheckpointInput,operationRef:string):Promise<Result<SessionCheckpointReceipt>> {
+    if(executionBlockRef.current)return {ok:false,error:safeError('runtime_busy')};
     const instance=hostRef.current.instanceId;
     if(!instance||hostRef.current.state!=='ready'||workspaceMutation.current||!confirmedWorkspace.current||workspaceRef.current?.sessionId!==input.sessionId
       ||workspaceRef.current.revision!==input.expectedWorkspaceRevision||detailsRef.current[input.sessionId]?.session.storageVersion!==input.expectedStorageVersion)return {ok:false,error:safeError('state_conflict')};
@@ -307,6 +312,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     return result;
   }
   async function restoreSession(input:RestoreSessionInput):Promise<Result<SessionDetail>> {
+    if(executionBlockRef.current)return {ok:false,error:safeError('runtime_busy')};
     const instance=hostRef.current.instanceId;
     if(!instance||hostRef.current.state!=='ready'||workspaceMutation.current||workspaceRef.current?.sessionId!==input.sessionId)return {ok:false,error:safeError('state_conflict')};
     workspaceMutation.current={instance,kind:'restore'};setSelecting(true);
@@ -617,6 +623,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     await Promise.all([...(value.inputId !== null && value.runId !== null ? [readRun(value.runId)] : []), readSession(value.sessionId), readActive()]);
   }
   function canStartIntentAction(source:RunView) {
+    if(executionBlockRef.current)return false;
     const sessionId=workspaceRef.current?.sessionId,draft=sessionId?draftsRef.current[sessionId]:null;
     const pending=draft?.pending,knownFailure=!pending||draft?.confirmedFailure===true&&source.kind==='agent'&&['failed','cancelled'].includes(source.status)
       &&pending.input.mode==='send'&&pending.operationRef===source.operationRef&&pending.input.sessionId===source.sessionId&&pending.input.clientSequence===source.clientSequence;
@@ -662,6 +669,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     await sendSession(false,{...draft,text:'Query form: '+canonicalRequest(params),mode:'send',routing:{mode:'user_form',params}});
   }
   async function sendSession(retry = false,preparedDraft?:SessionDraft) {
+    if(!retry&&executionBlockRef.current){setError(executionBlockRef.current);return;}
     const sessionId = workspaceRef.current?.sessionId, draft = preparedDraft??(sessionId ? draftsRef.current[sessionId] : null), instance = hostRef.current.instanceId;
     if (!sessionId || !draft || !instance || deletedSessions.current.has(sessionId) || detailsRef.current[sessionId]?.session.status !== 'active' || hostRef.current.state !== 'ready' || sendBusy.current || workspaceMutation.current || !confirmedWorkspace.current) return;
     const originalControl = detailsRef.current[sessionId]?.session.inputControl, root = selectedRuns.current.get(sessionId);
@@ -757,6 +765,11 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   const queueRootInput = queueRun?.inputId && current ? inputQueue.snapshots[current]?.items.find(value => value.id === queueRun.inputId) ?? null : null;
   const frozenRun = active?.kind === 'agent' && active.sessionId ? selectedRuns.current.get(active.sessionId) : run?.kind === 'agent' ? run : null;
   const frozenInput = frozenRun?.inputId ? inputQueue.snapshots[frozenRun.sessionId]?.items.find(value => value.id === frozenRun.inputId) ?? null : null;
+  let productionBlockReason: string | null = null;
+  if (!(host.state === 'stopped' && host.canStart)) {
+    if (host.state !== 'ready' || !control || control.instanceId !== host.instanceId) productionBlockReason = 'Chat execution readiness is unconfirmed.';
+    else if (!control.acceptingNewRuns || control.activeRootRun || control.blockReasons.length) productionBlockReason = 'A chat action is running or still requires stopping or saving.';
+  }
   return <div className={"desktop " + (ui.navCollapsed ? "nav-collapsed " : "") + (ui.detailOpen ? "has-details" : "")}>
     <Sidebar page={page} onPage={page => { setRequestedQuery(null); setPage(page); }} collapsed={ui.navCollapsed} onCollapse={() => void updateUi({ navCollapsed: true })} host={host}>
       <SessionList sessions={sessions} current={current} running={active?.sessionId ?? null} creating={creating} canCreate={host.state === "ready" && workspaceConfirmed && !selecting} canSelect={host.state === 'ready' && workspaceConfirmed} canRecoverCreate={host.state === 'ready' && !selecting && workspaceRecovery !== 'restart' && successfulRestoreInstance.current === host.instanceId}
@@ -767,9 +780,9 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       {pendingSessionChoice !== null && <p role="status">Session {pendingSessionChoice} is still your requested selection. <button disabled={!workspaceConfirmed || selecting} onClick={() => void selectSession(pendingSessionChoice)}>Confirm Session {pendingSessionChoice}</button></p>}
     </Sidebar>
     <main className="workspace">
-      <header className="page-header"><div className="header-title">{ui.navCollapsed && <button className="quiet" onClick={() => void updateUi({ navCollapsed: false })}>Expand navigation</button>}<h1>{{ chat: "Chat", data: "Data Workspace", queries: "Query History", models: "Models", prompt:"Prompt", skills:"Skills", extensions:"Extensions", settings: "Settings" }[page]}</h1></div><button ref={detailsButton} className="quiet" onClick={() => void updateUi({ detailOpen: true })}>View run details</button></header>
+      <header className="page-header"><div className="header-title">{ui.navCollapsed && <button className="quiet" onClick={() => void updateUi({ navCollapsed: false })}>Expand navigation</button>}<h1>{{ chat: "Chat", data: "Data Workspace", queries: "Query History", models: "Models", prompt:"Prompt", skills:"Skills", extensions:"Extensions", evaluation: 'Evaluation', settings: "Settings" }[page]}</h1></div><button ref={detailsButton} className="quiet" onClick={() => void updateUi({ detailOpen: true })}>View run details</button></header>
       {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="Dismiss notice" onClick={() => setError(null)}>×</button></div>}
-      <section className="page-content chat-page" hidden={page !== "chat"}><Chat compactionProgress={compactionProgress} visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control} run={run} preview={preview} events={runEvents.state} onFinalSource={runEvents.setFinalSource}
+      <section className="page-content chat-page" hidden={page !== "chat"}><Chat executionBlockReason={executionBlockReason} compactionProgress={compactionProgress} visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control} run={run} preview={preview} events={runEvents.state} onFinalSource={runEvents.setFinalSource}
         workspace={workspace} workspaceConfirmed={workspaceConfirmed} workspacePending={selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} onWorkspace={updateWorkspace} dataDefaults={catalog}
         session={currentDetail} draft={draft} selecting={selecting || !workspaceConfirmed} sending={sending !== null && sending === current} runningTitle={runningSession ? sessionDisplayTitle(runningSession) : null}
         queueRun={queueRun} queueRootInput={queueRootInput} frozenInput={frozenInput} frozenRunId={frozenRun?.id} inputs={current ? inputQueue.snapshots[current] ?? null : null} cancellingInputs={cancellingInputs}
@@ -777,16 +790,18 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
         onResumeCheckpoint={resumeCheckpoint} onRestoreSession={restoreSession} onHistoryVerified={refreshHistory}
         onDraft={patch => { if (current) editDraft(current, patch); }} onUseForSession={useForSession} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onNewAttempt={pending => { if (current) startNewAttempt({ instanceId: host.instanceId, sessionId: current, pending }); }} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} /></section>
       <section className="page-content" hidden={page !== "data"}><DataWorkspace host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} onDeleteCommit={commitDataDeletion} onDeleteResult={confirmDataDeletion} catalog={catalog} batches={catalog?.batches ?? []} onRefresh={page => void readCatalog(page)} onUpdate={updateWorkspace} onError={setError} /></section>
-      <section className="page-content" hidden={page !== "queries"}><QueryHistory visible={page === "queries"} requestedQuery={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} writable={!!control?.acceptingNewRuns} active={active} onUpdate={updateWorkspace} onError={setError}
+      <section className="page-content" hidden={page !== "queries"}><QueryHistory visible={page === "queries"} requestedQuery={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} writable={!!control?.acceptingNewRuns&&!executionBlockReason} active={active} onUpdate={updateWorkspace} onError={setError}
         formRun={queryFormRun} formPending={draft?.pending??null} formResendConfirmed={!!draft?.resendConfirmed} onSubmitForm={submitQueryForm}
         onReadSubmission={lookupSubmission} onResendSubmission={()=>sendSession(true)}
-        formReason={sending!==null?'A submission is being confirmed.':draft?.pending?'Read the original submission before starting another query.':!control?.acceptingNewRuns?'Wait for execution and saving to settle.':!draft?.model?'Select valid model metadata for this Session.':!draft.referenceDate||!draft.timezone?'Set the reference date and timezone in the Session.':null}/></section>
-      <section className="page-content" hidden={page !== "models"}><ModelsPage directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control}
+         formReason={executionBlockReason??(sending!==null?'A submission is being confirmed.':draft?.pending?'Read the original submission before starting another query.':!control?.acceptingNewRuns?'Wait for execution and saving to settle.':!draft?.model?'Select valid model metadata for this Session.':!draft.referenceDate||!draft.timezone?'Set the reference date and timezone in the Session.':null)}/></section>
+      <section className="page-content" hidden={page !== "models"}><ModelsPage executionBlockReason={executionBlockReason} directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control}
         sessionTarget={workspaceConfirmed && !selecting && current && currentDetail && host.instanceId ? { instanceId: host.instanceId, sessionId: current } : null} onUseForSession={useForSession}
         prompt={prompt} notification={authNotify} attempt={authAttempt} onChanged={changed} onAccepted={acceptedProvider} onError={setError} /></section>
-      <section className="page-content" hidden={page !== "settings"}><SettingsPage ui={ui} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost} /></section>
+      <section className="page-content" hidden={page !== "settings"}><SettingsPage executionBlockReason={executionBlockReason} ui={ui} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost} /></section>
+      <section className="page-content" hidden={page !== 'evaluation'}><EvaluationPage visible={page === 'evaluation'} evaluation={evaluation}
+        productionBlockReason={productionBlockReason} /></section>
       {(page==='prompt'||page==='skills')&&<section className="page-content"><ResourcePanel host={host} source={workspaceConfirmed&&!selecting&&current?{source:'selection',sessionId:current}:null} kind={page==='prompt'?'prompt':'skill'} activeRunId={active?.sessionId===current?active?.runId:null} onPublished={()=>void readDirectory()} /></section>}
-      {page==='extensions'&&<section className="page-content"><ExtensionsPage host={host} sessionId={workspaceConfirmed&&!selecting?current:null} runId={run?.kind==='agent'&&run.sessionId===current?run.id:null} activeRunId={active?.runId??null} stopping={!!active?.stopPending||!!active?.persistencePending} onStop={()=>void stop()} onDetails={()=>void updateUi({detailOpen:true})} onPublished={()=>void readDirectory()} /></section>}
+      {page==='extensions'&&<section className="page-content"><ExtensionsPage executionBlockReason={executionBlockReason} host={host} sessionId={workspaceConfirmed&&!selecting?current:null} runId={run?.kind==='agent'&&run.sessionId===current?run.id:null} activeRunId={active?.runId??null} stopping={!!active?.stopPending||!!active?.persistencePending} onStop={()=>void stop()} onDetails={()=>void updateUi({detailOpen:true})} onPublished={()=>void readDirectory()} /></section>}
     </main>
     {ui.detailOpen && <RunDetails inputs={inputQueue.snapshots[run?.kind === "agent" ? run.sessionId : current ?? 0] ?? null} onRefreshInputs={() => { const id=run?.kind === "agent" ? run.sessionId : current; if(id)void refreshInputs(id,true); }} onMoreInputs={() => { const id=run?.kind === "agent" ? run.sessionId : current; if(id)void readInputPage(id,"more"); }} cancellingInputs={cancellingInputs} onCancelInput={original => void cancelInput(original)} run={run} host={host} viewSessionId={current} tab={ui.detailTab} active={active} control={control} events={runEvents.state} onResumeGap={runEvents.resumeGap} onTab={tab => void updateUi({ detailTab: tab })} onClose={() => void closeDetails()} onError={setError}
       onIntentAction={(source,mode)=>void startIntentAction(source,mode)} intentActionsDisabled={!run||!canStartIntentAction(run)}

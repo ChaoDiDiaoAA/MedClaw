@@ -1,15 +1,28 @@
-import { readFile, rename, writeFile, open, unlink } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
 import { readReport, writeJsonExclusive } from '../reports/write.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { resolve } from 'node:path';
 import { evidencePath,replaceJson } from '../reports/write.ts';
+import { acquireEvaluationWriteLock } from '../reports/write-lock.ts';
 import { mapReport, assertSafeExport, type ExportEnvelope, type ExportEvent } from './map.ts';
 
 export interface PlatformConfig { baseUrl: string; publicKey: string; secretKey: string; serverVersion: string; transport: 'otel-http-json/v1' }
 export interface ExportReceipt { eventId: string; state: 'accepted' | 'rejected' | 'unknown'; receivedAt: string | null; safeError: string | null }
 export interface ExportState { state: 'disabled' | 'complete' | 'error'; receipts: ExportReceipt[]; attempts: { at: string; state: string; receipts: ExportReceipt[] }[] }
+export class PlatformReceiptSaveError extends Error {
+  readonly retrySave: () => Promise<void>;
+  constructor(save: () => Promise<void>) {
+    super('storage_write_failed');
+    let pendingRecovery: (() => Promise<void>) | undefined;
+    this.retrySave = async () => {
+      await pendingRecovery?.(); pendingRecovery = undefined;
+      try { await save(); }
+      catch (error) { if (error instanceof PlatformReceiptSaveError) pendingRecovery = error.retrySave; throw error; }
+    };
+  }
+}
 const pinnedRelease=(value:string|undefined)=>Boolean(value?.trim()&&!/replace|placeholder|^latest$/i.test(value.trim()));
 export function platformConfig(env: Record<string, string | undefined> = process.env): PlatformConfig {
   const baseUrl = env.LANGFUSE_BASE_URL, publicKey = env.LANGFUSE_PUBLIC_KEY, secretKey = env.LANGFUSE_SECRET_KEY, serverVersion = env.MEDCLAW_LANGFUSE_SERVER_VERSION;
@@ -67,12 +80,44 @@ export async function exportReport(path:string,backend:'local'|'langfuse',config
   config??=platformConfig();
   validatePlatformConfig(config);
   const report=await readReport(path);if(!report.trials.some(trial=>trial.startedAt))throw new Error('export_no_started_trials');
-  const root=path.endsWith('.json')?dirname(resolve(path)):resolve(path),lockPath=join(root,'.export.lock'),lock=await open(lockPath,'wx',0o600);await lock.close();
+  signal?.throwIfAborted();
+  const root=path.endsWith('.json')?dirname(resolve(path)):resolve(path),release=await acquireEvaluationWriteLock(root,'export');
+  let pendingSave:PlatformReceiptSaveError|undefined;
   try {
-    const {document}=await ensureExport(path),receipts:ExportReceipt[]=[];
-    for(const event of document.envelope.events)receipts.push(document.state.receipts.find(receipt=>receipt.eventId===event.id&&receipt.state==='accepted')??await sendEvent(event,config,signal));
-    const state=receipts.every(receipt=>receipt.state==='accepted')?'complete':'error';
-    document.state={state,receipts,attempts:[...document.state.attempts,{at:new Date().toISOString(),state,receipts}]};
-    await replaceJson(join(root,'export.json'),document);return document.state;
-  } finally {await unlink(lockPath);}
+    const {document}=await ensureExport(path),receipts=new Map(document.state.receipts.map(receipt=>[receipt.eventId,receipt]));
+    const attempt={at:new Date().toISOString(),state:'error',receipts:[] as ExportReceipt[]};let started=false;
+    const update=()=>{
+      const state=document.envelope.events.every(event=>receipts.get(event.id)?.state==='accepted')?'complete':'error';
+      document.state.state=state;document.state.receipts=document.envelope.events.flatMap(event=>receipts.has(event.id)?[receipts.get(event.id)!]:[]);attempt.state=state;
+    };
+    for(const event of document.envelope.events) {
+      if(receipts.get(event.id)?.state==='accepted')continue;
+      if(signal?.aborted)break;
+      if(!started){document.state.attempts.push(attempt);started=true;}
+      const pending:ExportReceipt={eventId:event.id,state:'unknown',receivedAt:null,safeError:'langfuse_delivery_unconfirmed'};
+      receipts.set(event.id,pending);attempt.receipts.push(pending);update();
+      try{await replaceJson(join(root,'export.json'),document);}catch(cause){throw new Error('storage_write_failed',{cause});}
+      const beforeResponse=structuredClone(document.state),receipt=await sendEvent(event,config,signal);
+      receipts.set(event.id,receipt);attempt.receipts[attempt.receipts.length-1]=receipt;update();
+      try{await replaceJson(join(root,'export.json'),document);}
+      catch {
+        throw new PlatformReceiptSaveError(async()=>{
+          const releaseRecovery=await acquireEvaluationWriteLock(root,'export');
+          try {
+            await evidencePath(root,'export.json');
+            const current=(await inspectExport(path)).document;
+            if(!isDeepStrictEqual(current.binding,document.binding)||!isDeepStrictEqual(current.envelope,document.envelope))throw new Error('state_conflict');
+            if(isDeepStrictEqual(current.state,document.state))return;
+            if(!isDeepStrictEqual(current.state,beforeResponse))throw new Error('state_conflict');
+            await replaceJson(join(root,'export.json'),document);
+          }finally{try{await releaseRecovery();}catch{throw new PlatformReceiptSaveError(releaseRecovery);}}
+        });
+      }
+    }
+    return document.state;
+  } catch(error) {if(error instanceof PlatformReceiptSaveError)pendingSave=error;throw error;}
+  finally {
+    try{await release();}
+    catch{const save=pendingSave?.retrySave;throw new PlatformReceiptSaveError(async()=>{await release();await save?.();});}
+  }
 }

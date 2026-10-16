@@ -31,7 +31,9 @@ export async function saveReportFixture(root:string,report=reportFixture(),obser
   for(const trial of report.trials) {
     const path='evidence/'+trial.trialId+'/trial.json';
     await writeJsonExclusive(join(root,path),trial);evidence.push({path,sensitivity:'private' as const});
-    const events='evidence/'+trial.trialId+'/events.jsonl';await writeFileExclusive(join(root,events),'');evidence.push({path:events,sensitivity:'private' as const});
+    const events='evidence/'+trial.trialId+'/events.jsonl';
+    const scoring=report.snapshot.plan===undefined?'':JSON.stringify({at:report.createdAt,kind:'scoring.completed',value:{trialId:trial.trialId,scores:report.scores.filter(score=>score.trialId===trial.trialId)}})+'\n';
+    await writeFileExclusive(join(root,events),scoring);evidence.push({path:events,sensitivity:'private' as const});
     if(trial.observationRef) {await writeJsonExclusive(join(root,trial.observationRef),observations[trial.trialId]??{executionId:report.executionId,trialId:trial.trialId,instanceId:trial.instanceId,observedFrom:trial.startedAt,observedUntil:trial.endedAt,identityChecks:[{id:'engineering-owner',passed:true,reason:'Controlled artificial observation'}],facts:{},missing:[]});evidence.push({path:trial.observationRef,sensitivity:'private' as const});}
   }
   return writeReport(root,report,evidence);

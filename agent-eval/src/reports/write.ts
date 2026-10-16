@@ -3,14 +3,14 @@ import { randomUUID } from 'node:crypto';
 import { resolve, join, dirname, relative, isAbsolute, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
-import { ExecutionIdSchema, ResolvedRunConfigSchema, type EvaluationReport, type ExecutionSnapshot } from '../types.ts';
+import { ExecutionIdSchema, ResolvedRunConfigSchema, type EvaluationReport, type ExecutionSnapshot, type ArchivedTrial, type TrialPlan } from '../types.ts';
 import { loadSnapshot, RelativePathSchema } from '../datasets.ts';
 import { aggregate } from '../scoring/aggregate.ts';
 import {assertJudgeCallMatches,assertCountedJudgeResult} from '../scoring/judges/client.ts';
 import {reviewCandidates} from '../review/candidates.ts';
 import {deriveReportAnalysis,assertQualityMetricCatalog} from './analysis.ts';
 import {projectObservation} from '../scoring/project-observation.ts';
-import type {ObservationLike} from '../scoring/types.ts';
+import type {ObservationLike,EvaluationScore,CheckSpec} from '../scoring/types.ts';
 import {record} from '../scoring/rules.ts';
 
 export async function executionReportPath(runsRoot:string,executionId:string):Promise<string> {
@@ -50,6 +50,89 @@ export function hydrateReport(raw:Omit<EvaluationReport,'snapshot'|'config'>,sna
 const scoreStatus=z.enum(['PASS','FAIL','UNJUDGEABLE','ERROR','NOT_RUN']);
 const finiteNullable=z.number().finite().nullable();
 const ScoreSchema=z.object({trialId:z.string(),caseId:z.string(),metricId:z.string(),version:z.literal('v1'),checkId:z.string(),name:z.string(),method:z.enum(['deterministic','llm-judge']),status:scoreStatus,applicable:z.boolean(),required:z.boolean(),hardConstraint:z.boolean(),unit:z.string(),scope:z.object({kind:z.enum(['trial','run','call','opportunity']),ref:z.string()}),value:finiteNullable,numerator:finiteNullable,denominator:finiteNullable,evidenceRefs:z.array(z.string()),reason:z.string(),missing:z.array(z.string())});
+function assertTrialIdentity(plan:TrialPlan,trial:ArchivedTrial) {
+  if(trial.trialId!==plan.trialId||trial.caseId!==plan.caseId||trial.repetition!==plan.repetition||!['completed','cancelled','failed','infra_error','not_run'].includes(trial.status)||trial.status==='not_run'&&trial.startedAt!==null)throw new Error('report_trial_identity_invalid');
+}
+function assertScoreIdentity(score:EvaluationScore,check:CheckSpec,caseId:string,name:string|undefined,trial:ArchivedTrial) {
+  ScoreSchema.parse(score);
+  if(score.trialId!==trial.trialId||score.caseId!==caseId||score.metricId!==check.metricId||score.version!==check.version||score.method!==check.kind||score.required!==check.required||score.hardConstraint!==check.hardConstraint||score.unit!==check.unit||name!==undefined&&score.name!==name||trial.status==='not_run'&&score.status!=='NOT_RUN'||score.denominator!==null&&score.denominator<0)throw new Error('report_check_contract_mismatch');
+}
+export interface PartialExecution {
+  snapshot:ExecutionSnapshot;trials:ArchivedTrial[];scores:EvaluationScore[];
+  gaps:{code:string;message:string;trialId:string|null}[];
+}
+export async function readPartialExecution(root:string):Promise<PartialExecution> {
+  try{await evidencePath(root,'report.json');throw new Error('partial_requires_missing_report');}
+  catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+  const snapshot=JSON.parse(await readFile(await evidencePath(root,'snapshot.json'),'utf8')) as ExecutionSnapshot;
+  if(snapshot.contract!=='medclaw-execution-snapshot/v1'||!snapshot.compiled||!Array.isArray(snapshot.plan)||!snapshot.plan.length)throw new Error('partial_snapshot_invalid');
+  ExecutionIdSchema.parse(snapshot.executionId);ResolvedRunConfigSchema.parse(snapshot.config);
+  const dataset=loadSnapshot(snapshot.dataset,root,snapshot.compiled);
+  if(snapshot.qualityMetricCatalog)assertQualityMetricCatalog(snapshot.qualityMetricCatalog,snapshot.qualityMetricCatalogVersion??'v1');
+  if(snapshot.dataset.review.state==='verified'&&!isDeepStrictEqual(snapshot.criteria,snapshot.dataset.review.verifiedData?.criteria))throw new Error('review_criteria_changed');
+  const criteria=z.array(z.object({id:z.string(),name:z.string().optional(),version:z.literal('v1'),kind:z.enum(['deterministic','llm-judge']),hardConstraint:z.boolean(),unit:z.string(),threshold:z.number().finite(),direction:z.enum(['higher','lower'])})).parse(snapshot.criteria);
+  const seen=new Set<string>();
+  for(const plan of snapshot.plan){ExecutionIdSchema.parse(plan.trialId);if(seen.has(plan.trialId)||!dataset.manifest.members.includes(plan.caseId)||!Number.isSafeInteger(plan.repetition)||plan.repetition<1)throw new Error('report_plan_invalid');seen.add(plan.trialId);}
+  const partial:PartialExecution={snapshot,trials:[],scores:[],gaps:[]};
+  const gap=(code:string,trialId:string)=>partial.gaps.push({code,message:'The original Trial or scoring record is missing or unconfirmed.',trialId});
+  for(const plan of snapshot.plan) {
+    let trial:ArchivedTrial,observation:ObservationLike|null=null;
+    try {
+      const stored=JSON.parse(await readFile(await evidencePath(root,'evidence/'+plan.trialId+'/trial.json'),'utf8'));
+      const {lifecycle,...state}=stored;
+      trial={...state,observationRef:state.observationRef==='observation.json'?'evidence/'+plan.trialId+'/observation.json':state.observationRef};
+      assertTrialIdentity(plan,trial);
+      if(trial.observationRef!==null){
+        if(trial.observationRef!=='evidence/'+trial.trialId+'/observation.json')throw new Error('observation_reference_invalid');
+        const original=JSON.parse(await readFile(await evidencePath(root,trial.observationRef),'utf8'));
+        if(original.executionId!==snapshot.executionId||original.trialId!==trial.trialId||original.instanceId!==trial.instanceId||!Array.isArray(original.identityChecks)||original.identityChecks.some((check:{passed:boolean})=>!check.passed))throw new Error('observation_identity_mismatch');
+        for(const file of original.facts?.artifactFiles??[]){
+          if(file.evidencePath!=='artifacts/'+file.artifactId+'/'+file.relativePath)throw new Error('artifact_reference_invalid');
+          const bytes=await readFile(await evidencePath(root,'evidence/'+trial.trialId+'/'+file.evidencePath));
+          if(typeof file.content!=='string'||bytes.length!==file.bytes||!bytes.equals(Buffer.from(file.content)))throw new Error('artifact_content_mismatch');
+        }
+        observation={...original,facts:{...original.facts,evidenceRoot:join(root,'evidence',trial.trialId)}};
+      }else if(trial.status==='completed')throw new Error('completed_trial_missing_observation');
+      partial.trials.push(trial);
+    } catch {gap('partial_trial_unconfirmed',plan.trialId);continue;}
+    try {
+      const journal=await readFile(await evidencePath(root,'evidence/'+plan.trialId+'/events.jsonl'),'utf8');
+      const events=journal.split('\n').filter(line=>line.trim()).map(line=>JSON.parse(line));
+      if(events.some(event=>!event||typeof event.kind!=='string'||!Number.isFinite(Date.parse(event.at))))throw new Error('event_journal_record_invalid');
+      const recorded=events.filter(event=>event.kind==='scoring.completed');
+      if(recorded.length!==1||recorded[0].value?.trialId!==trial.trialId||!Array.isArray(recorded[0].value.scores))throw new Error('scoring_journal_binding_mismatch');
+      const scores=recorded[0].value.scores as EvaluationScore[],task=dataset.cases.find(item=>item.id===plan.caseId)!;
+      if(scores.length!==task.expected.checks.length||new Set(scores.map(score=>score.checkId)).size!==scores.length)throw new Error('report_check_coverage_mismatch');
+      for(const check of task.expected.checks){
+        const score=scores.find(score=>score.checkId===check.id),criterion=criteria.find(item=>item.id===check.metricId);
+        if(!score||!criterion||criterion.kind!==check.kind||criterion.version!==check.version||criterion.hardConstraint!==check.hardConstraint||criterion.unit!==check.unit||criterion.direction!==check.direction)throw new Error('report_criteria_mismatch');
+        const expected=dataset.gold[task.id]!.values[check.evidenceKey];
+        const threshold=check.metricId==='tool.error_rate'?(record(expected)?expected.maxRate:undefined):criterion.threshold;
+        if(check.threshold!==threshold)throw new Error('report_criteria_mismatch');
+        assertScoreIdentity(score,check,task.id,criterion.name,trial);
+        if((/^(query|diff|export|answer)\./.test(check.metricId)||score.method==='llm-judge'&&['task.verify_completion','task.false_completion','evidence.coverage','evidence.valid'].includes(check.metricId))&&!isDeepStrictEqual(score.expected,expected))throw new Error('report_expected_content_mismatch');
+        if(score.method==='llm-judge'&&['PASS','FAIL'].includes(score.status)){
+          if(record(score.details)&&score.details.contract==='medclaw-answer-constraint/v1'){
+            if(score.status!=='FAIL'||!['answer.empty','answer.clarify','answer.refuse'].includes(check.metricId)||!observation)throw new Error('semantic_constraint_binding_mismatch');
+            const projected=await projectObservation(check,{trialId:trial.trialId,caseId:task.id,trialStatus:trial.status,task:{checks:task.expected.checks},gold:dataset.gold[task.id]!,observation,input:task});
+            if(!projected?.constraint||['status','value','numerator','denominator','reason','evidenceRefs','details'].some(key=>!isDeepStrictEqual(score[key as keyof EvaluationScore],projected.constraint![key as keyof typeof projected.constraint])))throw new Error('semantic_constraint_binding_mismatch');
+          }else{
+            const requests=events.filter(event=>event.kind==='judge.request'),results=events.filter(event=>event.kind==='judge.result');
+            if(trial.status!=='completed'||requests.length!==1||results.length!==1||requests[0].value?.trialId!==trial.trialId||events.indexOf(requests[0])>=events.indexOf(results[0]))throw new Error('judge_journal_binding_mismatch');
+            const result=results[0].value;assertJudgeCallMatches(snapshot.config.judge,result.metadata);
+            const requested=requests[0].value.checks?.find((item:{checkId:string})=>item.checkId===check.id),judged=result.results?.find((item:{checkId:string;value:unknown})=>item.checkId===check.id&&item.value===score.value);
+            if(!requested||!judged)throw new Error('judge_score_binding_missing');
+            const counted=record(score.expected)?score.expected.counted:undefined;
+            if(!isDeepStrictEqual(counted,requested.counted))throw new Error('judge_counted_request_mismatch');
+            if(counted){assertCountedJudgeResult(judged,requested.counted);if(score.numerator!==(judged.numerator??null)||score.denominator!==(judged.denominator??requested.counted.denominator??null))throw new Error('judge_counted_score_mismatch');}
+          }
+        }
+      }
+      partial.scores.push(...scores);
+    }catch{gap('partial_scoring_unconfirmed',plan.trialId);}
+  }
+  return partial;
+}
 export async function writeReport(root:string,report:EvaluationReport,files:{path:string;sensitivity:'private'|'approved-summary'}[]=[]) {
   if(report.snapshot.qualityMetricCatalog)report.analysis=deriveReportAnalysis(report);
   report.evidenceManifest=[];
@@ -103,7 +186,7 @@ export async function readReport(location:string):Promise<EvaluationReport> {
     if(!Number.isSafeInteger(plan.repetition)||plan.repetition<1||!dataset.manifest.members.includes(plan.caseId))throw new Error('report_plan_invalid');
     const trial=raw.trials.find(item=>item.trialId===plan.trialId);
     if(!trial)throw new Error('report_trial_missing');
-    if(trial.caseId!==plan.caseId||trial.repetition!==plan.repetition||!['completed','cancelled','failed','infra_error','not_run'].includes(trial.status)||trial.status==='not_run'&&trial.startedAt!==null)throw new Error('report_trial_identity_invalid');
+    assertTrialIdentity(plan,trial);
     const stateRef='evidence/'+trial.trialId+'/trial.json';if(!paths.has(stateRef))throw new Error('trial_state_reference_missing');
     if(!paths.has('evidence/'+trial.trialId+'/events.jsonl'))throw new Error('event_journal_reference_missing');
     const stored=JSON.parse(await readFile(await evidencePath(root,stateRef),'utf8'));
@@ -134,7 +217,7 @@ export async function readReport(location:string):Promise<EvaluationReport> {
       if(/^(query|diff|export|answer)\./.test(check.metricId)&&!isDeepStrictEqual(score.expected,dataset.gold[task.id]!.values[check.evidenceKey]))throw new Error('report_expected_content_mismatch');
       if(score.method==='llm-judge'&&['task.verify_completion','task.false_completion','evidence.coverage','evidence.valid'].includes(check.metricId)&&!isDeepStrictEqual(score.expected,dataset.gold[task.id]!.values[check.evidenceKey]))throw new Error('report_expected_content_mismatch');
       const criterion=criteria.find(criterion=>criterion.id===check.metricId)!;
-      if(score.caseId!==task.id||score.metricId!==check.metricId||score.version!==check.version||score.method!==check.kind||score.required!==check.required||score.hardConstraint!==check.hardConstraint||score.unit!==check.unit||criterion.name!==undefined&&score.name!==criterion.name||trial.status==='not_run'&&score.status!=='NOT_RUN'||score.denominator!==null&&score.denominator<0)throw new Error('report_check_contract_mismatch');
+      assertScoreIdentity(score,check,task.id,criterion.name,trial);
       if(score.details&&typeof score.details==='object'&&'contract' in score.details&&score.details.contract==='medclaw-answer-constraint/v1'){
         if(score.method!=='llm-judge'||score.status!=='FAIL'||!['answer.empty','answer.clarify','answer.refuse'].includes(check.metricId)||!observations.has(trial.trialId))throw new Error('semantic_constraint_binding_mismatch');
         // Verify only the recorded deterministic gate; never rerun Judge or replace archived Scores.

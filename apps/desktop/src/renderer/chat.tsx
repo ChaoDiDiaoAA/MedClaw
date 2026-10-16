@@ -282,7 +282,7 @@ export function SessionCompaction(props:{host:HostView;session:SessionDetail|nul
   </section>;
 }
 
-export function Chat(props: { compactionProgress?:{sessionId:number;runId:number|null;phase:string}|null;visible: boolean; sessionId: number | null; onCreate: () => void; directory: ModelDirectoryView | null; directoryCurrent: boolean; directoryStatus?: DirectoryReadStatus; host: HostView; active: ActiveRunView | null; control: RuntimeControlView | null;
+export function Chat(props: { executionBlockReason?:string|null;compactionProgress?:{sessionId:number;runId:number|null;phase:string}|null;visible: boolean; sessionId: number | null; onCreate: () => void; directory: ModelDirectoryView | null; directoryCurrent: boolean; directoryStatus?: DirectoryReadStatus; host: HostView; active: ActiveRunView | null; control: RuntimeControlView | null;
   run: RunView | null; preview: { text: string; truncated: boolean } | null; session: SessionDetail | null; draft: SessionDraft | null;
   events: RunEventProjectionState | null; onFinalSource: (source: 'native' | 'saved' | 'unavailable') => void;
   selecting: boolean; sending: boolean; runningTitle: string | null; onDraft: (patch: Partial<SessionDraft>) => void; onSend: () => void; onResend: () => void;
@@ -339,9 +339,9 @@ export function Chat(props: { compactionProgress?:{sessionId:number;runId:number
   const sendReason = !props.directoryCurrent ? "Reload the model directory in Models" : !choice ? "Select a session model" : !model || !model.input.includes("text") ? "The session model is unavailable. Select another model."
     : !model.maxTokens ? "Confirm the model output limit" : draft?.routing?.mode !== 'intent' && provider?.auth.state !== "available" ? "Authenticate the provider first" : !props.control ? "Run availability is unconfirmed"
     : !props.control.acceptingNewRuns ? (props.control.blockReasons[0] ? errorMessage(props.control.blockReasons[0]) : "Wait for the original run to stop and be saved") : null;
-  const reason = commonReason ?? (mode === 'send' ? sendReason : queueReason);
+  const reason = props.executionBlockReason ?? commonReason ?? (mode === 'send' ? sendReason : queueReason);
   const showActions = !!inputControl && props.active?.kind === 'agent' && props.active.sessionId === props.sessionId && props.active.runId === inputControl.runId;
-  const menuBlocked = !draft || props.selecting || props.sending || !!draft.pending || props.host.state !== 'ready';
+  const menuBlocked = !!props.executionBlockReason || !draft || props.selecting || props.sending || !!draft.pending || props.host.state !== 'ready';
   const actionKey = JSON.stringify([props.host.instanceId, props.host.state, props.sessionId, inputControl?.runId, props.active?.runId, props.visible]);
   const [actionMenu, setActionMenu] = useState<string | null>(null), actionGroup = useRef<HTMLDivElement>(null), actionTrigger = useRef<HTMLButtonElement>(null);
   const menuEdge = useRef<'first' | 'last'>('first'), menuOpen = actionMenu === actionKey && showActions && !menuBlocked;
@@ -442,8 +442,8 @@ export function Chat(props: { compactionProgress?:{sessionId:number;runId:number
             {showRunBody && run.output.nextOffset !== null && !props.preview && <p className="muted">Showing {run.output.text.length} / {run.output.totalChars} characters. Read the full output in Run details.</p>}
             {run.error && <p role="alert" className="error-text">{errorMessage(run.error)}</p>}</article></>}
         <QueryConditions sessionId={props.sessionId} context={props.session?.currentQueryContext}/>
-        <SessionCheckpoints host={props.host} session={props.session} workspace={props.workspace} visible={props.visible} blocked={props.selecting||props.sending||!props.workspaceConfirmed||!!props.draft?.pending||props.control?.acceptingNewRuns!==true||props.host.state!=='ready'} onResumeCheckpoint={props.onResumeCheckpoint} onRestoreSession={props.onRestoreSession} onHistoryVerified={props.onHistoryVerified}/>
-        <SessionCompaction host={props.host} session={props.session} model={choice??null} visible={props.visible} control={props.control} blockedReason={props.selecting||props.sending||!props.workspaceConfirmed||props.draft?.pending?'Verify the current session and original input first.':!props.session?'Create or select a session.':props.session.runtime.availability==='blocked'?'Restore the session before compacting.':sendReason} onHistoryVerified={props.onHistoryVerified} onRestoreSession={props.onRestoreSession}/>
+        <SessionCheckpoints host={props.host} session={props.session} workspace={props.workspace} visible={props.visible} blocked={!!props.executionBlockReason||props.selecting||props.sending||!props.workspaceConfirmed||!!props.draft?.pending||props.control?.acceptingNewRuns!==true||props.host.state!=='ready'} onResumeCheckpoint={props.onResumeCheckpoint} onRestoreSession={props.onRestoreSession} onHistoryVerified={props.onHistoryVerified}/>
+        <SessionCompaction host={props.host} session={props.session} model={choice??null} visible={props.visible} control={props.control} blockedReason={props.executionBlockReason??(props.selecting||props.sending||!props.workspaceConfirmed||props.draft?.pending?'Verify the current session and original input first.':!props.session?'Create or select a session.':props.session.runtime.availability==='blocked'?'Restore the session before compacting.':sendReason)} onHistoryVerified={props.onHistoryVerified} onRestoreSession={props.onRestoreSession}/>
         {props.compactionProgress?.sessionId===props.sessionId&&props.compactionProgress.runId===props.active?.runId&&<p role="status" aria-live="polite">Automatic context compaction · {props.compactionProgress.phase}</p>}
       </div>
     </div>
@@ -485,7 +485,7 @@ export function Chat(props: { compactionProgress?:{sessionId:number;runId:number
               items[next]?.focus();
             }
           }}>{(['send', 'steer', 'follow_up'] as const).map(value => {
-            const disabledReason = commonReason ?? (value === 'send' ? sendReason : queueReason);
+            const disabledReason = props.executionBlockReason ?? commonReason ?? (value === 'send' ? sendReason : queueReason);
             return <button key={value} role="menuitem" aria-current={value === mode ? 'true' : undefined} disabled={!!disabledReason} title={disabledReason ?? undefined} onClick={() => chooseAction(value)}>{value === 'follow_up' ? 'Follow Up' : value === 'steer' ? 'Steer' : 'Send'}</button>;
           })}</div>}
         </div>

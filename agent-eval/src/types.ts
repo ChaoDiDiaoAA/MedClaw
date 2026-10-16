@@ -5,6 +5,8 @@ import type {QualityMetricDefinition,QualityMetricCatalogVersion} from './scorin
 import type {ReportAnalysis} from './reports/analysis.ts';
 import { ANSWER_QUALITY_RUBRIC } from './scoring/judges/answer-quality.ts';
 import { CustomBaseUrlSchema,CustomProviderDefinitionSchema } from '../../packages/contracts/src/model.ts';
+import { ExecutionIdSchema, type DesktopEvaluationRequest } from '../../packages/contracts/src/evaluation.ts';
+export { ExecutionIdSchema } from '../../packages/contracts/src/evaluation.ts';
 
 export const JudgeConfigurationSchema=z.strictObject({
   baseUrl:z.url().refine(value=>{const url=new URL(value);return ['http:','https:'].includes(url.protocol)&&!url.username&&!url.password&&!url.search&&!url.hash&&(url.protocol==='https:'||['127.0.0.1','localhost','[::1]'].includes(url.hostname));}).transform(value=>new URL(value).href),
@@ -16,7 +18,6 @@ export const JudgeConfigurationSchema=z.strictObject({
 });
 export type JudgeConfiguration=z.infer<typeof JudgeConfigurationSchema>;
 
-export const ExecutionIdSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/).refine(value=>!/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(value),'Reserved filesystem identity');
 export const ResolvedRunConfigSchema = z.strictObject({
   version:z.literal(1), environment:z.string().regex(/^(?!langfuse)[a-z0-9][a-z0-9_-]{0,99}$/),
   model:z.strictObject({provider:z.string().min(1),model:z.string().min(1),maxTokens:z.number().int().positive(),definition:CustomProviderDefinitionSchema.optional()})
@@ -45,6 +46,7 @@ export interface TrialResult extends TrialPlan {
 export type ArchivedTrial = Omit<TrialResult,'observation'> & {observationRef:string|null};
 export interface EvidenceFile {path:string;bytes:number;sensitivity:'private'|'approved-summary'}
 export interface ExecutionSnapshot {
+  desktopRequest?:DesktopEvaluationRequest;
   contract:'medclaw-execution-snapshot/v1';executionId:string;dataset:DatasetSnapshot;
   config:ResolvedRunConfig;criteria:unknown;source:Record<string,unknown>;
   compiled:CompiledDataset;

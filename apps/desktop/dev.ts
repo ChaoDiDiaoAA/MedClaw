@@ -8,7 +8,7 @@ const args = Bun.argv.slice(2);
 if (args.length && (args.length !== 2 || args[0] !== "--data-root")) throw new Error("Usage: bun run dev:desktop [--data-root <isolated directory>]");
 const dataRoot = resolve(args[1] ?? join(root, ".medclaw-dev"));
 const source = join(import.meta.dir, "src");
-for (const path of [join(source, "main/index.ts"), join(source, "preload/index.ts"), join(source, "renderer/App.tsx"), join(root, "apps/host/src/main.ts")]) {
+for (const path of [join(source, "main/index.ts"), join(source, "preload/index.ts"), join(source, "renderer/App.tsx"), join(root, "apps/host/src/main.ts"), join(root, 'agent-eval/src/desktop/controller.ts')]) {
   if (!existsSync(path)) throw new Error(`Desktop entry is not implemented: ${path}`);
 }
 const output = join(root, ".build/desktop");
@@ -25,7 +25,8 @@ for (const part of ["main", "preload", "renderer"]) {
 mkdirSync(dataRoot, { recursive: true });
 const electronPath: string = createRequire(import.meta.url)("electron");
 const controlToken = crypto.randomUUID();
-const env: NodeJS.ProcessEnv = { ...process.env, MEDCLAW_HOST_ENTRY: join(root, "apps/host/src/main.ts"), MEDCLAW_BUN_EXECUTABLE: process.execPath, MEDCLAW_DEV_CONTROL_TOKEN: controlToken };
+const env: NodeJS.ProcessEnv = { ...process.env, MEDCLAW_HOST_ENTRY: join(root, "apps/host/src/main.ts"), MEDCLAW_BUN_EXECUTABLE: process.execPath, MEDCLAW_DEV_CONTROL_TOKEN: controlToken,
+  MEDCLAW_EVALUATION_SOURCE_ROOT: root };
 delete env.ELECTRON_RUN_AS_NODE;
 const child = spawn(electronPath, [join(output, "main/index.cjs"), "--medclaw-data-root", dataRoot], { env, stdio: ["ignore", "inherit", "inherit", "ipc"] });
 // Ask Main to close its Host and DB before exiting; an OS kill cannot confirm that cleanup.

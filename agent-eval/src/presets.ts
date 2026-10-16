@@ -36,8 +36,8 @@ export function parsePreset(input:string[]):Preset {
   if(mode==='upload'&&!preset.executionId)throw new Error('missing_execution_id');
   return preset;
 }
-export async function readPresetEnvironment(root=projectRoot):Promise<Record<string,string|undefined>> {
-  return parseEnv(await readFile(join(root,'agent-eval/configs/environment'),'utf8'));
+export async function readPresetEnvironment(root=projectRoot,configsRoot=join(root,'agent-eval/configs')):Promise<Record<string,string|undefined>> {
+  return parseEnv(await readFile(join(configsRoot,'environment'),'utf8'));
 }
 export async function mainPreset(args:string[],root=projectRoot,print:(value:unknown)=>void=value=>console.log(JSON.stringify(value,null,2))):Promise<number> {
   if(args.includes('--help')||args.includes('-h')){

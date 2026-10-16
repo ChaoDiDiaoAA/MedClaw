@@ -62,6 +62,10 @@ bun run eval:upload -- --execution-id EXECUTION_ID
 
 快捷命令按入口文件位置显式读取 `agent-eval/configs/agent.json` 与 `configs/environment`，以 `node:util.parseEnv` 解析中文注释、引号和空行。受管理变量以文件为准，不由同名 Shell 值补齐/覆盖，不修改全局环境。主模型仍只填写 url/key/model，Judge 仅填写 BASE_URL/MODEL/API_KEY 三项；上传仅读取平台配置和指定归档。旧显式 CLI 保留，不增加任意 .env 自动加载；密钥不进入 Agent、快照或日志。
 
+P16桌面Evaluation已经复用这些独立配置，只提供脱敏摘要和Check，不编辑文件或复制聊天Models凭据。开发入口由Main固定装配受管根和独立Bun进程；页面提供Run/Cancel/进度、报告/证据/比较、本地反馈及显式Sync feedback、Upload / Resend。已有聊天和草稿可浏览，新的聊天执行与评测/平台操作互斥；Main以原RuntimeControl核验队列、人工压缩及停止/保存。真实质量、校准和平台通过不是P16工程的历史成绩门槛，真实新Run仍沿当前审核与安全准入。
+
+缺最终report.json时，桌面只读有效snapshot和已核验的原Trial/scoring.completed；Partial不补NOT_RUN或生成最终报告，不允许比较、反馈写入或传输。Case/Trial筛选只改变相应明细，原目录、五态和分母保持；页面重载只查原操作身份，不自动重跑/上传。源码/SDK/补丁变化须确认原执行停止/保存后重启桌面；配置/材料变化重新Check。普通查看缺export.json不建平台ID；显式传输逐项持久化unknown与响应回执，异常恢复复用原ID，必要保存重试零HTTP、零模型/重评分。
+
 Judge 不受确定性高低分触发。独立 MEDCLAW_JUDGE_*，初始温度 0.8、超时 30 秒；每个适用 Trial 最多一次，不自动重试、不切模型、不继承 Agent 密钥。不设置人为输出 Token 上限或整次输出预算，沿用服务端和模型限制。请求数和 Trial 身份仍按计划校验；Agent、意图、压缩、子执行和 Judge 的实际用量分别记录，未知值不填零，不能推算固定费用上界。Case.maxToolCalls、资源预算和采证分页限制继续保留。
 
 Judge 通过 Pi SDK 0.87.1 的独立 Provider 调用，和主模型共用离线原生模型解析；不再手工拼接 `/chat/completions`。URL 与模型原生协议匹配，官方 DeepSeek `/anthropic` 使用 Messages 协议。环境仍只有三项配置，不填写额外 provider 或 Token 限制。SDK 在协议需要时自动发送原生模型上限，应用不设置 `maxTokens`；这是原生能力，不是已删除的 256 Token 或总输出预算。`snapshot.config.judge.nativeModel` 与调用元数据记录目录引用、API、原生输入/输出能力和 SDK 版本，Key 仅传独立 Judge。旧归档不补填这些字段，新旧配置差异仍被比较识别。
@@ -130,6 +134,7 @@ D:\code\MedClaw\agent-eval\
 ├─ src\
 │  ├─ cli.ts                             # 现有run/report/compare等入口
 │  ├─ presets.ts                         # Smoke／Full快捷入口及环境读取
+│  ├─ desktop\                           # P16独立控制入口、service及安全presentation
 │  ├─ evaluation.ts                      # Case、Gold、审核及来源契约
 │  ├─ datasets.ts                        # 加载、审核核对、历史快照读取
 │  ├─ dataset-compiler.ts                # 编译Case、检查及执行步骤
@@ -150,6 +155,7 @@ D:\code\MedClaw\agent-eval\
 │  │  └─ judges\                        # 独立Judge及校准
 │  ├─ reports\
 │  │  ├─ write.ts                       # 原报告保存、读取和证据校验
+│  │  ├─ write-lock.ts                  # 原平台旁记录串行写入；仅可证死所有者恢复
 │  │  ├─ compare.ts                     # 已有归档的可比性核对
 │  │  ├─ badcases.ts                    # 异常候选派生和Markdown渲染
 │  │  └─ analysis.ts                    # Case重复统计与50项覆盖，只读派生
@@ -167,7 +173,7 @@ D:\code\MedClaw\agent-eval\
    ├─ business\                         # 业务Agent执行的既有输出约定，按实际执行创建
    │  └─ <execution-id>\
    │     ├─ snapshot.json               # 数据、Gold、判据、配置及可选冻结指标目录
-   │     ├─ report.json                 # 计划、状态、评分、汇总及可选analysis
+   │     ├─ report.json                 # 完整运行才写入；缺失时只读部分原件，不补造
    │     ├─ evidence\<trial-id>\
    │     │  ├─ trial.json
    │     │  ├─ observation.json
@@ -317,3 +323,5 @@ SDK采证与逐题评分工程验证（证据日期2026-10-14）：类型检查�
 运行归档按用途保存到 `runs/business/<execution-id>/`（业务）、`runs/research/<execution-id>/`（研究）和 `runs/calibration/<execution-id>/`（独立 Judge 校准）。当前50题为业务集，研究目录预留；工程测试仍在独立 `test-results/`。复核及导出保留在所属执行内。 当前 Smoke/Full 自动写 business，校准省略 --output 自动写 calibration；业务/研究报告按 ID 统一查找，跨类同 ID 拒绝选择。完整目录、分类依据及数据交付状态见 05《MedClaw Agent评测分阶段实施与操作手册》的历史工程记录（原附录已移除，事实仅按本README保留的记载理解）；06仅保留前七个制作步骤。
 
 Trials与指标受控工程验证（证据日期2026-10-15）：399 PASS／0 FAIL、类型检查退出0；主集普通／-O核验各71531项通过。专项缺用户已删除的历史来源，review保持pending、结构状态draft；没有真实复测、校准或上传。完整结果与边界见05《MedClaw Agent评测分阶段实施与操作手册》的历史工程记录（原附录已移除，事实仅按本README保留的记载理解）。
+
+P16当前受控工程验证：单元44/44、集成58/58、终端Host 8/8、真实Electron 28/28，四类均零失败/跳过、退出0、报告完整；独立评测434/434（56文件）。原失败与专项复测记录保留，完整证据见medclaw-p16-evaluation第5.3节。测试使用实际SDK/Host/SQLite及回环协议，包含平台三个真实进程退出窗口、原ID恢复、保存/释放锁同时失败后的零HTTP保存恢复；没有执行真实外部模型、校准、Langfuse上传或安装验收。正式50/Registry140、主集50/Smoke10、历史v1的39项、专项pending及延迟SLO缺口保持。

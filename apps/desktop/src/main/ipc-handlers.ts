@@ -1,7 +1,9 @@
 import { ipcMain, shell, dialog, type BrowserWindow } from "electron";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
-import { createPublicMethodSchemas, publicMethodSchemas, publicOutputSchema, PublicMethodSchema, DesktopSecretInputSchema, DesktopSecretDiscardSchema, DesktopImportDirectorySchema, isReadOnlyMethod, type PublicMethod, type PublicPayload, type PrivateCredentialFrame, type DiagnosticsView, type RuntimeNotice } from "../../../../packages/contracts/src/protocol.ts";
+import { createPublicMethodSchemas, desktopMethodSchemas, publicOutputSchema, PublicMethodSchema, DesktopMethodSchema, DesktopSecretInputSchema, DesktopSecretDiscardSchema, DesktopImportDirectorySchema, isDesktopReadOnlyMethod, type DesktopMethod, type PublicMethod, type PublicPayload, type PrivateCredentialFrame, type DiagnosticsView, type RuntimeNotice } from "../../../../packages/contracts/src/protocol.ts";
+import { EvaluationMethodSchema, EvaluationOperationRefSchema, evaluationMethodSchemas, type EvaluationPayload, type EvaluationMethod } from '../../../../packages/contracts/src/evaluation';
+import type { EvaluationController } from './evaluation-controller';
 import { AppErrorSchema, OpaqueIdSchema, safeError, type Result } from "../../../../packages/contracts/src/error.ts";
 import { AuthLinkUrlSchema, type PublishedSettings } from "../../../../packages/contracts/src/model.ts";
 import { HostController } from "./host-controller.ts";
@@ -43,7 +45,7 @@ export async function privateCredentialRequest(credentials: MainCredentials, fra
     return { ok: true, data };
   } catch (error) { return { ok: false, error: safeError(error instanceof Error ? error.message : "credential_read_failed", error) }; }
 }
-export function registerIpc(options: { window: BrowserWindow; host: HostController; settings: MainSettings; credentials: MainCredentials; inputs: SecretInputs; fileTokens?: FileTokens; destinations?: DestinationTokens; diagnostics(categories: string[]): Promise<DiagnosticsView>; report(error: ReturnType<typeof safeError>): void; notify(notice: RuntimeNotice): void }) {
+export function registerIpc(options: { window: BrowserWindow; host: HostController; evaluation?: EvaluationController; settings: MainSettings; credentials: MainCredentials; inputs: SecretInputs; fileTokens?: FileTokens; destinations?: DestinationTokens; diagnostics(categories: string[]): Promise<DiagnosticsView>; report(error: ReturnType<typeof safeError>): void; notify(notice: RuntimeNotice): void }) {
   const { window, host, settings, credentials, inputs } = options;
   const operations = new Map<string, { method: PublicMethod; payload: unknown }>();
   // Only display subscriptions are owned by a renderer. Pi/Recorder listeners
@@ -80,7 +82,7 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
   const checkSelectionAuth = async (model: PublishedSettings["model"]) => {
     if (model && (await request("model.auth.status", { providerId: model.provider }) as { auth: { state: string } }).auth.state !== "available") throw new Error("model_auth_missing");
   };
-  const dispatch = async (method: PublicMethod, raw: unknown, operationRef: string): Promise<unknown> => {
+  const dispatch = async (method: PublicMethod, raw: unknown, operationRef: string, original = false): Promise<unknown> => {
     switch (method) {
       case "host.read": return host.read();
       case "host.start": return host.start();
@@ -198,6 +200,7 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
         if (method === "model.request" || method === "model.diagnose" || method === "session.submit") {
           // Query a reused identity first; current config/auth must not invalidate the original request.
           requireHost();
+          if (original) return request(method, raw, operationRef);
           const prior = unwrap(await host.request("run.read", { operationRef })) as { kind: "one"; run: unknown };
           if (method === "session.submit") {
             const p = raw as { sessionId: number; clientSequence: number };
@@ -212,21 +215,29 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
     }
   };
   ipcMain.handle("medclaw:request", async (event, envelope: unknown): Promise<Result<unknown>> => {
-    let method: PublicMethod | undefined, operationRef: string | undefined, replyReceived = false, parsingPayload = false;
+    let method: DesktopMethod | undefined, operationRef: string | undefined, replyReceived = false, parsingPayload = false;
     try {
       trusted(event);
       if (!envelope || typeof envelope !== "object" || Array.isArray(envelope) || Object.keys(envelope).some(k => !["method", "payload", "operationRef"].includes(k))) throw new Error("invalid_argument");
-      const input = envelope as { method: PublicMethod; payload: unknown; operationRef?: string };
-      method = PublicMethodSchema.parse(input.method);
-      operationRef = OpaqueIdSchema.parse(input.operationRef ?? crypto.randomUUID());
+      const input = envelope as { method: DesktopMethod; payload: unknown; operationRef?: string };
+      method = DesktopMethodSchema.parse(input.method);
+      operationRef = (method.startsWith('eval.') ? EvaluationOperationRefSchema : OpaqueIdSchema).parse(input.operationRef ?? crypto.randomUUID());
       let payload = input.payload;
       if (method === "model.request" || method === "model.diagnose") {
         if (payload && typeof payload === "object" && !Array.isArray(payload)) payload = { referenceDate: new Date().toLocaleDateString("sv-SE"), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, ...payload };
       }
       parsingPayload = true;
       const schema = ['data.read', 'data.rows', 'query.read', 'query.list', 'evidence.read', 'tool.read'].includes(method)
-        ? createPublicMethodSchemas()[method].input : publicMethodSchemas[method].input;
+        ? createPublicMethodSchemas()[PublicMethodSchema.parse(method)].input : desktopMethodSchemas[method].input;
       const parsed = JSON.parse(JSON.stringify(schema.parse(payload))) as unknown;
+      const evaluationMethod = EvaluationMethodSchema.safeParse(method);
+      if (evaluationMethod.success) {
+        parsingPayload = false;
+        if (!options.evaluation) throw new Error('host_not_ready');
+        const reply = await options.evaluation.dispatch(evaluationMethod.data, parsed as EvaluationPayload<EvaluationMethod>, operationRef);
+        replyReceived = true;
+        return { ok: true, data: evaluationMethodSchemas[evaluationMethod.data].output.parse(reply) };
+      }
       if(method==='session.submit'){
         const submission=SubmitInputSchema.parse(parsed);
         if(submission.mode==='send'&&submission.routing?.mode==='user_form'&&submission.text!=='Query form: '+canonicalRequest(submission.routing.params))throw new Error('invalid_argument');
@@ -239,11 +250,15 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
         operations.set(operationRef, { method, payload: parsed });
         if (operations.size > 100) operations.delete(operations.keys().next().value!);
       }
-      const reply = await dispatch(method, parsed, operationRef); replyReceived = true;
-      const data = publicOutputSchema(method,parsed).parse(reply);
+      const publicMethod = PublicMethodSchema.parse(method), identity = operationRef;
+      const execute = async (original: boolean) => {
+        const reply = await dispatch(publicMethod, parsed, identity, original); replyReceived = true;
+        return publicOutputSchema(publicMethod, parsed).parse(reply);
+      };
+      const data = options.evaluation ? await options.evaluation.withProductionAdmission(publicMethod, parsed, identity, execute) : await execute(false);
       return { ok: true, data };
     } catch (error) { const known = AppErrorSchema.safeParse(error); const safe = known.success ? known.data : safeError(error instanceof z.ZodError
-      ? replyReceived && method ? isReadOnlyMethod(method) ? "host_protocol_mismatch" : "operation_result_unknown"
+      ? replyReceived && method ? isDesktopReadOnlyMethod(method) ? "host_protocol_mismatch" : "operation_result_unknown"
         : parsingPayload && method === "session.messages.read" ? "input_invalid" : "invalid_argument"
       : error instanceof Error ? error.message : "invalid_argument", error, { operationRef }); options.report(safe); return { ok: false, error: safe }; }
   });

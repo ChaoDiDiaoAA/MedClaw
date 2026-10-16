@@ -3,6 +3,8 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./evaluation": "./src/evaluation.ts",
+    "./evaluation-transport": "./src/evaluation-transport.ts",
     "./export": "./src/export.ts",
     "./intent": "./src/intent.ts",
     "./error": "./src/error.ts",

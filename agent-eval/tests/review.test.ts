@@ -42,7 +42,8 @@ test('local platform service reuses persisted trace IDs and requires actual anno
     await importReview(path,'queue-1',config);await importReview(path,'queue-1',config);expect(await listFeedback(path)).toHaveLength(1);
     missingAuthor=true;await expect(importReview(path,'queue-1',config)).rejects.toThrow('provenance');
     await recordFeedback(path,{...(await listFeedback(path))[0]!,source:'local',sourceId:'local-1'});
-    await syncReview(path,config);await syncReview(path,config);expect(sentIds).toHaveLength(2);expect(sentIds[0]).toBe(sentIds[1]);
+    await syncReview(path,config);await syncReview(path,config);expect(sentIds).toHaveLength(1);
+    expect(sentIds[0]).toBe(JSON.parse(await readFile(join(root,'review.json'),'utf8')).feedback.find((record:any)=>record.value.source==='local').id);
   }finally{server.stop(true);await rm(root,{recursive:true,force:true});}
 });
 

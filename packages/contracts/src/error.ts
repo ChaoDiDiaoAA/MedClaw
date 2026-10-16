@@ -4,6 +4,8 @@ export const PositiveIdSchema = z.number().int().positive().max(Number.MAX_SAFE_
 export const ConfigVersionSchema = z.string().max(128).regex(/^(0|[1-9][0-9]*)$/);
 export const OpaqueIdSchema = z.string().min(1).max(256).regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/);
 export const TimestampSchema = z.string().datetime({ offset: true }).max(64);
+export const AbsolutePathSchema = z.string().min(1).max(32768).refine(path => !/[\u0000-\u001f]/.test(path)
+  && (/^[A-Za-z]:[\\/]/.test(path) || /^\\\\[^\\]+\\[^\\]+/.test(path) || path.startsWith('/')), 'Expected an absolute trusted path');
 export const ErrorCategorySchema = z.enum(["provider", "runtime", "tool", "session", "storage", "input", "extension", "internal"]);
 export const ErrorReasonSchema = z.enum(["runtime_busy", "workspace_revision_mismatch", "session_not_found", "session_deleted", "session_metadata_revision_mismatch", "message_cursor_invalid", "input_cursor_invalid", "host_interrupted", "checkpoint_invalid", "history_version_mismatch", "session_restore_failed", "compaction_model_failed", "compaction_capacity", "compaction_native_result_invalid",
   'resource_catalog_invalid', 'resource_missing', 'resource_conflict', 'resource_invalid', 'resource_dependency_missing', 'resource_changed', 'resource_too_large', 'resource_path_invalid', 'resource_snapshot_invalid', 'resource_expansion_failed',
@@ -33,6 +35,13 @@ export const resultSchema = <S extends z.ZodType>(data: S) => z.discriminatedUni
 ]);
 
 const errorDefinitions = {
+  report_page_too_large: ['input', 'The report page is too large. Load a smaller page.', false],
+  evaluation_runtime_changed: ['runtime', 'Evaluation code or dependencies changed. Restart the app before a new operation.', false],
+  evaluation_platform_failed: ['runtime', 'The platform request failed. Check the saved delivery status before retrying.', true],
+  feedback_conflict_preserved: ['input', 'This feedback conflicts with an existing submission. Both versions were preserved.', false],
+  review_no_local_feedback: ['input', 'Add local feedback before syncing.', false],
+  langfuse_config_incomplete: ['input', 'The independent platform configuration is incomplete.', false],
+  export_no_started_trials: ['input', 'This report has no started trials to upload.', false],
   extension_unavailable: ['extension', 'The selected extension cannot be verified or loaded. Read its original diagnostics.', false],
   extension_conflict: ['extension', 'The extension registration conflicts with the allowed capability names.', false],
   extension_hook_failed: ['extension', 'An extension hook failed. Read its original diagnostics and run status.', false],

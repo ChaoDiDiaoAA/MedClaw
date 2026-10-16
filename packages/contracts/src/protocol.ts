@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { ControllerEvidenceInputSchema,ControllerEvidenceOutputSchema } from './controller-evidence';
-import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, resultSchema, type Result } from "./error";
+import { AbsolutePathSchema, AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, resultSchema, type Result } from "./error";
+import { evaluationMethodSchemas, EvaluationNoticeSchema, isEvaluationReadOnlyMethod } from './evaluation';
+export { AbsolutePathSchema } from './error';
 import {
   AgentPolicySchema, ApiIdSchema, AuthAttemptViewSchema, AuthNotifyViewSchema, AuthPromptViewSchema, AuthStatusViewSchema,
   ConfigVersionSchema, CredentialRefSchema, CustomProviderDefinitionSchema, DesktopDisplayPreferencesSchema,
@@ -247,6 +249,14 @@ export function publicOutputSchema(method:PublicMethod,payload:unknown):z.ZodTyp
   return publicMethodSchemas[method].output;
 }
 export const PublicMethodSchema = z.enum(Object.keys(publicMethodSchemas) as [PublicMethod, ...PublicMethod[]]);
+export const desktopMethodSchemas = { ...publicMethodSchemas, ...evaluationMethodSchemas } as const;
+export type DesktopMethod = keyof typeof desktopMethodSchemas;
+export type DesktopPayload<M extends DesktopMethod> = z.input<(typeof desktopMethodSchemas)[M]['input']>;
+export type DesktopReturn<M extends DesktopMethod> = z.output<(typeof desktopMethodSchemas)[M]['output']>;
+export const DesktopMethodSchema = z.enum(Object.keys(desktopMethodSchemas) as [DesktopMethod, ...DesktopMethod[]]);
+export function isDesktopReadOnlyMethod(method: string): boolean {
+  return method.startsWith('eval.') ? isEvaluationReadOnlyMethod(method) : isReadOnlyMethod(method);
+}
 export function parsePublicPayload<M extends PublicMethod>(method: M, payload: unknown): ParsedPublicPayload<M>;
 export function parsePublicPayload(method: string, payload: unknown): unknown;
 export function parsePublicPayload(method: string, payload: unknown): unknown {
@@ -259,8 +269,6 @@ export interface Reply<T> { requestId: string; result: Result<T> }
 export const commandSchema = <S extends z.ZodType>(payload: S) => z.strictObject({ requestId: OpaqueIdSchema, instanceId: OpaqueIdSchema, operationRef: OpaqueIdSchema, payload });
 export const replySchema = <S extends z.ZodType>(data: S) => z.strictObject({ requestId: OpaqueIdSchema, result: resultSchema(data) });
 
-export const AbsolutePathSchema = z.string().min(1).max(32768).refine(path => !/[\u0000-\u001f]/.test(path)
-  && (/^[A-Za-z]:[\\/]/.test(path) || /^\\\\[^\\]+\\[^\\]+/.test(path) || path.startsWith("/")), "Expected an absolute trusted path");
 export const HostHelloSchema = z.strictObject({
   protocolVersion: z.literal(HOST_PROTOCOL_VERSION), instanceId: OpaqueIdSchema, startupToken: OpaqueIdSchema,
   sdkVersion: z.literal(SDK_VERSION), expectedSchemaVersion: z.literal(DATABASE_SCHEMA_VERSION),
@@ -405,7 +413,7 @@ export const RuntimeNoticeSchema = z.union([
   z.strictObject({ type: z.literal("model.refresh.status"), operationRef: OpaqueIdSchema, state: z.enum(["running", "completed", "aborted", "failed"]), error: AppErrorSchema.nullable() }),
   z.strictObject({ type: z.literal("config.changed"), configVersion: ConfigVersionSchema }),
 ]);
-export const DesktopNoticeSchema = z.union([RuntimeNoticeSchema, z.strictObject({ type: z.literal("host.status"), host: HostViewSchema })]);
+export const DesktopNoticeSchema = z.union([RuntimeNoticeSchema, z.strictObject({ type: z.literal("host.status"), host: HostViewSchema }), EvaluationNoticeSchema]);
 export const NoticeFrameSchema = z.strictObject({ protocolVersion: z.literal(HOST_PROTOCOL_VERSION), kind: z.literal("notice"), instanceId: OpaqueIdSchema, notice: RuntimeNoticeSchema });
 
 // OAuth extension fields belong to Pi's private credential format, never to public projections.

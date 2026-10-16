@@ -16,6 +16,8 @@ import {assertJudgeMatches} from '../scoring/judges/client.ts';
 import {trialProgress,type ProgressEvent} from './progress.ts';
 import {qualityMetricCatalog} from '../scoring/registry.ts';
 import {deriveCaseAnalysis} from '../reports/analysis.ts';
+import { isDeepStrictEqual } from 'node:util';
+import { DesktopEvaluationRequestSchema, type DesktopEvaluationRequest } from '../../../packages/contracts/src/evaluation.ts';
 
 const unsafeTrial=(trial:TrialResult)=>Boolean(trial.startedAt&&(trial.stopped!==true||trial.closed!==true))||['necessary_save_unconfirmed','trial_exception_stop_unknown','host_stop_unconfirmed'].includes(trial.reason??'');
 export function parseTrials(value:string|undefined,selection:'smoke'|'full'):number {
@@ -40,6 +42,7 @@ export async function executePlan(plan:TrialPlan[],run:(item:TrialPlan)=>Promise
   return trials;
 }
 export interface RunOptions {
+  desktopRequest?:DesktopEvaluationRequest;expectedSource?:Record<string,unknown>;
   datasetRoot:string;runsRoot:string;executionId:string;selection:'smoke'|'full';trials:number;
   config:ResolvedRunConfig;modelCredential?:AgentModelCredential;judgeMode:'required'|'off';judge?:Judge;signal?:AbortSignal;
   onProgress?:(trial:TrialResult)=>void;controlledFixture?:boolean;
@@ -60,9 +63,11 @@ export async function runExperiment(options:RunOptions):Promise<EvaluationReport
   try {
     const executionRoot=join(root,options.executionId);await mkdir(executionRoot);
     const source=await sourceInventory();
+    if(options.expectedSource&&['sdk','patch','packageJson','files'].some(key=>!isDeepStrictEqual(source[key],options.expectedSource![key])))throw new Error('evaluation_runtime_changed');
     const criteria=scoringCriteria(dataset.cases.flatMap(item=>item.expected.checks.map(check=>check.metricId)));
     const snapshot:ExecutionSnapshot={contract:'medclaw-execution-snapshot/v1',executionId:options.executionId,dataset:dataset.snapshot,compiled:snapshotCompiled(dataset),config,criteria,source,plan,preparationTurns:Object.fromEntries(dataset.cases.map(task=>[task.id,task.steps.filter(step=>step.action.action==='send'&&step.action.alias.startsWith('prepare-')).length]))};
     snapshot.qualityMetricCatalogVersion='v2';snapshot.qualityMetricCatalog=qualityMetricCatalog('v2');
+    if(options.desktopRequest){const request=DesktopEvaluationRequestSchema.parse(options.desktopRequest);if(options.executionId!=='desktop-'+request.operationRef||request.datasetId!==dataset.manifest.id||request.selection!==options.selection||request.trials!==options.trials)throw new Error('state_conflict');snapshot.desktopRequest=request;}
     await writeJsonExclusive(join(executionRoot,'snapshot.json'),snapshot);
     const blockers=runBlockers(dataset,source,config,{required:options.judgeMode==='required'&&judged.length>0,configured:!!options.judge});
     keepLock=true;

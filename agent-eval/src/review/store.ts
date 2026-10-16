@@ -1,12 +1,13 @@
 import { z } from 'zod';
-import { readFile,open,unlink } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { dirname,join,resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { readReport,writeJsonExclusive,replaceJson,evidencePath } from '../reports/write.ts';
+import { acquireEvaluationWriteLock } from '../reports/write-lock.ts';
 import { assertSafeExport } from '../langfuse/map.ts';
 import {reviewCandidates} from './candidates.ts';
-import {ensureExport} from '../langfuse/export.ts';
+import {ensureExport,inspectExport,PlatformReceiptSaveError} from '../langfuse/export.ts';
 export const FeedbackSchema=z.strictObject({contract:z.literal('medclaw-human-feedback/v1'),source:z.enum(['local','langfuse']),sourceId:z.string().min(1).max(200),reviewer:z.string().trim().min(1).max(200),reviewedAt:z.iso.datetime(),executionId:z.string().min(1),caseId:z.string().min(1),trialId:z.string().min(1),status:z.enum(['PASS','FAIL','UNJUDGEABLE']),comment:z.string().trim().min(1).max(4000),evidenceRefs:z.array(z.string())});
 export type HumanFeedback=z.infer<typeof FeedbackSchema>;
 export interface ReviewDocument {contract:'medclaw-review/v1';executionId:string;feedback:{id:string;value:HumanFeedback}[];conflicts:HumanFeedback[];queues:Record<string,unknown>;receipts:unknown[]}
@@ -17,21 +18,26 @@ export async function readReview(reportPath:string):Promise<ReviewDocument> {
   catch(error){
     if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;
     let platform:{queues:Record<string,unknown>;receipts:unknown[]}|undefined;
-    try{await evidencePath(root,'export.json');platform=(await ensureExport(reportPath)).document.review;}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+    try{await evidencePath(root,'export.json');platform=(await inspectExport(reportPath)).document.review;}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
     return {contract:'medclaw-review/v1',executionId:report.executionId,feedback:[],conflicts:[],queues:platform?.queues??{},receipts:platform?.receipts??[]};
   }
 }
 export async function updateReview<T>(reportPath:string,update:(document:ReviewDocument)=>Promise<T>|T):Promise<T> {
-  const root=rootOf(reportPath),lockPath=join(root,'.review.lock'),lock=await open(lockPath,'wx',0o600);await lock.close();
+  const root=rootOf(reportPath),release=await acquireEvaluationWriteLock(root,'review');
+  let pendingSave:PlatformReceiptSaveError|undefined;
   try{
     const document=await readReview(reportPath),result=await update(document);
     if(document.feedback.length||document.conflicts.length)await replaceJson(join(root,'review.json'),document);
     else {
-      const exportLockPath=join(root,'.export.lock'),exportLock=await open(exportLockPath,'wx',0o600);await exportLock.close();
-      try{const {document:exported}=await ensureExport(reportPath);exported.review={queues:document.queues,receipts:document.receipts};await replaceJson(join(root,'export.json'),exported);}finally{await unlink(exportLockPath);}
+      const releaseExport=await acquireEvaluationWriteLock(root,'export');
+      try{const {document:exported}=await ensureExport(reportPath);exported.review={queues:document.queues,receipts:document.receipts};await replaceJson(join(root,'export.json'),exported);}finally{try{await releaseExport();}catch{throw new PlatformReceiptSaveError(releaseExport);}}
     }
     return result;
-  }finally{await unlink(lockPath);}
+  }catch(error){if(error instanceof PlatformReceiptSaveError)pendingSave=error;throw error;}
+  finally{
+    try{await release();}
+    catch{const save=pendingSave?.retrySave;throw new PlatformReceiptSaveError(async()=>{await release();await save?.();});}
+  }
 }
 export async function recordFeedback(reportPath:string,input:unknown):Promise<{state:'recorded'|'duplicate';id:string}> {
   const feedback=FeedbackSchema.parse(input),report=await readReport(reportPath);assertSafeExport(feedback);

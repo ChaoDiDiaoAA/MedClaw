@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, safeStorage } from "electron";
 import { mkdirSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { HostController } from "./host-controller.ts";
+import { EvaluationController } from './evaluation-controller';
 import { MainCredentials, SecretInputs } from "./credentials.ts";
 import { MainSettings } from "./settings.ts";
 import { FileTokens } from "./file-tokens.ts";
@@ -34,7 +35,7 @@ const destinations = new DestinationTokens(dataRoot, Date.now, async (instanceId
 });
 const notify = (notice: DesktopNotice) => {
   if ((notice.type === 'event.available' || notice.type === 'event.stream') && !ipc?.acceptEventNotice(notice, host.read().instanceId)) return;
-  const frame = { ...notice, instanceId: host.read().instanceId };
+  const frame = { ...notice, instanceId: notice.type.startsWith('eval.') ? null : host.read().instanceId };
   if (notice.type === "provider.preview") lastPreview = frame;
   if (notice.type === "provider.settled" || notice.type === "provider.persistence_failed") lastPreview = null;
   if (notice.type === "host.status" && notice.host.state !== "ready") lastPreview = null;
@@ -58,6 +59,13 @@ const host = new HostController({ dataRoot, hostEntry, bunExecutable: process.en
     notify(notice);
     if (notice.type === "auth.finished" && (notice.attempt.state === "completed" || notice.attempt.state === "sync_unknown")) void ipc?.publishCredentials().catch(error => errors.add(safeError(error instanceof Error ? error.message : "model_auth_sync_failed")));
   },
+});
+const evaluationSourceRoot = process.env.MEDCLAW_EVALUATION_SOURCE_ROOT ?? resolve(desktopEntryDir, '../../..');
+const evaluation = new EvaluationController({
+  paths: { sourceRoot: evaluationSourceRoot, configsRoot: process.env.MEDCLAW_EVALUATION_CONFIGS_ROOT ?? join(evaluationSourceRoot, 'agent-eval/configs'),
+    runsRoot: process.env.MEDCLAW_EVALUATION_RUNS_ROOT ?? join(evaluationSourceRoot, 'agent-eval/runs') },
+  workerEntry: join(evaluationSourceRoot, 'agent-eval/src/desktop/controller.ts'), bunExecutable: process.env.MEDCLAW_BUN_EXECUTABLE,
+  production: host, notify, report: error => errors.add(error),
 });
 const unwrap = <T>(result: Result<T>): T => { if (!result.ok) throw new Error(result.error.code); return result.data; };
 const settings = new MainSettings(host.paths.settingsPath, {
@@ -84,8 +92,16 @@ void app.whenReady().then(async () => {
   window.webContents.on('preload-error', () => startupFailure('preload_failed'));
   window.webContents.on('did-fail-load', (_event, _code, _description, _url, isMainFrame) => { if (isMainFrame) startupFailure('renderer_load_failed'); });
   window.webContents.on('render-process-gone', () => startupFailure('renderer_process_gone'));
-  ipc = registerIpc({ window, host, settings, credentials, inputs: new SecretInputs(), fileTokens, destinations, diagnostics, report: error => errors.add(error), notify });
-  ipcMain.on("medclaw:subscribe", event => { if (window && event.sender.id === window.webContents.id && event.senderFrame === event.sender.mainFrame) { event.sender.send("medclaw:notice", { type: "host.status", host: host.read(), instanceId: host.read().instanceId }); if (lastPreview) event.sender.send("medclaw:notice", lastPreview); } });
+  ipc = registerIpc({ window, host, evaluation, settings, credentials, inputs: new SecretInputs(), fileTokens, destinations, diagnostics, report: error => errors.add(error), notify });
+  void evaluation.initialize().then(() => {
+    const control = evaluation.read(); notify({ type: 'eval.status', controllerInstanceId: control.controllerInstanceId, executionId: control.executionId, sequence: control.sequence, control });
+  }).catch(() => errors.add(safeError('host_start_failed')));
+  ipcMain.on("medclaw:subscribe", event => { if (window && event.sender.id === window.webContents.id && event.senderFrame === event.sender.mainFrame) {
+    event.sender.send("medclaw:notice", { type: "host.status", host: host.read(), instanceId: host.read().instanceId });
+    const control = evaluation.read();
+    if (control.sequence > 0) event.sender.send('medclaw:notice', { type: 'eval.status', controllerInstanceId: control.controllerInstanceId, executionId: control.executionId, sequence: control.sequence, control, instanceId: null });
+    if (lastPreview) event.sender.send("medclaw:notice", lastPreview);
+  } });
   runtimeLog.add('renderer_load_start');
   try { await window.loadFile(join(desktopEntryDir, "../renderer/index.html")); }
   catch { startupFailure('renderer_load_failed'); return; }
@@ -106,6 +122,10 @@ app.on("before-quit", event => {
   if (shuttingDown) return;
   shuttingDown = true;
   void (async () => {
+    const proof = await evaluation.shutdown();
+    if (proof.stopConfirmed !== true || proof.saveConfirmed !== true || !proof.controllerExited) {
+      errors.add(safeError('host_stop_unconfirmed')); shuttingDown = false; return;
+    }
     const instanceId = host.read().instanceId;
     if (instanceId && !host.read().canStart) await host.stop(instanceId);
     await destinations.settlePrevious();

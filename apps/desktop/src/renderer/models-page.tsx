@@ -92,7 +92,7 @@ const blankProvider = (): CustomProviderDefinition => ({ providerId: "", name: "
 const authLabels = { available: "Authentication available", unavailable: "Not authenticated", checking: "Checking", sync_unknown: "Credential sync unconfirmed" };
 export type DirectoryReadStatus = { state: 'unread' | 'loading' | 'ready' | 'error'; error: string | null };
 
-export function ModelsPage(props: { directory: ModelDirectoryView | null; directoryCurrent: boolean; directoryStatus?: DirectoryReadStatus; host: HostView; active: ActiveRunView | null; control: RuntimeControlView | null;
+export function ModelsPage(props: { executionBlockReason?:string|null;directory: ModelDirectoryView | null; directoryCurrent: boolean; directoryStatus?: DirectoryReadStatus; host: HostView; active: ActiveRunView | null; control: RuntimeControlView | null;
   sessionTarget: { instanceId: string; sessionId: number } | null; onUseForSession: (target: { instanceId: string; sessionId: number }, choice: ModelChoice) => void;
   prompt: AuthPromptView | null; notification: AuthNotifyView | null; attempt: AuthAttemptView | null; onChanged: () => Promise<void>; onAccepted: (value: ProviderAccepted) => Promise<void>; onError: (message: string | null) => void }) {
   const [search, setSearch] = useState("");
@@ -161,6 +161,7 @@ export function ModelsPage(props: { directory: ModelDirectoryView | null; direct
     setMessage(null); props.onUseForSession(target, selected);
   }
   async function diagnose() {
+    if(props.executionBlockReason){props.onError(props.executionBlockReason);return;}
     const selected = directory?.selection;
     if (!selected || !directory) return;
     setBusy(true);
@@ -240,7 +241,7 @@ export function ModelsPage(props: { directory: ModelDirectoryView | null; direct
       <div className="selection-actions"><span className="muted">{choice ? `Selected model: ${choice.provider} / ${choice.modelId}` : "Select a model from the directory"}</span><p className="tiny muted">{props.sessionTarget ? `Current session target: Session ${props.sessionTarget.sessionId}` : "Confirm a session before selecting its model."}</p><div className="actions">
         <button disabled={!choice || !props.sessionTarget || catalogBlocked} onClick={useForSession}>Use for this session</button>
         <button className="primary" disabled={!choice || blocked || authRunning} onClick={() => void publish()}>Set as default model</button>
-        <button disabled={blocked || !directory?.selection || authRunning} onClick={() => void diagnose()}>Test default model connection</button></div></div>
+        <button disabled={!!props.executionBlockReason || blocked || !directory?.selection || authRunning} onClick={() => void diagnose()}>Test default model connection</button></div>{props.executionBlockReason&&<p role="status">{props.executionBlockReason}</p>}</div>
       {message && <p className="success-text" role="status">{message}</p>}
     </section>
     <section className="panel" aria-labelledby="auth-title"><div className="section-heading"><h2 id="auth-title">Provider authentication</h2><span className="muted">{selectedProvider?.name ?? "Select a provider first"}</span></div>{selectedProvider ? <><p>{authLabels[selectedProvider.auth.state]} · {selectedProvider.auth.type ?? "No credential type"} · Source {selectedProvider.auth.source ?? "Not provided"} · {selectedProvider.auth.checkKind}</p><div className="actions">{selectedProvider.loginTypes.map(type => <button key={type} disabled={blocked || authRunning} onClick={() => void startAuth(type)}>{type === "api_key" ? "Sign in with API Key" : "Sign in with OAuth"}</button>)}<button onClick={() => void checkAuth()}>Read authentication status</button></div>{!selectedProvider.loginTypes.length && <p className="muted">This provider uses environment or system credentials. Configure them at the source, then read authentication status.</p>}</> : <p className="muted">You can browse models without authentication. Sign-in methods are provided by the selected provider.</p>}
