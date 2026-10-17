@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdtempSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { spawn, execFile } from "node:child_process";
@@ -10,6 +10,19 @@ import { _electron } from "@playwright/test";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, createProvider, InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import type { Api, AssistantMessage, AuthInteraction, CredentialStore, Model, ModelsStore, ModelsStoreEntry } from "@earendil-works/pi-ai";
+import { WriterLockRecordSchema } from '../../packages/contracts/src/maintenance';
+import { inspectStoppedJob } from '../../apps/host/src/windows-job';
+
+function ownedTreeStopped(root: string): boolean {
+  try {
+    const record = WriterLockRecordSchema.parse(JSON.parse(readFileSync(join(root, 'runtime/host.lock'), 'utf8')));
+    return !!record.processDomain && inspectStoppedJob(record, record.processDomain) !== null;
+  } catch { return false; }
+}
+function removeStoppedFixture(root: string): void {
+  const path = relative(tmpdir(), root);
+  if (path && path !== '..' && !path.startsWith('..\\') && !isAbsolute(path) && ownedTreeStopped(root)) rmSync(root, { recursive: true, force: true });
+}
 import { getApiProvider, getApiProviders } from "@earendil-works/pi-ai/compat";
 
 type PiProviderConfig = Parameters<ModelRuntime["registerProvider"]>[1];
@@ -191,19 +204,19 @@ test("actual_desktop_dev_command_stays_open_and_closes_its_owned_host", async ()
     $taskHost=Get-CimInstance Win32_Process -Filter ('ProcessId = '+$taskLock.pid);
     if ($taskHost.ParentProcessId -ne $taskMain.ProcessId -or $taskHost.Name -ne 'bun.exe') {throw 'Development Host ownership mismatch'};
     $taskClosed=$taskMainProcess.CloseMainWindow(); $taskExited=$taskMainProcess.WaitForExit(15000);
-    [pscustomobject]@{mainPid=$taskMain.ProcessId;hostPid=$taskLock.pid;closed=$taskClosed;mainExited=$taskExited;hostExited=($null -eq (Get-Process -Id $taskLock.pid -ErrorAction SilentlyContinue));lockRemoved=(-not (Test-Path -LiteralPath (Join-Path $taskRoot 'runtime/host.lock')))} | ConvertTo-Json -Compress`;
+    [pscustomobject]@{mainPid=$taskMain.ProcessId;hostPid=$taskLock.pid;closed=$taskClosed;mainExited=$taskExited;hostExited=($null -eq (Get-Process -Id $taskLock.pid -ErrorAction SilentlyContinue));lockRetained=(Test-Path -LiteralPath (Join-Path $taskRoot 'runtime/host.lock'))} | ConvertTo-Json -Compress`;
   try {
     const { stdout: closeOutput, stderr: closeErrors } = await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 45000 });
     expect(closeErrors.trim()).toBe("");
     const facts = JSON.parse(closeOutput);
     expect(facts.mainPid).toBeGreaterThan(0); expect(facts.hostPid).toBeGreaterThan(0);
-    expect(facts.closed).toBe(true); expect(facts.mainExited).toBe(true); expect(facts.hostExited).toBe(true); expect(facts.lockRemoved).toBe(true);
+    expect(facts.closed).toBe(true); expect(facts.mainExited).toBe(true); expect(facts.hostExited).toBe(true); expect(facts.lockRetained).toBe(true); expect(ownedTreeStopped(root)).toBe(true);
     expect(await exited).toBe(0);
     expect(output.trim()).toBe("");
     expect(errors).not.toContain("ERR_FAILED");
   } finally {
     // A failed startup must retain its isolated data until its processes are actually gone.
-    if (launcher.exitCode !== null && !existsSync(join(root, "runtime/host.lock"))) rmSync(root, { recursive: true, force: true });
+    if (launcher.exitCode !== null) removeStoppedFixture(root);
   }
 }, 60000);
 
@@ -230,11 +243,11 @@ test("desktop_development_ipc_accepts_only_its_token_and_closes_the_host", async
     expect(child.exitCode).toBe(null); expect(existsSync(lockPath)).toBe(true);
     child.send({ token, command: "quit" });
     expect(await exited).toBe(0);
-    expect(existsSync(lockPath)).toBe(false);
+    expect(JSON.parse(readFileSync(lockPath, 'utf8'))).toEqual(lock); expect(ownedTreeStopped(root)).toBe(true);
     expect(() => process.kill(lock.pid, 0)).toThrow();
     expect(stderr).not.toContain("ERR_FAILED");
   } finally {
     if (child.connected) child.disconnect();
-    if (child.exitCode !== null && !existsSync(join(root, "runtime/host.lock"))) rmSync(root, { recursive: true, force: true });
+    if (child.exitCode !== null) removeStoppedFixture(root);
   }
 }, 45000);

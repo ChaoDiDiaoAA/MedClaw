@@ -61,6 +61,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   const executionBlockReason = evaluationExecutionBlockReason(evaluation.control), executionBlockRef = useRef(executionBlockReason);
   executionBlockRef.current = executionBlockReason;
   const [page, setPage] = useState<ViewPage>("chat"), [ui, setUi] = useState(initialUi), [uiVersion, setUiVersion] = useState("0");
+  const [uiAvailable, setUiAvailable] = useState(false);
   const uiConfigVersion = useRef('0'), uiReadOrder = useRef(0), uiUpdates = useRef(Promise.resolve(true));
   const [host, setHost] = useState(initialHost), [directory, setDirectory] = useState<ModelDirectoryView | null>(null), [directoryCurrent, setDirectoryCurrent] = useState(false);
   const [directoryStatus, setDirectoryStatus] = useState<DirectoryReadStatus>({ state: 'unread', error: null });
@@ -143,7 +144,8 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     try {
       const result = await window.medclaw.request("settings.ui.read", {});
       if (order !== uiReadOrder.current || !mounted.current || bridgeFailed.current) return;
-      if (result.ok) { uiConfigVersion.current = result.data.configVersion; setUi(result.data.ui); setUiVersion(result.data.configVersion); } else setError(errorMessage(result.error));
+      if (result.ok) { uiConfigVersion.current = result.data.configVersion; setUi(result.data.ui); setUiVersion(result.data.configVersion); setUiAvailable(true); }
+      else { setUiAvailable(false); setError(errorMessage(result.error)); }
     } catch { if (order === uiReadOrder.current) failBridge(); }
   }, [failBridge]);
   const readDirectory = useCallback(async () => {
@@ -797,7 +799,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       <section className="page-content" hidden={page !== "models"}><ModelsPage executionBlockReason={executionBlockReason} directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control}
         sessionTarget={workspaceConfirmed && !selecting && current && currentDetail && host.instanceId ? { instanceId: host.instanceId, sessionId: current } : null} onUseForSession={useForSession}
         prompt={prompt} notification={authNotify} attempt={authAttempt} onChanged={changed} onAccepted={acceptedProvider} onError={setError} /></section>
-      <section className="page-content" hidden={page !== "settings"}><SettingsPage executionBlockReason={executionBlockReason} ui={ui} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost} /></section>
+      <section className="page-content" hidden={page !== "settings"}><SettingsPage executionBlockReason={executionBlockReason} ui={ui} uiAvailable={uiAvailable} onReadUi={readUi} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost} /></section>
       <section className="page-content" hidden={page !== 'evaluation'}><EvaluationPage visible={page === 'evaluation'} evaluation={evaluation}
         productionBlockReason={productionBlockReason} /></section>
       {(page==='prompt'||page==='skills')&&<section className="page-content"><ResourcePanel host={host} source={workspaceConfirmed&&!selecting&&current?{source:'selection',sessionId:current}:null} kind={page==='prompt'?'prompt':'skill'} activeRunId={active?.sessionId===current?active?.runId:null} onPublished={()=>void readDirectory()} /></section>}

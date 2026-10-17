@@ -1,6 +1,7 @@
 import {mkdtempSync,existsSync,rmSync} from "node:fs";
 import {tmpdir} from "node:os";
-import {join} from "node:path";
+import {join,resolve} from "node:path";
+import {pathToFileURL} from 'node:url';
 import type {ChildProcessWithoutNullStreams} from 'node:child_process';
 import type {HostController} from '../../apps/desktop/src/main/host-controller';
 import type {AppError} from '../../packages/contracts/src/error';
@@ -11,12 +12,15 @@ export async function fixture(mode = "normal") {
   const root = mkdtempSync(join(tmpdir(), "medclaw P1 中文 -"));
   const entry = join(root, "host.ts");
   await Bun.write(entry, `import {createInterface} from "node:readline";import {appendFileSync,existsSync,writeFileSync} from "node:fs";
-const mode=${JSON.stringify(mode)};const lines=createInterface({input:process.stdin});let hello,ready;const pending=new Map();
+const {createHostJob}=await import(${JSON.stringify(pathToFileURL(resolve(import.meta.dir,'../../apps/host/src/windows-job.ts')).href)});
+const {acquireWriterLock}=await import(${JSON.stringify(pathToFileURL(resolve(import.meta.dir,'../../apps/host/src/writer-lock.ts')).href)});
+const mode=${JSON.stringify(mode)};const lines=createInterface({input:process.stdin});let hello,ready,lease,readySent=false,stdoutClosed=false;const pending=new Map();
 function send(value){process.stdout.write(JSON.stringify(value)+"\\n");}
-function emitReady(){const text=JSON.stringify(ready)+"\\n";process.stdout.write(text.slice(0,17));setTimeout(()=>process.stdout.write(text.slice(17)),5);}
-lines.on("line",line=>{const frame=JSON.parse(line);if(!hello){hello=frame;
+function emitReady(){readySent=true;const text=JSON.stringify(ready)+"\\n";process.stdout.write(text.slice(0,17));setTimeout(()=>process.stdout.write(text.slice(17)),5);}
+lines.on("line",async line=>{const frame=JSON.parse(line);if(!hello){hello=frame;
 if(process.env.AWS_MAX_ATTEMPTS!=="1"||process.env.MEDCLAW_INSTANCE_ID!==hello.instanceId||process.env.MEDCLAW_STARTUP_TOKEN!==hello.startupToken)process.exit(41);
 if(mode==="reject-restart"){const marker=${JSON.stringify(join(root,'started-once'))};if(existsSync(marker))process.exit(43);writeFileSync(marker,'started');}
+const job=createHostJob(hello);lease=await acquireWriterLock({lockPath:hello.paths.lockPath,owner:hello,processDomain:job.domain});
 ready={protocolVersion:hello.protocolVersion,instanceId:hello.instanceId,sdkVersion:hello.sdkVersion,schemaVersion:hello.expectedSchemaVersion,configVersion:"1",dataRoot:hello.paths.dataRoot};
 if(mode==="wrong-instance")ready.instanceId="unrelated-instance";
 if(mode==="wrong-protocol")ready.protocolVersion="unrelated-protocol";
@@ -27,6 +31,7 @@ if(mode==="oversized"){process.stdout.write("x".repeat(4*1024*1024+1));return;}
 if(mode==="truncated"){process.stdout.write("{");setTimeout(()=>process.exit(0),5);return;}
 if(mode==="invalid-utf8"){process.stdout.write(Buffer.from([255,10]));return;}
 if(mode==="silence")return;
+if(mode==="late-ready"){writeFileSync(${JSON.stringify(join(root,'hello-accepted'))},'accepted');const waiting=setInterval(()=>{if(existsSync(${JSON.stringify(join(root,'emit-ready'))})){clearInterval(waiting);emitReady();}},10);return;}
 if(mode==="pre-ready"||mode==="invalid-private"){
 for(const method of ["credential.read","credential.list"]){const requestId="initial-"+method;pending.set(requestId,{initial:true});send({protocolVersion:hello.protocolVersion,kind:"private",instanceId:hello.instanceId,requestId,secret:mode!=="invalid-private",method,payload:method==="credential.read"?{providerId:"p1-offline",context:{purpose:"runtime",operationRef:"catalog"}}:{}});}return;}
 emitReady();return;}
@@ -35,8 +40,15 @@ const reply={protocolVersion:hello.protocolVersion,kind:"reply",instanceId:hello
 if(mode==="duplicate"){process.stdout.write([reply,reply,{...reply,requestId:"unknown-reply"}].map(value=>JSON.stringify(value)+"\\n").join(""));return;}
 if(mode==="preview"){for(let i=0;i<64;i++)send({protocolVersion:hello.protocolVersion,kind:"notice",instanceId:hello.instanceId,notice:{type:"provider.preview",runId:1,text:"preview-"+i,truncated:false}});setTimeout(()=>send({protocolVersion:hello.protocolVersion,kind:"notice",instanceId:hello.instanceId,notice:{type:"provider.settled",runId:1}}),80);}
 send(reply);return;}
-if(frame.method==="host.shutdown"){send({protocolVersion:hello.protocolVersion,kind:"reply",instanceId:hello.instanceId,requestId:frame.requestId,result:{ok:true,data:{executionStopped:true,databaseClosed:true}}});if(mode!=="ack-without-exit")setTimeout(()=>process.exit(0),5);return;}
+if(frame.method==="host.shutdown"){
+if(stdoutClosed){lease.release();process.exit(0);return;}
+if(mode==="late-ready"&&!readySent)return;
+if((mode==="maintenance-refusal"||mode==="stdout-eof-after-refusal")&&frame.payload.requireIdle){send({protocolVersion:hello.protocolVersion,kind:"reply",instanceId:hello.instanceId,requestId:frame.requestId,result:{ok:false,error:{code:"maintenance_busy",category:"runtime",retryable:true,message:"Another operation must finish before maintenance can begin."}}});return;}
+send({protocolVersion:hello.protocolVersion,kind:"reply",instanceId:hello.instanceId,requestId:frame.requestId,result:{ok:true,data:{executionStopped:true,requiredPersistenceComplete:true,databaseClosed:true}}});if(mode!=="ack-without-exit")setTimeout(()=>{lease.release();process.exit(0);},5);return;}
 if(mode==="lost-reply"&&["model.list","session.messages.read","session.readSubmission","session.create"].includes(frame.method)){appendFileSync(${JSON.stringify(join(root, "received.jsonl"))},JSON.stringify(frame)+"\\n");return;}
+if(mode==="reader-close"&&frame.method==="session.create"){appendFileSync(${JSON.stringify(join(root,"received.jsonl"))},JSON.stringify(frame)+"\\n");return;}
+// Bun stdout.end leaves the native pipe open; close only this owned child's output handle.
+if((mode==="stdout-eof"||mode==="stdout-eof-after-refusal")&&frame.method==="session.create"){appendFileSync(${JSON.stringify(join(root,"received.jsonl"))},JSON.stringify(frame)+"\\n");const {dlopen,FFIType}=await import("bun:ffi");const api=dlopen(process.env.SystemRoot+"/System32/kernel32.dll",{GetStdHandle:{args:[FFIType.i32],returns:FFIType.u64},CloseHandle:{args:[FFIType.u64],returns:FFIType.i32}});const closed=api.symbols.CloseHandle(api.symbols.GetStdHandle(-11));api.close();if(closed!==1)process.exit(44);stdoutClosed=true;return;}
 if(frame.method==="model.list"){const requestId="private-"+frame.requestId;pending.set(requestId,frame);send({protocolVersion:hello.protocolVersion,kind:"private",instanceId:hello.instanceId,requestId,secret:true,method:"credential.read",payload:{providerId:"p1-offline",context:{purpose:"runtime",operationRef:frame.operationRef}}});}
 });lines.on("close",()=>process.exit(0));`);
   return { root, entry };
@@ -65,11 +77,12 @@ export function createHostDiagnostics(){
   return trace;
 }
 
-export async function finishHostFixture(host:Pick<HostController,'read'|'stop'>,root:string,entry:string,trace:ReturnType<typeof createHostDiagnostics>,failed:boolean){
+export async function finishHostFixture(host:Pick<HostController,'read'|'stop'|'refreshStopProof'>,root:string,entry:string,trace:ReturnType<typeof createHostDiagnostics>,failed:boolean){
   const observed=host.read(),phase=trace.phase;
   trace.phase='cleanup';
   let cleanupError:string|undefined;
   if(observed.instanceId&&!observed.canStart){try{await host.stop(observed.instanceId);}catch{cleanupError='fixture_stop_failed';}}
+  if(!host.read().canStart){try{await host.refreshStopProof();}catch{cleanupError??='fixture_stop_failed';}}
   const final=host.read(),cleanupConfirmed=final.canStart;
   const context={phase,state:observed.state,error:errorFields(observed.error),instanceId:observed.instanceId,
     entryExists:existsSync(entry),dataDirectoryExists:existsSync(root),lockExists:existsSync(join(root,'runtime/host.lock')),

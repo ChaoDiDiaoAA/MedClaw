@@ -161,6 +161,7 @@ export type ImportRecord = {
 };
 export type DiffEvent = Omit<Change, 'id'> & { eventKey: string };
 export interface ImportStore {
+  assertWritable(): void;
   read(operationRef: string): ImportRecord | null;
   begin(request: ImportPreviewRequest, instanceId: string): ImportRecord;
   update(operationRef: string, patch: { state: ImportOperation['state']; preview?: ImportPreview; error?: ImportOperation['error']; result?: ImportResult; commitRequest?: ImportCommitRequest }): ImportOperation;

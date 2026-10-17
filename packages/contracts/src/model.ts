@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { HostShutdownProofSchema } from './maintenance';
 import { AppErrorSchema, ConfigVersionSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } from "./error";
 import { ResourceSettingsSchema } from './resources';
 import { ExtensionSettingsSchema } from './extensions';
@@ -284,6 +285,7 @@ export const AuthNotifyViewSchema = z.discriminatedUnion("type", [
 export const HostViewSchema = z.strictObject({
   instanceId: OpaqueIdSchema.nullable(), state: z.enum(["stopped", "starting", "handshaking", "ready", "stopping", "failed"]),
   canStart: z.boolean(), sdkVersion: nonblank(128).nullable(), schemaVersion: PositiveIdSchema.nullable(), error: AppErrorSchema.nullable(),
+  shutdown: HostShutdownProofSchema.optional(), canPrepareRecovery: z.boolean().optional(),
 });
 
 export type ModelChoice = z.infer<typeof ModelChoiceSchema>;

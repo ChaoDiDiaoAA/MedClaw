@@ -41,7 +41,7 @@ test('Host fixture retains its directory when stopping remains unconfirmed',asyn
   expect(typeof fixtures.finishHostFixture).toBe('function');
   const root=mkdtempSync(join(tmpdir(),'mc-host-unknown-')),entry=join(root,'entry.ts');writeFileSync(entry,'preserve');
   const view:HostView={instanceId:'unconfirmed',state:'stopping',canStart:false,sdkVersion:null,schemaVersion:null,error:safeError('host_stop_unconfirmed')};
-  const host={read:()=>view,stop:async()=>view};
+  const host={read:()=>view,stop:async()=>view,refreshStopProof:async()=>{}};
   const output=spyOn(console,'error').mockImplementation(()=>{});
   try {
     const trace=fixtures.createHostDiagnostics();trace.phase='stop';
@@ -58,7 +58,24 @@ test('confirmed Host fixture cleanup removes only its own directory',async()=>{
   const root=mkdtempSync(join(tmpdir(),'mc-host-owned-')),other=mkdtempSync(join(tmpdir(),'mc-host-unrelated-'));
   const view:HostView={instanceId:null,state:'stopped',canStart:true,sdkVersion:null,schemaVersion:null,error:null};
   try {
-    expect(await fixtures.finishHostFixture({read:()=>view,stop:async()=>view},root,join(root,'entry.ts'),fixtures.createHostDiagnostics(),false)).toBe(true);
+    expect(await fixtures.finishHostFixture({read:()=>view,stop:async()=>view,refreshStopProof:async()=>{}},root,join(root,'entry.ts'),fixtures.createHostDiagnostics(),false)).toBe(true);
     expect(existsSync(root)).toBe(false);expect(existsSync(other)).toBe(true);
   } finally {rmSync(root,{recursive:true,force:true});rmSync(other,{recursive:true,force:true});}
+});
+
+test('Host fixture joins the original stop proof before deciding whether its owned directory can be removed',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'mc-host-proof-pending-')),entry=join(root,'entry.ts');writeFileSync(entry,'preserve until proof');
+  const view:HostView={instanceId:'original-owner',state:'stopping',canStart:false,sdkVersion:null,schemaVersion:null,error:null};
+  let reached!:()=>void,release!:()=>void;
+  const began=new Promise<void>(done=>{reached=done;}),proof=new Promise<void>(done=>{release=()=>{view.state='stopped';view.canStart=true;done();};});
+  const host={read:()=>view,stop:async()=>view,refreshStopProof:async()=>{reached();await proof;}};
+  const output=spyOn(console,'error').mockImplementation(()=>{});
+  const pending=fixtures.finishHostFixture(host,root,entry,fixtures.createHostDiagnostics(),false);
+  try {
+    expect(await Promise.race([began.then(()=>true),pending.then(()=>false,()=>false)])).toBe(true);
+    expect(existsSync(entry)).toBe(true);release();expect(await pending).toBe(true);expect(existsSync(root)).toBe(false);
+  } finally {
+    release();await pending.catch(()=>{});output.mockRestore();
+    if(existsSync(root))await fixtures.finishHostFixture(host,root,entry,fixtures.createHostDiagnostics(),false);
+  }
 });

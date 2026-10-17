@@ -10,6 +10,7 @@ import {omitLegacyFields,legacyWorkspaceContext} from './legacy-business-fields'
 type Row={operation_ref:string;request_json:string;preview_json:string;commit_request_json:string|null;receipt_json:string|null;state:'ready'|'committed';cleanup_json:string;updated_at:string};
 const encode=(ids:number[])=>JSON.stringify(ids);
 export class SqliteDataDeletionStore {
+ private writesBlocked=false;
  private readonly transactions:SqliteWriteTransactions;
  constructor(private readonly db:Database,private readonly repositories:Repositories,private readonly assertRuntimeIdle:()=>void=()=>{}){this.transactions=SqliteWriteTransactions.forDatabase(db);}
  private row(operationRef:string){return this.db.query<Row,[string]>('SELECT * FROM data_deletions WHERE operation_ref=?').get(operationRef);}
@@ -25,6 +26,7 @@ export class SqliteDataDeletionStore {
  AND NOT EXISTS(SELECT 1 FROM change_events e WHERE e.device_id=d.id AND e.old_batch_id NOT IN (SELECT value FROM json_each(?1)) AND e.new_batch_id NOT IN (SELECT value FROM json_each(?1))) ORDER BY d.id`).all(encode(batchIds)).map(row=>row.id);}
  targetIds(input:DataDeletePreviewRequest):number[]{return this.db.query<{id:number},[string,string]>("SELECT id FROM batches WHERE status='active' AND (?='all' OR id IN (SELECT value FROM json_each(?))) ORDER BY id").all(input.target.kind,input.target.kind==='batches'?encode(input.target.batchIds):'[]').map(row=>row.id);}
  assertIdle(operationRef?:string){
+  this.assertWritable();
   this.assertRuntimeIdle();
   if(this.count("SELECT COUNT(*) n FROM runs WHERE status IN ('created','running')")||this.count("SELECT COUNT(*) n FROM session_inputs WHERE processing_status='pending'")||this.count("SELECT COUNT(*) n FROM imports WHERE state IN ('preparing','committing')"))throw safeError('state_conflict',undefined,{reason:'runtime_busy'});
   if(this.count("SELECT COUNT(*) n FROM data_deletions WHERE state='committed' AND json_extract(cleanup_json,'$.state')<>'complete' AND operation_ref<>?",[operationRef??'']))throw new Error('operation_result_unknown');
@@ -82,5 +84,11 @@ export class SqliteDataDeletionStore {
    return this.read(input.operationRef)!;
   });
  }
- saveCleanup(operationRef:string,cleanup:DataDeleteOperation['cleanup'],time:string){return this.transactions.immediate(()=>{const operation=this.read(operationRef);if(!operation||operation.state!=='committed')throw new Error('state_conflict');this.db.query('UPDATE data_deletions SET cleanup_json=?,updated_at=? WHERE operation_ref=?').run(canonicalRequest(cleanup),time,operationRef);return this.read(operationRef)!;});}
+ assertWritable(){if(this.writesBlocked)throw new Error('operation_result_unknown');}
+ saveCleanup(operationRef:string,cleanup:DataDeleteOperation['cleanup'],time:string){
+  this.assertWritable();
+  try{return this.transactions.immediate(()=>{const operation=this.read(operationRef);if(!operation||operation.state!=='committed')throw new Error('state_conflict');this.db.query('UPDATE data_deletions SET cleanup_json=?,updated_at=? WHERE operation_ref=?').run(canonicalRequest(cleanup),time,operationRef);return this.read(operationRef)!;});}
+  // Deletion is already committed; a lost save acknowledgement must not overwrite its cleanup fact.
+  catch(error){this.writesBlocked=true;throw error;}
+ }
 }

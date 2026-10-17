@@ -1,12 +1,11 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { SCHEMA_VERSION, migrationSql, validateDatabaseSchema as validate } from './schema-validation';
+export { SCHEMA_VERSION } from './schema-validation';
 
-export const SCHEMA_VERSION = 16;
-const migrations = ["001_p1.sql", "002_p2.sql", "003_p3.sql", "004_p5.sql", "005_p6.sql", "006_session_lifecycle.sql", "007_batch_deletion.sql", "008_p8.sql", "009_p9.sql", "010_p10.sql", "011_p11.sql", "012_p13.sql", "013_p14.sql", "014_p15.sql", "015_p15_query_plan.sql", "016_business_identity.sql"].map(name => {
-  const sql = readFileSync(new URL(`./migrations/${name}`, import.meta.url));
+const migrations = migrationSql.map(sql => {
   // Git checkout newline conversion changes byte hashes without changing SQL.
   // Accept only these two forms of the current content; retain stored identities.
   const lf = sql.toString("utf8").replaceAll("\r\n", "\n");
@@ -14,32 +13,6 @@ const migrations = ["001_p1.sql", "002_p2.sql", "003_p3.sql", "004_p5.sql", "005
   return { sql: sql.toString("utf8"), checksum: createHash("sha256").update(sql).digest("hex"), checksums };
 });
 const runColumns = "id,session_id,input_id,kind,prior_run_id,instance_id,status,goal,input_text,output_text,config_json,scope_json,workspace_json,reference_date,timezone,error_json,created_at,started_at,cancel_requested_at,stopped_at,ended_at,cleanup_json,usage_json";
-const schemaQuery = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name";
-const schemaRows = (db: Database) => db.query<{ type: string; name: string; tbl_name: string; sql: string | null }, []>(schemaQuery).all()
-  .map(row => ({ ...row, sql: row.sql?.replaceAll("\r\n", "\n") ?? null }));
-const expectedSchemas = (() => {
-  const reference = new Database(":memory:", { strict: true });
-  try {
-    return migrations.map((migration, index) => {
-      if(index===1||index===3||index===5||index===6||index===8||index===9||index===11||index===12||index===13||index===14||index===15){
-        reference.exec("PRAGMA foreign_keys=OFF");
-        if(reference.query<{foreign_keys:number},[]>("PRAGMA foreign_keys").get()?.foreign_keys!==0)throw new Error("storage_migration_failed");
-        try{reference.transaction(()=>reference.exec(migration.sql)).immediate();}
-        finally{reference.exec("PRAGMA foreign_keys=ON");if(reference.query<{foreign_keys:number},[]>("PRAGMA foreign_keys").get()?.foreign_keys!==1)throw new Error("storage_migration_failed");}
-      }else reference.exec(migration.sql);
-      return schemaRows(reference);
-    });
-  } finally {
-    reference.close();
-  }
-})();
-function validate(db: Database, version: number) {
-  const tables = db.query<{ name: string; strict: number }, []>("SELECT name,strict FROM pragma_table_list WHERE schema='main' AND name NOT LIKE 'sqlite_%' ORDER BY name").all();
-  if (!isDeepStrictEqual(schemaRows(db), expectedSchemas[version - 1]) || tables.some(row => row.strict !== 1)
-    || db.query("PRAGMA foreign_key_check").all().length
-    || db.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get()?.integrity_check !== "ok") throw new Error("storage_migration_failed");
-  if (version >= 2 && db.query("SELECT c.id FROM model_calls c JOIN runs r ON r.id=c.run_id WHERE c.session_id IS NOT r.session_id").all().length) throw new Error("storage_migration_failed");
-}
 
 // The Host verifies its root and exclusive process identity before calling this.
 export function openDatabase(path: string, beforeMigrationCommit?: (phase?: string) => void): Database {

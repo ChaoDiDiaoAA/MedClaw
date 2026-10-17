@@ -18,6 +18,17 @@ export function safeStageMessage(message: string, context: LogContext = {}) {
   const lengths = ["inputChars", "outputChars"] as const;
   return (label + lengths.flatMap(key => Number.isSafeInteger(context[key]) && context[key]! >= 0 ? [` ${key}=${context[key]}`] : []).join("")).slice(0, 2000);
 }
+/** Reconstruct an already formatted summary from the same fixed stage vocabulary. */
+export function safeStageSummary(message: string): string {
+  for (const [code, label] of Object.entries(stages)) {
+    if (!message.startsWith(label)) continue;
+    const suffix = /^(?: inputChars=(\d+))?(?: outputChars=(\d+))?$/.exec(message.slice(label.length));
+    if (suffix) return safeStageMessage(code, { ...(suffix[1] ? { inputChars: Number(suffix[1]) } : {}), ...(suffix[2] ? { outputChars: Number(suffix[2]) } : {}) });
+  }
+  const startup = /^Host startup failed: ([a-z_]+)\/([a-z_]+)\./.exec(message);
+  const failure = startup ? parseHostStartupFailure(`MedClaw Host terminated: ${startup[1]}/${startup[2]}.`) : null;
+  return failure ? `Host startup failed: ${failure.phase}/${failure.error.code}. ${failure.error.message}` : 'Diagnostic content omitted';
+}
 export class RuntimeLog {
   private entries: DiagnosticsEntry[] = [];
   private stderr = "";

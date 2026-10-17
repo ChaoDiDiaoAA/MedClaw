@@ -9,7 +9,9 @@ export async function sourceInventory():Promise<Record<string,unknown>> {
   const patch=Object.values(manifest.patchedDependencies??{})[0] as string|undefined;
   const resources=Object.fromEntries(await Promise.all([...new Bun.Glob('**/*').scanSync({cwd:join(root,'resources'),onlyFiles:true})].sort().map(async path=>{const content=await readFile(join(root,'resources',path),'utf8');return [path.replaceAll('\\','/'),content];})));
   let patchContent='missing';if(patch)try{patchContent=await readFile(join(root,patch),'utf8');}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
-  const paths=['apps/host/src','apps/desktop/src/main','packages','agent-eval/src'].flatMap(folder=>[...new Bun.Glob('**/*.{ts,py}').scanSync({cwd:join(root,folder),onlyFiles:true})].map(path=>folder+'/'+path.replaceAll('\\','/'))).sort();
+  // NSIS expands workspace links into source and manifest copies that the installed Host loads.
+  const copies=['node_modules/@medclaw/*/src/**/*.{ts,py}','node_modules/@medclaw/*/package.json'].flatMap(pattern=>[...new Bun.Glob(pattern).scanSync({cwd:root,onlyFiles:true,followSymlinks:false})]);
+  const paths=[...['apps/host/src','apps/desktop/src/main','packages','agent-eval/src'].flatMap(folder=>[...new Bun.Glob('**/*.{ts,py}').scanSync({cwd:join(root,folder),onlyFiles:true})].map(path=>folder+'/'+path.replaceAll('\\','/'))),...copies.map(path=>path.replaceAll('\\','/'))].sort();
   const files=Object.fromEntries(await Promise.all(paths.map(async path=>{const content=await readFile(join(root,path),'utf8');return [path,content];})));
   return {sdk:installed.version,patch:patchContent,packageJson:packageText,resources,files};
 }

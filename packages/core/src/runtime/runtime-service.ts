@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { stopProofForOwner, type ProcessTreeProof } from '@medclaw/contracts/maintenance';
 import { performance } from "node:perf_hooks";
 import { AppErrorSchema, PositiveIdSchema, safeError, serviceResult, type AppError, type Result } from "../../../contracts/src/error";
 import type { Command, CommandContext, RuntimeNotice } from "../../../contracts/src/protocol";
@@ -1105,12 +1106,13 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     }
     return this.retrySaveNow(runId);
   }, "storage_write_failed", { runId }); }
-  recoverInterrupted(previousProcessExited: boolean) {
+  recoverInterrupted(previousProcessExited: boolean, processTreeProof?: ProcessTreeProof) {
     try {
       const candidates = this.store.recoveryCandidates(this.instanceId), at = now();
       this.manualRecoveries.clear();for(const operation of this.store.recoverManualCompactions?.(this.instanceId,previousProcessExited,at)??[])this.manualRecoveries.set(operation.operationRef,operation);
       for (const run of candidates) {
-        const facts = this.store.verifyPriorToolFacts?.(run.id, previousProcessExited, at) ?? {
+        const treeProof = run.cleanup?.processTreeProof ?? (previousProcessExited ? stopProofForOwner(processTreeProof, run.instanceId) : undefined);
+        const facts = this.store.verifyPriorToolFacts?.(run.id, previousProcessExited, at, treeProof) ?? {
           stopConfirmed: previousProcessExited ? true : null, requiredPersistenceComplete: true,
           unconfirmedItems: previousProcessExited ? [] : ['stop', 'resources'],
         };
@@ -1130,6 +1132,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
             requiredPersistenceComplete: facts.requiredPersistenceComplete && intentFacts.requiredPersistenceComplete && inputFacts.requiredPersistenceComplete && contextFacts.requiredPersistenceComplete && historyFacts.requiredPersistenceComplete&&compactionFacts.requiredPersistenceComplete, inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed===true&&(!this.store.readRunExtensions?.(run.id)?.selection.extension||releasedExtension?.resourcesReleased===true||!!extensionReleaseBasis),
             ...(releasedExtension?{extensions:releasedExtension}:{}),
             ...(extensionReleaseBasis?{extensionReleaseBasis}:{}),
+            ...(treeProof ? { processTreeProof: treeProof } : {}),
             unconfirmedItems: [...new Set([...facts.unconfirmedItems, ...intentFacts.unconfirmedItems, ...inputFacts.unconfirmedItems,...contextFacts.unconfirmedItems,...historyFacts.unconfirmedItems,...compactionFacts.unconfirmedItems])], secondaryErrors: run.cleanup?.secondaryErrors ?? [], verifiedAt: facts.stopConfirmed === true && intentFacts.requiredPersistenceComplete && inputFacts.inputsSettled && contextFacts.requiredPersistenceComplete && historyFacts.requiredPersistenceComplete&&compactionFacts.requiredPersistenceComplete ? at : run.cleanup?.verifiedAt ?? null,
             ...(run.cleanup?.budgetSummary !== undefined ? { budgetSummary: run.cleanup.budgetSummary } : {}) } });
       }
@@ -1158,8 +1161,18 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       try{await Promise.race([manual.task,new Promise<void>(resolve=>{timer=setTimeout(resolve,1000);})]);}finally{clearTimeout(timer);}
       if(!manual.nativeIdle||!manual.observed)throw safeError('stop_unconfirmed');
       for(const [callId,pending]of manual.pendingCalls){this.store.finishCompactionCall(pending.owner,pending.fact);manual.pendingCalls.delete(callId);}
-      // Closing needs durable facts and stop proof; no subsequent SDK request will use this binding.
-      await this.saveManualCompaction(manual,true);if(manual.timer)clearTimeout(manual.timer);manual.released=true;if(this.manual===manual)this.manual=null;
+      if(!manual.released) {
+        await this.saveManualCompaction(manual,true);
+        try { await this.saveManualCompaction(manual); }
+        catch(error) {
+          const receipt=this.store.readCompactionOperation({sessionId:manual.operation.request.sessionId,operationRef:manual.operation.operationRef})?.receipt;
+          if(receipt?.nativeSaved!==false||!this.agent?.discardCompactionForRestore)throw error;
+          // Discard idle setup only after the original receipt and call facts are confirmed durable.
+          await this.agent.discardCompactionForRestore({sessionId:manual.operation.request.sessionId,operationRef:manual.operation.operationRef,
+            nativeIdle:true,nativeQueuesEmpty:true,observersSettled:true,requiredCallFactsSaved:true});
+        }
+      }
+      if(manual.timer)clearTimeout(manual.timer);manual.released=true;if(this.manual===manual)this.manual=null;
     }
     if (execution) { execution.acceptingInputs = false; execution.stopEpoch++; }
     if (execution && !execution.nativeTerminal && !execution.cause) { execution.cause = "shutdown"; execution.abort.abort(); }

@@ -1,17 +1,34 @@
 import { mkdir, writeFile, realpath, readFile, lstat, rm } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { MainSettings, atomicWriteJson } from '../../../apps/desktop/src/main/settings.ts';
 import { DEFAULT_INTENT_MODEL, IntentModelConfigurationSchema, PublishedSettingsSchema, RequestPolicySchema } from '../../../packages/contracts/src/model.ts';
 import { mergeRuntimeConfigurationPolicies } from '../../../packages/contracts/src/runtime-config.ts';
-import { ProductAdapter, unwrap, type ShutdownProof } from '../adapters/product.ts';
+import { ProductAdapter, unwrap, type ProductOptions, type ShutdownProof } from '../adapters/product.ts';
+import { readInstallManifest } from '../../../apps/desktop/src/main/runtime-paths.ts';
 import { verifyPublishedConfiguration } from '../adapters/configuration.ts';
 import type { AgentModelCredential,ResolvedRunConfig, VerifiedObservation } from '../types.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { within } from '../adapters/files.ts';
 import {OllamaIntentClient} from '../../../packages/intent-ollama/src/index.ts';
 
-export async function prepareInstance(options: { trialRoot: string; workRoot?:string; config: ResolvedRunConfig; modelCredential?:AgentModelCredential; hostEntry?: string; bunExecutable?: string; controlledToolFault?: 'query-timeout-once'; owner?: { executionId: string; trialId: string; caseId: string } }) {
+export async function prepareInstance(options: { trialRoot: string; workRoot?:string; config: ResolvedRunConfig; modelCredential?:AgentModelCredential; installManifestPath?:string; hostEntry?: string; bunExecutable?: string; controlledToolFault?: 'query-timeout-once'; owner?: { executionId: string; trialId: string; caseId: string } }) {
   if(options.modelCredential&&(options.modelCredential.providerId!==options.config.model.provider||!options.modelCredential.key.trim()))throw new Error('agent_credential_provider_mismatch');
+  let runtimePaths: Pick<ProductOptions, 'hostEntry' | 'bunExecutable' | 'resourceRoot' | 'maintenanceEntry' | 'installManifestPath'> = { hostEntry: options.hostEntry, bunExecutable: options.bunExecutable };
+  if (options.installManifestPath !== undefined) {
+    try {
+      if (!isAbsolute(options.installManifestPath)) throw new Error('host_protocol_mismatch');
+      const installManifestPath = await realpath(options.installManifestPath), installRoot = dirname(installManifestPath), manifest = readInstallManifest(installManifestPath);
+      const binary = manifest.binaries.find(value => value.name === 'bun'); if (!binary) throw new Error('host_protocol_mismatch');
+      const hostEntry = await realpath(join(installRoot, manifest.hostEntry)), maintenanceEntry = await realpath(join(installRoot, manifest.maintenanceEntry));
+      const resourceRoot = await realpath(join(installRoot, manifest.resourceRoot)), bunExecutable = await realpath(join(installRoot, binary.path));
+      for (const [path, directory] of [[hostEntry, false], [maintenanceEntry, false], [bunExecutable, false], [resourceRoot, true]] as const) {
+        within(installRoot, path); const info = await lstat(path);
+        if (directory ? !info.isDirectory() : !info.isFile()) throw new Error('host_protocol_mismatch');
+      }
+      if (await realpath(resolve(dirname(hostEntry), '../../..')) !== await realpath(resolve(import.meta.dir, '../../..'))) throw new Error('host_protocol_mismatch');
+      runtimePaths = { hostEntry, bunExecutable, resourceRoot, maintenanceEntry, installManifestPath };
+    } catch (error) { throw new Error(error instanceof Error && error.message === 'path_outside_owned_root' ? 'access_denied' : 'host_protocol_mismatch'); }
+  }
   const trialRoot = resolve(options.trialRoot), dataRoot = join(resolve(options.workRoot??trialRoot), 'product');
   await mkdir(trialRoot, { recursive: true }); await mkdir(dataRoot); await mkdir(join(dataRoot, 'data'));
   const settingsPath = join(dataRoot, 'data', 'settings.json'), initial = new MainSettings(settingsPath).read();
@@ -26,7 +43,7 @@ export async function prepareInstance(options: { trialRoot: string; workRoot?:st
     intentModel, ...mergeRuntimeConfigurationPolicies(initial, { requestPolicy: RequestPolicySchema.parse({ ...initial.requestPolicy, ...options.config.policy }) }) });
   atomicWriteJson(settingsPath, settings);
   await writeFile(join(trialRoot, 'isolation.json'), JSON.stringify({ mode: 'local', ownRoot: await realpath(dataRoot), otherTrialRoots: [], childEnvironment: 'minimal', observedAt: new Date().toISOString() }, null, 2));
-  const adapter = new ProductAdapter({ dataRoot, tracePath: join(trialRoot, 'events.jsonl'), hostEntry: options.hostEntry, bunExecutable: options.bunExecutable,
+  const adapter = new ProductAdapter({ dataRoot, tracePath: join(trialRoot, 'events.jsonl'), ...runtimePaths,
     controlledToolFault: options.controlledToolFault, modelCredential:options.modelCredential, owner: options.owner ?? { executionId: 'controlled-fixture', trialId: 'engineering', caseId: 'engineering' } });
   try {
     await adapter.start();
@@ -52,7 +69,8 @@ export async function cleanupInstance(options: CleanupOptions) {
   }
 }
 async function removeOwnedInstance(options: CleanupOptions) {
-  if (options.proof.stopped !== true || options.proof.closed !== true || !options.proof.processExited) throw new Error('cleanup_stop_unconfirmed');
+  if (options.proof.stopped !== true || options.proof.closed !== true || !options.proof.processExited
+    || options.proof.processTreeStopped !== true || options.proof.requiredPersistenceComplete !== true) throw new Error('cleanup_stop_unconfirmed');
   const trialRoot = await realpath(options.trialRoot), marker = JSON.parse(await readFile(join(trialRoot, 'ownership.json'), 'utf8'));
   const target = join(resolve(options.workRoot??trialRoot), 'product');
   if (marker.contract !== 'medclaw-eval-instance/v1' || marker.executionId !== options.executionId || marker.trialId !== options.trialId

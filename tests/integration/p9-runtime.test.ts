@@ -133,9 +133,12 @@ function commitAnswer(f:Awaited<ReturnType<typeof stoppedAnswer>>) {
 
 test('p9 interrupted recovery validates only committed native history and preserves independent context and stop gaps',async()=>{
   const f=await stoppedAnswer();
+  let unsaved:unknown;try{await f.agent.disposeIdleSessions();}catch(error){unsaved=error;}
+  expect(unsaved).toMatchObject({code:'storage_write_failed'});
   const row=f.db.query<{native_entry_id:string;entry_json:string},[]>('SELECT native_entry_id,entry_json FROM memories LIMIT 1').get()!;
   f.db.query("UPDATE memories SET entry_json=json_set(entry_json,'$.timestamp','ENGINEERING-bad-time') WHERE native_entry_id=?").run(row.native_entry_id);
-  const {app}=applicationFor(f,'recovered-host');app.runs.recoverInterrupted(true);
+  // A restarted Host has a fresh SDK instance; it cannot retain the interrupted process's unsaved tail.
+  const {app}=applicationFor({...f,agent:new PiAgentRuntime(f.runtime,f.root,f.history)},'recovered-host');app.runs.recoverInterrupted(true);
   expect(app.runs.persistencePending).toBe(true);expect(await app.runs.readControl()).toMatchObject({ok:true,data:{acceptingNewRuns:false}});
   expect(f.repo.read({runId:f.input.runId})).toMatchObject({kind:'one',run:{status:'failed',cleanup:{stopConfirmed:true,requiredPersistenceComplete:false,unconfirmedItems:expect.arrayContaining(['history_persistence'])}}});
   expect(await app.runs.retrySave(f.input.runId)).toMatchObject({ok:false,error:{code:'run_save_unavailable'}});expect(f.requests).toHaveLength(1);

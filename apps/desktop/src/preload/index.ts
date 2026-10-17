@@ -28,10 +28,17 @@ const bridge = {
       body = desktopMethodSchemas[name].input.parse(payload);
       parsingPayload = false;
     } catch { return { ok: false, error: safeError(parsingPayload && method === "session.messages.read" ? "input_invalid" : "invalid_argument") }; }
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const result: unknown = await ipcRenderer.invoke("medclaw:request", { method: name, payload: body, operationRef: identity });
-      return resultSchema(desktopMethodSchemas[name].output).parse(result) as Result<DesktopReturn<M>>;
+      const call = ipcRenderer.invoke("medclaw:request", { method: name, payload: body, operationRef: identity });
+      const result: unknown = name === 'backup.create' || name === 'backup.restore' || name === 'diagnostics.export'
+        ? await Promise.race([call, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('operation_result_unknown')), 600000); })]) : await call;
+      const parsed = resultSchema(desktopMethodSchemas[name].output).parse(result);
+      if (name === 'backup.read' && parsed.ok && parsed.data !== null && typeof parsed.data === 'object' && 'kind' in parsed.data
+        && parsed.data.kind !== (body as { kind: string }).kind) throw new Error('host_protocol_mismatch');
+      return parsed as Result<DesktopReturn<M>>;
     } catch { return { ok: false, error: safeError(isDesktopReadOnlyMethod(name) ? "host_protocol_mismatch" : "operation_result_unknown", undefined, { operationRef: identity }) }; }
+    finally { clearTimeout(timer); }
   },
   subscribe(listener: (notice: DesktopNotice & { instanceId: string | null }) => void) { listeners.add(listener); ipcRenderer.send("medclaw:subscribe"); return () => listeners.delete(listener); },
   async secretInput(input: DesktopSecretInput) { return resultSchema(DesktopSecretInputResultSchema).parse(await ipcRenderer.invoke("medclaw:secret-input", DesktopSecretInputSchema.parse(input))); },

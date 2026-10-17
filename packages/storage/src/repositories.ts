@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { stopProofForOwner, type ProcessTreeProof } from '@medclaw/contracts/maintenance';
 import { isDeepStrictEqual } from "node:util";
 import { legacyRunConfig, legacyRunScope, legacyRunResources, legacyRunExtensions, legacyContextBody, legacyModelCallContext, legacyModelSelection, legacyChildConfig, legacyChildResult, legacyQueryContext, legacyIntentExecution, legacyIntentMetadata, legacyInputContent, legacyWorkspaceContext, legacyToolDelivery, legacyBusinessToolOutput, omitLegacyFields } from './legacy-business-fields';
 import { ProviderRequestOriginalSchema } from '../../contracts/src/controller-evidence';
@@ -2043,6 +2044,10 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     const previous = decoded(row.cleanup_json);
     const next = checked(RunCleanupRecordSchema, input), old = RunCleanupRecordSchema.safeParse(previous);
     if (old.success) {
+      if (old.data.processTreeProof) {
+        if (next.processTreeProof && !isDeepStrictEqual(old.data.processTreeProof, next.processTreeProof)) fail('state_conflict');
+        next.processTreeProof = old.data.processTreeProof;
+      }
       if (next.budgetSummary == null && old.data.budgetSummary != null) next.budgetSummary = old.data.budgetSummary;
       if (!next.extensions && old.data.extensions) next.extensions = old.data.extensions;
       if(old.data.extensionReleaseBasis){
@@ -2064,6 +2069,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if (old.data.verifiedAt && (!next.verifiedAt || Date.parse(next.verifiedAt) < Date.parse(old.data.verifiedAt))) fail("state_conflict");
       if (old.data.secondaryErrors.some(error => !next.secondaryErrors.some(item => isDeepStrictEqual(item, error)))) fail("state_conflict");
     }
+    if (next.processTreeProof && next.processTreeProof.instanceId !== row.instance_id) fail('state_conflict');
     const selectedExtension=this.readRunExtensions(row.id)?.selection.extension;
     if(next.extensionReleaseBasis&&(!selectedExtension||next.extensions||next.extensionReleaseBasis==='not_loaded'&&(next.executionStarted!==false||this.calls(row.id).some(call=>call.kind!=='intent'))))fail('state_conflict');
     if (next.resourcesReleased===true && selectedExtension && !next.extensions&&!next.extensionReleaseBasis) fail('state_conflict');
@@ -2336,7 +2342,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
     });
   }
 
-  verifyPriorToolFacts(runId: number, previousProcessExited: boolean, time: string): {
+  verifyPriorToolFacts(runId: number, previousProcessExited: boolean, time: string, processTreeProof?: ProcessTreeProof): {
     stopConfirmed: boolean | null; requiredPersistenceComplete: boolean; unconfirmedItems: string[];
   } {
     id(runId); timestamp(time);
@@ -2344,6 +2350,8 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const run = this.row(runId);
       if (!run) fail('run_not_found');
       const prior = RunCleanupRecordSchema.safeParse(decoded(run.cleanup_json));
+      const treeProof = previousProcessExited ? stopProofForOwner(processTreeProof, run.instance_id) ?? (prior.success ? prior.data.processTreeProof : undefined) : undefined;
+      const treeStopped = treeProof?.instanceId === run.instance_id;
       const unconfirmed = new Set(prior.success ? prior.data.unconfirmedItems.filter(item =>
         ['tool_persistence', 'tool_effect_unknown', 'tool_results_unknown'].includes(item)) : []);
       let stopConfirmed: boolean | null = previousProcessExited || prior.success && prior.data.stopConfirmed === true ? true : null;
@@ -2356,12 +2364,12 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         for (const tool of tools) {
           const spawned = ['bash', 'powershell', 'grep', 'find'].includes(tool.tool_name);
           // The owning Host exiting proves neither a spawned child's stop nor its original result.
-          if (spawned && tool.status === 'running') {
+          if (spawned && tool.status === 'running' && !treeStopped) {
             stopConfirmed = null;
             unconfirmed.add('tool_results_unknown');
             continue;
           }
-          if (spawned && tool.started_at !== null && tool.stopped_at === null && !(prior.success && prior.data.stopConfirmed === true)) stopConfirmed = null;
+          if (spawned && tool.started_at !== null && tool.stopped_at === null && !treeStopped && !(prior.success && prior.data.stopConfirmed === true)) stopConfirmed = null;
           if (tool.status === 'requested' || tool.status === 'running') {
             if (!previousProcessExited) {
               unconfirmed.add('tool_results_unknown');
@@ -2371,8 +2379,8 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
               ? { outcomeUnknown: true, recoveredAfterHostExit: true }
               : { executionStarted: false, recoveredAfterHostExit: true };
             const error = safeError('runtime_interrupted', undefined, { runId, toolCallId: tool.id });
-            this.db.query(`UPDATE tool_calls SET status='failed',result_json=?,error_json=?,ended_at=? WHERE id=? AND status=?`)
-              .run(JSON.stringify(result), JSON.stringify(error), time, tool.id, tool.status);
+            this.db.query(`UPDATE tool_calls SET status='failed',result_json=?,error_json=?,ended_at=?,stopped_at=CASE WHEN ?=1 THEN COALESCE(stopped_at,?) ELSE stopped_at END WHERE id=? AND status=?`)
+              .run(JSON.stringify(result), JSON.stringify(error), time, treeStopped ? 1 : 0, treeProof?.observedAt ?? null, tool.id, tool.status);
             this.recoveredToolEvent(run,tool.id,error,time);
             changed = true;
             if (tool.status === 'running' && tool.effect === 'LOCAL_WRITE') unconfirmed.add('tool_effect_unknown');
@@ -2381,7 +2389,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
             if (typeof result === 'object' && result !== null && 'outcomeUnknown' in result && result.outcomeUnknown === true) unconfirmed.add('tool_effect_unknown');
           }
         }
-        if (previousProcessExited && !tools.some(tool => ['bash', 'powershell', 'grep', 'find'].includes(tool.tool_name) && tool.status === 'running')) unconfirmed.delete('tool_results_unknown');
+        if (previousProcessExited && (treeStopped || !tools.some(tool => ['bash', 'powershell', 'grep', 'find'].includes(tool.tool_name) && tool.status === 'running'))) unconfirmed.delete('tool_results_unknown');
       }
       if (stopConfirmed !== true) { unconfirmed.add('stop'); unconfirmed.add('resources'); }
       if (changed) this.beforeCommit?.();
@@ -2447,7 +2455,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
   }
 
   // Called only after the Host has confirmed the old owning process exited.
-  recoverInterrupted(instanceId: string, time: string): number {
+  recoverInterrupted(instanceId: string, time: string, processTreeProof?: ProcessTreeProof): number {
     timestamp(time);
     if (!instanceId) fail("invalid_argument");
     return this.transactions.immediate(() => {
@@ -2460,7 +2468,8 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         const prior = RunCleanupRecordSchema.safeParse(decoded(row.cleanup_json));
         const intentFacts = this.verifyPriorIntentFacts(row.id,true,time);
         const inputFacts = this.verifyPriorInputFacts(row.id,true,time);
-        const facts = row.kind === 'agent' && this.p3 ? this.verifyPriorToolFacts(row.id, true, time) : null;
+        const treeProof = prior.success && prior.data.processTreeProof || stopProofForOwner(processTreeProof, row.instance_id);
+        const facts = row.kind === 'agent' && this.p3 ? this.verifyPriorToolFacts(row.id, true, time, treeProof) : null;
         const contextFacts = this.verifyPriorContextFacts(row.id);
         const historyFacts = this.verifyPriorHistoryFacts(row.id);
         const extension=prior.success?prior.data.extensions:undefined;
@@ -2474,6 +2483,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
           inputsSettled: inputFacts.inputsSettled, resourcesReleased: facts.stopConfirmed===true&&extensionReleased, unconfirmedItems: [...facts.unconfirmedItems,...intentFacts.unconfirmedItems,...inputFacts.unconfirmedItems,...contextFacts.unconfirmedItems,...historyFacts.unconfirmedItems,...(extensionReleased?[]:['resources','extension_cleanup'])],
           ...(exitedExtension?{extensions:exitedExtension}:{}),
           ...(extensionReleaseBasis?{extensionReleaseBasis}:{}),
+          ...(treeProof ? { processTreeProof: treeProof } : {}),
           secondaryErrors: prior.success ? prior.data.secondaryErrors : [], verifiedAt: facts.stopConfirmed === true&&extensionReleased ? time : null,
           ...(prior.success && prior.data.budgetSummary !== undefined ? { budgetSummary: prior.data.budgetSummary } : {}),
         }) : { previousInstanceId: row.instance_id, oldProcessExited: true, observationGap: true };

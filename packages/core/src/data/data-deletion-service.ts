@@ -41,5 +41,5 @@ export class DataDeletionService {
      return this.store.saveCleanup(operation.operationRef,{state:'complete',remainingCount:0,error:null},new Date().toISOString());
    }catch{return this.store.saveCleanup(operation.operationRef,{state:'failed',remainingCount:operation.preview.files.length-completed,error:safeError('storage_write_failed')},new Date().toISOString());}
  }
- async shutdown(){this.closing=true;await Promise.all([...this.active.values()].map(operation=>operation.promise));}
+ async shutdown(){this.closing=true;await Promise.all([...this.active.values()].map(operation=>operation.promise));this.store.assertWritable();}
 }

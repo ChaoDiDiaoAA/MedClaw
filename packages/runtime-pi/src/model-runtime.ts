@@ -3,7 +3,7 @@ import { getApiProvider, getApiProviders } from "@earendil-works/pi-ai/compat";
 import type { Api, AssistantMessage, AuthInteraction, AuthType, CredentialStore, Model, ModelsStore, ModelsStoreEntry } from "@earendil-works/pi-ai";
 import { fileURLToPath } from "node:url";
 import { readFile, mkdir, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import type { AuthStatusView, CustomProviderDefinition, ModelChoice, ModelDirectoryView, ModelEntryView, ModelSelection, RequestPolicy, ModelRuntimePort, ResolvedProviderSelection } from "../../contracts/src/model.ts";
 import { CustomProviderDefinitionSchema } from "../../contracts/src/model.ts";
@@ -14,9 +14,15 @@ export type { ProviderOutcome } from "../../contracts/src/run.ts";
 
 export const SDK_VERSION = "0.87.1" as const;
 export async function installedSdkVersion(): Promise<string> {
-  const entry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
-  const value: unknown = JSON.parse(await readFile(`${dirname(entry)}/../package.json`, "utf8"));
-  return z.strictObject({ version: z.string() }).passthrough().parse(value).version;
+  try {
+    const entry = fileURLToPath(import.meta.resolve('@earendil-works/pi-coding-agent')), packageRoot = dirname(dirname(entry));
+    await Promise.all(['pi-coding-agent', 'pi-ai', 'pi-agent-core', 'pi-tui', 'pi-telemetry', 'chord'].map(async name => {
+      const installedEntry = Bun.resolveSync('@earendil-works/' + name, packageRoot);
+      const value: unknown = JSON.parse(await readFile(join(dirname(installedEntry), '../package.json'), 'utf8'));
+      z.strictObject({ name: z.literal('@earendil-works/' + name), version: z.literal(SDK_VERSION) }).passthrough().parse(value);
+    }));
+    return SDK_VERSION;
+  } catch { throw safeError('host_protocol_mismatch'); }
 }
 export interface ResolvedModel extends ResolvedProviderSelection {
   model: Model<Api>; selection: ModelSelection; policy: RequestPolicy; pricingKnown: boolean;

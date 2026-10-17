@@ -235,7 +235,7 @@ test('A10 unknown selection remains locked after read until explicit Host restar
   expect((await calls()).filter(call => call.method === 'workspace.update')).toHaveLength(before + 1);
   const oldHost = await page.evaluate(() => window.medclaw.request('host.read', {}));
   await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('button', { name: 'Restart Host', exact: true }).click();
-  await expect.poll(async () => { const host = await page.evaluate(() => window.medclaw.request('host.read', {})); return host.ok && oldHost.ok && host.data.state === 'ready' && host.data.instanceId !== oldHost.data.instanceId; }).toBe(true);
+  await expect.poll(async () => { const host = await page.evaluate(() => window.medclaw.request('host.read', {})); return host.ok && oldHost.ok && host.data.state === 'ready' && host.data.instanceId !== oldHost.data.instanceId; }, { timeout: 30000 }).toBe(true);
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Apply 0 selected batches', exact: true })).toBeEnabled();
   expect(sql('SELECT count(*) AS n FROM runs')[0].n).toBe(0); expect(physical).toBe(0);
@@ -303,7 +303,7 @@ test('A13 nonempty saved selection restores once after explicit Host restart wit
   const before = sql('SELECT * FROM workspace')[0], models = physical, count = sql('SELECT count(*) AS n FROM runs')[0].n, restores = (await calls()).filter(call => call.method === 'workspace.restore').length;
   const old = await page.evaluate(() => window.medclaw.request('host.read', {}));
   await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('button', { name: 'Restart Host', exact: true }).click();
-  await expect.poll(async () => { const host = await page.evaluate(() => window.medclaw.request('host.read', {})); return host.ok && old.ok && host.data.state === 'ready' && host.data.instanceId !== old.data.instanceId; }).toBe(true);
+  await expect.poll(async () => { const host = await page.evaluate(() => window.medclaw.request('host.read', {})); return host.ok && old.ok && host.data.state === 'ready' && host.data.instanceId !== old.data.instanceId; }, { timeout: 30000 }).toBe(true);
   await expect.poll(async () => (await calls()).filter(call => call.method === 'workspace.restore').length).toBe(restores + 1);
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click(); await expect(page.getByTestId('confirmed-selection').last()).toContainText(view.data.page.rowKeys[0]!);
   expect(sql('SELECT * FROM workspace')[0]).toEqual(before); expect(physical).toBe(models); expect(sql('SELECT count(*) AS n FROM runs')[0].n).toBe(count);

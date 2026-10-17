@@ -67,8 +67,9 @@ export class EvaluationWorker {
       if (!operation.abort.signal.aborted) operation.view.state = 'running';
       this.statusNotice(operation); enteredRunner = true;
       const saved = new Set<string>();
-      await runExperiment({ datasetRoot: prepared.options.datasetId, runsRoot: join(this.service.paths.runsRoot, 'business'), executionId: operation.view.executionId!,
+      await runExperiment({ datasetRoot: prepared.datasetRoot, runsRoot: join(this.service.paths.runsRoot, 'business'), executionId: operation.view.executionId!,
         selection: prepared.options.selection, trials: prepared.options.trials, config: prepared.config, modelCredential: prepared.modelCredential,
+        installManifestPath: this.service.paths.installManifestPath,
         judgeMode: 'required', judge, signal: operation.abort.signal, desktopRequest: operation.request, expectedSource: prepared.expectedSource,
         onProgress: trial => { operation.view.currentTrial = projectTrial({ ...trial, observationRef: null }, secrets); this.statusNotice(operation); },
         onEvent: event => {

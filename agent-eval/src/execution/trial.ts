@@ -12,7 +12,7 @@ import { materializeControlFixtures, parseFixtureCatalog } from '../dataset-fixt
 import { collectObservation } from './observe.ts';
 import type {TrialPhase} from './progress.ts';
 
-export interface RunTrialOptions { executionId: string; trialId: string; caseId: string; repetition: number; case: EvalCase; datasetRoot: string; fixtureFiles?: Record<string,string>; productResources?: readonly ProductResource[]; config: ResolvedRunConfig; modelCredential?:AgentModelCredential; trialRoot: string; signal?: AbortSignal; controlledFixture?: boolean;onPhase?:(phase:TrialPhase)=>void }
+export interface RunTrialOptions { executionId: string; trialId: string; caseId: string; repetition: number; case: EvalCase; datasetRoot: string; fixtureFiles?: Record<string,string>; productResources?: readonly ProductResource[]; config: ResolvedRunConfig; modelCredential?:AgentModelCredential; installManifestPath?:string; trialRoot: string; signal?: AbortSignal; controlledFixture?: boolean;onPhase?:(phase:TrialPhase)=>void }
 export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
   const result: TrialResult = { trialId: options.trialId, caseId: options.caseId, repetition: options.repetition, status: 'preparing', instanceId: null, startedAt: null, endedAt: null, reason: null, stopped: null, closed: null, observation: null };
   const trialRoot = resolve(options.trialRoot); await mkdir(trialRoot, { recursive: true });
@@ -59,7 +59,7 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
     if(options.fixtureFiles) await materializeControlFixtures(options.case.input.fixture.ref, options.fixtureFiles, workRoot);
     else if(options.case.input.fixture.ref==='private-canary') throw new Error('controller_fixture_inputs_missing');
     options.onPhase?.('prepare_host');
-    product = await prepareInstance({ trialRoot,workRoot, config: options.config, modelCredential:options.modelCredential, controlledToolFault: profile?.controlledToolFault,
+    product = await prepareInstance({ trialRoot,workRoot, config: options.config, modelCredential:options.modelCredential, installManifestPath:options.installManifestPath, controlledToolFault: profile?.controlledToolFault,
       owner: { executionId: options.executionId, trialId: options.trialId, caseId: options.caseId } }); result.instanceId = product.instanceId; result.status = 'running';
     options.signal?.addEventListener('abort', onAbort, { once: true }); options.signal?.throwIfAborted();
     executor = new ActionExecutor(product, options.config, inputRoot, trialRoot, options.productResources,publicMaterials,()=>preparePublicMaterials(options.case,inputRoot,profile?.absentFiles));
@@ -97,7 +97,7 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
       const proof = error.shutdownProof as ShutdownProof; result.stopped = proof.stopped; result.closed = proof.closed;
       firstShutdown=proof;
       if ('instanceId' in error && typeof error.instanceId === 'string') result.instanceId = error.instanceId;
-      if (proof.stopped !== true || proof.closed !== true || !proof.processExited || proof.residuals.length) result.reason = 'host_stop_unconfirmed';
+      if (proof.stopped !== true || proof.closed !== true || !proof.processExited || proof.processTreeStopped !== true || proof.requiredPersistenceComplete !== true || proof.residuals.length) result.reason = 'host_stop_unconfirmed';
     }
   } finally {
     if(executionStart!==undefined&&executionStop===undefined)executionStop=performance.now();
@@ -118,7 +118,7 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
       try { const latest = await product.stop();const proof=firstShutdown??latest;firstShutdown??=latest; result.stopped = proof.stopped; result.closed = proof.closed;
         await writeFile(join(trialRoot, 'shutdown.json'), JSON.stringify(proof, null, 2));
         if(latest!==proof)await writeFile(join(trialRoot,'cleanup-shutdown.json'),JSON.stringify(latest,null,2));
-        if (proof.stopped !== true || proof.closed !== true || !proof.processExited || proof.residuals.length) { result.status = 'infra_error'; result.reason = 'host_stop_unconfirmed'; }
+        if (proof.stopped !== true || proof.closed !== true || !proof.processExited || proof.processTreeStopped !== true || proof.requiredPersistenceComplete !== true || proof.residuals.length) { result.status = 'infra_error'; result.reason = 'host_stop_unconfirmed'; }
         else if (options.config.retention === 'preserve_on_failure' && result.status === 'completed' && result.observation && result.observation.missing.length === 0) {
           try { await cleanupInstance({ trialRoot,workRoot, executionId: options.executionId, trialId: options.trialId, instanceId: product.instanceId, proof, observation: result.observation }); cleanup = { status: 'removed', reason: null }; }
           catch (error) { result.status = 'infra_error'; result.reason = `cleanup_preserved:${error instanceof Error ? error.message : 'unknown'}`; cleanup.reason = result.reason; }
@@ -130,7 +130,7 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
         }
         result.status = 'infra_error'; result.reason = 'host_stop_unconfirmed';
       }
-      if (result.stopped !== true || result.closed !== true || firstShutdown?.processExited !== true || firstShutdown.residuals.length) cleanup.reason = 'host_stop_unconfirmed';
+      if (result.stopped !== true || result.closed !== true || firstShutdown?.processExited !== true || firstShutdown.processTreeStopped !== true || firstShutdown.requiredPersistenceComplete !== true || firstShutdown.residuals.length) cleanup.reason = 'host_stop_unconfirmed';
       await writeFile(join(trialRoot, 'cleanup.json'), JSON.stringify({ contract: 'medclaw-eval-cleanup/v1', executionId: options.executionId, trialId: options.trialId,
         instanceId: product.instanceId, productRoot: product.paths.dataRoot, ...cleanup, observedAt: new Date().toISOString() }, null, 2));
       if(result.observation) {

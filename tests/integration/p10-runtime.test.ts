@@ -207,12 +207,15 @@ for(const reason of ['second_overflow','summary_failure'] as const)test(`p10 aut
   expect(f.db.query("SELECT id FROM model_calls WHERE kind='compaction'").all()).toHaveLength(2);
 });
 
-test('p10 shutdown cancels the original manual task and returns only after stop and durable call facts',async()=>{
+for(const changedModel of [false,true])test(`p10 shutdown cancels the original manual task and returns only after stop and durable call facts${changedModel?' with uncommitted model setup':''}`,async()=>{
   const f=await fixture(true,true);
+  if(changedModel)f.db.exec("UPDATE memories SET entry_json=json_set(entry_json,'$.modelId','legacy-fixture') WHERE entry_type='model_change'");
+  const original=await f.history.store.load(1);
   expect(await f.sessions.compact(f.request,{instanceId:'host',operationRef:'closing'})).toMatchObject({ok:true});await waitFor(()=>f.requests.length===1);
   expect(await f.app.shutdown()).toEqual({executionStopped:true});
   expect(f.repo.readCompactionOperation({sessionId:1,operationRef:'closing'})).toMatchObject({receipt:{status:'cancelled',nativeSaved:false,callIds:[expect.any(String)]}});
   expect(f.db.query("SELECT state FROM model_calls WHERE kind='compaction'").all()).toEqual([{state:'cancelled'}]);expect(f.requests).toHaveLength(1);
+  expect(await f.history.store.load(1)).toEqual(original);
 });
 
 test('p10 failed manual call persistence blocks restore until the exact observed fact is saved, without HTTP replay',async()=>{

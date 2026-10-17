@@ -1,47 +1,13 @@
 import { expect,test } from 'bun:test';
-import { Database } from 'bun:sqlite';
-import { mkdtempSync,rmSync,existsSync,writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join,resolve } from 'node:path';
-import type { ChildProcessWithoutNullStreams } from 'node:child_process';
-import { HostController } from '../../apps/desktop/src/main/host-controller';
-import { MainSettings,atomicWriteJson } from '../../apps/desktop/src/main/settings';
-import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
-import { safeError,type Result } from '../../packages/contracts/src/error';
-import { NewSessionResultSchema,SessionDetailSchema,SessionCheckpointPageSchema,SessionCheckpointReceiptSchema,SubmitResultSchema,type SubmitInput } from '../../packages/contracts/src/session';
+import { type Result } from '../../packages/contracts/src/error';
+import { SessionDetailSchema,SessionCheckpointPageSchema,SessionCheckpointReceiptSchema } from '../../packages/contracts/src/session';
 import { SessionMessagePageSchema } from '../../packages/contracts/src/messages';
-import { WorkspaceViewSchema } from '../../packages/contracts/src/workspace';
-import { RuntimeControlViewSchema,ReadRunResultSchema } from '../../packages/contracts/src/run';
+import { ReadRunResultSchema } from '../../packages/contracts/src/run';
 import { EventPageSchema } from '../../packages/contracts/src/event';
+import { sessionHostFixture as fixture } from '../fixtures/p9-host';
 
 function unwrap<T>(result:Result<T>):T {if(!result.ok)throw result.error;return result.data;}
 async function until(check:()=>Promise<boolean>) {const end=Date.now()+10000;while(!await check()){if(Date.now()>end)throw new Error('ENGINEERING Host condition timeout');await Bun.sleep(10);}}
-async function fixture(barrier?:'final-before'|'final-after'|'checkpoint-after') {
-  const root=mkdtempSync(join(tmpdir(),'medclaw-p9-host-')),requests:Record<string,unknown>[]=[];let hold=false;
-  const armed=join(root,'arm'),reached=join(root,'reached'),entry=join(root,'barrier-host.ts');
-  if(barrier)writeFileSync(entry,`import{existsSync,unlinkSync,writeFileSync}from'node:fs';import{Repositories}from ${JSON.stringify(resolve('packages/storage/src/repositories.ts'))};import{PiAgentRuntime}from ${JSON.stringify(resolve('packages/runtime-pi/src/agent-runtime.ts'))};
-    const block=()=>{if(!existsSync(${JSON.stringify(armed)}))return;unlinkSync(${JSON.stringify(armed)});writeFileSync(${JSON.stringify(reached)},${JSON.stringify(barrier)});Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,60000);};
-    ${barrier==='checkpoint-after'?`const restore=PiAgentRuntime.prototype.restore;PiAgentRuntime.prototype.restore=function(...args){block();return restore.apply(this,args);};`:`const finalize=Repositories.prototype.finalizeAgent;Repositories.prototype.finalizeAgent=function(...args){${barrier==='final-before'?'block();':''}const result=finalize.apply(this,args);${barrier==='final-after'?'block();':''}return result;};`}
-    await import(${JSON.stringify(resolve('apps/host/src/main.ts'))});`);
-  const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){requests.push(await request.json() as Record<string,unknown>);const waiting=hold;return new Response(new ReadableStream({start(controller){const send=(value:unknown)=>controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(value)}\n\n`));
-    send({id:'ENGINEERING',model:'fixture',choices:[{index:0,delta:{role:'assistant',content:waiting?'ENGINEERING temporary':'ENGINEERING answer'},finish_reason:waiting?null:'stop'}]});if(!waiting){controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));controller.close();}}}),{headers:{'content-type':'text/event-stream'}});}});
-  const host=new HostController({dataRoot:root,hostEntry:barrier?entry:resolve('apps/host/src/main.ts'),bunExecutable:process.execPath,onCredentialRequest:async frame=>frame.method==='export.destination.settlePrevious'?{ok:true,data:{stopped:true}}:frame.method==='credential.list'?{ok:true,data:[{providerId:'p9-fixture',type:'api_key'}]}:frame.method==='credential.read'?{ok:true,data:frame.payload.providerId==='p9-fixture'?{type:'api_key',key:'ENGINEERING'}:null}:{ok:false,error:safeError('access_denied')}});
-  const initial=new MainSettings(host.paths.settingsPath).read(),definition={providerId:'p9-fixture',name:'ENGINEERING',api:'openai-completions',baseUrl:`http://127.0.0.1:${server.port}/v1`,models:[{id:'fixture',name:'ENGINEERING',input:['text'],reasoning:false,contextWindow:32768,maxTokens:1024,outputLimitConfirmed:true,pricingKnown:false,cost:null}]};
-  atomicWriteJson(host.paths.settingsPath,PublishedSettingsSchema.parse({...initial,model:{provider:'p9-fixture',modelId:'fixture'},customProviders:[{definition,credentialRef:null}]}));
-  expect(await host.start()).toMatchObject({state:'ready',schemaVersion:16});
-  const sql=(query:string)=>{const db=new Database(host.paths.databasePath,{readonly:true});try{return db.query(query).all();}finally{db.close();}};
-  const workspace=async()=>WorkspaceViewSchema.parse(unwrap(await host.request('workspace.read',{})));
-  const create=async(op:string)=>NewSessionResultSchema.parse(unwrap(await host.request('session.create',{expectedWorkspaceRevision:(await workspace()).revision},op)));
-  const select=async(sessionId:number)=>unwrap(await host.request('session.select',{sessionId,expectedWorkspaceRevision:(await workspace()).revision}));
-  const idle=()=>until(async()=>RuntimeControlViewSchema.parse(unwrap(await host.request('run.control.read',{}))).acceptingNewRuns);
-  async function send(sessionId:number,text:string,op:string) {
-    const detail=SessionDetailSchema.parse(unwrap(await host.request('session.read',{sessionId}))),w=await workspace();
-    const request:SubmitInput={sessionId,clientSequence:detail.session.nextSubmissionSequence,text,mode:'send',expectedRevision:w.revision,expectedBatchIds:[],expectedQueryId:null,model:{provider:'p9-fixture',modelId:'fixture',expectedConfigVersion:'1'},referenceDate:'2026-10-05',timezone:'Asia/Shanghai'};
-    return SubmitResultSchema.parse(unwrap(await host.request('session.submit',request,op)));
-  }
-  async function close(){try{if(host.read().instanceId&&!host.read().canStart)await host.stop(host.read().instanceId!);}finally{server.stop(true);rmSync(root,{recursive:true,force:true});}}
-  return {host,requests,sql,workspace,create,select,idle,send,close,hold:(value:boolean)=>{hold=value;},arm:()=>writeFileSync(armed,'ENGINEERING'),reached:()=>existsSync(reached)};
-}
 
 for(const barrier of ['final-before','final-after','checkpoint-after'] as const)test(`p9 real Host kill at ${barrier} proves committed facts and never replays execution`,async()=>{
   const f=await fixture(barrier);try{
@@ -54,7 +20,7 @@ for(const barrier of ['final-before','final-after','checkpoint-after'] as const)
     }else pending=f.send(a.session.id,'ENGINEERING final barrier turn','barrier-second');
     await until(async()=>f.reached());const committed=f.sql('SELECT * FROM memories ORDER BY id'),answers=f.sql('SELECT * FROM answers ORDER BY id'),position=f.sql('SELECT current_leaf_id,storage_version FROM sessions');
     expect(answers).toHaveLength(barrier==='final-after'?2:1);if(barrier==='checkpoint-after'){expect(committed).toEqual(oldHistory);expect(answers).toEqual(oldAnswers);}else expect(committed.length).toBeGreaterThan(oldHistory.length);
-    const instance=f.host.read().instanceId!,child=(f.host as unknown as {child:ChildProcessWithoutNullStreams}).child,exit=new Promise<void>(done=>child.once('close',()=>done()));expect(child.pid).toBeGreaterThan(0);expect(child.kill('SIGKILL')).toBe(true);await exit;await pending;
+    const instance=await f.kill();await pending;
     const network=f.requests.length;expect(await f.host.restart(instance)).toMatchObject({state:'ready'});await f.idle();
     expect(f.requests).toHaveLength(network);expect(f.sql('SELECT * FROM memories ORDER BY id')).toEqual(committed);expect(f.sql('SELECT * FROM answers ORDER BY id')).toEqual(answers);expect(f.sql('SELECT current_leaf_id,storage_version FROM sessions')).toEqual(position);
     if(barrier==='checkpoint-after')expect(await f.host.request('evidence.readOperation',{kind:'session_checkpoint',operationRef:'barrier-position'})).toMatchObject({ok:true,data:{operationRef:'barrier-position',sessionId:a.session.id}});
@@ -89,8 +55,8 @@ test('p9 real Host strong kill keeps only committed prefix; restart never resume
   const f=await fixture();try {
     const a=await f.create('create-kill');await f.send(a.session.id,'ENGINEERING durable prefix','durable');await f.idle();f.hold(true);
     const accepted=await f.send(a.session.id,'ENGINEERING interrupted request','interrupted');await until(async()=>f.requests.length===2);
-    const original=f.sql('SELECT * FROM memories ORDER BY id'),instance=f.host.read().instanceId!,child=(f.host as unknown as {child:ChildProcessWithoutNullStreams}).child,exited=new Promise<void>(resolve=>child.once('close',resolve));
-    expect(child.kill('SIGKILL')).toBe(true);await exited;f.hold(false);expect(await f.host.restart(instance)).toMatchObject({state:'ready'});
+    const original=f.sql('SELECT * FROM memories ORDER BY id'),instance=await f.kill();
+    f.hold(false);expect(await f.host.restart(instance)).toMatchObject({state:'ready'});
     expect(f.sql('SELECT * FROM memories ORDER BY id')).toEqual(original);expect(f.sql('SELECT id FROM answers')).toHaveLength(1);expect(f.requests).toHaveLength(2);
     expect(ReadRunResultSchema.parse(unwrap(await f.host.request('run.read',{runId:accepted.runId})))).toMatchObject({kind:'one',run:{status:'failed',error:{code:'runtime_interrupted'}}});
     const page=SessionMessagePageSchema.parse(unwrap(await f.host.request('session.messages.read',{sessionId:a.session.id})));expect(JSON.stringify(page)).not.toContain('ENGINEERING temporary');

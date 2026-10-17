@@ -21,6 +21,7 @@ export interface EvaluationControllerOptions {
   paths: EvaluationPaths; workerEntry: string; bunExecutable?: string;
   production: Pick<HostController, 'read' | 'request'>;
   notify?(notice: EvaluationNotice): void; report?(error: AppError): void;
+  maintenanceBusy?(): boolean;
 }
 const gap = (code: string) => ({ code, message: 'Evaluation lifecycle facts could not be confirmed.', trialId: null });
 const executionMethods: PublicMethod[] = ['model.request', 'model.diagnose', 'session.submit', 'session.compact', 'extensions.command', 'session.restoreCheckpoint', 'session.restore', 'host.restart'];
@@ -40,6 +41,7 @@ export class EvaluationController {
   private sealed = false;
   private workerSequence = 0;
   private admission: Admission | null = null;
+  private initializationPending = false;
   private shutdownTask: Promise<ShutdownProof> | null = null;
   private view: EvaluationControlView;
   constructor(private readonly options: EvaluationControllerOptions) {
@@ -53,6 +55,10 @@ export class EvaluationController {
       stopConfirmed: true, saveConfirmed: true, controllerExited: this.exitObserved, blockReasons: [], result: null, error: null };
   }
   read(): EvaluationControlView { return structuredClone(this.view); }
+  get admissionPending(): boolean {
+    return this.admission !== null || this.initializationPending || this.evaluationBusy()
+      || [...this.productionOperations.values()].some(operation => operation.pending !== null || operation.unconfirmed);
+  }
   private diagnostic(error: AppError) { try { this.options.report?.(error); } catch {} }
   private notify(notice: EvaluationNotice) { try { this.options.notify?.(structuredClone(notice)); } catch { this.diagnostic(safeError('preview_delivery_failed')); } }
   private status() {
@@ -139,7 +145,8 @@ export class EvaluationController {
   }
   initialize(): Promise<void> {
     if (this.initializing) return this.initializing;
-    this.initializing = this.launch(); return this.initializing;
+    this.initializationPending = true;
+    this.initializing = this.launch().finally(() => { this.initializationPending = false; }); return this.initializing;
   }
   private async launch() {
     const decoder = new EvaluationFrameDecoder(this.instanceId);
@@ -213,6 +220,7 @@ export class EvaluationController {
     return false;
   }
   async withProductionAdmission<T>(method: PublicMethod, payload: unknown, operationRef: string, work: (original: boolean) => Promise<T>): Promise<T> {
+    if (method === 'host.start' && this.options.maintenanceBusy?.()) throw safeError('maintenance_busy');
     if (method === 'host.start' && this.closing) throw safeError('runtime_busy');
     if (!executionMethods.includes(method)) return work(false);
     const old = this.productionOperations.get(operationRef);
@@ -228,7 +236,9 @@ export class EvaluationController {
       try {
         const original = await this.originalProduction(method, payload, operationRef);
         if (!original) {
+          if (this.options.maintenanceBusy?.()) throw safeError('maintenance_busy');
           if (this.initializing) try { await this.initializing; } catch {}
+          if (this.options.maintenanceBusy?.()) throw safeError('maintenance_busy');
           if (this.admission !== admission || this.closing || this.evaluationBusy()) throw safeError('runtime_busy');
         }
         entered = true;
@@ -291,8 +301,10 @@ export class EvaluationController {
               return receipt;
             }
           }
+          if (this.options.maintenanceBusy?.()) throw safeError('maintenance_busy');
           if (this.admission !== admission || this.closing || this.sealed || this.evaluationBusy() && this.view.operationRef !== operationRef || this.view.blockReasons.some(reason => reason.code === 'external_execution_lock')) throw safeError('runtime_busy');
           await this.productionIdle();
+          if (this.options.maintenanceBusy?.()) throw safeError('maintenance_busy');
           this.view = { ...this.idle(), sequence: this.view.sequence, operationRef, operationKind: method === 'eval.start' ? 'run' : method === 'eval.review.sync' ? 'review_sync' : 'resend',
             executionId: method === 'eval.start' ? 'desktop-' + operationRef : raw.executionId!, state: 'starting', stopConfirmed: null, saveConfirmed: null };
           this.status(); sent = true;

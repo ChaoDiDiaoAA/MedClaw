@@ -2,13 +2,16 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
+import { isDeepStrictEqual } from 'node:util';
+import { WriterLockRecordSchema, type WriterLockRecord, type HostShutdownProof } from '@medclaw/contracts/maintenance';
+import { requestMaintenance } from './maintenance-controller';
 import type { z } from 'zod';
 import { OpaqueIdSchema, safeError, type AppError, type Result } from "@medclaw/contracts/error";
 import { SDK_VERSION, type HostView } from "@medclaw/contracts/model";
 import { HostStartupFailureReader, type HostStartupFailure } from '../../../../packages/logging/src/host-startup-failure';
 import {
   DATABASE_SCHEMA_VERSION, HOST_PROTOCOL_VERSION, MAX_FRAME_BYTES,
-  HostHelloSchema, HostReadySchema, HostRequestSchema, PrivateCredentialFrameSchema, PrivateCredentialReplySchema,
+  HostHelloSchema, HostReadySchema, HostRequestSchema, HostShutdownResultSchema, PrivateCredentialFrameSchema, PrivateCredentialReplySchema,
   encodeHostFrame, parseHostFrame, hostPrivateMethodSchemas, publicOutputSchema, isReadOnlyMethod,
   type DesktopNotice, type HostHello, type HostPrivateMethod, type HostReady,
   type PrivateCredentialFrame, type PublicHostRequest,
@@ -18,6 +21,9 @@ export interface HostControllerOptions {
   dataRoot: string;
   hostEntry: string;
   bunExecutable?: string;
+  resourceRoot?: string;
+  installManifestPath?: string;
+  maintenanceEntry?: string;
   onCredentialRequest?: (frame: PrivateCredentialFrame) => Promise<Result<unknown>>;
   onNotice?: (notice: DesktopNotice) => void;
   onError?: (error: AppError) => void;
@@ -36,6 +42,9 @@ const waitForExit = async (exited: Promise<void>) => {
 export class HostController {
   readonly paths: HostHello["paths"];
   private child: ChildProcessWithoutNullStreams | null = null;
+  private starting: Promise<void> | null = null;
+  private checkingStop: Promise<void> | null = null;
+  private verifiedLock: WriterLockRecord | null = null;
   private exited: Promise<void> = Promise.resolve();
   private view: HostView = { instanceId: null, state: "stopped", canStart: true, sdkVersion: null, schemaVersion: null, error: null };
   private handshake: { resolve: (ready: HostReady) => void; reject: (error: AppError) => void } | null = null;
@@ -86,13 +95,52 @@ export class HostController {
   }
   private lockAvailable(): boolean {
     try {
-      const lock = JSON.parse(readFileSync(this.paths.lockPath, "utf8")) as { pid?: unknown; instanceId?: unknown; startupToken?: unknown };
-      if (!Number.isSafeInteger(lock.pid) || (lock.pid as number) <= 0 || !OpaqueIdSchema.safeParse(lock.instanceId).success || !OpaqueIdSchema.safeParse(lock.startupToken).success) return false;
-      try { process.kill(lock.pid as number, 0); return false; }
-      catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+      const lock = WriterLockRecordSchema.parse(JSON.parse(readFileSync(this.paths.lockPath, 'utf8')));
+      return isDeepStrictEqual(lock, this.verifiedLock);
     } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
   }
-  read(): HostView { return { ...this.view, canStart: this.child === null && this.lockAvailable(), error: this.view.error ? { ...this.view.error } : null }; }
+  read(): HostView { return structuredClone({ ...this.view, canStart: this.child === null && this.starting === null && this.view.state !== 'stopping' && this.lockAvailable() }); }
+  private settleStoppedState(): void {
+    const saved = this.view.shutdown;
+    if (this.child || this.view.state !== 'stopping' || !saved?.processExited) return;
+    if (saved.processTreeStopped !== true) { this.view.error ??= safeError('host_stop_unconfirmed'); return; }
+    const clean = saved.executionStopped === true && saved.requiredPersistenceComplete === true && saved.databaseClosed === true;
+    this.view.state = clean ? 'stopped' : 'failed';
+    this.view.error = clean ? null : saved.error ?? safeError('host_interrupted');
+  }
+  refreshStopProof(): Promise<void> {
+    if (this.child) return Promise.resolve();
+    this.checkingStop ??= this.readStopProof().finally(() => { this.checkingStop = null; });
+    return this.checkingStop;
+  }
+  private async readStopProof(): Promise<void> {
+    if (this.child) return;
+    this.verifiedLock = null; this.view.canPrepareRecovery = false;
+    let lock: WriterLockRecord;
+    try { lock = WriterLockRecordSchema.parse(JSON.parse(readFileSync(this.paths.lockPath, 'utf8'))); }
+    catch (error) {
+      if (this.view.shutdown) this.view.shutdown.processTreeStopped = null;
+      this.settleStoppedState();
+      return;
+    }
+    const result = await requestMaintenance({ bunExecutable: this.options.bunExecutable ?? process.execPath,
+      maintenanceEntry: this.options.maintenanceEntry ?? resolve(import.meta.dir, '../../../../apps/host/src/maintenance.ts') },
+      { action: 'process.check', owner: { instanceId: lock.instanceId, startupToken: lock.startupToken }, lockPath: this.paths.lockPath }, randomUUID());
+    if (this.child) return;
+    this.view.canPrepareRecovery = result.ok && result.data.canPrepareRecovery;
+    if (result.ok && result.data.stopped && result.data.processTreeProof?.instanceId === lock.instanceId) this.verifiedLock = lock;
+    if (this.view.shutdown) this.view.shutdown.processTreeStopped = this.verifiedLock && lock.instanceId === this.view.instanceId ? true : null;
+    this.settleStoppedState();
+  }
+  async prepareRecovery(): Promise<HostView> {
+    if (this.child || this.starting) throw new Error('runtime_busy');
+    const lock = WriterLockRecordSchema.parse(JSON.parse(readFileSync(this.paths.lockPath, 'utf8')));
+    const result = await requestMaintenance({ bunExecutable: this.options.bunExecutable ?? process.execPath,
+      maintenanceEntry: this.options.maintenanceEntry ?? resolve(import.meta.dir, '../../../../apps/host/src/maintenance.ts') },
+      { action: 'process.prepareRecovery', owner: { instanceId: lock.instanceId, startupToken: lock.startupToken }, lockPath: this.paths.lockPath }, randomUUID());
+    if (!result.ok) throw result.error;
+    await this.refreshStopProof(); return this.read();
+  }
   private status() { this.deliverNotice({ type: "host.status", host: this.read() }); }
   private settle(requestId: string, result: Result<unknown>) {
     const pending = this.pending.get(requestId);
@@ -106,7 +154,7 @@ export class HostController {
     this.previewTimer = null;
   }
   private fail(code: string) {
-    if (this.view.error) return;
+    if (this.view.error && this.view.state !== 'ready') return;
     const error = safeError(code);
     this.view = { ...this.view, state: this.child ? "stopping" : "failed", error };
     this.handshake?.reject(error); this.handshake = null;
@@ -174,7 +222,7 @@ export class HostController {
         const ready = HostReadySchema.parse(raw);
         if (ready.instanceId !== this.view.instanceId || ready.dataRoot !== this.paths.dataRoot) throw new Error("host_protocol_mismatch");
         const handshake = this.handshake; this.handshake = null;
-        this.view = { ...this.view, state: this.view.state === "stopping" ? "stopping" : "ready", sdkVersion: ready.sdkVersion, schemaVersion: ready.schemaVersion, error: null };
+        this.view = { ...this.view, state: this.view.state === "stopping" ? "stopping" : "ready", sdkVersion: ready.sdkVersion, schemaVersion: ready.schemaVersion, error: this.view.state === 'stopping' ? this.view.error : null };
         this.status(); handshake.resolve(ready); continue;
       }
       const frame = parseHostFrame(line, this.view.instanceId!);
@@ -206,10 +254,16 @@ export class HostController {
     if (this.buffer.length > MAX_FRAME_BYTES) throw new Error("frame_too_large");
   }
   async start(): Promise<HostView> {
-    if (this.child) throw new Error("runtime_busy");
-    if (!this.lockAvailable()) {
-      this.view = { ...this.view, state: "failed", error: safeError("host_stop_unconfirmed") };
-      this.diagnostic(this.view.error!); this.status(); return this.read();
+    if (this.child || this.starting) throw new Error('runtime_busy');
+    const work = this.startOwned(); this.starting = work;
+    try { await work; } finally { this.starting = null; this.status(); }
+    return this.read();
+  }
+  private async startOwned(): Promise<void> {
+    await this.refreshStopProof();
+    if (this.view.state === 'stopping' || !this.lockAvailable()) {
+      this.view = { ...this.view, state: this.view.state === 'stopping' ? 'stopping' : 'failed', error: safeError("host_stop_unconfirmed") };
+      this.diagnostic(this.view.error!); this.status(); return;
     }
     const instanceId = randomUUID(); const startupToken = randomUUID();
     this.view = { instanceId, state: "starting", canStart: false, sdkVersion: null, schemaVersion: null, error: null };
@@ -217,25 +271,27 @@ export class HostController {
     this.clearStreams();
     const ready = new Promise<HostReady>((resolve, reject) => { this.handshake = { resolve, reject }; });
     void ready.catch(() => {});
-    const child = spawn(this.options.bunExecutable ?? "bun", ["--no-env-file", resolve(this.options.hostEntry)], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, AWS_MAX_ATTEMPTS: "1", MEDCLAW_INSTANCE_ID: instanceId, MEDCLAW_STARTUP_TOKEN: startupToken } });
+    const child = spawn(this.options.bunExecutable ?? "bun", ["--no-env-file", resolve(this.options.hostEntry)], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, AWS_MAX_ATTEMPTS: "1", MEDCLAW_INSTANCE_ID: instanceId, MEDCLAW_STARTUP_TOKEN: startupToken, PI_CODING_AGENT_DIR: join(this.paths.dataRoot, 'runtime/sdk') } });
     const startupFailure: { value: HostStartupFailure | null } = { value: null };
     const failureReader = new HostStartupFailureReader();
     this.child = child;
-    this.exited = new Promise<void>(done => child.once("close", () => {
+    this.exited = new Promise<void>(done => child.once("close", (code, signal) => { void (async () => {
       if (this.child === child) {
         this.child = null; this.preview = null; this.clearStreams();
-        const stopped = this.view.state === "stopping" && (!this.view.error || this.view.error.code === "host_stop_unconfirmed");
+        const stopped = this.view.state === "stopping" && (!this.view.error || this.view.error.code === "host_stop_unconfirmed") && code === 0 && signal === null;
         const failed = this.view.error !== null;
         const error = this.view.error ?? startupFailure.value?.error ?? safeError("host_interrupted");
         if (startupFailure.value) { try { this.options.onStartupFailure?.(startupFailure.value); } catch { /* Diagnostics cannot alter Host control. */ } }
         this.handshake?.reject(error); this.handshake = null;
         this.interrupt(error);
-        this.view = { ...this.view, state: stopped ? "stopped" : "failed", canStart: true, error: stopped ? null : error };
+        this.view = { ...this.view, state: stopped ? "stopping" : "failed", canStart: false, error: stopped ? null : error };
+        this.view.shutdown = { executionStopped: null, requiredPersistenceComplete: null, databaseClosed: null, processTreeStopped: null, error: null,
+          ...this.view.shutdown, processExited: true };
         if (!stopped && !failed) this.diagnostic(error);
-        this.options.onExit?.(instanceId); this.status();
+        this.options.onExit?.(instanceId); await this.refreshStopProof(); this.status();
       }
       done();
-    }));
+    })().catch(() => { this.diagnostic(safeError('host_stop_unconfirmed')); done(); }); }));
     const exited = this.exited;
     child.on("error", () => { if (this.child === child) this.fail("host_start_failed"); });
     child.stdin.on("error", () => { if (this.child === child && this.view.state !== "stopping") this.fail("host_interrupted"); });
@@ -244,7 +300,17 @@ export class HostController {
       try { this.receive(chunk); }
       catch (error) { this.fail(error instanceof Error && error.message === "frame_too_large" ? "frame_too_large" : this.view.state === "handshaking" ? "host_protocol_mismatch" : "invalid_frame"); }
     });
-    child.stdout.on("end", () => { if (this.child === child && this.buffer.length) this.fail("invalid_frame"); });
+    const outputClosed = () => {
+      if (this.child !== child) return;
+      if (this.buffer.length) this.fail('invalid_frame');
+      else if (this.view.state !== 'stopping') {
+        if (this.handshake) {
+          // Keep startup diagnostics readable until close confirms the failed process.
+          this.view.state = 'stopping'; this.status(); child.kill();
+        } else this.fail('host_interrupted');
+      }
+    };
+    child.stdout.on('end', outputClosed); child.stdout.on('close', outputClosed); child.stdout.on('error', outputClosed);
     // Never forward raw stderr, which can contain provider secrets. A fatal
     // startup line is useful only after its phase/code are validated and exit is confirmed.
     child.stderr.on("data", (chunk: Buffer) => {
@@ -255,7 +321,9 @@ export class HostController {
     // The full imported catalog requires a synchronous integrity check before ready.
     const timer = setTimeout(() => { if (this.child === child && this.handshake) this.fail("host_start_failed"); }, 60000);
     try {
-      const hello = HostHelloSchema.parse({ protocolVersion: HOST_PROTOCOL_VERSION, instanceId, startupToken, sdkVersion: SDK_VERSION, expectedSchemaVersion: DATABASE_SCHEMA_VERSION, paths: this.paths });
+      const hello = HostHelloSchema.parse({ protocolVersion: HOST_PROTOCOL_VERSION, instanceId, startupToken, sdkVersion: SDK_VERSION, expectedSchemaVersion: DATABASE_SCHEMA_VERSION, paths: this.paths,
+        resourceRoot: this.options.resourceRoot ?? resolve(import.meta.dir, '../../../../resources'),
+        installManifestPath: this.options.installManifestPath ?? resolve(import.meta.dir, '../../../../.build/package-resources/medclaw/install.json') });
       await this.write(`${JSON.stringify(hello)}\n`);
       await ready;
     } catch {
@@ -263,7 +331,6 @@ export class HostController {
       await waitForExit(exited);
       if (this.child === child) { this.view.state = "stopping"; this.view.error ??= safeError("host_stop_unconfirmed"); this.status(); }
     } finally { clearTimeout(timer); }
-    return this.read();
   }
   async request(method: HostMethod, payload: unknown, operationRef: string = randomUUID(), requestId: string = randomUUID(), expectedInstanceId?: string): Promise<Result<unknown>> {
     if (expectedInstanceId && expectedInstanceId !== this.view.instanceId) return { ok: false, error: safeError('host_interrupted', undefined, { operationRef }) };
@@ -289,17 +356,36 @@ export class HostController {
     });
     return reply;
   }
-  async stop(expectedInstanceId: string): Promise<HostView> {
+  async stop(expectedInstanceId: string, requireIdle = false): Promise<HostView> {
     if (expectedInstanceId !== this.view.instanceId) throw new Error("host_protocol_mismatch");
     const child = this.child;
     if (!child) return this.read();
     const exited = this.exited;
+    if (this.view.error?.code === 'maintenance_busy') this.view.error = null;
     this.view.state = "stopping"; this.status(); this.preview = null; this.clearStreams();
-    void this.request("host.shutdown", { expectedInstanceId }).catch(() => {});
+    const response = this.request('host.shutdown', { expectedInstanceId, ...(requireIdle ? { requireIdle: true } : {}) });
+    const shutdown = response.then(result => {
+      if (this.view.instanceId !== expectedInstanceId) return;
+      const proof: HostShutdownProof = { executionStopped: null, requiredPersistenceComplete: null, databaseClosed: null,
+        processExited: this.child === null, processTreeStopped: this.view.shutdown?.processTreeStopped ?? null, error: result.ok ? null : result.error };
+      if (result.ok) {
+        const saved = HostShutdownResultSchema.parse(result.data);
+        proof.executionStopped = saved.executionStopped; proof.requiredPersistenceComplete = saved.requiredPersistenceComplete ?? null; proof.databaseClosed = saved.databaseClosed;
+      }
+      this.view.shutdown = proof;
+      this.settleStoppedState();
+    }).catch(() => { this.diagnostic(safeError('host_stop_unconfirmed')); });
+    if (requireIdle) {
+      const result = await response; await shutdown;
+      if (!result.ok && result.error.code === 'maintenance_busy' && this.child === child) {
+        this.view.state = 'ready'; this.view.error = result.error; delete this.view.shutdown; this.status(); return this.read();
+      }
+    }
     await waitForExit(exited);
     if (this.child === child) { child.kill(); await waitForExit(exited); }
     if (this.child === child) { this.view.error ??= safeError("host_stop_unconfirmed"); this.status(); }
+    await shutdown;
     return this.read();
   }
-  async restart(expectedInstanceId: string): Promise<HostView> { await this.stop(expectedInstanceId); return this.child ? this.read() : this.start(); }
+  async restart(expectedInstanceId: string): Promise<HostView> { await this.stop(expectedInstanceId); return this.read().canStart ? this.start() : this.read(); }
 }

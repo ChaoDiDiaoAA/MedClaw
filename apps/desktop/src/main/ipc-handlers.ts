@@ -1,9 +1,12 @@
 import { ipcMain, shell, dialog, type BrowserWindow } from "electron";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
+import { dirname } from 'node:path';
 import { createPublicMethodSchemas, desktopMethodSchemas, publicOutputSchema, PublicMethodSchema, DesktopMethodSchema, DesktopSecretInputSchema, DesktopSecretDiscardSchema, DesktopImportDirectorySchema, isDesktopReadOnlyMethod, type DesktopMethod, type PublicMethod, type PublicPayload, type PrivateCredentialFrame, type DiagnosticsView, type RuntimeNotice } from "../../../../packages/contracts/src/protocol.ts";
 import { EvaluationMethodSchema, EvaluationOperationRefSchema, evaluationMethodSchemas, type EvaluationPayload, type EvaluationMethod } from '../../../../packages/contracts/src/evaluation';
 import type { EvaluationController } from './evaluation-controller';
+import type { MaintenanceController } from './maintenance-controller';
+import type { RestoreReceipt } from '@medclaw/contracts/maintenance';
 import { AppErrorSchema, OpaqueIdSchema, safeError, type Result } from "../../../../packages/contracts/src/error.ts";
 import { AuthLinkUrlSchema, type PublishedSettings } from "../../../../packages/contracts/src/model.ts";
 import { HostController } from "./host-controller.ts";
@@ -16,8 +19,9 @@ import { EventSubscribeInputSchema, EventSubscribeResultSchema, type OpenEventSu
 import { canonicalRequest } from '../../../../packages/contracts/src/run';
 import { SubmitInputSchema } from '../../../../packages/contracts/src/session';
 
-export async function privateCredentialRequest(credentials: MainCredentials, frame: PrivateCredentialFrame, fileTokens?: FileTokens, windowId?: number, destinations?: DestinationTokens): Promise<Result<unknown>> {
+export async function privateCredentialRequest(credentials: MainCredentials, frame: PrivateCredentialFrame, fileTokens?: FileTokens, windowId?: number, destinations?: DestinationTokens, maintenance?: MaintenanceController): Promise<Result<unknown>> {
   try {
+    const work = async (): Promise<Result<unknown>> => {
     let data: unknown;
     switch (frame.method) {
       case 'export.destination.describe': case 'export.destination.copy': {
@@ -43,9 +47,12 @@ export async function privateCredentialRequest(credentials: MainCredentials, fra
       case "credential.modify.abort": data = await credentials.abort(frame.instanceId, frame.payload); break;
     }
     return { ok: true, data };
+    };
+    const modification = ['credential.modify.begin', 'credential.modify.commit', 'credential.modify.abort', 'credential.delete'].includes(frame.method);
+    return maintenance && modification ? await maintenance.withWrite(work, frame.method === 'credential.modify.commit' || frame.method === 'credential.modify.abort') : await work();
   } catch (error) { return { ok: false, error: safeError(error instanceof Error ? error.message : "credential_read_failed", error) }; }
 }
-export function registerIpc(options: { window: BrowserWindow; host: HostController; evaluation?: EvaluationController; settings: MainSettings; credentials: MainCredentials; inputs: SecretInputs; fileTokens?: FileTokens; destinations?: DestinationTokens; diagnostics(categories: string[]): Promise<DiagnosticsView>; report(error: ReturnType<typeof safeError>): void; notify(notice: RuntimeNotice): void }) {
+export function registerIpc(options: { window: BrowserWindow; host: HostController; evaluation?: EvaluationController; maintenance?: MaintenanceController; onRestored?(receipt: RestoreReceipt): void; settings: MainSettings; credentials: MainCredentials; inputs: SecretInputs; fileTokens?: FileTokens; destinations?: DestinationTokens; diagnostics(categories: string[]): Promise<DiagnosticsView>; report(error: ReturnType<typeof safeError>): void; notify(notice: RuntimeNotice): void }) {
   const { window, host, settings, credentials, inputs } = options;
   const operations = new Map<string, { method: PublicMethod; payload: unknown }>();
   // Only display subscriptions are owned by a renderer. Pi/Recorder listeners
@@ -84,7 +91,7 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
   };
   const dispatch = async (method: PublicMethod, raw: unknown, operationRef: string, original = false): Promise<unknown> => {
     switch (method) {
-      case "host.read": return host.read();
+      case "host.read": await options.maintenance?.refresh(); await host.refreshStopProof(); return host.read();
       case "host.start": return host.start();
       case "host.stop": return host.stop((raw as { expectedInstanceId: string }).expectedInstanceId);
       case "host.restart": return host.restart((raw as { expectedInstanceId: string }).expectedInstanceId);
@@ -230,11 +237,104 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       const schema = ['data.read', 'data.rows', 'query.read', 'query.list', 'evidence.read', 'tool.read'].includes(method)
         ? createPublicMethodSchemas()[PublicMethodSchema.parse(method)].input : desktopMethodSchemas[method].input;
       const parsed = JSON.parse(JSON.stringify(schema.parse(payload))) as unknown;
+      if (method === 'maintenance.discardSelection') {
+        parsingPayload = false;
+        if (!options.fileTokens) throw new Error('access_denied');
+        options.fileTokens.discardMaintenance(window.id, operationRef);
+        replyReceived = true; return { ok: true, data: null };
+      }
+      if (method === 'diagnostics.selectDestination' || method === 'diagnostics.export' || method === 'diagnostics.readExport') {
+        parsingPayload = false;
+        if (!options.fileTokens || !options.destinations) throw new Error('diagnostics_export_failed');
+        const files = options.fileTokens, destinations = options.destinations;
+        let data: unknown;
+        try {
+          if (method === 'diagnostics.selectDestination') {
+            const purpose = (parsed as { purpose: 'create' | 'read' }).purpose;
+            const selected = await dialog.showOpenDialog(window, { title: purpose === 'create' ? 'Choose a support bundle destination' : 'Choose the original completed support bundle',
+              properties: [purpose === 'create' ? 'openDirectory' : 'openFile'] });
+            if (window.isDestroyed?.()) throw new Error('access_denied');
+            if (selected.canceled || selected.filePaths.length !== 1) data = null;
+            else {
+              const path = selected.filePaths[0]!, original = purpose === 'read' ? await destinations.inspectSupportFile(path) : undefined;
+              if (window.isDestroyed?.()) throw new Error('access_denied');
+              const identity = original?.operationRef ?? operationRef, grant = files.issueMaintenance(window.id, identity, original ? 'support-result' : 'support-destination', original ? dirname(path) : path);
+              data = { destinationToken: grant.fileToken, displayName: grant.directoryName+' / MedClaw-support-'+identity+'.json', ...(original ? { original } : {}) };
+            }
+          } else {
+            const input = parsed as { destinationToken: string; categories: Array<'versions' | 'host' | 'errors' | 'runtime' | 'prompt_trace'> };
+            const authorize = () => files.resolveMaintenance(input.destinationToken, window.id, operationRef!, method === 'diagnostics.readExport' ? 'support-result' : 'support-destination');
+            const directory = authorize(), request = { operationRef, categories: input.categories };
+            data = await destinations.readSupport(directory, request); authorize();
+            if (method === 'diagnostics.export' && data === null) {
+              const work = () => {
+                files.consumeMaintenance(window.id, operationRef!, [{ token: input.destinationToken, purpose: 'support-destination' }]);
+                return destinations.exportSupport(directory, request, () => options.diagnostics(input.categories), authorize);
+              };
+              data = options.maintenance ? await options.maintenance.withWrite(work) : await work();
+            }
+          }
+        } catch (error) {
+          if (error instanceof Error && error.message === 'export_destination_invalid') throw new Error(method === 'diagnostics.export' ? 'diagnostics_export_failed' : 'diagnostics_bundle_invalid');
+          throw error;
+        }
+        replyReceived = true;
+        return { ok: true, data: desktopMethodSchemas[method].output.parse(data) };
+      }
+      if (method.startsWith('backup.')) {
+        parsingPayload = false;
+        const maintenance = options.maintenance;
+        if (!maintenance || !options.fileTokens) throw new Error('host_not_ready');
+        const context = { windowId: window.id, operationRef };
+        let data: unknown;
+        if (method === 'backup.select') {
+          const { purpose } = parsed as { purpose: 'create' | 'restore' | 'read' };
+          const select = async (title: string) => {
+            const result = await dialog.showOpenDialog(window, { title, properties: ['openDirectory'] });
+            if (window.isDestroyed?.()) throw new Error('access_denied');
+            return result.canceled || result.filePaths.length !== 1 ? null : result.filePaths[0]!;
+          };
+          const path = await select(purpose === 'create' ? 'Choose a backup destination directory' : purpose === 'restore' ? 'Choose a completed MedClaw backup' : 'Choose a backup or restored data directory');
+          if (!path) data = null;
+          else if (purpose === 'read') data = maintenance.selectResult(path, context);
+          else if (purpose === 'create') {
+            const grant = options.fileTokens.issueMaintenance(window.id, operationRef, 'backup-destination', path);
+            data = { destinationToken: grant.fileToken, destinationLabel: grant.directoryName };
+          } else {
+            const parent = await select('Choose the parent directory for a new restored data folder');
+            if (!parent) data = null;
+            else {
+              const source = options.fileTokens.issueMaintenance(window.id, operationRef, 'backup-source', path), target = options.fileTokens.issueMaintenance(window.id, operationRef, 'restore-target', parent);
+              data = { sourceToken: source.fileToken, sourceLabel: source.directoryName, targetRootToken: target.fileToken, targetRootLabel: target.directoryName };
+            }
+          }
+        } else if (method === 'backup.create') {
+          const input = parsed as { destinationToken: string };
+          options.fileTokens.consumeMaintenance(window.id, operationRef, [{ token: input.destinationToken, purpose: 'backup-destination' }]);
+          data = unwrap(await maintenance.create(input, context));
+        } else if (method === 'backup.restore') {
+          const input = parsed as { sourceToken: string; targetRootToken: string };
+          options.fileTokens.consumeMaintenance(window.id, operationRef, [{ token: input.sourceToken, purpose: 'backup-source' }, { token: input.targetRootToken, purpose: 'restore-target' }]);
+          data = unwrap(await maintenance.restore(input, context));
+        }
+        else data = unwrap(await maintenance.read(parsed as { resultToken: string; kind: 'create' | 'restore' }, context));
+        replyReceived = true;
+        data = desktopMethodSchemas[method].output.parse(data);
+        if (method === 'backup.restore') setImmediate(() => options.onRestored?.(data as RestoreReceipt));
+        return { ok: true, data };
+      }
+      if (method === 'host.prepareRecovery') {
+        parsingPayload = false; options.maintenance?.assertWritable();
+        const result = await host.prepareRecovery(); replyReceived = true;
+        return { ok: true, data: desktopMethodSchemas[method].output.parse(result) };
+      }
       const evaluationMethod = EvaluationMethodSchema.safeParse(method);
       if (evaluationMethod.success) {
         parsingPayload = false;
         if (!options.evaluation) throw new Error('host_not_ready');
-        const reply = await options.evaluation.dispatch(evaluationMethod.data, parsed as EvaluationPayload<EvaluationMethod>, operationRef);
+        const work = () => options.evaluation!.dispatch(evaluationMethod.data, parsed as EvaluationPayload<EvaluationMethod>, operationRef!);
+        const reply = options.maintenance && !isDesktopReadOnlyMethod(method) && !['eval.cancel', 'eval.start', 'eval.review.sync', 'eval.resend'].includes(method)
+          ? await options.maintenance.withWrite(work) : await work();
         replyReceived = true;
         return { ok: true, data: evaluationMethodSchemas[evaluationMethod.data].output.parse(reply) };
       }
@@ -255,7 +355,10 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
         const reply = await dispatch(publicMethod, parsed, identity, original); replyReceived = true;
         return publicOutputSchema(publicMethod, parsed).parse(reply);
       };
-      const data = options.evaluation ? await options.evaluation.withProductionAdmission(publicMethod, parsed, identity, execute) : await execute(false);
+      const guarded = (original: boolean) => options.maintenance && !isDesktopReadOnlyMethod(publicMethod)
+        && !['host.stop', 'run.cancel', 'session.cancelInput', 'import.cancel', 'operation.cancel', 'model.auth.cancel', 'export.cancel'].includes(publicMethod)
+        ? options.maintenance.withWrite(() => execute(original), original) : execute(original);
+      const data = options.evaluation ? await options.evaluation.withProductionAdmission(publicMethod, parsed, identity, guarded) : await guarded(false);
       return { ok: true, data };
     } catch (error) { const known = AppErrorSchema.safeParse(error); const safe = known.success ? known.data : safeError(error instanceof z.ZodError
       ? replyReceived && method ? isDesktopReadOnlyMethod(method) ? "host_protocol_mismatch" : "operation_result_unknown"
@@ -301,9 +404,12 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
       const identity = notice.type === 'event.available' ? notice : notice.snapshot;
       return identity.runId === owner.input.runId && (owner.sessionId === null || identity.sessionId === owner.sessionId);
     },
-    publishCredentials: async () => {
+    publishCredentials: () => {
+      const work = async () => {
     const current = settings.read(), refs = credentials.captureRefs();
     if (isDeepStrictEqual(current.credentialRefs, refs)) return;
     await publish(current.configVersion, { credentialRefs: refs, customProviders: current.customProviders.map(p => ({ ...p, credentialRef: refs[p.definition.providerId] ?? null })) }, "model");
+      };
+      return options.maintenance ? options.maintenance.withWrite(work, true) : work();
   } };
 }

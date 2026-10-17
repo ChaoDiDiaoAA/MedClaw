@@ -52,7 +52,7 @@ export class SqliteImportStore implements ImportStore {
       return this.read(operationRef)!.operation;
     } catch (error) { this.writesBlocked = true; throw error; }
   }
-  private assertWritable() { if (this.writesBlocked) throw new Error('operation_result_unknown'); }
+  assertWritable() { if (this.writesBlocked) throw new Error('operation_result_unknown'); }
   revision(): number {
     const row = this.db.query<{ revision: number }, []>('SELECT revision FROM catalog_state WHERE id=1').get();
     if (!row) throw new Error('storage_read_failed'); return row.revision;

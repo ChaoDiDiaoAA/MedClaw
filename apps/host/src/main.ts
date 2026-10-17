@@ -1,4 +1,8 @@
-import { open, readFile, unlink, realpath } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
+import { createHostJob, type HostJob } from './windows-job';
+import { acquireWriterLock, type WriterLease } from './writer-lock';
+import { prepareNativeDependencies } from './native-dependencies';
+import type { NativeDependency } from '@medclaw/contracts/maintenance';
 import { createResourceSource } from '@medclaw/runtime-pi/resource-loader';
 import { dirname, isAbsolute, relative, resolve, sep, join } from "node:path";
 import { HostHelloSchema, HostRequestSchema, HostPrivateRequestSchema, PrivateCredentialReplySchema, NoticeFrameSchema, encodeHostFrame, publicMethodSchemas, createPublicMethodSchemas, hostPrivateMethodSchemas, privateCredentialMethodSchemas, isReadOnlyMethod, MAX_FRAME_BYTES, HOST_PROTOCOL_VERSION, type HostHello, type HostRequest, type RuntimeNotice, type PrivateCredentialMethod } from "../../../packages/contracts/src/protocol.ts";
@@ -69,7 +73,9 @@ let deletions:DataDeletionService;
 let events: EventService | null = null;
 let contexts: ContextService;
 let controllerEvidence:ControllerEvidenceReader;
-let locked = false, closing = false, controlCount = 0;
+let writerLease: WriterLease | null = null, hostJob: HostJob | null = null;
+let nativeDependencies: NativeDependency[] = [];
+let closing = false, controlCount = 0;
 let terminating = false, shutdownTask: Promise<void> | null = null, fatalTask: Promise<void> | null = null;
 let startupPhase = "hello";
 let writes: Promise<unknown> = Promise.resolve();
@@ -127,10 +133,6 @@ async function credentials(method: string, payload: unknown): Promise<unknown> {
   catch (error) { const call = pending.get(requestId); if (call) { clearTimeout(call.timer); pending.delete(requestId); call.reject(error); } }
   return promise;
 }
-function processAlive(pid: unknown): boolean {
-  if (!Number.isSafeInteger(pid) || (pid as number) <= 0) return true;
-  try { process.kill(pid as number, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
-}
 async function acquireLock(config: HostHello) {
   const root = await realpath(config.paths.dataRoot);
   if (resolve(root).toLowerCase() !== resolve(config.paths.dataRoot).toLowerCase()) throw new Error("access_denied");
@@ -144,25 +146,11 @@ async function acquireLock(config: HostHello) {
       if (parentPart === ".." || parentPart.startsWith(`..${sep}`) || isAbsolute(parentPart)) throw new Error("access_denied");
     }
   }
-  try {
-    const handle = await open(config.paths.lockPath, "wx", 0o600);
-    await handle.writeFile(JSON.stringify({ pid: process.pid, instanceId: config.instanceId, startupToken: config.startupToken })); await handle.sync(); await handle.close(); locked = true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    let previous: { pid?: unknown; instanceId?: unknown; startupToken?: unknown };
-    try { previous = JSON.parse(await readFile(config.paths.lockPath, "utf8")); }
-    catch { throw new Error("host_stop_unconfirmed"); }
-    if (!previous || !OpaqueIdSchema.safeParse(previous.instanceId).success || !OpaqueIdSchema.safeParse(previous.startupToken).success) throw new Error("host_stop_unconfirmed");
-    if (processAlive(previous.pid)) throw new Error("host_stop_unconfirmed");
-    await unlink(config.paths.lockPath); await acquireLock(config);
-  }
+  hostJob = createHostJob(config);
+  writerLease = await acquireWriterLock({ lockPath: config.paths.lockPath, owner: config, processDomain: hostJob.domain });
 }
 async function releaseLock() {
-  if (!locked || !hello) return;
-  try {
-    const current = JSON.parse(await readFile(hello.paths.lockPath, "utf8"));
-    if (current.pid === process.pid && current.instanceId === hello.instanceId && current.startupToken === hello.startupToken) await unlink(hello.paths.lockPath);
-  } finally { locked = false; }
+  writerLease?.release(); writerLease = null;
 }
 function shutdownHost(): Promise<void> {
   if (shutdownTask) return shutdownTask;
@@ -174,6 +162,7 @@ function shutdownHost(): Promise<void> {
   return shutdownTask = (async () => {
     const stopped = await Promise.allSettled([application?.shutdown(), imports?.shutdown(), deletions?.shutdown()]);
     for (const result of stopped) if (result.status === 'rejected') throw result.reason;
+    if (hostJob && hostJob.readActiveProcesses() !== 1) throw new Error('host_stop_unconfirmed');
     database?.close(); database = null; await releaseLock();
   })();
 }
@@ -187,6 +176,7 @@ async function initialize(raw: unknown) {
   hello = config; await acquireLock(config);
   startupPhase = "settings_read";
   const settings = PublishedSettingsSchema.parse(JSON.parse(await readFile(config.paths.settingsPath, "utf8")));
+  startupPhase = 'native_dependencies'; nativeDependencies = await prepareNativeDependencies(config);
   startupPhase = "database_open"; database = openDatabase(config.paths.databasePath);
   const transactions = SqliteWriteTransactions.forDatabase(database);
   let agent: PiAgentRuntime | null = null;
@@ -195,7 +185,7 @@ async function initialize(raw: unknown) {
     error => errorLog.add(error, { ...(error.runId ? { runId: error.runId } : {}) }), notice);
   const memory=new SqliteMemoryStore(database,validateNativeHistory,events,transactions);
   repositories = new Repositories(database, undefined, events, transactions,memory,config.instanceId);
-  try { repositories.recoverInterrupted(config.instanceId, new Date().toISOString()); }
+  try { repositories.recoverInterrupted(config.instanceId, new Date().toISOString(), writerLease?.processTreeProof ?? undefined); }
   catch { errorLog.add(safeError("storage_write_failed")); }
   const credentialStore = new BridgeCredentialStore(credentials);
   startupPhase = "pi_runtime";
@@ -225,7 +215,7 @@ async function initialize(raw: unknown) {
   agent = new PiAgentRuntime(runtime, config.paths.dataRoot, {store:memory,commitSync:change=>{
     try{return transactions.immediate(()=>memory.commitInTransaction(change));}
     catch(error){try{const proof=memory.confirmCommitted(change);if(proof)return proof;}catch{/* Read failure keeps the original write unconfirmed. */}throw error;}
-  }}, { ...configure(), recorder, configure },contexts,resolve(import.meta.dir, '../../../resources/extensions'));
+  }}, { ...configure(), recorder, configure },contexts,join(config.resourceRoot, 'extensions'));
   imports = new ImportService({ store: new SqliteImportStore(database), artifacts, instanceId: config.instanceId,
     assertWritable: () => { if (application?.exports?.busy) throw new Error('runtime_busy'); },
     resolveToken: async (fileToken, operationRef) => AbsolutePathSchema.parse(await credentials('file.resolve', { fileToken, operationRef })) });
@@ -241,10 +231,10 @@ async function initialize(raw: unknown) {
     (context, action) => credentialStore.withContext(context, action),
     Object.assign((...args:Parameters<ModelCallStarter>) => new ModelCallRecorder(repositories, ...args),
       {forCompaction:(owner:CompactionCallOwner,time:string)=>ModelCallRecorder.forCompaction(repositories!,owner,time)}),
-    notice, error => errorLog.add(error), agent, events,transactions, createResourceSource(resolve(import.meta.dir, '../../../resources')),
+    notice, error => errorLog.add(error), agent, events,transactions, createResourceSource(config.resourceRoot),
     {service:new IntentService(repositories,contexts,new OllamaIntentClient({classify:CLASSIFY_PROMPT,verify:VERIFY_PROMPT}),new IntentValidator(catalogService),events,transactions),queries}, exports);
   await exports.recoverInterrupted();
-  application.runs.recoverInterrupted(true); // The writer lock proves that the previous owning process exited.
+  application.runs.recoverInterrupted(true, writerLease?.processTreeProof ?? undefined);
   sessions = new SessionService(config.instanceId, repositories, agent, (input, context) => application!.runs.submitAgent(input, context),
     () => application!.runs.activeHandle, sessionId => application!.runs.readInputControl(sessionId),
     (inputId, context) => application!.runs.cancelInput(inputId, context), application.runs,transactions);
@@ -430,9 +420,11 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case "settings.commit": { app.commitConfig(request.payload.token, request.payload.publishedVersion); return { configVersion: app.config.configVersion, selection: (await app.directory()).selection }; }
     case "settings.abort": await app.abortConfig(request.payload.token); return { aborted: true };
     case "host.shutdown":
+      if (request.payload.requireIdle && (app.busy || imports.busy || deletions.busy)) throw new Error('maintenance_busy');
       if (request.payload.expectedInstanceId !== hello.instanceId) throw new Error("host_protocol_mismatch");
-      await shutdownHost(); return { executionStopped: true, databaseClosed: true };
-    case "diagnostics.read": return { partial: false, missingSources: [], versions: { sdkVersion: SDK_VERSION, protocolVersion: HOST_PROTOCOL_VERSION, schemaVersion: SCHEMA_VERSION, configVersion: app.config.configVersion, bunVersion: Bun.version, electronVersion: null }, host: { instanceId: hello.instanceId, state: "ready", canStart: false, sdkVersion: SDK_VERSION, schemaVersion: SCHEMA_VERSION, error: null }, entries: [...errorLog.read(), ...runtimeLog.read(), ...promptTrace.read()].filter(entry => request.payload.categories.includes(entry.category)) };
+      await shutdownHost(); return { executionStopped: true, requiredPersistenceComplete: true, databaseClosed: true };
+    case "diagnostics.read": return { dependencies: request.payload.categories.includes('versions') ? nativeDependencies : undefined,
+      partial: false, missingSources: [], versions: { sdkVersion: SDK_VERSION, protocolVersion: HOST_PROTOCOL_VERSION, schemaVersion: SCHEMA_VERSION, configVersion: app.config.configVersion, bunVersion: Bun.version, electronVersion: null }, host: { instanceId: hello.instanceId, state: "ready", canStart: false, sdkVersion: SDK_VERSION, schemaVersion: SCHEMA_VERSION, error: null }, entries: [...errorLog.read(), ...runtimeLog.read(), ...promptTrace.read()].filter(entry => request.payload.categories.includes(entry.category)) };
     default: throw new Error("access_denied"); // Main owns all publication, display and Host-control methods.
   }
 }
@@ -474,9 +466,9 @@ function fatal(error?: unknown): Promise<void> {
   pending.forEach(p => { clearTimeout(p.timer); p.reject(new Error("host_interrupted")); }); pending.clear();
   return fatalTask = (async () => {
     try { await shutdownHost(); } catch { /* Recovery will mark any unknown execution after this writer exits. */ }
-    try { database?.close(); database = null; await releaseLock(); } catch {}
-    const code = safeError(error instanceof Error ? error.message : "host_interrupted").code;
-    process.stderr.write(`MedClaw Host terminated: ${startupPhase}/${code}.\n`);
+    try { database?.close(); database = null; } catch {}
+    const known = AppErrorSchema.safeParse(error), failure = known.success ? known.data : safeError(error instanceof Error ? error.message : 'host_interrupted');
+    process.stderr.write(`MedClaw Host terminated: ${startupPhase}/${failure.code}${startupPhase === 'native_dependencies' && failure.reason ? '/' + failure.reason : ''}.\n`);
     process.exit(1);
   })();
 }

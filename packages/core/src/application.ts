@@ -21,7 +21,7 @@ const now = () => new Date().toISOString();
 export class Application<Resolved extends ResolvedProviderSelection = ResolvedProviderSelection> {
   readonly runs: RuntimeService<Resolved>;
   readonly resources: ResourceService | null;
-  private refreshes = new Map<string, AbortController>();
+  private refreshes = new Map<string, { abort: AbortController; task: Promise<unknown> }>();
   private logins = new Map<string, Login>();
   private prepared: { token: string; candidate: PublishedSettings; old: PublishedSettings; changedRuntime: boolean } | null = null;
   private lastCommit: { token: string; version: string } | null = null;
@@ -83,12 +83,16 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
   }
   async refresh(operationRef: string, providerId?: string) {
     this.assertIdle();
-    const abort = new AbortController(); this.refreshes.set(operationRef, abort);
+    const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), 30000);
-    try { return await this.runtime.refresh(providerId, abort.signal); }
+    try {
+      const task = this.runtime.refresh(providerId, abort.signal);
+      this.refreshes.set(operationRef, { abort, task });
+      return await task;
+    }
     finally { clearTimeout(timer); this.refreshes.delete(operationRef); }
   }
-  cancelOperation(operationRef: string) { const pending = this.refreshes.get(operationRef); pending?.abort(); return { cancelRequested: !!pending, settled: !pending }; }
+  cancelOperation(operationRef: string) { const pending = this.refreshes.get(operationRef); pending?.abort.abort(); return { cancelRequested: !!pending, settled: !pending }; }
   async inspectIntentModel(input:Pick<IntentModelConfiguration,'baseUrl'|'modelTag'>) {
     if(this.closing)throw safeError('runtime_busy');
     if(!this.intents)throw safeError('intent_model_unavailable');
@@ -198,10 +202,18 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
     this.runs.assertShutdownAvailable();
     this.closing = true;
     this.intentAbort.abort();
-    this.refreshes.forEach(a => a.abort()); this.logins.forEach(l => l.abort.abort());
-    await Promise.all([...this.logins.values()].map(l => l.task));
-    await Promise.allSettled([...this.intentInspections]);
-    await this.exports?.shutdown();
-    return this.runs.shutdown();
+    const refreshes = [...this.refreshes.values()];
+    refreshes.forEach(refresh => refresh.abort.abort()); this.logins.forEach(l => l.abort.abort());
+    const stopping = this.runs.shutdown();
+    const settled = await Promise.allSettled([
+      ...[...this.logins.values()].map(login => login.task),
+      Promise.allSettled(refreshes.map(refresh => refresh.task)),
+      Promise.allSettled([...this.intentInspections]),
+      this.exports?.shutdown(), stopping,
+    ]);
+    for (const result of settled) if (result.status === 'rejected') throw result.reason;
+    const stopped = await stopping;
+    await this.agent?.disposeIdleSessions?.();
+    return stopped;
   }
 }

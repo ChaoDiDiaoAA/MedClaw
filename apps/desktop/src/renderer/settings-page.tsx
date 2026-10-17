@@ -6,6 +6,7 @@ import { TOOL_CONFIG, type ToolConfiguration } from '../../../../packages/contra
 import type { PublicReturn } from "../../../../packages/contracts/src/protocol";
 import { Diagnostics } from "./diagnostics";
 import { hostLabel } from "./sidebar";
+import type { MaintenanceSelection, BackupReceipt, RestoreReceipt } from '@medclaw/contracts/maintenance';
 
 const budgetLabels: Record<keyof RuntimeConfiguration['runBudget'], string> = {
   maxToolCalls: 'Tool call budget',
@@ -14,8 +15,10 @@ const budgetLabels: Record<keyof RuntimeConfiguration['runBudget'], string> = {
   singleToolTimeoutMs: 'Tool timeout (milliseconds)',
   maxRecoveryAttempts: 'Recovery round budget',
 };
+type PendingMaintenance = { kind: 'create' | 'restore'; operationRef: string; selection: MaintenanceSelection };
 
-export function SettingsPage(props: { executionBlockReason?:string|null;ui: DesktopDisplayPreferences; host: HostView; configVersion: string; onUi: (patch: Partial<DesktopDisplayPreferences>) => Promise<boolean>; onChanged: () => Promise<void>; onError: (message: string | null) => void; onHost: (host: HostView) => void }) {
+export function SettingsPage(props: { executionBlockReason?:string|null;ui: DesktopDisplayPreferences; uiAvailable: boolean; onReadUi: () => Promise<void>; host: HostView; configVersion: string; onUi: (patch: Partial<DesktopDisplayPreferences>) => Promise<boolean>; onChanged: () => Promise<void>; onError: (message: string | null) => void; onHost: (host: HostView) => void }) {
+  const maintenanceUnavailable = props.host.error?.reason === 'desktop_bootstrap_failed';
   const [draft, setDraft] = useState(props.ui);
   const [runtimeConfiguration, setRuntimeConfiguration] = useState<RuntimeConfiguration>(() => structuredClone(RUNTIME_CONFIG));
   const [toolConfiguration, setToolConfiguration] = useState<ToolConfiguration>(() => structuredClone(TOOL_CONFIG));
@@ -23,6 +26,9 @@ export function SettingsPage(props: { executionBlockReason?:string|null;ui: Desk
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [rollbackConfirm, setRollbackConfirm] = useState(false);
+  const [pendingMaintenance, setPendingMaintenance] = useState<PendingMaintenance | null>(null), pendingMaintenanceRef = useRef<PendingMaintenance | null>(null);
+  const [maintenanceReceipt, setMaintenanceReceipt] = useState<BackupReceipt | RestoreReceipt | null>(null);
+  const [maintenanceAttempt, setMaintenanceAttempt] = useState<string | null>(null);
   const uiDirty = useRef(false);
   const policyDirty = useRef(false);
   useEffect(() => { if (!uiDirty.current) setDraft(props.ui); }, [props.ui]);
@@ -51,16 +57,79 @@ export function SettingsPage(props: { executionBlockReason?:string|null;ui: Desk
     else { props.onError(errorMessage(result.error)); await readConfig(); }
     setBusy(false);
   }
-  async function control(action: "start" | "stop" | "restart") {
+  async function control(action: "start" | "stop" | "restart" | 'read' | 'prepareRecovery') {
     if(action==='restart'&&props.executionBlockReason){props.onError(props.executionBlockReason);return;}
     setBusy(true); setMessage(null);
-    const result = action === "start" ? await window.medclaw.request("host.start", {}) : props.host.instanceId ? await window.medclaw.request(action === "stop" ? "host.stop" : "host.restart", { expectedInstanceId: props.host.instanceId }) : null;
+    const result = action === 'read' ? await window.medclaw.request('host.read', {}) : action === 'prepareRecovery' ? await window.medclaw.request('host.prepareRecovery', {})
+      : action === "start" ? await window.medclaw.request("host.start", {}) : props.host.instanceId ? await window.medclaw.request(action === "stop" ? "host.stop" : "host.restart", { expectedInstanceId: props.host.instanceId }) : null;
     if (result?.ok) props.onHost(result.data); else if (result && !result.ok) props.onError(errorMessage(result.error));
+    if (result?.ok && action === 'prepareRecovery') setMessage('Recovery observation saved. Restart Windows, reopen MedClaw, and read Host status.');
     setBusy(false);
+  }
+  async function discardPendingMaintenance(): Promise<boolean> {
+    const pending = pendingMaintenanceRef.current; if (!pending) return true;
+    pendingMaintenanceRef.current = null;
+    const result = await window.medclaw.request('maintenance.discardSelection', {}, pending.operationRef);
+    if (result.ok) { setPendingMaintenance(null); return true; }
+    pendingMaintenanceRef.current = pending; props.onError(errorMessage(result.error)); return false;
+  }
+  async function cancelMaintenance() {
+    if (busy || !pendingMaintenanceRef.current) return;
+    setBusy(true); props.onError(null);
+    try { if (await discardPendingMaintenance()) setMessage('Selection cancelled.'); } finally { setBusy(false); }
+  }
+  async function chooseMaintenance(kind: 'create' | 'restore') {
+    if (busy) return;
+    setBusy(true); setMessage(null); props.onError(null);
+    try {
+      if (!await discardPendingMaintenance()) return;
+      const operationRef = crypto.randomUUID(), result = await window.medclaw.request('backup.select', { purpose: kind }, operationRef);
+      if (!result.ok) props.onError(errorMessage(result.error));
+      else if (result.data) { const pending = { kind, operationRef, selection: result.data }; pendingMaintenanceRef.current = pending; setPendingMaintenance(pending); }
+    } finally { setBusy(false); }
+  }
+  async function confirmMaintenance() {
+    if (!pendingMaintenanceRef.current || busy) return;
+    const { kind, selection, operationRef } = pendingMaintenanceRef.current;
+    if (kind === 'create' ? !selection.destinationToken : !selection.sourceToken || !selection.targetRootToken) return;
+    pendingMaintenanceRef.current = null;
+    setBusy(true); setPendingMaintenance(null); setMaintenanceAttempt(operationRef); setMaintenanceReceipt(null); setMessage(null); props.onError(null);
+    try {
+      const result = kind === 'create' ? await window.medclaw.request('backup.create', { destinationToken: selection.destinationToken! }, operationRef)
+        : await window.medclaw.request('backup.restore', { sourceToken: selection.sourceToken!, targetRootToken: selection.targetRootToken! }, operationRef);
+      if (result.ok) {
+        setMaintenanceReceipt(result.data); setMaintenanceAttempt(null);
+        setMessage(kind === 'create' ? 'Backup completed. Host remains stopped.' : 'Data restored. Reopen the application to use the restored data.');
+      } else { props.onError(errorMessage(result.error)); setMessage('Completion was not confirmed. Select the result directory to read the original receipt.'); }
+      const current = await window.medclaw.request('host.read', {}); if (current.ok) props.onHost(current.data);
+    } finally { setBusy(false); }
+  }
+  async function readMaintenanceResult() {
+    if (busy) return;
+    setBusy(true); setMessage(null); props.onError(null);
+    try {
+      if (!await discardPendingMaintenance()) return;
+      const chosen = await window.medclaw.request('backup.select', { purpose: 'read' }, crypto.randomUUID());
+      if (!chosen.ok) { props.onError(errorMessage(chosen.error)); return; }
+      if (!chosen.data) return;
+      const { resultToken, originalKind, originalOperationRef } = chosen.data;
+      if (!resultToken || !originalKind || !originalOperationRef) { props.onError('The selected result could not be verified.'); return; }
+      const result = await window.medclaw.request('backup.read', { resultToken, kind: originalKind }, originalOperationRef);
+      if (!result.ok) props.onError(errorMessage(result.error));
+      else if (!result.data) setMessage('No completed receipt was found for the original operation.');
+      else { setMaintenanceReceipt(result.data); setMaintenanceAttempt(null); setMessage('Original completion receipt found. Read Host status to check the current application.'); }
+    } finally { setBusy(false); }
   }
   return <div className="settings-layout">
     {message && <p className="success-text" role="status">{message}</p>}
-    <section className="panel"><div className="section-heading"><h2>Display preferences</h2></div><p className="muted">You can save these preferences when Host is unavailable. Form drafts and published values are retained separately.</p><div className="checkbox-row"><label><input type="checkbox" checked={draft.navCollapsed} onChange={event => { uiDirty.current = true; setDraft(value => ({ ...value, navCollapsed: event.target.checked })); }} />Collapse navigation</label><label><input type="checkbox" checked={draft.detailOpen} onChange={event => { uiDirty.current = true; setDraft(value => ({ ...value, detailOpen: event.target.checked })); }} />Open run details</label></div><label>Default details tab<select value={draft.detailTab} onChange={event => { uiDirty.current = true; setDraft(value => ({ ...value, detailTab: event.target.value as DesktopDisplayPreferences["detailTab"] })); }}><option value="conditions">Conditions</option><option value="runtime">Run details</option></select></label><p className="tiny muted">Published: navigation {props.ui.navCollapsed ? "collapsed" : "expanded"}, details {props.ui.detailOpen ? "open" : "closed"}, tab {props.ui.detailTab}</p><button className="primary" disabled={busy} onClick={() => void saveUi()}>Save display preferences</button></section>
+    <section className="panel">
+      <div className="section-heading"><h2>Display preferences</h2><button disabled={busy} onClick={() => void props.onReadUi()}>Read saved display preferences</button></div>
+      <p className="muted">You can save these preferences when Host is unavailable. Form drafts and published values are retained separately.</p>
+      <div className="checkbox-row"><label><input type="checkbox" checked={draft.navCollapsed} onChange={event => { uiDirty.current = true; setDraft(value => ({ ...value, navCollapsed: event.target.checked })); }} />Collapse navigation</label><label><input type="checkbox" checked={draft.detailOpen} onChange={event => { uiDirty.current = true; setDraft(value => ({ ...value, detailOpen: event.target.checked })); }} />Open run details</label></div>
+      <label>Default details tab<select value={draft.detailTab} onChange={event => { uiDirty.current = true; setDraft(value => ({ ...value, detailTab: event.target.value as DesktopDisplayPreferences["detailTab"] })); }}><option value="conditions">Conditions</option><option value="runtime">Run details</option></select></label>
+      {props.uiAvailable ? <p className="tiny muted">Published: navigation {props.ui.navCollapsed ? "collapsed" : "expanded"}, details {props.ui.detailOpen ? "open" : "closed"}, tab {props.ui.detailTab}</p> : <p role="status">Saved display preferences are not confirmed. Draft values have not been published.</p>}
+      <button className="primary" disabled={busy || !props.uiAvailable} onClick={() => void saveUi()}>Save display preferences</button>
+    </section>
     <section className="panel"><div className="section-heading"><h2>Model request policy</h2><button onClick={() => void readConfig()}>Reload published configuration</button></div><p className="muted">Active runs keep their frozen configuration. Published changes apply to new runs.</p><form onSubmit={event => { event.preventDefault(); void savePolicy(); }}>
       <fieldset><legend>RunBudget</legend><div className="form-grid">{(Object.keys(budgetLabels) as (keyof RuntimeConfiguration['runBudget'])[]).map(key => <label key={key}>{budgetLabels[key]}<input type="number" min={key === 'timeoutMs' ? 1000 : key === 'maxRecoveryAttempts' ? 0 : 1} max={Number.MAX_SAFE_INTEGER} step="1" required value={runtimeConfiguration.runBudget[key]} onChange={event => editBudget(key, Number(event.target.value))} /></label>)}</div></fieldset>
       <fieldset><legend>LLM request</legend><div className="form-grid"><label>Native retries<select value={runtimeConfiguration.llm.maxRetries} onChange={event => { policyDirty.current = true; setRuntimeConfiguration(current => ({ ...current, llm: { ...current.llm, maxRetries: Number(event.target.value) as 0 | 1 } })); }}><option value="0">0</option><option value="1">1</option></select></label><label>Server retry delay limit (milliseconds)<input type="number" min="1" max="5000" step="1" required value={runtimeConfiguration.llm.maxRetryDelayMs} onChange={event => { policyDirty.current = true; setRuntimeConfiguration(current => ({ ...current, llm: { ...current.llm, maxRetryDelayMs: Number(event.target.value) } })); }} /></label></div></fieldset>
@@ -68,6 +137,20 @@ export function SettingsPage(props: { executionBlockReason?:string|null;ui: Desk
       <p className="tiny muted">Tool attempts include SDK parameter rejections. Recovery rounds share the same Run budget. Each Run saves its accepted configuration.</p><button className="primary" type="submit" disabled={busy || props.host.state !== "ready" || !config}>Publish request policy</button></form></section>
     <section className="panel"><h2>Previous configuration</h2><p>{config ? config.previousConfigVersion ? "Previous configuration available for rollback" : "No configuration available for rollback" : "Reading configuration"}</p><p className="muted">Verify the previous models, definitions and credentials before publishing a rollback. Saved runs keep their original configuration.</p><button disabled={busy || props.host.state !== "ready" || !config?.previousConfigVersion} onClick={() => setRollbackConfirm(true)}>Roll back to previous configuration</button>{rollbackConfirm && <div className="confirmation" role="alertdialog" aria-label="Confirm configuration rollback"><p>Verify the previous configuration and publish a rollback?</p><button onClick={() => setRollbackConfirm(false)}>Keep current configuration</button><button className="danger" onClick={() => void rollback()}>Confirm rollback publication</button></div>}</section>
     <section className="panel"><div className="section-heading"><h2>Host</h2><span>{hostLabel(props.host)}</span></div><p className="muted">Instance {props.host.instanceId ?? "None"}</p>{props.host.error && <p role="alert" className="error-text">{errorMessage(props.host.error)}</p>}<div className="actions"><button disabled={busy || !props.host.canStart} onClick={() => void control("start")}>Start Host</button><button disabled={busy || !props.host.instanceId || ["stopped", "stopping"].includes(props.host.state)} onClick={() => void control("stop")}>Stop Host</button><button disabled={!!props.executionBlockReason || busy || !props.host.instanceId || props.host.state !== "ready"} onClick={() => void control("restart")}>Restart Host</button></div>{props.executionBlockReason&&<p role="status">{props.executionBlockReason}</p>}</section>
-    <Diagnostics onError={props.onError} />
+    <section className="panel" aria-labelledby="maintenance-title">
+      <h2 id="maintenance-title">Backup and restore</h2>
+      <p className="muted">Backup requires an idle Host with all changes saved and leaves it stopped. Restore creates a separate data folder and keeps your current data. Model credentials must be configured again.</p>
+      <div className="actions"><button disabled={busy || maintenanceUnavailable} onClick={() => void chooseMaintenance('create')}>Choose backup destination</button><button disabled={busy || maintenanceUnavailable} onClick={() => void chooseMaintenance('restore')}>Choose backup to restore</button><button disabled={busy || maintenanceUnavailable} onClick={() => void readMaintenanceResult()}>Read original result</button></div>
+      {pendingMaintenance && <div className="confirmation" role="alertdialog" aria-label={pendingMaintenance.kind === 'create' ? 'Confirm data backup' : 'Confirm data restore'}>
+        <p>{pendingMaintenance.kind === 'create' ? `Create a new backup in ${pendingMaintenance.selection.destinationLabel}?` : `Restore ${pendingMaintenance.selection.sourceLabel} into the new folder ${pendingMaintenance.selection.targetRootLabel}?`}</p>
+        {pendingMaintenance.kind === 'restore' && <p>Current data will be retained. You will need to configure model credentials again and explicitly start new queries.</p>}
+        <button disabled={busy} onClick={() => void cancelMaintenance()}>{pendingMaintenance.kind === 'create' ? 'Keep working' : 'Keep current data'}</button>
+        <button className="primary" disabled={busy || !!props.executionBlockReason} onClick={() => void confirmMaintenance()}>{pendingMaintenance.kind === 'create' ? 'Confirm backup' : 'Confirm restore'}</button>
+      </div>}
+      {maintenanceAttempt && <p role="status">Operation to check: {maintenanceAttempt}</p>}
+      {maintenanceReceipt && <div role="status"><p>{maintenanceReceipt.kind === 'create' ? 'Backup' : 'Restore'} completion receipt · App {maintenanceReceipt.appVersion}</p><p>Original operation: {maintenanceReceipt.operationRef}</p></div>}
+    </section>
+    <div className="actions"><button disabled={busy} onClick={() => void control('read')}>Read Host status</button>{props.host.canPrepareRecovery && <button disabled={busy} onClick={() => void control('prepareRecovery')}>Prepare restart recovery</button>}</div>
+    <Diagnostics onError={props.onError} exportAvailable={!maintenanceUnavailable} />
   </div>;
 }

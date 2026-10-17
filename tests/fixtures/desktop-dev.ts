@@ -3,6 +3,7 @@ import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { mkdirSync, writeFileSync, readdirSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { canonicalRequest } from '../../packages/contracts/src/run';
 
 export const projectRoot = resolve(import.meta.dirname, '../..');
@@ -10,7 +11,19 @@ export const projectRoot = resolve(import.meta.dirname, '../..');
 export const electronTestWindowArgs=['--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows','--disable-features=CalculateNativeWinOcclusion'];
 export const bunExecutable = process.env.MEDCLAW_BUN_EXECUTABLE ?? execFileSync('bun', ['-e', 'process.stdout.write(process.execPath)'], { encoding: 'utf8' }).trim();
 
-export async function launchActualDev(temporary: string, dataRoot: string, importDirectory?: string, beforePageAcquisition?: () => void, controlledHostEntry?: string, controlledMainEntry?: string): Promise<{ page: Page; browser: Browser; child: ChildProcess; close(): Promise<void> }> {
+export function confirmedDevHostStop(dataRoot: string): boolean {
+  const paths = pathToFileURL(join(projectRoot, 'apps/desktop/src/main/runtime-paths.ts')).href;
+  const writer = pathToFileURL(join(projectRoot, 'apps/host/src/writer-lock.ts')).href;
+  try {
+    const source = 'import{existsSync,readFileSync}from"node:fs";import{join}from"node:path";'
+      + 'const{selectedDataRoot}=await import('+JSON.stringify(paths)+');const{inspectWriterLock}=await import('+JSON.stringify(writer)+');'
+      + 'const root='+JSON.stringify(dataRoot)+',roots=[...new Set([root,selectedDataRoot(root)])];'
+      + 'const stopped=roots.every(root=>{const path=join(root,"runtime/host.lock");if(!existsSync(path))return true;const owner=JSON.parse(readFileSync(path,"utf8"));return inspectWriterLock(path,owner).stopped;});console.log(JSON.stringify(stopped));';
+    return JSON.parse(execFileSync(bunExecutable, ['--no-env-file', '-e', source], { cwd: projectRoot, encoding: 'utf8', timeout: 10000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })) === true;
+  } catch { return false; }
+}
+
+export async function launchActualDev(temporary: string, dataRoot: string, importDirectory?: string, beforePageAcquisition?: () => void, controlledHostEntry?: string, controlledMainEntry?: string): Promise<{ page: Page; browser: Browser; child: ChildProcess; close(expectedExitCode?: number): Promise<void> }> {
   mkdirSync(temporary, { recursive: true });
   const listener = createServer();
   await new Promise<void>(resolve => listener.listen(0, '127.0.0.1', resolve));
@@ -54,11 +67,12 @@ export async function launchActualDev(temporary: string, dataRoot: string, impor
   let browser: Browser | undefined;
   const confirmExit = async () => {
     // Ask the ordinary Main to quit even when CDP/page acquisition failed. Main's
-    // existing before-quit handler still owns Host shutdown and lock removal.
+    // existing before-quit handler still owns Host shutdown; retained metadata proves its tree stopped.
     writeFileSync(quitRequest, 'quit');
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([exited, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Actual dev Main/Host exit is unconfirmed; retain its isolated root')), 15000); })]);
+      if (!confirmedDevHostStop(dataRoot)) throw new Error('Actual dev Host tree exit is unconfirmed; retain its isolated roots');
       writeFileSync(exitConfirmation, 'exited');
     } finally { clearTimeout(timer); }
   };
@@ -74,9 +88,9 @@ export async function launchActualDev(temporary: string, dataRoot: string, impor
     let page = context.pages()[0];
     if (!page) page = await context.waitForEvent('page', { timeout: 15000 });
     await page.waitForLoadState('domcontentloaded');
-    return { page, browser, child, async close() {
+    return { page, browser, child, async close(expectedExitCode = 0) {
       await confirmExit(); await browser!.close();
-      if (child.exitCode !== 0) throw new Error(`Actual dev launcher exited ${child.exitCode}`);
+      if (child.exitCode !== expectedExitCode) throw new Error(`Actual dev launcher exited ${child.exitCode}, expected ${expectedExitCode}`);
     } };
   } catch (error) {
     await confirmExit(); await browser?.close();

@@ -1,12 +1,14 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { appendFile, mkdir, realpath, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, realpath, writeFile, readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { FileTokens } from '../../../apps/desktop/src/main/file-tokens.ts';
 import { DestinationTokens } from '../../../apps/desktop/src/main/destination-tokens.ts';
 import { MainSettings } from '../../../apps/desktop/src/main/settings.ts';
 import { AppErrorSchema, safeError, type Result } from '../../../packages/contracts/src/error.ts';
 import { SDK_VERSION } from '../../../packages/contracts/src/model.ts';
+import { WriterLockRecordSchema } from '../../../packages/contracts/src/maintenance';
+import { requestMaintenance } from '../../../apps/desktop/src/main/maintenance-controller';
 import type { AgentModelCredential } from '../types.ts';
 import {
   DATABASE_SCHEMA_VERSION, HOST_PROTOCOL_VERSION, MAX_FRAME_BYTES, HostHelloSchema, HostReadySchema,
@@ -18,18 +20,20 @@ import {
 type Method = PublicMethod | HostPrivateMethod;
 type Pending = { method: Method; payload: unknown; operationRef: string; resolve: (value: Result<unknown>) => void; timer: ReturnType<typeof setTimeout> };
 export interface ProductTrace { at: string; instanceId: string; kind: string; [key: string]: unknown }
-export interface ShutdownProof { stopped: boolean | null; closed: boolean | null; processExited: boolean; residuals: string[] }
-export interface ProductOptions { dataRoot: string; hostEntry?: string; bunExecutable?: string; tracePath: string; timeoutMs?: number; controlledToolFault?: 'query-timeout-once'; modelCredential?:AgentModelCredential; owner?: { executionId: string; trialId: string; caseId: string } }
+export interface ShutdownProof { stopped: boolean | null; closed: boolean | null; processExited: boolean; residuals: string[];
+  requiredPersistenceComplete?: boolean | null; processTreeStopped?: boolean | null }
+export interface ProductOptions { dataRoot: string; hostEntry?: string; bunExecutable?: string; tracePath: string; timeoutMs?: number; controlledToolFault?: 'query-timeout-once'; modelCredential?:AgentModelCredential; owner?: { executionId: string; trialId: string; caseId: string };
+  resourceRoot?: string; installManifestPath?: string; maintenanceEntry?: string }
 
 /** Only required variables reach the Host; native tools still use the current account permissions. */
 export function childEnvironment(dataRoot: string, instanceId: string, startupToken: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  for (const name of ['SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT']) if (process.env[name]) env[name] = process.env[name];
+  for (const name of ['SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'ProgramFiles', 'ProgramFiles(x86)']) if (process.env[name]) env[name] = process.env[name];
   const systemRoot = env.SystemRoot ?? env.WINDIR;
   env.PATH = systemRoot ? [join(systemRoot, 'System32'), systemRoot, join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0')].join(';') : '/usr/bin:/bin';
   return { ...env, HOME: join(dataRoot, 'home'), USERPROFILE: join(dataRoot, 'home'), APPDATA: join(dataRoot, 'home', 'AppData', 'Roaming'),
     LOCALAPPDATA: join(dataRoot, 'home', 'AppData', 'Local'), TEMP: join(dataRoot, 'tmp'), TMP: join(dataRoot, 'tmp'), TMPDIR: join(dataRoot, 'tmp'),
-    AWS_MAX_ATTEMPTS: '1', MEDCLAW_INSTANCE_ID: instanceId, MEDCLAW_STARTUP_TOKEN: startupToken };
+    AWS_MAX_ATTEMPTS: '1', MEDCLAW_INSTANCE_ID: instanceId, MEDCLAW_STARTUP_TOKEN: startupToken, PI_CODING_AGENT_DIR: join(dataRoot, 'runtime/sdk') };
 }
 
 export class ProductAdapter {
@@ -51,6 +55,7 @@ export class ProductAdapter {
   private traceWrites: Promise<void> = Promise.resolve();
   private traceFailure: unknown;
   private mainSettings: MainSettings | null = null;
+  private lastShutdown: ShutdownProof | null = null;
   private handshake: { resolve(value: HostReady): void; reject(error: unknown): void } | null = null;
   constructor(readonly options: ProductOptions) {
     this.destinations = new DestinationTokens(resolve(options.dataRoot),undefined,async(instanceId,input)=>{
@@ -153,6 +158,7 @@ export class ProductAdapter {
     await writeFile(join(dirname(this.options.tracePath), 'ownership.json'), JSON.stringify({ contract: 'medclaw-eval-instance/v1', ...this.options.owner,
       dataRoot, instanceIds: this.instanceIds, observedAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
     this.ready = null; this.buffer = Buffer.alloc(0); this.writes = Promise.resolve();
+    this.lastShutdown = null;
     this.expired.clear();
     const ready = new Promise<HostReady>((resolve, reject) => { this.handshake = { resolve, reject }; });
     void ready.catch(() => {});
@@ -168,6 +174,8 @@ export class ProductAdapter {
       await writeFile(join(dirname(this.options.tracePath), 'ownership.json'), JSON.stringify({ contract: 'medclaw-eval-instance/v1', ...this.options.owner,
         dataRoot, instanceIds: this.instanceIds, hostPid: child.pid ?? null, observedAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
       await this.write(HostHelloSchema.parse({ protocolVersion: HOST_PROTOCOL_VERSION, instanceId: this.instanceId, startupToken, sdkVersion: SDK_VERSION, expectedSchemaVersion: DATABASE_SCHEMA_VERSION, paths: this.paths,
+        resourceRoot: this.options.resourceRoot ?? resolve(dirname(this.options.hostEntry ?? resolve(import.meta.dir, '../../../apps/host/src/main.ts')), '../../../resources'),
+        installManifestPath: this.options.installManifestPath ?? resolve(dirname(this.options.hostEntry ?? resolve(import.meta.dir, '../../../apps/host/src/main.ts')), '../../../.build/package-resources/medclaw/install.json'),
         ...(this.options.controlledToolFault ? { controlledToolFault: this.options.controlledToolFault } : {}) }));
       return await ready;
     } finally { clearTimeout(timer); }
@@ -228,7 +236,8 @@ export class ProductAdapter {
     return result;
   }
   async stop(timeoutMs = 30000): Promise<ShutdownProof> {
-    if (!this.child) return { stopped: null, closed: null, processExited: true, residuals: ['shutdown_ack_missing'] };
+    if (!this.child) return structuredClone({ ...(this.lastShutdown ?? { stopped: null, closed: null, processTreeStopped: null,
+      requiredPersistenceComplete: null, residuals: ['shutdown_ack_missing', 'process_tree_stop_unconfirmed'] }), processExited: true });
     const deadline = Date.now() + timeoutMs;
     if (!this.ready) this.child.stdin.end();
     const result = await this.request('host.shutdown', { expectedInstanceId: this.instanceId }, randomUUID(), timeoutMs);
@@ -236,12 +245,24 @@ export class ProductAdapter {
     await Promise.race([this.exited, new Promise<void>(done => { timer = setTimeout(done, Math.max(0, deadline - Date.now())); })]); clearTimeout(timer);
     const exited = this.child === null;
     const ack = result.ok ? hostPrivateMethodSchemas['host.shutdown'].output.parse(result.data) : null;
-    const proof = { stopped: ack?.executionStopped === true && exited ? true : null, closed: ack?.databaseClosed === true && exited ? true : null,
+    let processTreeStopped: boolean | null = null;
+    if (exited) try {
+      const lock = WriterLockRecordSchema.parse(JSON.parse(await readFile(this.paths.lockPath, 'utf8')));
+      if (lock.instanceId !== this.instanceId) throw new Error('host_stop_unconfirmed');
+      const checked = await requestMaintenance({ bunExecutable: this.options.bunExecutable ?? process.execPath,
+        maintenanceEntry: this.options.maintenanceEntry ?? resolve(import.meta.dir, '../../../apps/host/src/maintenance.ts') },
+        { action: 'process.check', owner: { instanceId: lock.instanceId, startupToken: lock.startupToken }, lockPath: this.paths.lockPath }, randomUUID());
+      if (checked.ok && checked.data.stopped && checked.data.processTreeProof?.instanceId === this.instanceId) processTreeStopped = true;
+    } catch { /* Missing legacy ownership leaves tree stop unknown. */ }
+    const proof: ShutdownProof = { stopped: ack?.executionStopped === true && exited && processTreeStopped === true ? true : null,
+      closed: ack?.databaseClosed === true && exited ? true : null, processTreeStopped, requiredPersistenceComplete: ack?.requiredPersistenceComplete ?? null,
       processExited: exited, residuals: [...(!ack ? ['shutdown_ack_missing'] : []), ...(ack && !ack.executionStopped ? ['execution_stop_unconfirmed'] : []),
-        ...(ack && !ack.databaseClosed ? ['database_close_unconfirmed'] : []), ...(!exited ? ['host_process_exit_unconfirmed'] : [])] };
+        ...(ack && !ack.databaseClosed ? ['database_close_unconfirmed'] : []), ...(!exited ? ['host_process_exit_unconfirmed'] : []),
+        ...(processTreeStopped !== true ? ['process_tree_stop_unconfirmed'] : []), ...(ack?.requiredPersistenceComplete !== true ? ['required_save_unconfirmed'] : [])] };
+    this.lastShutdown = proof;
     this.record('shutdown_proof', { proof, timeoutMs }); await this.flush(); return proof;
   }
-  async restart() { const proof = await this.stop(); if (proof.stopped !== true || proof.closed !== true) throw Object.assign(new Error('host_stop_unconfirmed'), { shutdownProof: proof, instanceId: this.instanceId }); return this.start(); }
+  async restart() { const proof = await this.stop(); if (proof.stopped !== true || proof.closed !== true || proof.processTreeStopped !== true || proof.requiredPersistenceComplete !== true) throw Object.assign(new Error('host_stop_unconfirmed'), { shutdownProof: proof, instanceId: this.instanceId }); return this.start(); }
 }
 
 export function unwrap<T>(result: Result<T>): T { if (!result.ok) throw Object.assign(new Error(result.error.code), { appError: result.error }); return result.data; }

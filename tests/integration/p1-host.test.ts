@@ -1,6 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -56,7 +56,11 @@ test("wrong ready identity and oversized incomplete frames fail and cannot adopt
     const { root, entry } = await fixture(mode);
     const exited: string[] = [];
     const stopping: boolean[] = [];
-    const host = new HostController({ dataRoot: root, hostEntry: entry, bunExecutable: process.execPath, onExit: instance => exited.push(instance), onNotice: notice => { if (notice.type === "host.status" && notice.host.state === "stopping") stopping.push(notice.host.canStart); } });
+    const diagnostic = createHostDiagnostics(); diagnostic.phase = mode; let failed = false;
+    const host = new HostController({ dataRoot: root, hostEntry: entry, bunExecutable: process.execPath,
+      onStarting: instance => diagnostic.starting(instance, (host as unknown as { child: ChildProcessWithoutNullStreams }).child),
+      onError: diagnostic.onError, onExit: instance => { exited.push(instance); diagnostic.onExit(instance); },
+      onNotice: notice => { diagnostic.onNotice(notice); if (notice.type === "host.status" && notice.host.state === "stopping") stopping.push(notice.host.canStart); } });
     try {
       expect((await host.start()).state).toBe("failed");
       expect(host.read().error?.code).toBe(mode === "oversized" ? "frame_too_large" : mode === "truncated" ? "invalid_frame" : "host_protocol_mismatch");
@@ -64,7 +68,8 @@ test("wrong ready identity and oversized incomplete frames fail and cannot adopt
       expect(exited).toHaveLength(1);
       expect(stopping).toEqual([false]);
       expect((await host.request("model.list", {})).ok).toBe(false);
-    } finally { rmSync(root, { recursive: true, force: true }); }
+    } catch (error) { failed = true; throw error; }
+    finally { await finishHostFixture(host, root, entry, diagnostic, failed); }
   }
 }, 30000);
 
@@ -102,7 +107,8 @@ test("actual Host can request Main credentials before ready and restarts only af
     expect(directory).toMatchObject({ ok: true });
     if (directory.ok) expect((directory.data as { models: unknown[] }).models.length).toBeGreaterThan(0);
     expect((await host.stop(instance)).state).toBe("stopped");
-    expect(existsSync(host.paths.lockPath)).toBe(false);
+    expect(existsSync(host.paths.lockPath)).toBe(true);
+    expect(JSON.parse(readFileSync(host.paths.lockPath, 'utf8'))).toEqual(lock);
     expect((await host.start()).state).toBe("ready");
     expect(host.read().instanceId).not.toBe(instance);
   } finally {
@@ -205,7 +211,7 @@ test("actual Host recovers an interrupted slow Run only after its owned writer e
     const lock = JSON.parse(readFileSync(host.paths.lockPath, "utf8"));
     expect(lock).toMatchObject({ instanceId: oldInstance, pid: child.pid });
     expect(lock.startupToken.length).toBeGreaterThan(0);
-    const closed = new Promise<void>(resolve => child.once("close", resolve));
+    const closed = (host as unknown as { exited: Promise<void> }).exited;
     expect(child.kill("SIGKILL")).toBe(true);
     await closed;
     expect(host.read()).toMatchObject({ state: "failed", canStart: true, error: { code: "host_interrupted" } });
@@ -225,7 +231,7 @@ test("actual Host recovers an interrupted slow Run only after its owned writer e
     expect(service.requests).toHaveLength(1);
     expect(await host.stop(newInstance)).toMatchObject({ state: "stopped", canStart: true });
     expect(exits).toEqual([oldInstance, newInstance]);
-    expect(existsSync(host.paths.lockPath)).toBe(false);
+    expect(JSON.parse(readFileSync(host.paths.lockPath, 'utf8'))).toMatchObject({ instanceId: newInstance, processDomain: { contract: 'medclaw.host-job/v1' } });
     // Read persisted cleanup only after the real Host has closed its database.
     const database = new Database(host.paths.databasePath, { readonly: true });
     try {
@@ -306,7 +312,7 @@ test("actual Host orderly shutdown aborts native retry wait and restart never re
     expect(await host.stop(oldInstance)).toMatchObject({ state: "stopped", canStart: true, error: null });
     expect(child.exitCode).toBe(0);
     expect(exits).toEqual([oldInstance]);
-    expect(existsSync(host.paths.lockPath)).toBe(false);
+    expect(JSON.parse(readFileSync(host.paths.lockPath, 'utf8'))).toEqual(lock);
     expect(service.requests).toHaveLength(1);
     expect(await host.start()).toMatchObject({ state: "ready", error: null });
     expect(host.read().instanceId).not.toBe(oldInstance);
@@ -387,7 +393,8 @@ test("actual Host keeps a failed required save closed through forced shutdown an
     expect(host.read()).toMatchObject({ state: "stopping", canStart: false });
     // No implicit retrySave: shutdown rejects the unsaved fact. Main's timeout then
     // terminates only this owned child; its in-memory native success cannot be recovered.
-    expect(await stopped).toMatchObject({ state: "stopped", canStart: true });
+    expect(await stopped).toMatchObject({ state: "failed", canStart: true, shutdown: { processExited: true, processTreeStopped: true,
+      requiredPersistenceComplete: null, error: { code: 'storage_write_failed' } } });
     expect(exits).toEqual([oldInstance]);
     expect(child.exitCode === null && child.signalCode === null).toBe(false);
     expect(await host.start()).toMatchObject({ state: "ready", error: null });
@@ -481,7 +488,7 @@ test("shutdown acknowledgement never substitutes for exit and an unconfirmed own
     expect(exited).toEqual([]);
     expect(() => process.kill(child!.pid!, 0)).not.toThrow();
   } finally {
-    if (child && kill) { child.kill = kill; const closed = new Promise<void>(resolve => child!.once("close", resolve)); kill(); await closed; }
+    if (child && kill) { child.kill = kill; const closed = (host as unknown as { exited: Promise<void> }).exited; kill(); await closed; }
     expect(host.read().canStart).toBe(true);
     expect(exited).toEqual([host.read().instanceId!]);
     rmSync(root, { recursive: true, force: true });
@@ -527,11 +534,13 @@ test("actual Host invalid UTF8 input is rejected before it can become a replacem
     const line = Buffer.from(`${JSON.stringify({ protocolVersion: HOST_PROTOCOL_VERSION, kind: "request", instanceId: host.read().instanceId, requestId: "invalid-utf8-request", operationRef: "invalid-utf8-operation", method: "model.auth.status", payload: { providerId: marker.toString() } })}\n`);
     const offset = line.indexOf(marker);
     const closed = new Promise<boolean>(resolve => child.once("close", () => resolve(true)));
+    const observedExit = (host as unknown as { exited: Promise<void> }).exited;
     child.stdin.write(Buffer.concat([line.subarray(0, offset), Buffer.from([255]), line.subarray(offset)]));
     expect(await Promise.race([closed, Bun.sleep(5000).then(() => false)])).toBe(true);
     expect(child.exitCode).toBe(1);
+    await observedExit;
     expect(host.read()).toMatchObject({ state: "failed", canStart: true });
-    expect(existsSync(host.paths.lockPath)).toBe(false);
+    expect(JSON.parse(readFileSync(host.paths.lockPath, 'utf8'))).toMatchObject({ instanceId: host.read().instanceId, processDomain: { contract: 'medclaw.host-job/v1' } });
   } finally {
     if (host.read().instanceId && !host.read().canStart) await host.stop(host.read().instanceId!);
     rmSync(root, { recursive: true, force: true });
@@ -542,22 +551,35 @@ test("actual Host duplicate shutdown commands share one application and database
   const { HostController } = await import("../../apps/desktop/src/main/host-controller");
   const { MainSettings } = await import("../../apps/desktop/src/main/settings");
   const root = mkdtempSync(join(tmpdir(), "medclaw-p1-host-shutdown-"));
-  const host = new HostController({ dataRoot: root, hostEntry: join(import.meta.dir, "../../apps/host/src/main.ts"), bunExecutable: process.execPath,
+  const entered = join(root, 'shutdown-entered'), release = join(root, 'release-shutdown'), entry = join(root, 'overlapping-shutdown.ts');
+  await Bun.write(entry, `import{existsSync,writeFileSync}from'node:fs';import{Application}from ${JSON.stringify(join(import.meta.dir,'../../packages/core/src/application.ts'))};
+    const shutdown=Application.prototype.shutdown;Application.prototype.shutdown=async function(...args){writeFileSync(${JSON.stringify(entered)},'entered');const end=Date.now()+10000;while(!existsSync(${JSON.stringify(release)})){if(Date.now()>end)throw new Error('ENGINEERING shutdown gate expired');await Bun.sleep(5);}return shutdown.apply(this,args);};
+    await import(${JSON.stringify(join(import.meta.dir,'../../apps/host/src/main.ts'))});`);
+  const host = new HostController({ dataRoot: root, hostEntry: entry, bunExecutable: process.execPath,
     onCredentialRequest: async frame => ({ ok: true, data: frame.method === 'export.destination.settlePrevious' ? { stopped: true } : frame.method === "credential.list" ? [] : null }),
   });
   try {
     new MainSettings(host.paths.settingsPath).read();
     expect((await host.start()).state).toBe("ready");
     const child = (host as unknown as { child: ChildProcessWithoutNullStreams }).child;
-    const closed = new Promise<void>(resolve => child.once("close", resolve));
+    const closed = (host as unknown as { exited: Promise<void> }).exited;
     const payload = { expectedInstanceId: host.read().instanceId! };
-    const replies = await Promise.all([host.request("host.shutdown", payload, "shutdown-op-a"), host.request("host.shutdown", payload, "shutdown-op-b")]);
-    replies.forEach(reply => expect(reply).toMatchObject({ ok: true, data: { executionStopped: true, databaseClosed: true } }));
+    const requests = [host.request("host.shutdown", payload, "shutdown-op-a"), host.request("host.shutdown", payload, "shutdown-op-b")];
+    const deadline = Date.now() + 5000;
+    while (!existsSync(entered) && Date.now() < deadline) await Bun.sleep(10);
+    expect(existsSync(entered)).toBe(true);
+    // This later round trip proves both earlier shutdown frames reached the Host before release.
+    expect(await host.request('run.control.read', {})).toMatchObject({ ok: false, error: { code: 'runtime_busy' } });
+    writeFileSync(release, 'release the owned shutdown');
+    const replies = await Promise.all(requests);
+    replies.forEach(reply => expect(reply).toMatchObject({ ok: true, data: { executionStopped: true, requiredPersistenceComplete: true, databaseClosed: true } }));
     await closed;
     expect(child.exitCode).toBe(0);
-    expect(existsSync(host.paths.lockPath)).toBe(false);
+    expect(JSON.parse(readFileSync(host.paths.lockPath, 'utf8'))).toMatchObject({ instanceId: host.read().instanceId, processDomain: { contract: 'medclaw.host-job/v1' } });
   } finally {
+    writeFileSync(release, 'release cleanup');
     if (host.read().instanceId && !host.read().canStart) await host.stop(host.read().instanceId!);
-    rmSync(root, { recursive: true, force: true });
+    if (host.read().canStart) rmSync(root, { recursive: true, force: true });
+    else throw new Error('owned_shutdown_fixture_stop_unconfirmed');
   }
 }, 20000);

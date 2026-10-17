@@ -35,6 +35,7 @@ export class MainCredentials {
   private leases = new Map<string, Lease>();
   private providerQueues = new Map<string, Promise<void>>();
   private publication: Promise<unknown> = Promise.resolve();
+  private pendingPublications = 0;
   private commits = new Map<string, {
     instanceId: string; input: PrivateCredentialPayload<"credential.modify.commit">;
     assignedReference?: string; result: Promise<Credential | null>; settled: boolean;
@@ -42,6 +43,7 @@ export class MainCredentials {
   constructor(private readonly path: string, private readonly protection: SafeStoragePort) {
     if (!isAbsolute(path)) fail("invalid_argument");
   }
+  get busy(): boolean { return this.leases.size > 0 || this.providerQueues.size > 0 || this.pendingPublications > 0 || [...this.commits.values()].some(commit => !commit.settled); }
   attachInstance(instanceId: string): void {
     if (!instanceId || this.instanceId && this.instanceId !== instanceId) fail("state_conflict");
     this.instanceId = instanceId;
@@ -82,6 +84,7 @@ export class MainCredentials {
     };
   }
   private update(action: (state: CredentialState) => void): Promise<void> {
+    this.pendingPublications++;
     const task = this.publication.then(() => {
       const state = this.load();
       action(state);
@@ -94,7 +97,7 @@ export class MainCredentials {
       } catch { fail("credential_write_failed"); }
     });
     this.publication = task.then(() => undefined, () => undefined);
-    return task;
+    return task.finally(() => { this.pendingPublications--; });
   }
 
   async read(instanceId: string, payload: PrivateCredentialPayload<"credential.read">): Promise<Credential | null> {

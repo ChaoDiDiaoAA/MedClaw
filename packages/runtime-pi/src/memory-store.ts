@@ -302,10 +302,14 @@ export class PiMemoryAdapter {
     try {const result=this.options.commitSync(structuredClone(change));this.acknowledgeSaved(change,result.storageVersion);this.pending=null;}
     catch(error){this.failure(error);throw error;}
   }
-  dispose():void {
+  assertDisposable():void {
     if(this.disposed)return;
     if(this.pending||this.heldFrom!==null||this.final||this.compaction||this.product)throw safeError('storage_write_failed');
     for(const [method,{wrapped}]of this.wrappers)if(this.manager[method]!==wrapped)throw safeError('state_conflict');
+  }
+  dispose():void {
+    if(this.disposed)return;
+    this.assertDisposable();
     for(const [method,{original}]of this.wrappers)Reflect.set(this.manager,method,original);
     this.disposed=true;
   }

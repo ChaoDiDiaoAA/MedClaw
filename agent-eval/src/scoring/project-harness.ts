@@ -229,7 +229,7 @@ export async function projectHarness(check:CheckSpec,context:EvaluationContext):
     const lifecycle=record(facts.lifecycle)?facts.lifecycle:undefined;if(!lifecycle)return {evidenceRefs:[],reason:'Controller stop, cleanup and isolation originals are missing'};
     const proof=lifecycle.shutdown,cleanup=lifecycle.cleanup;
     if(metric==='facility.isolation')return {expected:{opportunities:[{id:metric,expected:{ownRoot:lifecycle.productRoot}}]},actual:{opportunities:[{id:metric,actual:lifecycle.isolation,evidenceRefs:['lifecycle:isolation']}]},evidenceRefs:['lifecycle:isolation']};
-    const value=metric==='host.shutdown'?{accepting:proof?.processExited?false:null,runningPids:proof?.processExited?[]:null,stopped:proof?.stopped,cleanupSaved:proof?.stopped===true,databaseClosed:proof?.closed,processExited:proof?.processExited}:
+    const value=metric==='host.shutdown'?{accepting:proof?.processExited?false:null,runningPids:proof?.processTreeStopped===true?[]:null,stopped:proof?.stopped,cleanupSaved:proof?.requiredPersistenceComplete===true,databaseClosed:proof?.closed,processExited:proof?.processExited}:
       {stopped:proof?.stopped,closed:proof?.closed,deletedRoots:cleanup?.status==='removed'?[lifecycle.productRoot]:[],retainedUnknownStop:cleanup?.reason==='host_stop_unconfirmed'};
     return {expected:{opportunities:[{id:metric,expected:metric==='host.shutdown'?{}:{ownRoot:lifecycle.productRoot}}]},actual:{opportunities:[{id:metric,actual:value,evidenceRefs:['lifecycle:shutdown','lifecycle:cleanup']}]},evidenceRefs:['lifecycle:shutdown','lifecycle:cleanup']};
   }

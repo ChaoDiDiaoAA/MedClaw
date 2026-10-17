@@ -220,5 +220,6 @@ export class ImportService implements ImportServicePort {
     const operations = [...this.active.values()];
     for (const operation of operations) operation.controller.abort();
     await Promise.allSettled(operations.map(operation => operation.promise));
+    this.dependencies.store.assertWritable();
   }
 }

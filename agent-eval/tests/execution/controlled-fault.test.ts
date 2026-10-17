@@ -124,6 +124,7 @@ test('an omitted fault preserves normal execution and other tools never consume 
 
 test('HostHello accepts only the explicit optional controlled query-timeout fixture', () => {
   const hello = { protocolVersion: HOST_PROTOCOL_VERSION, instanceId: 'controlled', startupToken: 'token', sdkVersion: '0.87.1',
+    resourceRoot: '/runtime/resources', installManifestPath: '/runtime/install.json',
     expectedSchemaVersion: DATABASE_SCHEMA_VERSION, paths: { dataRoot: '/fixture', databasePath: '/fixture/app.sqlite',
       settingsPath: '/fixture/settings.json', cachePath: '/fixture/cache', lockPath: '/fixture/host.lock' } };
   expect(HostHelloSchema.safeParse(hello).success).toBe(true);

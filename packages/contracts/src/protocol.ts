@@ -2,6 +2,7 @@ import { z } from "zod";
 import { ControllerEvidenceInputSchema,ControllerEvidenceOutputSchema } from './controller-evidence';
 import { AbsolutePathSchema, AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema, resultSchema, type Result } from "./error";
 import { evaluationMethodSchemas, EvaluationNoticeSchema, isEvaluationReadOnlyMethod } from './evaluation';
+import { maintenanceMethodSchemas, MaintenanceOperationRefSchema, NativeDependencySchema } from './maintenance';
 export { AbsolutePathSchema } from './error';
 import {
   AgentPolicySchema, ApiIdSchema, AuthAttemptViewSchema, AuthNotifyViewSchema, AuthPromptViewSchema, AuthStatusViewSchema,
@@ -33,7 +34,7 @@ import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, Even
 import { IntentBaseUrlSchema, IntentModelConfigurationSchema, IntentModelInspectionSchema, IntentReadResultSchema, ReadIntentInputSchema } from './intent';
 import { ExportDestinationSchema, ExportDestinationCopySchema, ExportCopyReceiptSchema, ExportReferenceSchema, ExportRequestSchema, ExportOperationSchema, ExportArtifactSchema, ExportListInputSchema, ExportListSchema, ActivityListInputSchema, ActivityListSchema } from './export';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p15-v4" as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p17-v1" as const;
 export const DATABASE_SCHEMA_VERSION = 16 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
@@ -86,9 +87,20 @@ export const DiagnosticsVersionsSchema = z.strictObject({
   configVersion: ConfigVersionSchema.nullable(), bunVersion: z.string().min(1).max(128).nullable(), electronVersion: z.string().min(1).max(128).nullable(),
 });
 export const DiagnosticsViewSchema = z.strictObject({
+  dependencies: z.array(NativeDependencySchema).max(4).optional(),
   partial: z.boolean(), missingSources: z.array(z.enum(["main", "host"])).max(2), versions: DiagnosticsVersionsSchema,
   host: HostViewSchema, entries: z.array(DiagnosticsEntrySchema).max(8300),
 });
+export const SupportDiagnosticsSchema = DiagnosticsViewSchema.omit({ dependencies: true }).extend({
+  dependencies: z.array(NativeDependencySchema.omit({ path: true }).extend({ program: z.string().min(1).max(512) })).max(4).optional(),
+});
+export const SupportExportRequestSchema = z.strictObject({ operationRef: MaintenanceOperationRefSchema,
+  categories: z.array(DiagnosticsCategorySchema).max(5).refine(value => new Set(value).size === value.length) });
+export const SupportExportReceiptSchema = z.strictObject({ operationRef: MaintenanceOperationRefSchema, state: z.literal('completed'),
+  createdAt: TimestampSchema, partial: z.boolean(), bytes: z.number().int().nonnegative().safe() });
+export const SupportBundleSchema = z.strictObject({ contract: z.literal('medclaw.support/v1'), request: SupportExportRequestSchema,
+  receipt: SupportExportReceiptSchema.omit({ bytes: true }), diagnostics: SupportDiagnosticsSchema })
+  .refine(value => value.request.operationRef === value.receipt.operationRef && value.receipt.partial === value.diagnostics.partial);
 
 /** Each public method owns its exact input and output; private control and secrets are absent. */
 export const ExtensionsReadResultSchema = z.discriminatedUnion('source', [
@@ -249,13 +261,21 @@ export function publicOutputSchema(method:PublicMethod,payload:unknown):z.ZodTyp
   return publicMethodSchemas[method].output;
 }
 export const PublicMethodSchema = z.enum(Object.keys(publicMethodSchemas) as [PublicMethod, ...PublicMethod[]]);
-export const desktopMethodSchemas = { ...publicMethodSchemas, ...evaluationMethodSchemas } as const;
+export const desktopMethodSchemas = { ...publicMethodSchemas, ...evaluationMethodSchemas, ...maintenanceMethodSchemas,
+  'host.prepareRecovery': { input: EmptyPayloadSchema, output: HostViewSchema },
+  'diagnostics.selectDestination': { input: z.strictObject({ purpose: z.enum(['create', 'read']) }), output: z.strictObject({
+    destinationToken: OpaqueIdSchema, displayName: z.string().min(1).max(512), original: SupportExportRequestSchema.optional(),
+  }).nullable() },
+  'diagnostics.export': { input: z.strictObject({ categories: publicMethodSchemas['diagnostics.read'].input.shape.categories, destinationToken: OpaqueIdSchema }),
+    output: SupportExportReceiptSchema },
+  'diagnostics.readExport': { input: z.strictObject({ categories: publicMethodSchemas['diagnostics.read'].input.shape.categories, destinationToken: OpaqueIdSchema }), output: SupportExportReceiptSchema.nullable() },
+} as const;
 export type DesktopMethod = keyof typeof desktopMethodSchemas;
 export type DesktopPayload<M extends DesktopMethod> = z.input<(typeof desktopMethodSchemas)[M]['input']>;
 export type DesktopReturn<M extends DesktopMethod> = z.output<(typeof desktopMethodSchemas)[M]['output']>;
 export const DesktopMethodSchema = z.enum(Object.keys(desktopMethodSchemas) as [DesktopMethod, ...DesktopMethod[]]);
 export function isDesktopReadOnlyMethod(method: string): boolean {
-  return method.startsWith('eval.') ? isEvaluationReadOnlyMethod(method) : isReadOnlyMethod(method);
+  return method === 'diagnostics.selectDestination' || method === 'diagnostics.readExport' || (method.startsWith('eval.') ? isEvaluationReadOnlyMethod(method) : isReadOnlyMethod(method));
 }
 export function parsePublicPayload<M extends PublicMethod>(method: M, payload: unknown): ParsedPublicPayload<M>;
 export function parsePublicPayload(method: string, payload: unknown): unknown;
@@ -273,14 +293,15 @@ export const HostHelloSchema = z.strictObject({
   protocolVersion: z.literal(HOST_PROTOCOL_VERSION), instanceId: OpaqueIdSchema, startupToken: OpaqueIdSchema,
   sdkVersion: z.literal(SDK_VERSION), expectedSchemaVersion: z.literal(DATABASE_SCHEMA_VERSION),
   controlledToolFault: z.literal('query-timeout-once').optional(),
+  resourceRoot: AbsolutePathSchema, installManifestPath: AbsolutePathSchema,
   paths: z.strictObject({ dataRoot: AbsolutePathSchema, databasePath: AbsolutePathSchema, settingsPath: AbsolutePathSchema, cachePath: AbsolutePathSchema, lockPath: AbsolutePathSchema }),
 });
 export const HostReadySchema = z.strictObject({
   protocolVersion: z.literal(HOST_PROTOCOL_VERSION), instanceId: OpaqueIdSchema, sdkVersion: z.literal(SDK_VERSION),
   schemaVersion: z.literal(DATABASE_SCHEMA_VERSION), configVersion: ConfigVersionSchema, dataRoot: AbsolutePathSchema,
 });
-export const HostShutdownRequestSchema = instanceControl;
-export const HostShutdownResultSchema = z.strictObject({ executionStopped: z.boolean(), databaseClosed: z.boolean() });
+export const HostShutdownRequestSchema = instanceControl.extend({ requireIdle: z.literal(true).optional() });
+export const HostShutdownResultSchema = z.strictObject({ executionStopped: z.boolean(), requiredPersistenceComplete: z.boolean().optional(), databaseClosed: z.boolean() });
 export const ExportCopyVerificationSchema = z.strictObject({ operationRef: OpaqueIdSchema, exportId: PositiveIdSchema,
   artifactId: PositiveIdSchema, temporaryPath: AbsolutePathSchema });
 export const hostPrivateMethodSchemas = {

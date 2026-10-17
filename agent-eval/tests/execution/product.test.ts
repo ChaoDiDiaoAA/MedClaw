@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdtemp, readFile, writeFile, rm, mkdir } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm, mkdir, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { childEnvironment, ProductAdapter } from '../../src/adapters/product.ts';
@@ -17,6 +17,7 @@ import { QueryParamsSchema } from '../../../packages/contracts/src/query.ts';
 import { evaluate } from '../../src/scoring/evaluate.ts';
 import {observedConditions} from '../../src/scoring/project-observation.ts';
 import type { CheckSpec } from '../../src/scoring/types.ts';
+import { within } from '../../src/adapters/files.ts';
 
 const intentPaths: string[] = [];
 const intentMetadata = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
@@ -316,6 +317,7 @@ for (const scenario of [
 
 test('cleanup rejects active or wrongly owned product roots and retains verified evidence after actual shutdown', async () => {
   const root = await mkdtemp(join(tmpdir(), 'medclaw-eval-cleanup-')); let product, stopped = false;
+  const confirmed = { stopped: true, closed: true, processExited: true, processTreeStopped: true, requiredPersistenceComplete: true } as const;
   try {
     product = await prepareInstance({ trialRoot: root, config: config(), owner: { executionId: 'engineering', trialId: 'cleanup', caseId: 'cleanup' } });
     const executor = new ActionExecutor(product, config(), root, root); await executor.execute({ action: 'new_session', alias: 'A' });
@@ -323,10 +325,22 @@ test('cleanup rejects active or wrongly owned product roots and retains verified
     const owner = { trialRoot: root, executionId: 'engineering', trialId: 'cleanup', instanceId: product.instanceId, observation };
     await expect(cleanupInstance({ ...owner, proof: { stopped: null, closed: true, processExited: false, residuals: [] } })).rejects.toThrow('cleanup_stop_unconfirmed');
     expect(JSON.parse(await readFile(join(root, 'cleanup.json'), 'utf8'))).toMatchObject({ status: 'preserved', reason: 'cleanup_stop_unconfirmed' });
-    await expect(cleanupInstance({ ...owner, proof: { stopped: true, closed: true, processExited: true, residuals: [] } })).rejects.toThrow('cleanup_process_still_alive');
-    const proof = await product.stop(); stopped = proof.stopped === true && proof.closed === true;
+    const claimed = { ...confirmed, residuals: [] };
+    for (const missing of [{ stopped: null }, { closed: null }, { processExited: false }, { processTreeStopped: null }, { requiredPersistenceComplete: null }]) {
+      await expect(cleanupInstance({ ...owner, proof: { ...claimed, ...missing } })).rejects.toThrow('cleanup_stop_unconfirmed');
+      expect(await Bun.file(join(root, 'product', 'data', 'app.sqlite')).exists()).toBe(true);
+    }
+    await expect(cleanupInstance({ ...owner, proof: claimed })).rejects.toThrow('cleanup_process_still_alive');
+    const proof = await product.stop(); expect(proof).toMatchObject(confirmed); stopped = true;
     await expect(cleanupInstance({ ...owner, executionId: 'other', proof })).rejects.toThrow('cleanup_ownership_unconfirmed');
     await cleanupInstance({ ...owner, proof }); expect(await Bun.file(join(root, 'product', 'data', 'app.sqlite')).exists()).toBe(false); expect(await Bun.file(join(root, 'observation.json')).exists()).toBe(true);
     expect(JSON.parse(await readFile(join(root, 'cleanup.json'), 'utf8'))).toMatchObject({ status: 'removed', reason: null });
-  } finally { if (product && !stopped) expect(await product.stop()).toMatchObject({ stopped: true, closed: true }); if (stopped) await rm(root, { recursive: true, force: true }); }
+  } finally {
+    if (product && !stopped) { expect(await product.stop()).toMatchObject(confirmed); stopped = true; }
+    if (stopped) {
+      const canonical = await realpath(root); within(await realpath(tmpdir()), canonical);
+      if (canonical !== resolve(root)) throw new Error('ENGINEERING cleanup root changed');
+      await rm(root, { recursive: true, force: true });
+    }
+  }
 }, 60000);

@@ -3,7 +3,7 @@ import { DATABASE_SCHEMA_VERSION } from '../../packages/contracts/src/protocol';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
-import { createLegacyLfRoot, createStartupPackage, launchActualDev, readStartupFacts, setFixtureMigrationChecksum } from '../fixtures/desktop-dev';
+import { confirmedDevHostStop, createLegacyLfRoot, createStartupPackage, launchActualDev, readStartupFacts, setFixtureMigrationChecksum } from '../fixtures/desktop-dev';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -50,7 +50,7 @@ test('S01/S06/S07/S08 actual dev starts unconfigured, reads unauthenticated prov
     await testInfo.attach('startup-facts', { body: JSON.stringify({ initial, final, providers: directory.data.providers.length, models: directory.data.models.length }), contentType: 'application/json' });
   } finally {
     await desktop?.close();
-    expect(existsSync(join(dataRoot, 'runtime/host.lock'))).toBe(false);
+    expect(confirmedDevHostStop(dataRoot)).toBe(true);
     const path = relative(resolve(tmpdir()), resolve(temporary));
     if (existsSync(join(temporary, 'dev-exit-confirmed')) && path && !path.startsWith('..') && !path.includes(':')) rmSync(temporary, { recursive: true, force: true });
   }
@@ -76,7 +76,7 @@ test('S02 actual dev migrates an LF legacy root on Windows and preserves its ori
     await testInfo.attach('legacy-startup-facts', { body: JSON.stringify({ before, after }), contentType: 'application/json' });
   } finally {
     await desktop?.close();
-    expect(existsSync(join(dataRoot, 'runtime/host.lock'))).toBe(false);
+    expect(confirmedDevHostStop(dataRoot)).toBe(true);
     const path = relative(resolve(tmpdir()), resolve(temporary));
     if (existsSync(join(temporary, 'dev-exit-confirmed')) && path && !path.startsWith('..') && !path.includes(':')) rmSync(temporary, { recursive: true, force: true });
   }
@@ -119,7 +119,7 @@ test('S03 actual dev reports a real migration failure and permits explicit recov
     await testInfo.attach('failure-recovery-facts', { body: JSON.stringify({ failed: failed.data, diagnostic: diagnostic.data, recovered }), contentType: 'application/json' });
   } finally {
     await desktop?.close();
-    expect(existsSync(join(dataRoot, 'runtime/host.lock'))).toBe(false);
+    expect(confirmedDevHostStop(dataRoot)).toBe(true);
     const path = relative(resolve(tmpdir()), resolve(temporary));
     if (existsSync(join(temporary, 'dev-exit-confirmed')) && path && !path.startsWith('..') && !path.includes(':')) rmSync(temporary, { recursive: true, force: true });
   }
@@ -137,10 +137,11 @@ test('S03 actual dev acquisition failure confirms Main exit before its isolated 
     expect(Number.isSafeInteger(main.pid)).toBe(true);
     expect(() => process.kill(main.pid, 0)).toThrow();
     expect(existsSync(join(temporary, 'dev-exit-confirmed'))).toBe(true);
-    expect(existsSync(join(dataRoot, 'runtime/host.lock'))).toBe(false);
-    await testInfo.attach('acquisition-cleanup-facts', { body: JSON.stringify({ mainPid: main.pid, mainExited: true, launcherExited: true, lockRemoved: true }), contentType: 'application/json' });
+    expect(existsSync(join(dataRoot, 'runtime/host.lock'))).toBe(true);
+    expect(confirmedDevHostStop(dataRoot)).toBe(true);
+    await testInfo.attach('acquisition-cleanup-facts', { body: JSON.stringify({ mainPid: main.pid, mainExited: true, launcherExited: true, lockRetained: true, processTreeStopped: true }), contentType: 'application/json' });
   } finally {
     const path = relative(resolve(tmpdir()), resolve(temporary));
-    if (existsSync(join(temporary, 'dev-exit-confirmed')) && !existsSync(join(dataRoot, 'runtime/host.lock')) && path && !path.startsWith('..') && !path.includes(':')) rmSync(temporary, { recursive: true, force: true });
+    if (existsSync(join(temporary, 'dev-exit-confirmed')) && confirmedDevHostStop(dataRoot) && path && !path.startsWith('..') && !path.includes(':')) rmSync(temporary, { recursive: true, force: true });
   }
 });

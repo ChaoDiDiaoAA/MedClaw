@@ -82,12 +82,13 @@ test('legacy import and export manifest metadata is read without rewriting origi
   } finally {await rm(root,{recursive:true,force:true});}
 });
 
-test('ENGINEERING transport waits for both delayed shutdown acknowledgement and actual process exit', async () => {
+test('ENGINEERING transport observes delayed acknowledgement and exit while missing Job and save proof remain unknown', async () => {
   const root = await mkdtemp(join(tmpdir(), 'medclaw-eval-delayed-stop-'));
   const product = new ProductAdapter({ dataRoot: join(root, 'product'), tracePath: join(root, 'observations.jsonl'), hostEntry: resolve(import.meta.dir, 'fixtures/delayed-transport.ts') });
   try {
     await mkdir(product.options.dataRoot); await writeFile(join(product.options.dataRoot, 'engineering-transport.json'), JSON.stringify({ ackDelayMs: 80, exitDelayMs: 80 }));
-    await product.start(); expect(await product.stop(1000)).toEqual({ stopped: true, closed: true, processExited: true, residuals: [] });
+    await product.start(); expect(await product.stop(1000)).toEqual({ stopped: null, closed: true, processExited: true,
+      processTreeStopped: null, requiredPersistenceComplete: null, residuals: ['process_tree_stop_unconfirmed', 'required_save_unconfirmed'] });
     expect(product.traces.some(trace => trace.kind === 'process_exit')).toBe(true);
   } finally { if (product.traces.some(trace => trace.kind === 'process_exit')) await rm(root, { recursive: true, force: true }); }
 }, 30000);

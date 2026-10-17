@@ -98,6 +98,7 @@ test("P4 message methods use the P5 protocol and schema 4 and classifies message
   expect(HostReadySchema.safeParse(ready).success).toBe(true);
   expect(HostReadySchema.safeParse({ ...ready, schemaVersion: 3 }).success).toBe(false);
   const hello = { protocolVersion: HOST_PROTOCOL_VERSION, instanceId: "host-1", sdkVersion: "0.87.1", expectedSchemaVersion: DATABASE_SCHEMA_VERSION, startupToken: "token-1",
+    resourceRoot: 'D:/runtime/resources', installManifestPath: 'D:/runtime/install.json',
     paths: { dataRoot: "D:/fixture", databasePath: "D:/fixture/db", settingsPath: "D:/fixture/settings", cachePath: "D:/fixture/cache", lockPath: "D:/fixture/lock" } };
   expect(HostHelloSchema.safeParse(hello).success).toBe(true);
   expect(HostHelloSchema.safeParse({ ...hello, protocolVersion: "medclaw.host/p3-v1" }).success).toBe(false);

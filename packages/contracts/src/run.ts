@@ -1,6 +1,7 @@
 import type { StreamSnapshot, StreamSnapshotReader } from './event';
 import type { ModelCallContext, StartCallContext } from './context';
 import { z } from "zod";
+import { ProcessTreeProofSchema, type ProcessTreeProof } from './maintenance';
 import { AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, TimestampSchema } from "./error";
 import { AgentPolicySchema, BudgetSummarySchema, IntentModelSelectionSchema, MeasurementContextSchema, ModelSelectionSchema, ReferenceDateSchema, RequestPolicySchema, TimezoneSchema, ToolProfileSnapshotSchema } from "./model";
 import type { AppError } from "./error";
@@ -56,6 +57,7 @@ export const RunCleanupRecordSchema = z.strictObject({
   budgetSummary: BudgetSummarySchema.nullable().optional(),
   extensions: ExtensionAssemblyProofSchema.optional(),
   extensionReleaseBasis: z.enum(['not_loaded','owner_process_exited']).optional(),
+  processTreeProof: ProcessTreeProofSchema.optional(),
 });
 export const RunCleanupSummarySchema = RunCleanupRecordSchema.omit({ contract: true, unconfirmedItems: true, secondaryErrors: true }).extend({
   unconfirmedCount: z.number().int().min(0).max(32), secondaryErrorCount: z.number().int().min(0).max(32),
@@ -331,10 +333,10 @@ export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputSt
   saveRunCleanup(runId: number, cleanup: RunCleanupRecord): void;
   recoveryCandidates(instanceId: string): RunView[];
   verifyPriorInputFacts?(runId: number, previousProcessExited: boolean, time: string): { inputsSettled: boolean; requiredPersistenceComplete: boolean; unconfirmedItems: string[] };
-  verifyPriorToolFacts?(runId: number, previousProcessExited: boolean, time: string): {
+  verifyPriorToolFacts?(runId: number, previousProcessExited: boolean, time: string, proof?: ProcessTreeProof): {
     stopConfirmed: boolean | null; requiredPersistenceComplete: boolean; unconfirmedItems: string[];
   };
-  recoverInterrupted(instanceId: string, time: string): number;
+  recoverInterrupted(instanceId: string, time: string, proof?: ProcessTreeProof): number;
 }
 export interface ModelCallRecorderPort {
   readonly callId?: string;

@@ -44,6 +44,7 @@ export async function executePlan(plan:TrialPlan[],run:(item:TrialPlan)=>Promise
 export interface RunOptions {
   desktopRequest?:DesktopEvaluationRequest;expectedSource?:Record<string,unknown>;
   datasetRoot:string;runsRoot:string;executionId:string;selection:'smoke'|'full';trials:number;
+  installManifestPath?:string;
   config:ResolvedRunConfig;modelCredential?:AgentModelCredential;judgeMode:'required'|'off';judge?:Judge;signal?:AbortSignal;
   onProgress?:(trial:TrialResult)=>void;controlledFixture?:boolean;
   onEvent?:(event:ProgressEvent)=>void;
@@ -81,7 +82,7 @@ export async function runExperiment(options:RunOptions):Promise<EvaluationReport
       if(!value){value=trialProgress(item,plan.findIndex(trial=>trial.trialId===item.trialId)+1,plan.length,event=>options.onEvent?.({...event,trialsPerCase:plan.filter(trial=>trial.caseId===item.caseId).length}));progress.set(item.trialId,value);}return value;
     };
     let trials:TrialResult[];
-    try {trials=await executePlan(plan,item=>runTrial({...item,executionId:options.executionId,case:dataset.cases.find(task=>task.id===item.caseId)!,datasetRoot:dataset.root,fixtureFiles:dataset.snapshot.fixtures,productResources:dataset.snapshot.productResources,config,controlledFixture:options.controlledFixture,modelCredential:options.modelCredential,trialRoot:join(executionRoot,'evidence',item.trialId),signal:options.signal,onPhase:phase=>forTrial(item).phase(phase)}),{blockers,signal:options.signal,onProgress:async trial=>{
+    try {trials=await executePlan(plan,item=>runTrial({...item,executionId:options.executionId,case:dataset.cases.find(task=>task.id===item.caseId)!,datasetRoot:dataset.root,fixtureFiles:dataset.snapshot.fixtures,productResources:dataset.snapshot.productResources,config,controlledFixture:options.controlledFixture,modelCredential:options.modelCredential,installManifestPath:options.installManifestPath,trialRoot:join(executionRoot,'evidence',item.trialId),signal:options.signal,onPhase:phase=>forTrial(item).phase(phase)}),{blockers,signal:options.signal,onProgress:async trial=>{
       const current=forTrial(trial);current.emit({kind:'execution',executionStatus:trial.status,reason:trial.reason});current.phase('score');
       const task=dataset.cases.find(task=>task.id===trial.caseId)!;
       const directory=join(executionRoot,'evidence',trial.trialId);await mkdir(directory,{recursive:true});

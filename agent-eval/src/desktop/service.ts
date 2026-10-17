@@ -1,5 +1,5 @@
-import { readFile, readdir, lstat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readFile, readdir, lstat, realpath } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import {
@@ -31,7 +31,10 @@ export class EvaluationService {
   private secrets: string[] = [];
   private readonly preflights = new Map<string, { options: EvaluationRunOptions; originals: unknown }>();
   constructor(paths: EvaluationPaths) { this.paths = EvaluationPathsSchema.parse(paths); }
-  async initializeRuntime() { if (this.startupSource === null) this.startupSource = runtimeSource(await sourceInventory()); }
+  async initializeRuntime() {
+    if (await realpath(this.paths.sourceRoot) !== await realpath(resolve(import.meta.dir, '../../..'))) throw new Error('host_protocol_mismatch');
+    if (this.startupSource === null) this.startupSource = runtimeSource(await sourceInventory());
+  }
   private async readSource() {
     if (this.runtimeChanged) throw new Error('evaluation_runtime_changed');
     if (this.startupSource === null) throw new Error('host_not_ready');
@@ -54,7 +57,15 @@ export class EvaluationService {
   private async prepare(input: EvaluationRunOptions) {
     const options = EvaluationRunOptionsSchema.parse(input);
     if (!['medclaw-agent-v1', 'medclaw-badcase-v1'].includes(options.datasetId)) throw new Error('invalid_argument');
-    const source = await this.readSource(), dataset = await loadDataset(options.datasetId);
+    const source = await this.readSource();
+    let datasetRoot = options.datasetId, dataset: Awaited<ReturnType<typeof loadDataset>>;
+    if (this.paths.datasetsRoot) {
+      try {
+        datasetRoot = await evidencePath(this.paths.datasetsRoot, options.datasetId + '/snapshot.json');
+        dataset = await loadDataset(datasetRoot);
+        if (dataset.manifest.id !== options.datasetId) throw new Error('dataset_identity_mismatch');
+      } catch (error) { throw new Error(absent(error) ? 'evaluation_dataset_missing' : 'evaluation_dataset_invalid'); }
+    } else dataset = await loadDataset(datasetRoot);
     const members = options.selection === 'smoke' ? dataset.manifest.smoke : dataset.manifest.members;
     const trials = parseTrials(options.trials === undefined ? undefined : String(options.trials), options.selection);
     const plan = planTrials(members, trials), judged = plan.filter(item => dataset.cases.find(task => task.id === item.caseId)!.expected.checks.some(check => check.kind === 'llm-judge'));
@@ -69,11 +80,21 @@ export class EvaluationService {
     } catch { blockers.push(diagnostic('evaluation_config_unavailable')); }
     let lock: string | null = null;
     try { lock = await readFile(await evidencePath(join(this.paths.runsRoot, 'business'), '.active-execution.json'), 'utf8'); blockers.push(diagnostic('runtime_busy')); } catch (error) { if (!absent(error)) blockers.push(diagnostic('stop_unconfirmed')); }
-    return { options: { ...options, trials }, dataset, plan, judged, resolved, source, env, blockers, platformConfigured,
-      originals: { options: { ...options, trials }, dataset: dataset.snapshot, source, raw, env, lock } };
+    return { options: { ...options, trials }, dataset, datasetRoot, plan, judged, resolved, source, env, blockers, platformConfigured,
+      originals: { options: { ...options, trials }, dataset: dataset.snapshot, datasetRoot, source, raw, env, lock } };
   }
   async preflight(input: EvaluationRunOptions) {
-    const prepared = await this.prepare(input), preflightId = randomUUID();
+    let prepared: Awaited<ReturnType<EvaluationService['prepare']>>;
+    try { prepared = await this.prepare(input); }
+    catch (error) {
+      if (!(error instanceof Error) || !['evaluation_dataset_missing', 'evaluation_dataset_invalid'].includes(error.message)) throw error;
+      const options = EvaluationRunOptionsSchema.parse(input), trials = parseTrials(options.trials === undefined ? undefined : String(options.trials), options.selection);
+      this.preflights.clear();
+      return { preflightId: randomUUID(), datasetId: options.datasetId, selection: options.selection, trials,
+        cases: 0, plannedTrials: 0, judgeRequestLimit: 0, readiness: 'materials_unavailable', config: null,
+        platformConfigured: false, blockers: [diagnostic(error.message)] };
+    }
+    const preflightId = randomUUID();
     this.preflights.clear(); this.preflights.set(preflightId, { options: prepared.options, originals: prepared.originals });
     return { preflightId, datasetId: prepared.options.datasetId, selection: prepared.options.selection, trials: prepared.options.trials,
       cases: prepared.plan.length / prepared.options.trials, plannedTrials: prepared.plan.length, judgeRequestLimit: prepared.judged.length,
@@ -118,7 +139,8 @@ export class EvaluationService {
         const stored = JSON.parse(await readFile(await evidencePath(root, 'evidence/' + trial.trialId + '/trial.json'), 'utf8'));
         const proof = stored.lifecycle?.shutdown ?? stored.lifecycle?.['startup-shutdown'];
         if (proof || trial.startedAt !== null || ['host_stop_unconfirmed', 'trial_exception_stop_unknown', 'necessary_save_unconfirmed'].includes(trial.reason ?? '')) {
-          if (trial.stopped !== true || trial.closed !== true || proof?.stopped !== true || proof?.closed !== true || proof?.processExited !== true || !Array.isArray(proof.residuals) || proof.residuals.length) stopped = false;
+          if (trial.stopped !== true || trial.closed !== true || proof?.stopped !== true || proof?.closed !== true || proof?.processExited !== true
+            || proof?.processTreeStopped !== true || proof?.requiredPersistenceComplete !== true || !Array.isArray(proof.residuals) || proof.residuals.length) stopped = false;
         }
       }
       return { summary: projectSummary(archive, this.secrets), stopConfirmed: stopped ? true : null, saveConfirmed: complete ? true : null };

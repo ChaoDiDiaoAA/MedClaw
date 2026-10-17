@@ -9,7 +9,8 @@ export const AbsolutePathSchema = z.string().min(1).max(32768).refine(path => !/
 export const ErrorCategorySchema = z.enum(["provider", "runtime", "tool", "session", "storage", "input", "extension", "internal"]);
 export const ErrorReasonSchema = z.enum(["runtime_busy", "workspace_revision_mismatch", "session_not_found", "session_deleted", "session_metadata_revision_mismatch", "message_cursor_invalid", "input_cursor_invalid", "host_interrupted", "checkpoint_invalid", "history_version_mismatch", "session_restore_failed", "compaction_model_failed", "compaction_capacity", "compaction_native_result_invalid",
   'resource_catalog_invalid', 'resource_missing', 'resource_conflict', 'resource_invalid', 'resource_dependency_missing', 'resource_changed', 'resource_too_large', 'resource_path_invalid', 'resource_snapshot_invalid', 'resource_expansion_failed',
-  'subagent_binding_failed', 'subagent_limit', 'subagent_execution_failed']);
+  'subagent_binding_failed', 'subagent_limit', 'subagent_execution_failed',
+  'dependency_rg_unavailable', 'dependency_fd_unavailable', 'dependency_bash_unavailable', 'dependency_powershell_unavailable', 'desktop_bootstrap_failed']);
 
 export const EventRangeErrorSchema = z.strictObject({ runId: PositiveIdSchema, firstSequence: PositiveIdSchema.nullable(), lastSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), resumeAfterSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable() }).refine(value => (value.firstSequence === null ? value.lastSequence === 0 : value.firstSequence <= value.lastSequence) && (value.resumeAfterSequence === null || value.resumeAfterSequence <= value.lastSequence));
 export type EventRangeError = z.infer<typeof EventRangeErrorSchema>;
@@ -35,6 +36,15 @@ export const resultSchema = <S extends z.ZodType>(data: S) => z.discriminatedUni
 ]);
 
 const errorDefinitions = {
+  host_dependency_unavailable: ['runtime', 'Required tool dependency is unavailable. Check diagnostics.', true],
+  host_process_tracking_unavailable: ['runtime', 'Process tracking is unavailable. The Host cannot start safely.', false],
+  backup_invalid: ['input', 'The backup is invalid or incomplete.', false],
+  backup_write_failed: ['storage', 'Backup publication was not confirmed. Read the original result.', true],
+  backup_incompatible: ['input', 'The backup does not match this application and resource version.', false],
+  restore_failed: ['storage', 'Restore or activation was not confirmed. Read the original result.', true],
+  maintenance_busy: ['runtime', 'Another operation must finish before maintenance can begin.', true],
+  diagnostics_export_failed: ['storage', 'Support bundle publication was not confirmed. Read the original result.', true],
+  diagnostics_bundle_invalid: ['input', 'The support bundle is invalid or unavailable. Choose the original completed file.', false],
   report_page_too_large: ['input', 'The report page is too large. Load a smaller page.', false],
   evaluation_runtime_changed: ['runtime', 'Evaluation code or dependencies changed. Restart the app before a new operation.', false],
   evaluation_platform_failed: ['runtime', 'The platform request failed. Check the saved delivery status before retrying.', true],
@@ -173,10 +183,15 @@ export function safeError(code: string, _native?: unknown, context: ErrorContext
   if (safeCode === 'resource_unavailable' && error.reason?.startsWith('resource_')) error.message = 'The selected resource cannot be verified. Read its diagnostics and refresh after repair.';
   if (safeCode === "input_invalid" && error.reason === "session_not_found") error.message = errorDefinitions.session_not_found[1];
   if (safeCode === "runtime_interrupted") error.reason = "host_interrupted";
+  if (safeCode === 'host_dependency_unavailable' && error.reason === 'dependency_rg_unavailable') error.message = 'Text search (rg) is unavailable. Check the application installation and diagnostics, then start Host.';
+  if (safeCode === 'host_dependency_unavailable' && error.reason === 'dependency_fd_unavailable') error.message = 'File search (fd) is unavailable. Check the application installation and diagnostics, then start Host.';
+  if (safeCode === 'host_dependency_unavailable' && error.reason === 'dependency_bash_unavailable') error.message = 'Git Bash is unavailable. Check Git for Windows and file access, then start Host.';
+  if (safeCode === 'host_dependency_unavailable' && error.reason === 'dependency_powershell_unavailable') error.message = 'PowerShell is unavailable. Check the system shell and file access, then start Host.';
   return error;
 }
 
 export function errorMessage(error: AppError): string {
+  if (error.reason === 'desktop_bootstrap_failed') return 'Desktop initialization failed. Repair the application files or saved data folder selection, then reopen MedClaw.';
   return safeError(error.code, undefined, { reason: error.reason }).message;
 }
 

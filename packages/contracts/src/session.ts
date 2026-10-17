@@ -261,6 +261,7 @@ export type ReadSubmissionRequest = z.infer<typeof ReadSubmissionRequestSchema>;
 export type NativeSessionPreview = SessionDetail["history"] & { leafId: string | null;storageVersion:number };
 export type InitialNativeHistory = Pick<NativeHistorySnapshot,'header'|'entries'|'activeLeafId'>;
 export type NativeSessionBindings = {
+  disposeIdleSessions?: () => Promise<void>;
   allocate: () => { nativeSessionId: string; history:InitialNativeHistory; bind: (sessionId: number) => void; discard: () => void };
   read: (sessionId: number) => Promise<NativeSessionPreview>;
   readMessages: (input: ReadSessionMessagesInput) => Promise<SessionMessagePage>;

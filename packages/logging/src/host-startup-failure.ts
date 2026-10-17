@@ -1,12 +1,15 @@
 import { safeError, type AppError } from '../../contracts/src/error';
 
-const phases = ['hello', 'sdk_version', 'writer_lock', 'settings_read', 'database_open', 'pi_runtime', 'custom_registration', 'ready'] as const;
+const phases = ['hello', 'sdk_version', 'writer_lock', 'settings_read', 'native_dependencies', 'database_open', 'pi_runtime', 'custom_registration', 'ready'] as const;
 export type HostStartupFailure = { phase: typeof phases[number]; error: AppError };
 
 export function parseHostStartupFailure(line: string): HostStartupFailure | null {
-  const match = /^MedClaw Host terminated: ([a-z_]+)\/([a-z_]+)\.$/.exec(line);
+  const match = /^MedClaw Host terminated: ([a-z_]+)\/([a-z_]+)(?:\/([a-z_]+))?\.$/.exec(line);
   if (!match || match[0].length !== line.length || !phases.includes(match[1] as typeof phases[number])) return null;
-  const error = safeError(match[2]!);
+  const reason = match[3];
+  if (reason && (match[1] !== 'native_dependencies' || match[2] !== 'host_dependency_unavailable'
+    || !['dependency_rg_unavailable', 'dependency_fd_unavailable', 'dependency_bash_unavailable', 'dependency_powershell_unavailable'].includes(reason))) return null;
+  const error = safeError(match[2]!, undefined, reason ? { reason: reason as NonNullable<AppError['reason']> } : {});
   return error.code === match[2] ? { phase: match[1] as typeof phases[number], error } : null;
 }
 

@@ -167,6 +167,23 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel,RunControl
     await this.rebuild(sessionId);
   }
   async restore(sessionId:number):Promise<void> {await this.rebuild(sessionId);}
+  async disposeIdleSessions(): Promise<void> {
+    await Promise.all([...this.loading.values()]);
+    for (const binding of this.sessions.values()) await binding.compaction?.settle();
+    // A later binding can still own unsaved facts; validate all before releasing any.
+    for (const binding of this.sessions.values()) {
+      if (binding.execution || binding.manual || binding.assembling || binding.session && (!binding.session.isIdle || binding.session.agent.hasQueuedMessages())
+        || binding.extension && !binding.extension.proof.resourcesReleased) throw safeError('stop_unconfirmed');
+      const runId = binding.lastRunId ?? binding.ownerRunId;
+      if (runId !== undefined && (this.inputs.has(runId) || this.inputStartFailures.has(runId) || this.controls.has(runId)
+        || this.toolContexts.has(runId) || this.toolPersistencePending(runId) || this.hasPendingContextPersistence(runId)
+        || this.productCancellations.has(runId))) throw safeError('storage_write_failed');
+      binding.memory?.assertDisposable();
+    }
+    for (const [sessionId, binding] of this.sessions) {
+      binding.memory?.dispose(); binding.session?.dispose(); this.sessions.delete(sessionId);
+    }
+  }
   async discardCompactionForRestore(proof:Omit<import('../../contracts/src/session').RestoreDiscardProof,'persistentSnapshot'>):Promise<void> {
     const binding=this.sessions.get(proof.sessionId);
     if(!binding?.memory||binding.execution||binding.manual||binding.memory.compactionOperationRef!==proof.operationRef||binding.session&&(!binding.session.isIdle||binding.session.agent.hasQueuedMessages()))throw safeError('stop_unconfirmed');

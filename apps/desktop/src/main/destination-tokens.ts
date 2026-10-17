@@ -3,11 +3,14 @@ import { lstatSync, realpathSync, type BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readFile, readdir, realpath, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
+import { isDeepStrictEqual } from 'node:util';
 import { OpaqueIdSchema } from '../../../../packages/contracts/src/error';
 import { canonicalRequest } from '../../../../packages/contracts/src/run';
 import { DesktopExportDestinationSchema, ExportCopyReceiptSchema, ExportDestinationCopySchema, ExportDestinationSchema, ExportManifestSchema,
   type ExportCopyReceipt, type ExportCopyVerification, type ExportManifest } from '../../../../packages/contracts/src/export';
 import { pinDirectory, publishNoReplace } from '../../../../packages/storage/src/publish-no-replace';
+import { SupportBundleSchema, SupportExportReceiptSchema, SupportExportRequestSchema, type DiagnosticsView } from '../../../../packages/contracts/src/protocol';
+import { supportDiagnostics } from '../../../../packages/logging/src/diagnostics';
 
 type Source = z.infer<typeof DesktopExportDestinationSchema>;
 type Copy = z.infer<typeof ExportDestinationCopySchema>;
@@ -22,6 +25,76 @@ export class DestinationTokens {
   private readonly active = new Map<string, Copying>();
   constructor(private readonly dataRoot: string, private readonly clock = Date.now,
     private readonly verifyCopy?: (instanceId: string, input: ExportCopyVerification) => Promise<void>) {}
+  get busy(): boolean { return this.active.size > 0; }
+  private async supportRecord(path: string) {
+    try {
+      const before = await lstat(path, { bigint: true });
+      if (!before.isFile() || before.isSymbolicLink() || before.size > 8n * 1024n * 1024n || !samePath(await realpath(path), path)) throw new Error();
+      const file = await open(path, 'r');
+      try {
+        if (identity(await file.stat({ bigint: true })) !== identity(before)) throw new Error();
+        const bytes = Buffer.alloc(Number(before.size)); let offset = 0;
+        while (offset < bytes.length) { const part = await file.read(bytes, offset, bytes.length - offset, offset); if (!part.bytesRead) throw new Error(); offset += part.bytesRead; }
+        const after = await file.stat({ bigint: true });
+        if (after.size !== before.size || after.mtimeNs !== before.mtimeNs || identity(await lstat(path, { bigint: true })) !== identity(before)) throw new Error();
+        const record = SupportBundleSchema.parse(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)));
+        return { record, bytes: bytes.length };
+      } finally { await file.close(); }
+    } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw new Error('diagnostics_bundle_invalid'); }
+  }
+  async inspectSupportFile(path: string) {
+    if (!isAbsolute(path)) throw new Error('diagnostics_bundle_invalid');
+    const parent = this.directory(dirname(path)), saved = await this.supportRecord(join(parent.path, basename(path)));
+    if (!saved || basename(path) !== 'MedClaw-support-'+saved.record.request.operationRef+'.json') throw new Error('diagnostics_bundle_invalid');
+    return saved.record.request;
+  }
+  async readSupport(directory: string, raw: z.infer<typeof SupportExportRequestSchema>) {
+    const input = SupportExportRequestSchema.parse({ ...raw, categories: [...raw.categories].sort() }), parent = this.directory(directory);
+    const saved = await this.supportRecord(join(parent.path, 'MedClaw-support-'+input.operationRef+'.json'));
+    if (!saved) return null;
+    if (!isDeepStrictEqual(saved.record.request, input)) throw new Error('state_conflict');
+    return SupportExportReceiptSchema.parse({ ...saved.record.receipt, bytes: saved.bytes });
+  }
+  /** Main tracks this operation as a necessary write; the published file contains its original receipt. */
+  async exportSupport(directory: string, raw: z.infer<typeof SupportExportRequestSchema>, read: () => Promise<DiagnosticsView>, authorize: () => void) {
+    const input = SupportExportRequestSchema.parse({ ...raw, categories: [...raw.categories].sort() }); authorize();
+    const parent = this.directory(directory), target = join(parent.path, 'MedClaw-support-'+input.operationRef+'.json'), data = this.directory(this.dataRoot);
+    const within = relative(data.path, target);
+    if (!within || within !== '..' && !within.startsWith('..'+sep) && !isAbsolute(within)) throw new Error('access_denied');
+    const original = await this.readSupport(parent.path, input); if (original) return original;
+    let unpin: (() => Promise<void>) | undefined, temporary: string | undefined, owned: string | undefined, published = false;
+    const current = () => { authorize(); if (this.directory(parent.path).identity !== parent.identity) throw new Error('access_denied'); };
+    try {
+      unpin = await pinDirectory(parent.path); current();
+      const concurrent = await this.readSupport(parent.path, input); if (concurrent) return concurrent;
+      const diagnostics = supportDiagnostics(await read(), input.categories); current();
+      const record = SupportBundleSchema.parse({ contract: 'medclaw.support/v1', request: input,
+        receipt: { operationRef: input.operationRef, state: 'completed', createdAt: new Date(this.clock()).toISOString(), partial: diagnostics.partial }, diagnostics });
+      const bytes = Buffer.from(JSON.stringify(record, null, 2)+'\n');
+      if (bytes.length > 8 * 1024 * 1024) throw new Error('diagnostics_export_failed');
+      temporary = join(parent.path, '.MedClaw-support-'+input.operationRef+'.'+randomUUID()+'.tmp');
+      const file = await open(temporary, 'wx');
+      try { owned = identity(await file.stat({ bigint: true })); await file.writeFile(bytes); await file.sync(); } finally { await file.close(); }
+      current(); if (identity(await lstat(temporary, { bigint: true })) !== owned) throw new Error('access_denied');
+      try { await publishNoReplace(temporary, target, 'file'); published = true; }
+      catch (error) {
+        if (error instanceof Error && error.message === 'destination_conflict') { const receipt = await this.readSupport(parent.path, input); if (receipt) return receipt; }
+        throw error;
+      }
+      const saved = await this.supportRecord(target);
+      if (!saved || !isDeepStrictEqual(saved.record, record) || saved.bytes !== bytes.length) throw new Error('diagnostics_export_failed');
+      return SupportExportReceiptSchema.parse({ ...record.receipt, bytes: bytes.length });
+    } catch (error) {
+      if (error instanceof Error && ['access_denied', 'state_conflict', 'diagnostics_bundle_invalid'].includes(error.message)) throw error;
+      throw new Error('diagnostics_export_failed');
+    } finally {
+      try {
+        if (!published && temporary && owned) {
+          try { const info = await lstat(temporary, { bigint: true }); if (!info.isSymbolicLink() && identity(info) === owned && this.directory(parent.path).identity === parent.identity) await unlink(temporary); } catch {}
+        }
+      } finally { await unpin?.(); }
+    }
+  }
   private directory(path: string) {
     const absolute = resolve(path), root = parse(absolute).root;
     let current = root;

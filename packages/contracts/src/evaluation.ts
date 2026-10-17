@@ -4,7 +4,7 @@ import { AbsolutePathSchema, AppErrorSchema, OpaqueIdSchema, PositiveIdSchema, T
 export const ExecutionIdSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/)
   .refine(value => !/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(value), 'Reserved filesystem identity');
 export const EvaluationOperationRefSchema = z.uuid();
-export const EvaluationPathsSchema = z.strictObject({ sourceRoot: AbsolutePathSchema, configsRoot: AbsolutePathSchema, runsRoot: AbsolutePathSchema });
+export const EvaluationPathsSchema = z.strictObject({ sourceRoot: AbsolutePathSchema, configsRoot: AbsolutePathSchema, runsRoot: AbsolutePathSchema, datasetsRoot: AbsolutePathSchema.optional(), installManifestPath: AbsolutePathSchema.optional() });
 export const EvaluationRunOptionsSchema = z.strictObject({ datasetId: ExecutionIdSchema, selection: z.enum(['smoke', 'full']), trials: PositiveIdSchema.optional() });
 export const DesktopEvaluationRequestSchema = EvaluationRunOptionsSchema.extend({ operationRef: EvaluationOperationRefSchema, trials: PositiveIdSchema });
 export const EvaluationPaginationSchema = z.strictObject({ page: PositiveIdSchema.default(1), pageSize: PositiveIdSchema.max(100).default(50) })

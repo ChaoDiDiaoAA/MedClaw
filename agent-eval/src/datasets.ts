@@ -1,10 +1,6 @@
 import { lstat, readFile, mkdir, writeFile, realpath } from 'node:fs/promises';
 import { resolve, join, basename, relative } from 'node:path';
 import {isDeepStrictEqual} from 'node:util';
-import { cases as builtInCases, datasetInfo, smokeIds } from './datasets/medclaw-agent-v1.ts';
-import { goldDefinitions, sourceReferences } from './datasets/medclaw-agent-v1.gold.ts';
-import * as badcaseDataset from './datasets/medclaw-badcase-v1.ts';
-import {goldDefinitions as badcaseGold,sourceReferences as badcaseReferences} from './datasets/medclaw-badcase-v1.gold.ts';
 import type { GoldDefinition } from './evaluation.ts';
 import { fixtureMaterials, loadFixtureFiles, loadProductResources, parseFixtureCatalog,fixtureConversation } from './dataset-fixtures.ts';
 import { assertNoDatasetHashes } from './data-format.ts';
@@ -102,8 +98,14 @@ export function loadSnapshot(raw:unknown,root='archived',archived?:CompiledDatas
 }
 export async function loadDataset(location='medclaw-agent-v1'):Promise<LoadedDataset> {
   const directory=resolve(import.meta.dir,'datasets');
-  const declaration=location==='medclaw-badcase-v1'?{info:badcaseDataset.datasetInfo,cases:badcaseDataset.cases,smokeIds:badcaseDataset.smokeIds,gold:badcaseGold,sourceReferences:badcaseReferences,caseOrigins:badcaseDataset.caseOrigins,lineage:badcaseDataset.lineage}
-    :location==='medclaw-agent-v1'||resolve(location)===directory?{info:datasetInfo,cases:builtInCases,smokeIds,gold:goldDefinitions,sourceReferences}:null;
+  let declaration: Pick<DatasetSnapshot, 'info' | 'cases' | 'smokeIds' | 'gold' | 'sourceReferences'> & Partial<Pick<DatasetSnapshot, 'caseOrigins' | 'lineage'>> | null = null;
+  if (location === 'medclaw-badcase-v1') {
+    const [dataset, gold] = await Promise.all([import('./datasets/medclaw-badcase-v1.ts'), import('./datasets/medclaw-badcase-v1.gold.ts')]);
+    declaration = { info: dataset.datasetInfo, cases: dataset.cases, smokeIds: dataset.smokeIds, gold: gold.goldDefinitions, sourceReferences: gold.sourceReferences, caseOrigins: dataset.caseOrigins, lineage: dataset.lineage };
+  } else if (location === 'medclaw-agent-v1' || resolve(location) === directory) {
+    const [dataset, gold] = await Promise.all([import('./datasets/medclaw-agent-v1.ts'), import('./datasets/medclaw-agent-v1.gold.ts')]);
+    declaration = { info: dataset.datasetInfo, cases: dataset.cases, smokeIds: dataset.smokeIds, gold: gold.goldDefinitions, sourceReferences: gold.sourceReferences };
+  }
   if(declaration) {
     const fixtures=await loadFixtureFiles();
     const review=JSON.parse(await readFile(join(directory,declaration.info.id+'.review.json'),'utf8'));
