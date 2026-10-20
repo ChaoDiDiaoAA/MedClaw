@@ -8,6 +8,7 @@ node_modules/
 /.codebase-memory/
 /.codegraph/
 /.zread/
+/.codex/config.toml
 /test-results/
 /playwright-report/
 **/credentials.enc.json
