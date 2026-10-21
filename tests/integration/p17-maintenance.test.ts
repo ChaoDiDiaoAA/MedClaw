@@ -26,9 +26,9 @@ function fixture() {
   for (const path of [join(dataRoot, 'data'), selectionRoot, destination, targetParent]) mkdirSync(path, { recursive: true });
   const db = openDatabase(join(dataRoot, 'data/app.sqlite')); db.close(); new MainSettings(join(dataRoot, 'data/settings.json')).read();
   mkdirSync(join(root, 'install')); const installManifestPath = join(root, 'install/install.json');
-  writeFileSync(installManifestPath, JSON.stringify({ contract: 'medclaw.install/v1', appVersion: '0.1.0', platform: 'win32', arch: 'x64', sdkVersion: '0.87.1', bunVersion: '1.4.0', electronVersion: '44.5.1', protocolVersion: 'medclaw.host/p17-v2', schemaVersion: 16,
+  writeFileSync(installManifestPath, JSON.stringify({ contract: 'medclaw.install/v1', appVersion: '0.1.0', platform: 'win32', arch: 'x64', sdkVersion: '0.87.1', bunVersion: '1.4.0', electronVersion: '44.5.1', protocolVersion: 'medclaw.host/p17-v3', schemaVersion: 17,
     hostEntry: 'runtime/apps/host/src/main.ts', maintenanceEntry: 'runtime/apps/host/src/maintenance.ts', resourceRoot: 'runtime/resources', resources: [], plugins: [], binaries: [{ name: 'bun', version: '1.4.0', source: 'ENGINEERING fixture', path: 'bin/bun.exe' }] }));
-  let view: HostView = { instanceId: 'source-host', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion: 16, error: null };
+  let view: HostView = { instanceId: 'source-host', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion: 17, error: null };
   let check!: (value: Result<unknown>) => void, stops = 0, writesBusy = false;
   let gate: Promise<Result<unknown>> | null = null;
   const host = {
@@ -214,7 +214,7 @@ test('private maintenance reply correlation and framing: ' + mode, async () => {
     process.stdin.on('data', chunk => {
       buffer += chunk.toString(); if (!buffer.includes('\\n')) return;
       const { input, ...identity } = JSON.parse(buffer), now = new Date().toISOString();
-      const receipt = { operationRef: identity.operationRef, state: 'completed', appVersion: '0.1.0', schemaVersion: 16, sdkVersion: '0.87.1', kind: 'create', createdAt: now };
+      const receipt = { operationRef: identity.operationRef, state: 'completed', appVersion: '0.1.0', schemaVersion: 17, sdkVersion: '0.87.1', kind: 'create', createdAt: now };
       let frame = { ...identity, action: input.action, result: { ok: true, data: null } };
       if (input.action === 'process.checkDomain') frame.result.data = { stopped: true, canPrepareRecovery: false,
         processTreeProof: { instanceId: input.owner.instanceId, basis: 'windows_job_empty', observedAt: now } };
@@ -381,7 +381,8 @@ for (const kind of ['create', 'restore'] as const) test(`a valid ${kind} reply a
     const targetRoot = f.files.resolveMaintenance(targetRootToken, 7, context.operationRef, 'restore-target');
     const input = { sourceToken, targetRootToken }, originalSettings = readFileSync(join(f.dataRoot, 'data/settings.json'), 'utf8');
     pending = kind === 'create' ? controller.create({ destinationToken }, context) : controller.restore(input, context);
-    const deadline = Date.now() + 10000;
+    // Match the Host startup allowance for cold Windows imports before this fault barrier.
+    const deadline = Date.now() + 60000;
     while (!existsSync(reached)) { if (Date.now() > deadline) throw new Error('ENGINEERING worker barrier timeout'); await Bun.sleep(10); }
     expect(readFileSync(reached, 'utf8')).toBe('1');
     owner = JSON.parse(readFileSync(ownerPath, 'utf8'));
@@ -405,6 +406,9 @@ for (const kind of ['create', 'restore'] as const) test(`a valid ${kind} reply a
     const retried = kind === 'create' ? await controller.create({ destinationToken }, context) : await controller.restore(input, context);
     expect(retried).toEqual({ ok: true, data: receipt }); expect(readFileSync(receiptPath, 'utf8')).toBe(receiptBytes);
     if (kind === 'restore') expect(JSON.parse(readFileSync(join(f.selectionRoot, 'launch.json'), 'utf8'))).toMatchObject({ activeDataRoot: targetRoot, restoreOperationRef: context.operationRef });
+  } catch (error) {
+    console.error('ENGINEERING late-member ' + kind + ' failed before cleanup:', error);
+    throw error;
   } finally {
     writeFileSync(release, 'ENGINEERING cleanup release');
     if (member) { member.kill(); await member.exited; }
@@ -416,7 +420,7 @@ for (const kind of ['create', 'restore'] as const) test(`a valid ${kind} reply a
     if (realpathSync(f.root) !== resolve(f.root) || !f.root.startsWith(realpathSync(tmpdir()) + sep)) throw new Error('ENGINEERING maintenance cleanup root changed');
     f.close();
   }
-}, 45000);
+}, 120000);
 
 test('actual Windows write denial preserves old backups and roots while a read-only installation still permits backup', async () => {
   const { MaintenanceController } = await import('../../apps/desktop/src/main/maintenance-controller');

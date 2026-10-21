@@ -209,6 +209,7 @@ legend { padding: 0 6px; font-weight: 600; }
 .resource-input-menu [role="group"] { display: grid; gap: 6px; margin: 6px 0; }
 .resource-input-menu button { text-align: left; white-space: normal; overflow-wrap: anywhere; }
 .resource-input-menu [aria-selected="true"] { outline: 2px solid var(--accent); }
+[aria-label="Agent management"] textarea { width: 100%; min-width: 0; resize: vertical; padding: 12px; }
 .prompt-workbench { display: grid; gap: 12px; }
 .prompt-workbench textarea { width: 100%; min-width: 0; resize: vertical; padding: 12px; }
 .prompt-workbench pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; }

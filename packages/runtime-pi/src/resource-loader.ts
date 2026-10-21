@@ -1,11 +1,14 @@
 import { isDeepStrictEqual } from 'node:util';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, opendir, realpath } from 'node:fs/promises';
+import { lstat, mkdir, open, opendir, realpath, rename, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { DefaultResourceLoader, SettingsManager } from '@earendil-works/pi-coding-agent';
+import { DefaultResourceLoader, SettingsManager, parseFrontmatter } from '@earendil-works/pi-coding-agent';
+import { z } from 'zod';
 import { AppErrorSchema, PositiveIdSchema, safeError } from '@medclaw/contracts/error';
-import { FrozenRunResourcesSchema, ResourceCatalogueSchema, ResourceFileSchema, ResourceRefSchema, ResourceSnapshotSchema, RESOURCE_LIMITS, getSkillReadiness, resourceRefKey,
-  type FrozenRunResources, type ResourceDefinition, type ResourceDiagnostic, type ResourceDiagnosticReason, type ResourceFileSnapshot, type ResourceItem, type ResourceRef, type ResourceSnapshot, type ResourceSource } from '@medclaw/contracts/resources';
+import { FrozenRunResourcesSchema, ResourceCatalogueSchema, ResourceFileSchema, ResourceRefSchema, ResourceSnapshotSchema, SubagentTemplateNameSchema, SubagentTemplateSourceSchema, RESOURCE_LIMITS, getSkillReadiness, resourceRefKey,
+  type FrozenRunResources, type ResourceInputPlan, type ResourceDefinition, type ResourceDiagnostic, type ResourceDiagnosticReason, type ResourceFileSnapshot, type ResourceItem, type ResourceRef, type ResourceSnapshot, type ResourceSource } from '@medclaw/contracts/resources';
+import { SaveSubagentRoleFileInputSchema, SubagentRoleContentSchema, SubagentRoleIdSchema, SubagentRoleSnapshotSchema, SubagentRoleToolsSchema, SUBAGENT_ROLE_LIMITS,
+  type SubagentRoleDiagnostic, type SubagentRoleItem, type SubagentRoleSnapshot, type SubagentRoleSource } from '@medclaw/contracts/subagent';
 
 type ResourceFailureReason = Exclude<ResourceDiagnosticReason, 'not_recorded' | 'sdk_warning'>;
 export function formatSkillReadinessSection(frozen: FrozenRunResources, allowedTools: readonly string[]): string {
@@ -119,6 +122,14 @@ export function createResourceSource(authorRoot: string): ResourceSource {
     catch { return fail('resource_catalog_invalid'); }
   };
   return {
+    async captureSubagentTemplate(rawName) {
+      const templateName = SubagentTemplateNameSchema.parse(rawName), file = `subagent-prompts/${templateName}.md`;
+      const { content } = await readText(root, file);
+      const { frontmatter, body } = parseFrontmatter(content);
+      if (typeof frontmatter.description !== 'string' || !frontmatter.description.trim() || !body.trim()
+        || (body.match(/\$(?:ARGUMENTS|@|\d+)|\$\{/g) ?? []).join() !== '$ARGUMENTS') fail('resource_invalid');
+      return SubagentTemplateSourceSchema.parse({ templateName, file, content });
+    },
     async discover() {
       const catalog = await catalogue(), items: ResourceItem[] = [];
       for (const definition of catalog.definitions) {
@@ -146,6 +157,110 @@ export function createResourceSource(authorRoot: string): ResourceSource {
   };
 }
 
+const roleFrontmatter = z.strictObject({ name: SubagentRoleIdSchema, description: z.string().trim().min(1).max(1024), tools: SubagentRoleToolsSchema });
+const roleSaveQueues = new Map<string, Promise<unknown>>();
+type RoleEntry = { item: SubagentRoleItem; snapshot: SubagentRoleSnapshot | null };
+function parseRole(roleId: string, content: string, source: SubagentRoleSnapshot['source']): SubagentRoleSnapshot {
+  SubagentRoleContentSchema.parse(content);
+  const parsed = parseFrontmatter(content), fields = roleFrontmatter.parse(parsed.frontmatter);
+  if (fields.name !== roleId || !parsed.body.trim()) fail('resource_invalid');
+  return SubagentRoleSnapshotSchema.parse({ roleId, description: fields.description, source, content, declaredTools: fields.tools });
+}
+function roleDiagnostic(roleId: string | null, source: SubagentRoleSnapshot['source'], code: SubagentRoleDiagnostic['reason']): SubagentRoleDiagnostic {
+  return { roleId, source, reason: code, message: `Subagent role verification: ${code}.` };
+}
+
+/** Author and user directories are supplied by the resolved application paths, never discovered from cwd. */
+export function createSubagentRoleSource(authorRoot: string, userRoot: string): SubagentRoleSource {
+  const roots = { builtin: resolve(authorRoot), user: resolve(userRoot) };
+  const inspect = async () => {
+    const entries = new Map<string, RoleEntry>(), diagnostics: SubagentRoleDiagnostic[] = [];
+    for (const kind of ['builtin', 'user'] as const) {
+      const root = roots[kind];
+      try { await managedPath(root); }
+      catch (error) { if (kind === 'user' && (error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
+      const files: string[] = [];
+      for await (const entry of await opendir(root)) if (/\.md$/i.test(entry.name)) files.push(entry.name);
+      const groups = new Map<string, string[]>();
+      for (const file of files.sort()) {
+        const id = file.slice(0, -3).toLowerCase();
+        if (!SubagentRoleIdSchema.safeParse(id).success || !ResourceFileSchema.safeParse(file).success) {
+          diagnostics.push(roleDiagnostic(null, { kind, file: file.slice(0, 256) }, 'resource_path_invalid')); continue;
+        }
+        const names = groups.get(id) ?? []; names.push(file); groups.set(id, names);
+      }
+      for (const [roleId, names] of groups) {
+        const source = { kind, file: names[0]! };
+        let snapshot: SubagentRoleSnapshot | null = null, code: SubagentRoleDiagnostic['reason'] | null = null;
+        try {
+          if (names.length !== 1) fail('resource_conflict');
+          if (source.file !== `${roleId}.md`) fail('resource_path_invalid');
+          snapshot = parseRole(roleId, (await readText(root, source.file, SUBAGENT_ROLE_LIMITS.fileBytes)).content, source);
+        } catch (error) {
+          const why = reason(error);
+          code = why === 'resource_conflict' || why === 'resource_missing' || why === 'resource_changed' || why === 'resource_too_large' || why === 'resource_path_invalid' ? why : 'resource_invalid';
+        }
+        const item: SubagentRoleItem = { roleId, source, description: snapshot?.description ?? null, declaredTools: snapshot?.declaredTools ?? null,
+          availability: code === 'resource_conflict' ? 'conflict' : code ? 'invalid' : 'ready', diagnostics: code ? [roleDiagnostic(roleId, source, code)] : [] };
+        // An invalid user declaration still owns its ID and blocks fallback to the builtin.
+        entries.set(roleId, { item, snapshot });
+      }
+    }
+    if (entries.size > SUBAGENT_ROLE_LIMITS.roles || diagnostics.length + [...entries.values()].reduce((sum, entry) => sum + entry.item.diagnostics.length, 0) > 256) fail('resource_too_large');
+    return { entries, diagnostics };
+  };
+  const read = async (roleId: string) => {
+    if (!SubagentRoleIdSchema.safeParse(roleId).success) throw safeError('invalid_argument');
+    const entry = (await inspect()).entries.get(roleId);
+    if (!entry) fail('resource_missing');
+    if (!entry.snapshot) fail(entry.item.diagnostics[0]?.reason ?? 'resource_invalid');
+    return entry.snapshot;
+  };
+  return {
+    async discover() { return { items: [...(await inspect()).entries.values()].map(entry => entry.item) }; },
+    read,
+    async capture() {
+      const { entries, diagnostics } = await inspect();
+      return { roles: [...entries.values()].flatMap(entry => entry.snapshot ? [entry.snapshot] : []), diagnostics: [...diagnostics, ...[...entries.values()].flatMap(entry => entry.item.diagnostics)] };
+    },
+    async save(raw) {
+      const parsed = SaveSubagentRoleFileInputSchema.safeParse(raw);
+      if (!parsed.success) throw safeError('invalid_argument');
+      const input = parsed.data;
+      try { parseRole(input.roleId, input.content, { kind: 'user', file: `${input.roleId}.md` }); }
+      catch { throw safeError('invalid_argument'); }
+      const key = process.platform === 'win32' ? roots.user.toLowerCase() : roots.user;
+      const previous = roleSaveQueues.get(key) ?? Promise.resolve();
+      const operation = previous.catch(() => {}).then(async () => {
+        const checkExpected = async () => {
+          const { entries } = await inspect(), entry = entries.get(input.roleId);
+          if (input.expectedContent === null ? !!entry : entry?.snapshot?.content !== input.expectedContent) throw safeError('state_conflict');
+          if (!entry && entries.size >= SUBAGENT_ROLE_LIMITS.roles) fail('resource_too_large');
+        };
+        await checkExpected();
+        await managedPath(dirname(roots.user));
+        try { await mkdir(roots.user); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw safeError('storage_write_failed'); }
+        await managedPath(roots.user);
+        const file = `${input.roleId}.md`, temporary = `.${input.roleId}.${crypto.randomUUID()}.tmp`, path = join(roots.user, temporary);
+        try {
+          const handle = await open(path, 'wx', 0o600);
+          try { await handle.writeFile(input.content, 'utf8'); await handle.sync(); } finally { await handle.close(); }
+          await checkExpected(); await managedPath(roots.user, temporary);
+          await rename(path, join(roots.user, file));
+          const saved = await read(input.roleId);
+          if (saved.content !== input.content) throw safeError('storage_write_failed');
+          return saved;
+        } catch (error) {
+          if (AppErrorSchema.safeParse(error).success) throw error;
+          throw safeError('storage_write_failed');
+        } finally { await unlink(path).catch(() => {}); }
+      });
+      roleSaveQueues.set(key, operation);
+      try { return await operation; } finally { if (roleSaveQueues.get(key) === operation) roleSaveQueues.delete(key); }
+    },
+  };
+}
+
 function checkedFrozen(raw: FrozenRunResources) {
   const frozen = FrozenRunResourcesSchema.safeParse(raw); if (!frozen.success) fail('resource_snapshot_invalid');
   return frozen.data;
@@ -155,7 +270,7 @@ export async function verifyRunResourceFiles(workdir: string, raw: FrozenRunReso
   try { const root = await managedPath(workdir, 'resources'); for (const snapshot of frozen.available) if (!isDeepStrictEqual(await filesFor(root, snapshot), [...snapshot.files].sort((a,b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0))) fail('resource_snapshot_invalid'); }
   catch (error) { if (reason(error) === 'resource_path_invalid') fail('resource_path_invalid'); fail('resource_snapshot_invalid'); }
 }
-export async function materializeRunResources(runId: number, workdir: string, raw: FrozenRunResources): Promise<{ skillPaths: string[]; promptPaths: string[] }> {
+export async function materializeRunResources(runId: number, workdir: string, raw: FrozenRunResources, inputPlan?: ResourceInputPlan): Promise<{ skillPaths: string[]; promptPaths: string[] }> {
   PositiveIdSchema.parse(runId); const frozen = checkedFrozen(raw), root = join(workdir, 'resources');
   if (frozen.available.length) {
     await managedPath(workdir);
@@ -175,5 +290,16 @@ export async function materializeRunResources(runId: number, workdir: string, ra
     await verifyRunResourceFiles(workdir, frozen);
   }
   const skillPaths = frozen.available.filter(s => s.ref.kind === 'skill').map(s => join(root, s.entry)), promptPaths = frozen.available.filter(s => s.ref.kind === 'prompt').map(s => join(root, s.entry));
+  if (inputPlan?.kind === 'subagent_template') {
+    const source = SubagentTemplateSourceSchema.parse(inputPlan.source), directory = join(workdir, 'subagent-prompts');
+    await managedPath(workdir);
+    try { await mkdir(directory); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+    await managedPath(workdir, 'subagent-prompts');
+    const file = `${source.templateName}.md`, path = join(directory, file);
+    try { const handle = await open(path, 'wx'); try { await handle.writeFile(source.content, 'utf8'); } finally { await handle.close(); } }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+    if ((await readText(directory, file)).content !== source.content) fail('resource_snapshot_invalid');
+    promptPaths.push(path);
+  }
   return { skillPaths, promptPaths };
 }

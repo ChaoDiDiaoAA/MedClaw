@@ -123,7 +123,8 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   }
   failToolPersistence(runId: number, error: AppError): void {
     const execution = this.execution;
-    if (!execution || execution.handle.runId !== runId || execution.stopped) return;
+    if (!execution || execution.stopped || execution.handle.runId !== runId
+      && ![...execution.children?.values()??[]].some(child=>child.identity?.childRunId===runId)) return;
     execution.toolGap = true;
     this.checkpoint(execution, error); execution.abort.abort();
   }
@@ -314,6 +315,8 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
       if (session.status === 'deleted') throw safeError('state_conflict', undefined, { reason: 'session_deleted' });
       const extension=request.mode==='send'?this.settings().extensions?.bySession[String(request.sessionId)]?.extension:this.execution?.agentFields?.extensions?.selection.extension;
       if(extension&&request.text.trimStart().split(/\s/,1)[0]==='/extension_status')throw safeError('extension_command_required');
+      const explicitDelegation=/^\/(?:subagent|medclaw-evidence-review|parallel-medclaw-review)(?:\s|$)/.test(request.text);
+      if(explicitDelegation&&request.mode!=='send')throw safeError('runtime_busy');
       if (request.mode !== 'send') return this.submitQueuedInput(request, context);
       this.reserve(context.operationRef, request, "agent", request.sessionId);
       try {
@@ -330,7 +333,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const form=request.routing?.mode==='user_form'?request.routing:null;
         if(form&&(request.text!=='Query form: '+canonicalRequest(form.params)
           ||!isDeepStrictEqual(form.params.batchIds,request.expectedBatchIds)))throw safeError('invalid_argument');
-        const intentRouted=request.routing?.mode==='intent',businessRouted=intentRouted||!!form;
+        const intentRouted=request.routing?.mode==='intent'&&!explicitDelegation;
         const config = this.settings();
         if(intentRouted&&(!this.intents||!config.intentModel?.enabled||!this.agent.appendProductTurn||!this.store.readHistorySnapshot||!this.store.startIntentRun))throw safeError('intent_model_unavailable');
         if(form&&(!this.intents||!this.agent.appendProductTurn||!this.store.readHistorySnapshot||!this.store.startIntentRun))throw safeError('state_conflict');
@@ -342,11 +345,15 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const extensions = form?undefined:await this.agent.freezeExtensions?.(request.sessionId,config);
         this.recheck(context.operationRef, config.configVersion);
         const workspace = this.store.readWorkspace(), scope = this.store.freezeAgentScope(workspace,
-          form?[]:[...(this.agent.toolNames ?? []), ...(extensions?.source?.manifest.tools ?? []), ...(intentRouted?['query_intent_step']:[])].filter(name=>!businessRouted||name!=='Agent'));
-        const resources = form?undefined:await this.resources?.freeze(request.sessionId, config, scope), inputPlan = resources ? this.resources!.planInput(resources, request) : undefined;
+          form?[]:[...(this.agent.toolNames ?? []), ...(extensions?.source?.manifest.tools ?? []), ...(intentRouted?['query_intent_step']:[])]);
+        const resources = form?undefined:await this.resources?.freeze(request.sessionId, config, scope);
         this.recheck(context.operationRef, config.configVersion);
         if (!isDeepStrictEqual(this.store.readWorkspace(), workspace)) throw safeError('state_conflict', undefined, { reason: 'workspace_revision_mismatch' });
         if (resources) scope.allowedResourceRefs = resources.available.map(snapshot => resourceRefKey(snapshot.ref));
+        const subagents=form?undefined:await this.resources?.freezeSubagents(request.sessionId,scope);
+        const inputPlan=resources?await this.resources!.prepareInput(resources,request,subagents):undefined;
+        this.recheck(context.operationRef,config.configVersion);
+        if (new TextEncoder().encode(JSON.stringify({resources,subagents})).byteLength>RESOURCE_LIMITS.runBytes) throw safeError('resource_unavailable',undefined,{reason:'resource_too_large'});
         const toolConfiguration = normalizeToolConfiguration(config);
         const runtimeConfiguration = normalizeRuntimeConfiguration(config);
         const agentPolicy = projectRuntimePolicies(runtimeConfiguration).agentPolicy;
@@ -355,7 +362,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         const fields = { sessionId: request.sessionId, text: request.text, model: resolved.selection, policy: resolved.policy, goal: "answer" as const,
           workspace: toWorkspaceContext(workspace), scope, referenceDate: request.referenceDate, timezone: request.timezone, timeoutMs: resolved.policy.timeoutMs,
           agentPolicy, runtimeConfiguration, toolConfiguration, ...(intentAdmission?{intentAdmission}:{}), ...(profiles ? structuredClone(profiles) : {}),
-          ...(resources ? { resources, inputPlan } : {}), ...(extensions?{extensions}:{}), agentOptions: this.agent.describe(resolved), ...(this.agent.contextContract ? {contextContract:this.agent.contextContract} : {}),...(this.agent.historyContract?{historyContract:this.agent.historyContract}:{}) };
+          ...(resources ? { resources, inputPlan } : {}), ...(subagents?{subagents}:{}), ...(extensions?{extensions}:{}), agentOptions: this.agent.describe(resolved), ...(this.agent.contextContract ? {contextContract:this.agent.contextContract} : {}),...(this.agent.historyContract?{historyContract:this.agent.historyContract}:{}) };
         const createdAt = now(), content: InputContent = { contract: 'medclaw.session-input/v1', originalSubmitInput: request, text: request.text,
           workspaceContext: toWorkspaceContext(workspace), scope: structuredClone(scope), model: structuredClone(resolved.selection),
           referenceDate: request.referenceDate, timezone: request.timezone, deliveryAttempt: null, ...(intentAdmission?{intentAdmission}:{}), ...(inputPlan ? { resourceInputPlan: inputPlan } : {}) };
@@ -576,7 +583,8 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
     const owned=(execution.children??=new Map());
     return {
       own:(pluginAgentId,stop)=>{
-        this.checkActive(execution);if(this.execution!==execution||execution.handle.kind!=='agent'||owned.size||owned.has(pluginAgentId))throw safeError('state_conflict',undefined,{reason:'subagent_limit'});
+        this.checkActive(execution);if(this.execution!==execution||execution.handle.kind!=='agent'||owned.has(pluginAgentId))throw safeError('state_conflict');
+        if(owned.size>=4)throw safeError('runtime_busy');
         const slot={stop:async()=>{await stop();slot.stopped=true;},stopped:false,identity:undefined as BoundChildIdentity|undefined,unknown:false,pendingFinal:undefined as FinalChildFact|undefined,registration:undefined as RegisterChildInput|undefined};owned.set(pluginAgentId,slot);
         return()=>{if(owned.get(pluginAgentId)!==slot)return;if(slot.unknown)throw safeError('storage_read_failed');
           if(slot.identity){const saved=this.store.read({runId:slot.identity.childRunId});if(saved.kind!=='one'||saved.run?.kind!=='child'||!saved.run.childResult||!saved.run.cleanup?.stopConfirmed||!saved.run.cleanup.requiredPersistenceComplete||!saved.run.cleanup.resourcesReleased)throw safeError('storage_write_failed');}
@@ -676,7 +684,9 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         try{return this.transactions.immediate(()=>this.store.commitCompactionInTransaction(change,fact));}
         catch(error){try{const version=this.store.confirmCompactionSaved?.(change,fact);if(version!=null)return version;}catch{}this.checkpoint(execution,safeError('storage_write_failed'),false);execution.abort.abort();throw error;}
       },
-      failed:(operationRef,error,time,nativeGenerated)=>{if(!nativeGenerated)try{this.store.finishAutoCompaction?.(operationRef,runId,error,time);}catch{(execution.pendingCompactionFailures??=new Map()).set(operationRef,{runId,error,at:time});this.checkpoint(execution,safeError('storage_write_failed'),false);}
+      failed:(operationRef,error,time,nativeGenerated)=>{let saveFailed=false;
+        if(!nativeGenerated)try{this.store.finishAutoCompaction?.(operationRef,runId,error,time);}catch{saveFailed=true;(execution.pendingCompactionFailures??=new Map()).set(operationRef,{runId,error,at:time});this.checkpoint(execution,safeError('storage_write_failed'),false);}
+        if(runId!==execution.handle.runId&&!saveFailed&&error.code!=='storage_write_failed')return;
         if(execution.cause!=='user')this.checkpoint(execution,error,false);execution.abort.abort();},
       progress:(operationRef,phase)=>{const revision=(revisions.get(operationRef)??0)+1;revisions.set(operationRef,revision);try{this.notice({type:'compaction.progress',sessionId:sessionId,operationRef,runId:runId,revision,phase});}catch{}},
     };
@@ -849,7 +859,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
         entered = true;
         return this.agent!.execute({
         runId: execution.handle.runId, sessionId: input.sessionId, inputId: input.inputId, text: input.text, resolved: input.resolved, agentOptions: input.agentOptions,
-        instanceId:this.instanceId,extensions:input.extensions,resources: input.resources, inputPlan: input.inputPlan, nativeReceiptLimitBytes: input.nativeReceiptLimitBytes,
+        instanceId:this.instanceId,operationRef:execution.operationRef,extensions:input.extensions,resources: input.resources, subagents:input.subagents, inputPlan: input.inputPlan, nativeReceiptLimitBytes: input.nativeReceiptLimitBytes,
         scope: input.scope, workspaceContext: toWorkspaceContext(input.workspace), referenceDate: input.referenceDate, timezone: input.timezone, signal: execution.abort.signal, deadlineAt,
         agentPolicy: input.agentPolicy, runtimeConfiguration: input.runtimeConfiguration, toolConfiguration: input.toolConfiguration, measurementContext: input.measurementContext, toolProfileSnapshot: input.toolProfileSnapshot, ...(execution.control?{runControl:execution.control}:{}), ...(task?{intentTask:task}:{}) }, {
         startCall: (time,context) => this.startCall(execution.handle.runId, "main", time,context), preview: text => this.preview(execution, text),
@@ -889,7 +899,7 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
             this.checkActive(execution,true);return turn;
           },
         }:{}),
-        ...(this.store.registerChild&&!execution.intentAdmission?{subagents:this.childCallbacks(execution)}:{}),
+          ...(this.store.registerChild?{subagents:this.childCallbacks(execution)}:{}),
         fatal: error => { this.checkpoint(execution, error,!execution.compactionFailure); execution.abort.abort(); },
         extensionProof: proof => {
           if(proof.runId!==execution.handle.runId||proof.sessionId!==execution.handle.sessionId||proof.instanceId!==this.instanceId)throw safeError('state_conflict');
@@ -1011,6 +1021,18 @@ export class RuntimeService<Resolved extends ResolvedProviderSelection> {
   }
   cancelNow(runId: number): CancelRunResult {
     const execution = this.execution;
+    const child=execution&&[...execution.children?.values()??[]].find(slot=>slot.identity?.childRunId===runId);
+    if(child?.identity&&!child.cancelAt){
+      const saved=this.store.read({runId});
+      if(saved.kind!=='one'||saved.run?.kind!=='child')throw safeError('run_not_found');
+      if(saved.run.childResult===null){
+        child.cancelAt=now();
+        try{this.store.requestCancel(runId,child.cancelAt);}
+        catch{this.persistenceFailure(execution!);execution!.acceptingInputs=false;execution!.abort.abort();}
+        this.agent?.cancelChild?.(execution!.handle.runId,runId);
+        void child.stop().catch(error=>this.report(safeError('stop_unconfirmed',error)));
+      }
+    }
     const saved=execution?.handle.runId===runId&&(execution.intentAdmission||execution.form)&&!execution.finalCommitted?this.store.read({runId}):null;
     const pendingIntent=saved?.kind==='one'&&!!saved.run&&['created','running'].includes(saved.run.status);
     const pendingProduct=pendingIntent&&execution!.stopped&&execution!.fact&&'calls' in execution!.fact&&['program','user_form'].includes(execution!.fact.resultSource??'pi')&&execution!.fact.status==='completed';

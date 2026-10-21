@@ -2,8 +2,10 @@ import { AppErrorSchema, safeError } from '@medclaw/contracts/error';
 import type { PublishedSettings } from '@medclaw/contracts/model';
 import { SubmitInputSchema, type SubmitInput } from '@medclaw/contracts/session';
 import type { RunScope, RuntimeRunStore } from '@medclaw/contracts/run';
-import { FrozenRunResourcesSchema, ResourceInputPlanSchema, ResourceItemSchema, ResourceListInputSchema, ResourceListSchema, ResourceReadInputSchema, ResourceSelectionSchema, ResourceSnapshotSchema, ResourceTextSchema, resourceRefKey, getSkillReadiness, resourceCommand,
-  type FrozenRunResources, type ResourceDiagnostic, type ResourceDiagnosticReason, type ResourceInputPlan, type ResourceItem, type ResourceList, type ResourceListInput, type ResourceReadInput, type ResourceRef, type ResourceSelection, type ResourceSnapshot, type ResourceSource, type ResourceText } from '@medclaw/contracts/resources';
+import { FrozenRunResourcesSchema, ResourceInputPlanSchema, ResourceItemSchema, ResourceListInputSchema, ResourceListSchema, ResourceReadInputSchema, ResourceSelectionSchema, ResourceSnapshotSchema, ResourceTextSchema, SubagentTemplateNameSchema, InputCommandsListInputSchema, InputCommandsListSchema, resourceRefKey, getSkillReadiness, resourceCommand,
+  type FrozenRunResources, type InputCommandsList, type InputCommandsListInput, type ResourceDiagnostic, type ResourceDiagnosticReason, type ResourceInputPlan, type ResourceItem, type ResourceList, type ResourceListInput, type ResourceReadInput, type ResourceRef, type ResourceSelection, type ResourceSnapshot, type ResourceSource, type ResourceText } from '@medclaw/contracts/resources';
+import { FrozenRunSubagentsSchema, SubagentsListInputSchema, SubagentsListSchema, SubagentsReadInputSchema, SubagentsReadSchema, SubagentsSaveInputSchema,
+  type FrozenRunSubagents, type SubagentRoleItem, type SubagentRoleSnapshot, type SubagentRoleSource, type SubagentsList, type SubagentsListInput, type SubagentsRead, type SubagentsReadInput, type SubagentsSaveInput } from '@medclaw/contracts/subagent';
 
 const emptySelection = (): ResourceSelection => ({ prompt: null, skills: [] });
 const refs = (selection: ResourceSelection) => [...(selection.prompt ? [selection.prompt] : []), ...selection.skills];
@@ -22,8 +24,9 @@ function asItem(snapshot: ResourceSnapshot): ResourceItem {
 /** Published selection, immutable Run content and native evidence share the existing stores. */
 export class ResourceService {
   constructor(private readonly readSettings: () => PublishedSettings,
-    private readonly store: Pick<RuntimeRunStore, 'readSession' | 'read' | 'readRunResources' | 'readResourceEvidence' | 'readRunResourceScope'>,
-    private readonly source: ResourceSource, private readonly configuredToolNames: (settings: PublishedSettings) => readonly string[]) {}
+    private readonly store: Pick<RuntimeRunStore, 'readSession' | 'read' | 'readRunResources' | 'readResourceEvidence' | 'readRunResourceScope' | 'readRunSubagents'>,
+    private readonly source: ResourceSource, private readonly configuredToolNames: (settings: PublishedSettings) => readonly string[],
+    private readonly roleSource?: SubagentRoleSource, private readonly readOnlyToolNames: () => readonly string[] = () => []) {}
   private session(sessionId: number) {
     const session = this.store.readSession(sessionId); if (!session) throw safeError('input_invalid', undefined, { reason: 'session_not_found' });
     if (session.kind !== 'user') throw safeError('access_denied');
@@ -129,6 +132,72 @@ export class ResourceService {
     const frozen = FrozenRunResourcesSchema.safeParse({ contract: 'medclaw.run-resources/v1', sdkVersion: '0.87.1', sessionId, configVersion: settings.configVersion, selection, available, knownPromptNames, omitted, skillRequirements });
     if (!frozen.success) failure('resource_too_large'); return frozen.data;
   }
+  private roleItem(item: SubagentRoleItem, allowedTools: readonly string[], readOnlyTools: readonly string[]): SubagentsList['items'][number] {
+    const reasons = item.diagnostics.map(d => d.reason as string);
+    for (const name of item.declaredTools ?? []) {
+      if (!readOnlyTools.includes(name)) reasons.push(`tool_not_read_only:${name}`);
+      else if (!allowedTools.includes(name)) reasons.push(`scope_tool_not_allowed:${name}`);
+    }
+    return { roleId: item.roleId, description: item.description, source: item.source.kind, declaredTools: item.declaredTools,
+      valid: item.availability === 'ready', available: item.availability === 'ready' && reasons.length === 0, reasons };
+  }
+  private roleSnapshotItem(snapshot: SubagentRoleSnapshot): SubagentRoleItem {
+    return { roleId: snapshot.roleId, description: snapshot.description, source: snapshot.source, declaredTools: snapshot.declaredTools, availability: 'ready', diagnostics: [] };
+  }
+  private storedSubagents(runId: number) {
+    const result = this.store.read({ runId, inputLimit: 1, outputLimit: 1, callLimit: 1 });
+    if (result.kind !== 'one' || !result.run) throw safeError('run_not_found');
+    if (result.run.kind !== 'agent') throw safeError('access_denied');
+    if (!this.store.readRunSubagents) throw safeError('storage_read_failed');
+    const raw = this.store.readRunSubagents(runId);
+    if (raw === null) return { frozen: null, allowedTools: [] };
+    const parsed = FrozenRunSubagentsSchema.safeParse(raw);
+    if (!parsed.success) throw safeError('storage_read_failed');
+    const scope = this.store.readRunResourceScope?.(runId);
+    if (!scope) throw safeError('storage_read_failed');
+    return { frozen: parsed.data, allowedTools: scope.allowedToolNames };
+  }
+  async listSubagents(raw: SubagentsListInput): Promise<SubagentsList> {
+    const input = SubagentsListInputSchema.parse(raw);
+    if (input.source === 'selection') {
+      this.session(input.sessionId); if (!this.roleSource) failure('resource_missing');
+      const catalog = await this.roleSource.discover();
+      return SubagentsListSchema.parse({ items: catalog.items.map(item => this.roleItem(item, this.configuredToolNames(this.readSettings()), this.readOnlyToolNames())),
+        recorded: true, reasons: [], diagnostics: catalog.items.flatMap(item => item.diagnostics) });
+    }
+    const { frozen, allowedTools } = this.storedSubagents(input.runId);
+    const items = frozen?.roles.map(role => this.roleItem(this.roleSnapshotItem(role), allowedTools, allowedTools)) ?? [];
+    for (const diagnostic of frozen?.diagnostics ?? []) if (diagnostic.roleId && !items.some(item => item.roleId === diagnostic.roleId)) {
+      items.push({ roleId: diagnostic.roleId, description: null, source: diagnostic.source.kind, declaredTools: null, valid: false, available: false, reasons: [diagnostic.reason] });
+    }
+    return SubagentsListSchema.parse({ items, recorded: frozen !== null, reasons: frozen ? [] : ['not_recorded'], diagnostics: frozen?.diagnostics ?? [] });
+  }
+  async readSubagent(raw: SubagentsReadInput): Promise<SubagentsRead> {
+    const input = SubagentsReadInputSchema.parse(raw);
+    if (input.source === 'selection') {
+      this.session(input.sessionId); if (!this.roleSource) failure('resource_missing');
+      const role = await this.roleSource.read(input.roleId);
+      return SubagentsReadSchema.parse({ ...role, diagnostics: [], editable: true, expectedContent: role.content });
+    }
+    const { frozen } = this.storedSubagents(input.runId), role = frozen?.roles.find(item => item.roleId === input.roleId);
+    if (!role) failure('resource_missing');
+    return SubagentsReadSchema.parse({ ...role, diagnostics: frozen?.diagnostics.filter(item => item.roleId === role.roleId) ?? [], editable: false, expectedContent: null });
+  }
+  async saveSubagent(raw: SubagentsSaveInput): Promise<SubagentsRead> {
+    const input = SubagentsSaveInputSchema.parse(raw); this.session(input.sessionId);
+    if (!this.roleSource) failure('resource_missing');
+    const { sessionId: _, ...change } = input, role = await this.roleSource.save(change);
+    return SubagentsReadSchema.parse({ ...role, diagnostics: [], editable: true, expectedContent: role.content });
+  }
+  async freezeSubagents(sessionId: number, scope: RunScope): Promise<FrozenRunSubagents | undefined> {
+    if (!this.roleSource) return undefined;
+    this.session(sessionId); const captured = await this.roleSource.capture();
+    const items = captured.roles.map(role => this.roleItem(this.roleSnapshotItem(role), scope.allowedToolNames, this.readOnlyToolNames()));
+    const indexText = '<subagent_roles>\n' + items.map(({ roleId, description, available, reasons }) => JSON.stringify({ roleId, description, available, reasons })).join('\n') + '\n</subagent_roles>';
+    const frozen = FrozenRunSubagentsSchema.safeParse({ ...captured, indexText });
+    if (!frozen.success) failure('resource_too_large');
+    return frozen.data;
+  }
   planInput(raw: FrozenRunResources, request: SubmitInput): ResourceInputPlan {
     const frozen = FrozenRunResourcesSchema.parse(raw), input = SubmitInputSchema.parse(request);
     if (!input.text.isWellFormed()) throw safeError('invalid_argument');
@@ -148,5 +217,57 @@ export class ResourceService {
     if (input.mode === 'send' && frozen.selection.prompt) return ResourceInputPlanSchema.parse({ kind: 'prompt', resourceRef: required(frozen.selection.prompt),
       dispatchText: '/' + frozen.selection.prompt.id + ' ' + input.text.split('"').map(part => '"' + part + '"').join("'\"'") });
     return { kind: 'plain', resourceRef: null, dispatchText: input.text };
+  }
+  async prepareInput(raw: FrozenRunResources, request: SubmitInput, frozenRoles?: FrozenRunSubagents): Promise<ResourceInputPlan> {
+    const frozen = FrozenRunResourcesSchema.parse(raw), input = SubmitInputSchema.parse(request);
+    const name = input.text.startsWith('/') ? input.text.slice(1).split(/\s/, 1)[0] : '';
+    const template = SubagentTemplateNameSchema.safeParse(name);
+    if (name !== 'subagent' && !template.success) return this.planInput(frozen, input);
+    if (input.mode !== 'send') throw safeError('state_conflict');
+    if (input.sessionId !== frozen.sessionId || input.model.expectedConfigVersion !== frozen.configVersion) throw safeError('state_conflict');
+    if (!frozenRoles) failure('resource_missing');
+    const requireRole = (roleId: string) => {
+      const role = frozenRoles.roles.find(role => role.roleId === roleId);
+      if (!role) failure('resource_missing');
+      if (!this.roleItem(this.roleSnapshotItem(role), this.configuredToolNames(this.readSettings()), this.readOnlyToolNames()).available) failure('resource_dependency_missing');
+    };
+    if (name === 'subagent') {
+      const match = /^\/subagent ([a-z0-9]+(?:-[a-z0-9]+)*)[ \t]+([\s\S]+)$/.exec(input.text);
+      if (!match || !match[2]!.trim()) throw safeError('invalid_argument');
+      requireRole(match[1]!);
+      return ResourceInputPlanSchema.parse({ kind: 'subagent_command', resourceRef: null, dispatchText: input.text,
+        source: { name: 'subagent', roleId: match[1], task: match[2] } });
+    }
+    requireRole('medclaw-audit');
+    if (template.data === 'parallel-medclaw-review') requireRole('general-analyst');
+    if (!this.source.captureSubagentTemplate) failure('resource_missing');
+    const source = await this.source.captureSubagentTemplate(template.data!);
+    if (source.templateName !== template.data || source.file !== `subagent-prompts/${template.data}.md`) failure('resource_snapshot_invalid');
+    return ResourceInputPlanSchema.parse({ kind: 'subagent_template', resourceRef: null, dispatchText: input.text, source });
+  }
+  async listInputCommands(raw: InputCommandsListInput): Promise<InputCommandsList> {
+    const input = InputCommandsListInputSchema.parse(raw); this.session(input.sessionId);
+    const catalog = await this.list({ source: 'selection', sessionId: input.sessionId }), items: InputCommandsList['items'] = [];
+    for (const item of catalog.items.filter(item => item.ref.kind === 'skill' && item.enabled)) items.push({ group: 'skills', id: resourceRefKey(item.ref), command: `/skill:${item.ref.id}`,
+      description: item.description ?? item.ref.id, available: item.availability === 'ready', reasons: item.diagnostics.map(item => item.reason), registered: false, owner: null });
+    for (const item of catalog.items.filter(item => item.ref.kind === 'prompt' && item.enabled)) items.push({ group: 'prompt_templates', id: resourceRefKey(item.ref), command: `/${item.ref.id}`,
+      description: item.description ?? item.ref.id, available: item.availability === 'ready', reasons: item.diagnostics.map(item => item.reason), registered: false, owner: null });
+    const roles = this.roleSource ? await this.listSubagents({ source: 'selection', sessionId: input.sessionId }) : null;
+    if (roles) {
+      for (const role of roles.items) items.push({ group: 'subagents', id: role.roleId, command: `/subagent ${role.roleId}`,
+        description: role.description ?? role.roleId, available: role.available, reasons: role.reasons, registered: false, owner: null });
+    }
+    for (const name of SubagentTemplateNameSchema.options) {
+      let available = false; const reasons: string[] = [];
+      try { if (!this.source.captureSubagentTemplate) failure('resource_missing'); await this.source.captureSubagentTemplate(name); available = true; }
+      catch { reasons.push('resource_unavailable'); }
+      for (const roleId of name === 'parallel-medclaw-review' ? ['medclaw-audit', 'general-analyst'] : ['medclaw-audit']) {
+        const role = roles?.items.find(item => item.roleId === roleId);
+        if (!role?.available) { available = false; reasons.push(`role_unavailable:${roleId}`); }
+      }
+      items.push({ group: 'prompt_templates', id: name, command: `/${name}`, description: name === 'medclaw-evidence-review' ? 'Delegate read-only evidence review' : 'Delegate complementary evidence reviews', available, reasons, registered: false, owner: null });
+    }
+    items.push({ group: 'extension_commands', id: 'subagent', command: '/subagent', description: 'Delegate to a named read-only role', available: !!this.roleSource, reasons: this.roleSource ? [] : ['resource_unavailable'], registered: false, owner: null });
+    return InputCommandsListSchema.parse({ items });
   }
 }

@@ -167,7 +167,7 @@ test('p9 persisted history event records its original version and leaf, never pr
 test('p9 safe errors and actual runner registration expose this stage', () => {
   expect(safeError('answer_evidence_invalid')).toMatchObject({ code: 'answer_evidence_invalid', category: 'runtime', retryable: false });
   for (const reason of ['checkpoint_invalid', 'history_version_mismatch', 'session_restore_failed'] as const) expect(safeError('state_conflict', undefined, { reason })).toMatchObject({ reason });
-  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p17-v2'); expect(DATABASE_SCHEMA_VERSION).toBe(16);
+  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p17-v3'); expect(DATABASE_SCHEMA_VERSION).toBe(17);
   expect(discoverTests('unit', 'P9')).toContain(join(import.meta.dir, 'p9-memory.test.ts'));
 });
 

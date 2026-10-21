@@ -41,7 +41,7 @@ for (const limit of [2, 3]) {
   });
 }
 
-async function routedFixture(mode: 'rule' | 'classify' | 'verify' | 'http' | 'json' | 'ood' | 'unsupported' | 'missing' | 'stop_classify' | 'multi',options?:{prediction?:IntentResult;intents?:IntentItem[];respond?:Parameters<typeof agentRuntimeFixture>[0];allowMain?:boolean}) {
+async function routedFixture(mode: 'rule' | 'classify' | 'verify' | 'http' | 'json' | 'ood' | 'unsupported' | 'missing' | 'stop_classify' | 'multi',options?:{prediction?:IntentResult;intents?:IntentItem[];respond?:Parameters<typeof agentRuntimeFixture>[0];allowMain?:boolean;subagents?:boolean}) {
   let chats = 0;const intentRequests:IntentStageInput[]=[];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     const path = new URL(request.url).pathname;
@@ -67,7 +67,7 @@ async function routedFixture(mode: 'rule' | 'classify' | 'verify' | 'http' | 'js
   } });
   const f = await agentRuntimeFixture(options?.respond??(mode==='multi'?(index=>index===1?{role:'assistant',tool_calls:['s1','s2'].map((stepId,index)=>({index,id:`intent-step-${stepId}`,type:'function',
     function:{name:'query_intent_step',arguments:JSON.stringify({stepId,part:0})}}))}:{role:'assistant',content:'ENGINEERING completed both validated steps.'}):undefined), false, undefined, { client: new OllamaIntentClient({ classify: CLASSIFY_PROMPT, verify: VERIFY_PROMPT }),
-    configuration: IntentModelConfigurationSchema.parse({ ...disabledIntentModel(), enabled: true, baseUrl: `http://127.0.0.1:${server.port}`,  verifiedEvidenceRef: 'ENGINEERING' }) });
+    configuration: IntentModelConfigurationSchema.parse({ ...disabledIntentModel(), enabled: true, baseUrl: `http://127.0.0.1:${server.port}`,  verifiedEvidenceRef: 'ENGINEERING' }) },options?.subagents);
   // Exercise the retained v3 Agent path; P15 tests independently exercise new v4 program execution.
   const freeze=f.intentService!.freeze.bind(f.intentService);
   f.intentService!.freeze=(selection,...args)=>freeze({...selection,policyVersion:'medclaw.intent-policy/v3'},...args);
@@ -93,6 +93,28 @@ function sessionsFor(f:Awaited<ReturnType<typeof routedFixture>>) {
   return new SessionService('host',f.repos,f.agent,(input,context)=>f.app.runs.submitAgent(input,context),()=>f.app.runs.activeHandle,
     sessionId=>f.app.runs.readInputControl(sessionId),(inputId,context)=>f.app.runs.cancelInput(inputId,context),f.app.runs,SqliteWriteTransactions.forDatabase(f.db));
 }
+
+test('p13 P14 agent route may delegate read-only analysis while validated queries and final Answer remain on the parent',async()=>{
+  const f=await routedFixture('multi',{subagents:true,respond:index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'intent-helper',type:'function',
+    function:{name:'Agent',arguments:JSON.stringify({prompt:'Independently check the supplied comparison reasoning.',description:'Check reasoning',subagent_type:'general-analyst'})}}]}:
+    index===2?{role:'assistant',content:'ENGINEERING independent analysis; verify against the actual queries.'}:
+    index===3?{role:'assistant',tool_calls:['s1','s2'].map((stepId,index)=>({index,id:'parent-step-'+stepId,type:'function',function:{name:'query_intent_step',arguments:JSON.stringify({stepId,part:0})}}))}:
+    {role:'assistant',content:'ENGINEERING parent verified the two results and adopted its answer.'}});
+  try{
+    const accepted=await f.app.runs.submitAgent(f.request,{instanceId:'host',operationRef:'intent-with-helper'});if(!accepted.ok)throw accepted.error;
+    await f.settle();const root=accepted.data.runId!;
+    expect(f.repos.read({runId:root})).toMatchObject({kind:'one',run:{status:'completed'}});
+    const child=f.db.query<{id:number;status:string},[number]>("SELECT id,status FROM runs WHERE parent_run_id=?").get(root);
+    expect(child).toMatchObject({status:'completed'});
+    expect(f.db.query('SELECT id FROM queries WHERE run_id=?').all(root)).toHaveLength(2);
+    expect(f.db.query('SELECT id FROM queries WHERE run_id=?').all(child!.id)).toHaveLength(0);
+    expect(f.db.query('SELECT id FROM answers WHERE run_id=?').all(child!.id)).toHaveLength(0);
+    expect(f.db.query('SELECT id FROM answers WHERE run_id=?').all(root)).toHaveLength(1);
+    expect(f.repos.readIntent({runId:root})?.execution).toMatchObject({finalHistorySaved:true,stepResults:[{stepId:'s1'},{stepId:'s2'}]});
+    const childTools=f.requests[1]!.tools as unknown[]|undefined;expect(childTools??[]).toEqual([]);
+    expect(f.requests).toHaveLength(4);
+  }finally{await f.close();}
+},20_000);
 function nextRequest(f:Awaited<ReturnType<typeof routedFixture>>,text=f.request.text) {
   const workspace=f.repos.readWorkspace();
   return {...f.request,text,clientSequence:f.repos.readSession(1)!.nextSubmissionSequence,expectedRevision:workspace.revision,
@@ -553,7 +575,7 @@ test('p14 actual multi-intent root uses one Agent, bound step queries and a nati
     expect(f.requests).toHaveLength(2);expect(read.run.cleanup?.budgetSummary?.modelCalls).toBe(3);
     expect(JSON.stringify(f.requests[0]!.messages)).toContain('medclaw.intent-task/v1');
     const tools=f.requests[0]!.tools as {function:{name:string}}[];
-    expect(tools.some(tool=>tool.function.name==='query_intent_step')).toBe(true);expect(tools.some(tool=>tool.function.name==='Agent')).toBe(false);
+    expect(tools.some(tool=>tool.function.name==='query_intent_step')).toBe(true);expect(tools.some(tool=>tool.function.name==='Agent')).toBe(true);
     expect(f.db.query('SELECT id FROM runs WHERE parent_run_id=?').all(read.run.id)).toHaveLength(0);
     const queries=f.db.query<{id:number},[number]>('SELECT id FROM queries WHERE run_id=? ORDER BY id').all(read.run.id);
     expect(queries).toHaveLength(2);

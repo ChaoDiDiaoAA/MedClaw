@@ -13,7 +13,7 @@ const run = { datasetId: 'medclaw-agent-v1', selection: 'smoke' as const, trials
 async function setup(mode = 'normal', notify?: (notice: EvaluationNotice) => void) {
   const root = await mkdtemp(join(tmpdir(), 'medclaw-p16-main-'));
   const control = { instanceId: 'production-instance', activeRootRun: null, acceptingNewRuns: true, blockReasons: [] as ReturnType<typeof safeError>[], budget: null };
-  const hostView: HostView = { instanceId: control.instanceId, state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion: 16, error: null };
+  const hostView: HostView = { instanceId: control.instanceId, state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion: 17, error: null };
   let checkpoint: unknown = null;
   const production = { read: () => hostView, request: async (method: string): Promise<Result<unknown>> => {
     if (method === 'run.control.read') return { ok: true, data: control };

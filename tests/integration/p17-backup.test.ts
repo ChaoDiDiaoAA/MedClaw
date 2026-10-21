@@ -40,7 +40,7 @@ async function backupFixture(withQuery = false) {
   writeFileSync(join(sourceRoot, 'data/settings.json'), JSON.stringify({ ...settings, configVersion: '9007199254740993', credentialRefs: { openai: 'secret-ref' } }));
   writeFileSync(join(sourceRoot, 'data/credentials.enc.json'), 'DO NOT BACK UP');
   mkdirSync(join(directory, 'installation')); const installManifestPath = join(directory, 'installation/install.json');
-  writeFileSync(installManifestPath, JSON.stringify({ contract: 'medclaw.install/v1', appVersion: '0.1.0', platform: 'win32', arch: 'x64', sdkVersion: '0.87.1', bunVersion: '1.4.0', electronVersion: '44.5.1', protocolVersion: 'medclaw.host/p17-v2', schemaVersion: 16,
+  writeFileSync(installManifestPath, JSON.stringify({ contract: 'medclaw.install/v1', appVersion: '0.1.0', platform: 'win32', arch: 'x64', sdkVersion: '0.87.1', bunVersion: '1.4.0', electronVersion: '44.5.1', protocolVersion: 'medclaw.host/p17-v3', schemaVersion: 17,
     hostEntry: 'runtime/apps/host/src/main.ts', maintenanceEntry: 'runtime/apps/host/src/maintenance.ts', resourceRoot: 'runtime/resources', resources: [], plugins: [], binaries: [{ name: 'bun', version: '1.4.0', source: 'ENGINEERING fixture', path: 'bin/bun.exe' }] }));
   const input = { operationRef: 'backup-original', sourceRoot, destinationRoot, installManifestPath, validateHistory: validateNativeHistory };
   return { directory, sourceRoot, destinationRoot, database, memory, repo, session, artifactId, query, input, close() { database.close(); rmSync(directory, { recursive: true, force: true }); } };
@@ -347,15 +347,15 @@ test('snapshot validation reads the committed WAL and rejects a changed schema w
     const before = source.query('SELECT * FROM schema_migrations ORDER BY version').all();
     const reader = new Database(path, { readonly: true, strict: true });
     try {
-      expect(() => validateDatabaseSnapshot(reader, 16)).not.toThrow();
-      expect(() => validateDatabaseSnapshot(reader, 15)).toThrow('storage_migration_failed');
+      expect(() => validateDatabaseSnapshot(reader, 17)).not.toThrow();
+      expect(() => validateDatabaseSnapshot(reader, 16)).toThrow('storage_migration_failed');
       reader.query('VACUUM INTO ?').run(join(root, 'snapshot.sqlite'));
     } finally { reader.close(); }
     const snapshot = new Database(join(root, 'snapshot.sqlite'), { strict: true });
     try {
       expect(snapshot.query('SELECT * FROM schema_migrations ORDER BY version').all()).toEqual(before);
       snapshot.exec('CREATE TABLE unexpected(value TEXT) STRICT');
-      expect(() => validateDatabaseSnapshot(snapshot, 16)).toThrow('storage_migration_failed');
+      expect(() => validateDatabaseSnapshot(snapshot, 17)).toThrow('storage_migration_failed');
       expect(snapshot.query("SELECT name FROM sqlite_schema WHERE name='unexpected'").get()).not.toBeNull();
     } finally { snapshot.close(); }
     expect(source.query('SELECT * FROM schema_migrations ORDER BY version').all()).toEqual(before);
@@ -369,7 +369,7 @@ test('a stopped-root backup preserves WAL history branches and reserved files, a
   try {
     const original = await f.memory.load(f.session.id), signal = new AbortController().signal;
     const receipt = await createBackup(f.input, signal), path = join(f.destinationRoot, 'MedClaw-backup-backup-original');
-    expect(receipt).toMatchObject({ operationRef: 'backup-original', kind: 'create', state: 'completed', schemaVersion: 16, sdkVersion: '0.87.1' });
+    expect(receipt).toMatchObject({ operationRef: 'backup-original', kind: 'create', state: 'completed', schemaVersion: 17, sdkVersion: '0.87.1' });
     expect(await readBackup(path, 'backup-original')).toEqual(receipt);
     expect(await createBackup(f.input, signal)).toEqual(receipt);
     const snapshot = new Database(join(path, 'data/app.sqlite'), { readonly: true, strict: true });

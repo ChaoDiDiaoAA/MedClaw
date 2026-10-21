@@ -26,16 +26,17 @@ import { ReadSessionMessagesRequestSchema, SessionMessagePageSchema } from "./me
 import { ReadContextInputSchema, ContextReadResultSchema } from './context';
 import { ReadSessionCheckpointsInputSchema, RestoreSessionCheckpointInputSchema, SessionCheckpointPageSchema, SessionCheckpointReceiptSchema, RestoreSessionInputSchema } from './session';
 import { CompactSessionInputSchema, ReadCompactionInputSchema, CompactionOperationViewSchema, CancelCompactionResultSchema, CompactionPhaseSchema } from './session';
-import { ResourceListInputSchema, ResourceListSchema, ResourceSelectInputSchema, ResourceSelectionReceiptSchema, ResourceReadInputSchema, ResourceTextSchema } from './resources';
+import { InputCommandsListInputSchema, InputCommandsListSchema, ResourceListInputSchema, ResourceListSchema, ResourceSelectInputSchema, ResourceSelectionReceiptSchema, ResourceReadInputSchema, ResourceTextSchema } from './resources';
 import { ExtensionAssemblyProofSchema, ExtensionDescriptorSchema, ExtensionSelectionSchema, ExtensionStatusSchema, FrozenExtensionSummarySchema,
   ExtensionsReadInputSchema, ExtensionsSelectInputSchema, ExtensionsSelectResultSchema, ExtensionsCommandInputSchema } from './extensions';
+import { SubagentsListInputSchema, SubagentsListSchema, SubagentsReadInputSchema, SubagentsReadSchema, SubagentsSaveInputSchema } from './subagent';
 
 import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, EventSubscribeResultSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema } from './event';
 import { IntentBaseUrlSchema, IntentModelConfigurationSchema, IntentModelInspectionSchema, IntentReadResultSchema, ReadIntentInputSchema } from './intent';
 import { ExportDestinationSchema, ExportDestinationCopySchema, ExportCopyReceiptSchema, ExportReferenceSchema, ExportRequestSchema, ExportOperationSchema, ExportArtifactSchema, ExportListInputSchema, ExportListSchema, ActivityListInputSchema, ActivityListSchema } from './export';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p17-v2" as const;
-export const DATABASE_SCHEMA_VERSION = 16 as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p17-v3" as const;
+export const DATABASE_SCHEMA_VERSION = 17 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;
 export function isReadOnlyMethod(method: string): boolean {
@@ -122,6 +123,10 @@ export const publicMethodSchemas = {
   'resources.list': { input: ResourceListInputSchema, output: ResourceListSchema },
   'resources.select': { input: ResourceSelectInputSchema, output: ResourceSelectionReceiptSchema },
   'resources.read': { input: ResourceReadInputSchema, output: ResourceTextSchema },
+  'subagents.list': { input: SubagentsListInputSchema, output: SubagentsListSchema },
+  'subagents.read': { input: SubagentsReadInputSchema, output: SubagentsReadSchema },
+  'subagents.save': { input: SubagentsSaveInputSchema, output: SubagentsReadSchema },
+  'input.commands.list': { input: InputCommandsListInputSchema, output: InputCommandsListSchema },
   "context.read": { input: ReadContextInputSchema, output: ContextReadResultSchema },
   "event.read": { input: ReadEventsInputSchema, output: EventPageSchema },
   "event.subscribe": { input: EventSubscribeInputSchema, output: EventSubscribeResultSchema },
@@ -325,6 +330,10 @@ export const PublicHostRequestSchema = z.discriminatedUnion("method", [
   hostRequest('resources.list', publicMethodSchemas['resources.list'].input),
   hostRequest('resources.select', publicMethodSchemas['resources.select'].input),
   hostRequest('resources.read', publicMethodSchemas['resources.read'].input),
+  hostRequest('subagents.list', publicMethodSchemas['subagents.list'].input),
+  hostRequest('subagents.read', publicMethodSchemas['subagents.read'].input),
+  hostRequest('subagents.save', publicMethodSchemas['subagents.save'].input),
+  hostRequest('input.commands.list', publicMethodSchemas['input.commands.list'].input),
   hostRequest("context.read", publicMethodSchemas["context.read"].input),
   hostRequest("event.read", publicMethodSchemas["event.read"].input),
   hostRequest("event.subscribe", publicMethodSchemas["event.subscribe"].input),

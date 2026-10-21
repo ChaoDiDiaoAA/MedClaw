@@ -41,7 +41,8 @@ export async function withP13Plugin(action: (parent: AgentSession, trace: {
   }
   trace.extension = createManaged({ getMaxTurns: () => 4, async openSession(input) {
     trace.ids.push(input.pluginAgentId);
-    trace.events.push({ type: 'awaited_factory_enter', pluginAgentId: input.pluginAgentId, signalAborted: input.signal.aborted });
+    trace.events.push({ type: 'awaited_factory_enter', pluginAgentId: input.pluginAgentId, nativeToolCallId: input.nativeToolCallId,
+      roleId: input.roleId, signalAborted: input.signal.aborted });
     const child = await create(options.childFactory);
     trace.children.push(child);
     child.agent.streamFunction = () => { trace.childRequests++; return options.childResponse?.() ?? p12Response([{ type: 'text', text: 'ENGINEERING_CHILD_RESULT' }]); };

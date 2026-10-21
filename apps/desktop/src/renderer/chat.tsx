@@ -1,7 +1,7 @@
 import { errorMessage, safeError, type Result } from "../../../../packages/contracts/src/error";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { HostView, ModelChoice, ModelDirectoryView } from "../../../../packages/contracts/src/model";
-import type { ActiveRunView, RunView, RuntimeControlView } from "../../../../packages/contracts/src/run";
+import type { ActiveRunView, ReadRunResult, RunView, RuntimeControlView } from "../../../../packages/contracts/src/run";
 import type { InputMode, SessionDetail, SessionInput,CompactionOperationView } from "../../../../packages/contracts/src/session";
 import type { SessionCheckpoint, SessionCheckpointPage, SessionCheckpointReceipt, RestoreSessionCheckpointInput, RestoreSessionInput } from '../../../../packages/contracts/src/session';
 import type { WorkspaceChange, WorkspaceView } from "../../../../packages/contracts/src/workspace";
@@ -14,6 +14,35 @@ import { finalDisplaySource, resolveReadingAnchor, shouldRecordScroll, type Read
 import type { DirectoryReadStatus } from './models-page';
 import { QueryConditions } from './intent-panel';
 import { ResourceInput } from './resource-input';
+
+function SubagentTasks(props:{host:HostView;parentRunId:number;active:boolean;visible:boolean;revision:string;onDetails:(runId:number)=>void}){
+  const key=JSON.stringify([props.host.instanceId,props.host.state,props.parentRunId]),owner=useRef(key);owner.current=key;
+  const order=useRef(0),stops=useRef(new Set<number>());
+  const [view,setView]=useState<{key:string;data:Extract<ReadRunResult,{kind:'recent'}>}|null>(null),[notice,setNotice]=useState<string|null>(null),[stopping,setStopping]=useState<number[]>([]);
+  const children=view?.key===key?view.data.runs.filter(child=>child.kind==='child'):[];
+  async function read(){
+    if(!props.visible||props.host.state!=='ready')return;const target=key,sequence=++order.current;
+    try{const result=await window.medclaw.request('run.read',{recent:true,parentRunId:props.parentRunId,limit:20});if(owner.current!==target||sequence!==order.current)return;
+      if(!result.ok){setNotice(errorMessage(result.error));return;}
+      if(result.data.kind!=='recent'||result.data.runs.some(child=>child.kind!=='child'||child.parentRunId!==props.parentRunId))throw new Error('Child owner mismatch');
+      setView({key:target,data:result.data});
+    }catch{if(owner.current===target)setNotice('Subagent facts are unconfirmed. Refresh subagents.');}
+  }
+  useEffect(()=>{setNotice(null);void read();if(props.active&&props.visible){const timer=setInterval(()=>void read(),1000);return()=>clearInterval(timer);}},[key,props.visible,props.active,props.revision]);
+  useEffect(()=>()=>{owner.current='unmounted';},[]);
+  async function stop(childRunId:number){
+    if(!props.active||stops.current.has(childRunId))return;const target=key;stops.current.add(childRunId);setStopping([...stops.current]);setNotice(null);
+    try{const result=await window.medclaw.request('run.cancel',{runId:childRunId});if(owner.current!==target)return;
+      if(!result.ok)setNotice(errorMessage(result.error));else if(result.data.runId!==childRunId)throw new Error('Child cancellation owner mismatch');else if(!result.data.stopped||result.data.persistencePending)setNotice('Child cancellation requested. Stop and saving remain unconfirmed.');
+      await read();
+    }catch{if(owner.current===target)setNotice('Child cancellation is unconfirmed. Read the original subagent facts.');}
+    finally{stops.current.delete(childRunId);setStopping([...stops.current]);}
+  }
+  return <section aria-label="Chat subagent tasks" data-testid="chat-subagent-tasks"><div className="section-heading"><h3>Subagent tasks · Parent Run {props.parentRunId}</h3><button onClick={()=>void read()} disabled={props.host.state!=='ready'}>Refresh subagents</button></div>
+    {children.map(child=><article className="call-summary" key={child.id} data-testid="chat-subagent-card" data-child-run-id={child.id}><strong>{child.role?.roleId??'Role not recorded'} · Run {child.id}</strong><p>{child.status} · Parent ToolCall {child.originToolCallId} · Child Session {child.sessionId}</p><p className="tiny muted">Execution stopped: {child.cleanupSummary?.stopConfirmed===true?'Confirmed':'Unconfirmed'} · Result committed: {child.delivery?.resultRecorded?'Confirmed':'Unconfirmed'} · Parent receipt: {child.delivery?.sdkReturned?'Saved':'Unconfirmed'} · Parent consumption: {child.delivery?.consumptionEvidence==='provider_input_verified'?'Verified':'Unconfirmed'}</p><div className="actions"><button onClick={()=>props.onDetails(child.id)}>View Subagent Run {child.id}</button><button disabled={!props.active||props.host.state!=='ready'||stopping.includes(child.id)||child.cleanupSummary?.stopConfirmed===true||!!child.cancelRequestedAt} onClick={()=>void stop(child.id)}>Stop Subagent Run {child.id}</button></div></article>)}
+    {notice&&<p role="status">{notice}</p>}
+  </section>;
+}
 
 // Each public page stays bounded; the displayed collection is independent of that DTO.
 type MessageAvailability = { available: boolean; hasPage: boolean; hasHistory: boolean; hasMore: boolean; unavailable: boolean; runCovered: boolean };
@@ -290,7 +319,7 @@ export function Chat(props: { executionBlockReason?:string|null;compactionProgre
   onNewAttempt: (pending: NonNullable<SessionDraft['pending']>) => void;
   onResumeCheckpoint:(input:RestoreSessionCheckpointInput,operationRef:string)=>Promise<Result<SessionCheckpointReceipt>>;
   onRestoreSession:(input:RestoreSessionInput)=>Promise<Result<SessionDetail>>;onHistoryVerified:(sessionId:number,operationRef?:string)=>Promise<void>;
-  onLookup: () => void; onStop: () => void; onModels: () => void; workspace: WorkspaceView | null; workspaceConfirmed: boolean; workspacePending?: boolean; workspaceRecovery?: 'verify' | 'restart' | null; onVerifyWorkspace?: () => void; onWorkspace: (change: WorkspaceChange) => Promise<boolean>;
+  onLookup: () => void; onStop: () => void; onModels: () => void; onManageAgents:()=>void;onChildDetails:(runId:number)=>void;workspace: WorkspaceView | null; workspaceConfirmed: boolean; workspacePending?: boolean; workspaceRecovery?: 'verify' | 'restart' | null; onVerifyWorkspace?: () => void; onWorkspace: (change: WorkspaceChange) => Promise<boolean>;
   dataDefaults: { batchCount: number; referenceDate: string | null; timezone: string | null } | null;
   queueRun: RunView | null; queueRootInput: SessionInput | null; frozenInput?: SessionInput | null; frozenRunId?: number; inputs: InputQueueSnapshot | null; cancellingInputs: number[];
   onRefreshInputs: () => void; onMoreInputs: () => void; onCancelInput: (input: SessionInput) => void;
@@ -322,6 +351,7 @@ export function Chat(props: { executionBlockReason?:string|null;compactionProgre
     && candidateRun.cleanup?.requiredPersistenceComplete === true && currentAvailability?.hasPage
     && !currentAvailability.hasMore && !currentAvailability.runCovered;
   const run = offBranch ? null : candidateRun;
+  const parentRun=run?.kind==='agent'?run:props.queueRun?.kind==='agent'&&props.queueRun.sessionId===props.sessionId?props.queueRun:null;
   const readingKey = props.sessionId === null ? null : `${props.sessionId}:${candidateRun?.id ?? 'history'}:chat`;
   const inputControl = props.session?.session.inputControl, queueRun = props.queueRun, original = props.queueRootInput?.workspaceContext;
   const mode: InputMode = inputControl ? draft?.mode ?? 'send' : 'send';
@@ -441,6 +471,7 @@ export function Chat(props: { executionBlockReason?:string|null;compactionProgre
             {props.preview?.truncated && <p className="muted">The live preview was truncated. Read the full saved output in Run details.</p>}
             {showRunBody && run.output.nextOffset !== null && !props.preview && <p className="muted">Showing {run.output.text.length} / {run.output.totalChars} characters. Read the full output in Run details.</p>}
             {run.error && <p role="alert" className="error-text">{errorMessage(run.error)}</p>}</article></>}
+        {parentRun&&<SubagentTasks host={props.host} parentRunId={parentRun.id} active={props.active?.runId===parentRun.id} visible={props.visible} revision={parentRun.status} onDetails={props.onChildDetails}/>}
         <QueryConditions sessionId={props.sessionId} context={props.session?.currentQueryContext}/>
         <SessionCheckpoints host={props.host} session={props.session} workspace={props.workspace} visible={props.visible} blocked={!!props.executionBlockReason||props.selecting||props.sending||!props.workspaceConfirmed||!!props.draft?.pending||props.control?.acceptingNewRuns!==true||props.host.state!=='ready'} onResumeCheckpoint={props.onResumeCheckpoint} onRestoreSession={props.onRestoreSession} onHistoryVerified={props.onHistoryVerified}/>
         <SessionCompaction host={props.host} session={props.session} model={choice??null} visible={props.visible} control={props.control} blockedReason={props.executionBlockReason??(props.selecting||props.sending||!props.workspaceConfirmed||props.draft?.pending?'Verify the current session and original input first.':!props.session?'Create or select a session.':props.session.runtime.availability==='blocked'?'Restore the session before compacting.':sendReason)} onHistoryVerified={props.onHistoryVerified} onRestoreSession={props.onRestoreSession}/>
@@ -464,7 +495,7 @@ export function Chat(props: { executionBlockReason?:string|null;compactionProgre
       {props.active && <p className="tiny muted">Model changes apply to the next message. The current run uses its frozen configuration.</p>}
       <label>Message routing<select aria-label="Message routing" value={draft?.routing?.mode === 'intent' ? 'intent' : 'main_agent'} disabled={!draft || !!draft.pending || props.sending || mode !== 'send' || !props.directoryCurrent} onChange={event => props.onDraft({ routing: event.target.value === 'intent' ? { mode: 'intent', originRunId: null } : null })}><option value="intent">Intent routing</option><option value="main_agent">Main Agent</option></select></label>
       {mode !== 'send' && queueRun && <p className="tiny muted">Queueing for original Run {queueRun.id} · {queueRun.model.provider} / {queueRun.model.modelId} · {queueRun.referenceDate} · {queueRun.timezone}</p>}
-      <ResourceInput host={props.host} source={mode!=='send'&&inputControl?{source:'run',runId:inputControl.runId}:props.sessionId?{source:'selection',sessionId:props.sessionId}:null} configVersion={props.directory?.configVersion} visible={props.visible} value={draft?.text??''} disabled={!draft||!!draft.pending||props.selecting} onChange={text=>props.onDraft({text})} canSend={!reason&&!props.sending} onSend={props.onSend}/>
+      <ResourceInput host={props.host} source={mode!=='send'&&inputControl?{source:'run',runId:inputControl.runId}:props.sessionId?{source:'selection',sessionId:props.sessionId}:null} configVersion={props.directory?.configVersion} visible={props.visible} value={draft?.text??''} disabled={!draft||!!draft.pending||props.selecting} onChange={text=>props.onDraft({text})} canSend={!reason&&!props.sending} onSend={props.onSend} onManageAgents={props.onManageAgents}/>
       <div className="composer-bottom"><span className="tiny muted">Shift+Enter for a new line</span><div className="actions">
         {draft?.pending && <><button disabled={props.sending} onClick={props.onLookup}>Read original submission</button><button disabled={props.sending || !draft.resendConfirmed || !props.workspaceConfirmed || props.selecting || (draft.pending.input.mode === 'send' ? !props.control?.acceptingNewRuns : !inputControl?.acceptingInputs || inputControl.runId !== draft.pending.input.targetRunId)} onClick={props.onResend}>Resend original submission</button>{draft.confirmedFailure && <button disabled={props.sending || props.selecting || props.host.state !== 'ready' || !props.workspaceConfirmed} onClick={() => props.onNewAttempt(draft.pending!)}>Start a new attempt</button>}</>}
         {props.active && <><button className="danger" disabled={props.host.state !== "ready"} onClick={props.onStop}>Stop generating</button><span className="tiny" data-testid="stop-target">Stops {props.active.sessionId ? `Session ${props.active.sessionId}` : 'Provider'} · Run {props.active.runId}</span></>}

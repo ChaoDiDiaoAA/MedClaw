@@ -105,8 +105,8 @@ test('p14 event replay verifies saved identities and facts before appending any 
 });
 
 test('p14 Host negotiates the P14 protocol and schema13 explicitly', () => {
-  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p17-v2');
-  expect(DATABASE_SCHEMA_VERSION).toBe(16);
+  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p17-v3');
+  expect(DATABASE_SCHEMA_VERSION).toBe(17);
 });
 
 test('p14 failures keep registered user-visible causes without authorizing automatic retry', () => {

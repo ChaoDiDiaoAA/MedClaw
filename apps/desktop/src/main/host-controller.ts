@@ -359,7 +359,7 @@ export class HostController {
   async stop(expectedInstanceId: string, requireIdle = false): Promise<HostView> {
     if (expectedInstanceId !== this.view.instanceId) throw new Error("host_protocol_mismatch");
     const child = this.child;
-    if (!child) return this.read();
+    if (!child) { await this.exited; return this.read(); }
     const exited = this.exited;
     if (this.view.error?.code === 'maintenance_busy') this.view.error = null;
     this.view.state = "stopping"; this.status(); this.preview = null; this.clearStreams();

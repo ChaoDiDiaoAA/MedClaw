@@ -4,6 +4,7 @@ import { parseHostStartupFailure } from '../../packages/logging/src/host-startup
 import { EvaluationPathsSchema } from '../../packages/contracts/src/evaluation';
 import { HostViewSchema } from '../../packages/contracts/src/model';
 import { RunCleanupRecordSchema } from '../../packages/contracts/src/run';
+import { InstallManifestSchema, RestoreRecordSchema } from '../../packages/contracts/src/maintenance';
 import { DesktopMethodSchema, desktopMethodSchemas, HostHelloSchema, HOST_PROTOCOL_VERSION,
   PublicHostRequestSchema, isDesktopReadOnlyMethod } from '../../packages/contracts/src/protocol';
 
@@ -57,7 +58,7 @@ test('completed restore receipts require their saved configuration version and f
   expect(DesktopMethodSchema.safeParse('backup.restore').success).toBe(true);
   const output = desktopMethodSchemas[DesktopMethodSchema.parse('backup.restore')].output;
   const receipt = { operationRef, kind: 'restore', state: 'completed', appVersion: '0.1.0',
-    schemaVersion: 16, sdkVersion: '0.87.1', restoredAt: at, configVersion: '24' };
+    schemaVersion: 17, sdkVersion: '0.87.1', restoredAt: at, configVersion: '24' };
   expect(output.safeParse(receipt).success).toBe(true);
   expect(output.safeParse({ ...receipt, configVersion: 'arbitrary-uuid' }).success).toBe(false);
   expect(output.safeParse({ ...receipt, sdkVersion: '0.87.2' }).success).toBe(false);
@@ -67,7 +68,7 @@ test('completed restore receipts require their saved configuration version and f
 
 test('Host status preserves old records while keeping unconfirmed shutdown explicitly unknown', () => {
   const host = { instanceId: 'h', state: 'stopping', canStart: false, sdkVersion: '0.87.1',
-    schemaVersion: 16, error: null };
+    schemaVersion: 17, error: null };
   expect(HostViewSchema.parse(host)).not.toHaveProperty('shutdown');
   const shutdown = { executionStopped: null, requiredPersistenceComplete: null, databaseClosed: null,
     processExited: true, processTreeStopped: null, error: null };
@@ -87,16 +88,34 @@ test('run cleanup accepts an explicit owner-bound stop proof without inventing o
 });
 
 test('the P17 handshake accepts trusted resource roots and rejects old or mismatched SDK frames', () => {
-  const hello = { protocolVersion: 'medclaw.host/p17-v2', instanceId: 'h', startupToken: 'start-1',
-    sdkVersion: '0.87.1', expectedSchemaVersion: 16, resourceRoot: 'C:/Program Files/MedClaw/resources',
+  const hello = { protocolVersion: 'medclaw.host/p17-v3', instanceId: 'h', startupToken: 'start-1',
+    sdkVersion: '0.87.1', expectedSchemaVersion: 17, resourceRoot: 'C:/Program Files/MedClaw/resources',
     installManifestPath: 'C:/Program Files/MedClaw/install.json',
     paths: { dataRoot: 'C:/用户/Med Claw', databasePath: 'C:/用户/Med Claw/data/app.sqlite',
       settingsPath: 'C:/用户/Med Claw/data/settings.json', cachePath: 'C:/用户/Med Claw/data/pi-model-cache.json',
       lockPath: 'C:/用户/Med Claw/runtime/host.lock' } };
   expect(HostHelloSchema.safeParse(hello).success).toBe(true);
+  for(const protocolVersion of ['medclaw.host/p17-v1','medclaw.host/p17-v2'])
+    expect(HostHelloSchema.safeParse({...hello,protocolVersion,expectedSchemaVersion:16}).success).toBe(false);
   expect(HostHelloSchema.safeParse({ ...hello, protocolVersion: 'medclaw.host/p15-v4' }).success).toBe(false);
   expect(HostHelloSchema.safeParse({ ...hello, sdkVersion: '0.87.2' }).success).toBe(false);
   expect(HostHelloSchema.safeParse({ ...hello, resourceRoot: '../source' }).success).toBe(false);
+});
+
+test('current installation requires schema17 while saved schema16 restore records remain readable', () => {
+  const installation={contract:'medclaw.install/v1',appVersion:'0.1.0',platform:'win32',arch:'x64',sdkVersion:'0.87.1',
+    bunVersion:'1.4.0',electronVersion:'44.5.1',protocolVersion:'medclaw.host/p17-v3',schemaVersion:17,
+    hostEntry:'runtime/apps/host/src/main.ts',maintenanceEntry:'runtime/apps/host/src/maintenance.ts',resourceRoot:'runtime/resources',
+    resources:[],plugins:[],binaries:[{name:'bun',version:'1.4.0',source:'ENGINEERING',path:'bin/bun.exe'}]};
+  const record={request:{kind:'restore',sourceBackup:'C:/backup',targetRoot:'C:/restored'},sourceOperationRef:'old-backup',installation,
+    receipt:{operationRef,kind:'restore',state:'completed',appVersion:'0.1.0',schemaVersion:17,sdkVersion:'0.87.1',restoredAt:at,configVersion:'2'}};
+  expect(InstallManifestSchema.safeParse(installation).success).toBe(true);
+  expect(RestoreRecordSchema.safeParse(record).success).toBe(true);
+  for(const protocolVersion of ['medclaw.host/p17-v1','medclaw.host/p17-v2']){
+    const legacy={...installation,protocolVersion,schemaVersion:16};
+    expect(InstallManifestSchema.safeParse(legacy).success).toBe(false);
+    expect(RestoreRecordSchema.safeParse({...record,installation:legacy,receipt:{...record.receipt,schemaVersion:16}}).success).toBe(true);
+  }
 });
 
 test('installed evaluation roots preserve legacy callers and reject relative private material roots', () => {

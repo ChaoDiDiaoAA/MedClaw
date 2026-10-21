@@ -58,7 +58,7 @@ async function setup() {
   invoke = async (name, envelope) => handlers.get(name)!({ sender: { id: 10, mainFrame }, senderFrame: mainFrame }, envelope);
   await import('../../apps/desktop/src/preload/index.ts');
   const client = bridge;
-  try { expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion:16 }); }
+  try { expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion:17 }); }
   catch (error) {
     // Cleanup failures must not replace the original setup failure.
     try { const state = host.read(); if (state.instanceId && !state.canStart) await host.stop(state.instanceId); } catch {}

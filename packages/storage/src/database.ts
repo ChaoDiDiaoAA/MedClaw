@@ -2,10 +2,11 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { SCHEMA_VERSION, migrationSql, validateDatabaseSchema as validate } from './schema-validation';
+import { SCHEMA_VERSION, SCHEMA17_MIGRATION_MARKER, migrationSql, validateDatabaseSchema as validate } from './schema-validation';
 export { SCHEMA_VERSION } from './schema-validation';
 
-const migrations = migrationSql.map(sql => {
+const migrations = migrationSql.map((sql, index) => {
+  if (index === 16) return { sql: sql.toString('utf8'), checksum: SCHEMA17_MIGRATION_MARKER, checksums: [SCHEMA17_MIGRATION_MARKER] };
   // Git checkout newline conversion changes byte hashes without changing SQL.
   // Accept only these two forms of the current content; retain stored identities.
   const lf = sql.toString("utf8").replaceAll("\r\n", "\n");
@@ -324,6 +325,13 @@ export function openDatabase(path: string, beforeMigrationCommit?: (phase?: stri
           db.query('INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(16,?,?)').run(migrations[15]!.checksum,new Date().toISOString());
         }).immediate();
       } finally { db.exec('PRAGMA foreign_keys=ON'); if(db.query<{foreign_keys:number},[]>('PRAGMA foreign_keys').get()?.foreign_keys !== 1) throw new Error('storage_migration_failed'); }
+    }
+    if (version <= 16) {
+      db.transaction(() => {
+        db.exec(migrations[16]!.sql);
+        validate(db, 17); beforeMigrationCommit?.('p13_parallel_marker');
+        db.query('INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(17,?,?)').run(migrations[16]!.checksum, new Date().toISOString());
+      }).immediate();
     }
     validate(db, SCHEMA_VERSION);
     return db;

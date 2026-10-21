@@ -22,7 +22,7 @@ test('p8 real Host reads original Context across navigation without requests or 
   contexts.recordDelivery({runId:f.input.runId,sessionId:f.input.sessionId,inputId:f.input.inputId,callId:'host-call',snapshotId:snapshot.id,observation:{contract:'medclaw.context-observation/v1',api:'openai-completions',transport:'sse',httpStatus:200,observedAt:contextAt,verifiedNativeRefs:[]}}); db.close();
   const sql = (query:string) => {const read = new Database(host.paths.databasePath,{readonly:true});try{return read.query(query).all();}finally{read.close();}};
   try {
-    expect(await host.start()).toMatchObject({state:'ready',schemaVersion:16});
+    expect(await host.start()).toMatchObject({state:'ready',schemaVersion:17});
     const workspace = unwrap(await host.request('workspace.read',{})) as {revision:number};
     unwrap(await host.request('session.create',{expectedWorkspaceRevision:workspace.revision},'browse-other'));
     const before = {runs:sql('SELECT * FROM runs'),calls:sql('SELECT * FROM model_calls'),snapshots:sql('SELECT * FROM context_snapshots'),deliveries:sql('SELECT * FROM context_deliveries'),events:sql('SELECT * FROM runtime_events')};

@@ -11,7 +11,8 @@ import { AppErrorSchema, safeError, type AppError } from "../../contracts/src/er
 import type { EventService } from './events/event-service.ts';
 import type { WriteTransactions } from '../../contracts/src/event';
 import { ResourceService } from './resources/resource-service';
-import type { ResourceSource } from '../../contracts/src/resources';
+import type { SubagentRoleSource } from '@medclaw/contracts/subagent';
+import { InputCommandsListInputSchema, InputCommandsListSchema, type InputCommandsListInput, type InputCommandsList, type ResourceSource } from '../../contracts/src/resources';
 import { ExtensionsReadResultSchema, type ExtensionsReadResult } from '../../contracts/src/protocol';
 import { ExtensionsReadInputSchema, ExtensionsCommandInputSchema, type ExtensionsReadInput, type ExtensionsCommandInput } from '../../contracts/src/extensions';
 import type { ExportServicePort } from '../../contracts/src/export';
@@ -28,8 +29,8 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
   private closing = false;
   private readonly intentAbort = new AbortController();
   private readonly intentInspections = new Set<Promise<IntentModelInspection>>();
-  constructor(readonly instanceId: string, private settings: PublishedSettings, readonly runtime: ModelRuntimePort<Resolved>, readonly repositories: RuntimeRunStore, private readonly scope: CredentialScope, startCall: ModelCallStarter, private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void = () => {}, private readonly agent?: AgentRuntimePort<Resolved,RunControl> & NativeSessionBindings, events?: Pick<EventService, 'notifyStream'>,transactions?:WriteTransactions, resourceSource?:ResourceSource, private readonly intents?:IntentRoutingDependencies, readonly exports: ExportServicePort | null = null) {
-    this.resources = resourceSource ? new ResourceService(() => this.settings, repositories, resourceSource, () => agent?.toolNames ?? []) : null;
+  constructor(readonly instanceId: string, private settings: PublishedSettings, readonly runtime: ModelRuntimePort<Resolved>, readonly repositories: RuntimeRunStore, private readonly scope: CredentialScope, startCall: ModelCallStarter, private readonly notice: (notice: RuntimeNotice) => void, private readonly report: (error: AppError) => void = () => {}, private readonly agent?: AgentRuntimePort<Resolved,RunControl> & NativeSessionBindings, events?: Pick<EventService, 'notifyStream'>,transactions?:WriteTransactions, resourceSource?:ResourceSource, private readonly intents?:IntentRoutingDependencies, readonly exports: ExportServicePort | null = null, roleSource?:SubagentRoleSource) {
+    this.resources = resourceSource ? new ResourceService(() => this.settings, repositories, resourceSource, () => agent?.toolNames ?? [], roleSource, () => agent?.readOnlyToolNames ?? []) : null;
     this.runs = new RuntimeService(instanceId, () => this.settings, runtime, repositories, scope, startCall, notice, report, agent,
       () => this.closing || this.exports?.busy === true || this.prepared !== null || this.refreshes.size > 0 || [...this.logins.values()].some(login => !login.view.endedAt), snapshot => events?.notifyStream(snapshot),transactions,this.resources ?? undefined,intents);
   }
@@ -37,6 +38,26 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
   get busy() { return this.runs.busy; }
   get persistencePending() { return this.runs.persistencePending; }
   get stopPending() { return this.runs.stopPending; }
+  async listInputCommands(raw: InputCommandsListInput): Promise<InputCommandsList> {
+    const input = InputCommandsListInputSchema.parse(raw);
+    if (!this.resources) throw safeError('resource_unavailable');
+    const directory = await this.resources.listInputCommands(input), run = this.runs.activeHandle;
+    const extensions = await this.readExtensions({ source: 'selection', sessionId: input.sessionId });
+    if (extensions.source === 'selection' && extensions.available) for (const name of extensions.available.commands) {
+      const proof = extensions.live, registered = proof?.state === 'active' && proof.callableCommands.includes(name);
+      directory.items.push({ group: 'extension_commands', id: name, command: '/' + name, description: 'Inspect the current tool-audit extension',
+        available: !!registered, reasons: registered ? [] : ['extension_not_active'], registered: !!registered,
+        owner: registered ? { instanceId: proof.instanceId, sessionId: proof.sessionId, runId: proof.runId, assemblyId: proof.assemblyId } : null });
+    }
+    const live = run?.sessionId === input.sessionId ? this.agent?.readInputCommands?.(run.runId) ?? [] : [];
+    for (const command of live) {
+      if (command.owner.instanceId !== this.instanceId || command.owner.sessionId !== input.sessionId || command.owner.runId !== run?.runId) throw safeError('state_conflict');
+      const found = directory.items.find(item => item.group === 'extension_commands' && item.id === command.name);
+      const item = { group: 'extension_commands' as const, id: command.name, command: '/' + command.name, description: command.description, available: true, reasons: [], registered: true, owner: command.owner };
+      if (found) Object.assign(found, item); else directory.items.push(item);
+    }
+    return InputCommandsListSchema.parse(directory);
+  }
   private extensionSession(sessionId: number) {
     const session=this.repositories.readSession(sessionId);
     if(!session)throw safeError('input_invalid',undefined,{reason:'session_not_found'});

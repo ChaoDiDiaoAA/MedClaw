@@ -130,7 +130,7 @@ bridgeTest('P17 Preload and Main grant a backup and read its original result whi
   const db = openDatabase(join(dataRoot, 'data/app.sqlite')); db.close();
   const settings = new MainSettings(join(dataRoot, 'data/settings.json')); settings.read();
   const operationRef = crypto.randomUUID(), files = new FileTokens();
-  let view: HostView = { instanceId: 'fixture-host', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion: 16, error: null }, hostRequests = 0;
+  let view: HostView = { instanceId: 'fixture-host', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion: 17, error: null }, hostRequests = 0;
   const host = { read: () => view, refreshStopProof: async () => {}, request: async (method: string) => {
     hostRequests++; expect(method).toBe('run.control.read');
     return { ok: true, data: { instanceId: view.instanceId, activeRootRun: null, acceptingNewRuns: true, blockReasons: [], budget: null } };

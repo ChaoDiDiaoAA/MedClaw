@@ -50,7 +50,7 @@ test('schema4_to_latest_preserves_old_rows_and_checksums_with_only_lifecycle_met
     expect(db.query<Record<string,unknown>,[]>(`SELECT * FROM ${n} ORDER BY id`).all()).toEqual(expected);
   }
   expect(db.query('SELECT * FROM schema_migrations ORDER BY version').all().slice(0,4)).toEqual(markers);
-  expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16].map(version=>({version})));
+  expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17].map(version=>({version})));
   expect(db.query('SELECT * FROM runtime_events').all()).toEqual([]);
   expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);expect(db.query('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
  }finally{db.close();rmSync(root,{recursive:true,force:true});}

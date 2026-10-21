@@ -11,7 +11,7 @@ import type { WorkspaceView, WorkspaceContext } from "./workspace";
 import { StoredToolConfigurationSchema, type ToolConfiguration } from './tool-config';
 import { RuntimeConfigurationSchema, type RuntimeConfiguration } from './runtime-config';
 import { ExtensionAssemblyProofSchema } from './extensions';
-import { ChildResultViewSchema } from './subagent';
+import { ChildResultViewSchema, SubagentRoleIdSchema } from './subagent';
 
 export const RunStatusSchema = z.enum(["created", "running", "completed", "failed", "cancelled"]);
 export const SdkStopReasonSchema = z.enum(["stop", "length", "toolUse", "error", "aborted", "deferred"]);
@@ -91,6 +91,7 @@ export const ChildRunViewSchema = z.strictObject({ ...runFields, kind: z.literal
   goal: z.literal('answer'), answerRef: z.null(), parentRunId: PositiveIdSchema, originToolCallId: PositiveIdSchema,
   pluginAgentId: OpaqueIdSchema, nativeSessionId: OpaqueIdSchema, childResult: z.lazy(() => ChildResultViewSchema).nullable(),
   originSnapshotId:PositiveIdSchema,parentInputId:PositiveIdSchema.nullable(),
+  role: z.lazy(() => z.strictObject({ roleId: SubagentRoleIdSchema, description: z.string().min(1).max(1024) })).optional(),
   calls: z.array(ModelCallViewSchema).max(50), nextCallOffset: z.number().int().nonnegative().safe().nullable(),
   delivery: z.strictObject({ resultRecorded: z.boolean(), sdkReturned: z.boolean(), nativeEntryId: OpaqueIdSchema.nullable(),
     sdkResultIsError:z.boolean().nullable(),nextModelCallId: OpaqueIdSchema.nullable(), consumedAt: TimestampSchema.nullable(),
@@ -204,6 +205,7 @@ export interface FinalProviderFact {
   cleanup?: RunCleanupRecord | { oldProcessExited?: boolean; observationGap?: boolean; previousInstanceId?: string; errors?: AppError[] } | null;
 }
 interface AgentStartCommon {
+  subagents?: import('./subagent').FrozenRunSubagents;
   intentAdmission?: import('./intent').FrozenIntentAdmission;
   extensions?: import('./extensions').FrozenRunExtensions;
   resources?: import('./resources').FrozenRunResources;
@@ -230,10 +232,13 @@ export type AgentRuntimePort<Resolved, Control = unknown> = {
   freezeExtensions?: (sessionId: number, settings: import('./model').PublishedSettings) => Promise<import('./extensions').FrozenRunExtensions>;
   readExtensionDescriptor?: () => Promise<import('./extensions').ExtensionDescriptor | null>;
   readExtensionCleanup?: (runId: number) => import('./extensions').ExtensionAssemblyProof | null;
+  readInputCommands?: (runId: number) => {name:string;description:string;owner:import('./extensions').ExtensionOwner}[];
   executeExtensionCommand?: (input: import('./extensions').ExtensionsCommandInput) => Promise<import('./extensions').ExtensionStatus>;
   compact?: (input: import('./session').CompactionExecutionInput<Resolved>, callbacks: import('./session').CompactionCallbacks) => Promise<import('./session').NativeCompactionObservation>;
   abortCompaction?: (sessionId: number, operationRef: string) => void;
   acknowledgeCompactionSaved?:(sessionId:number,operationRef:string,change:NativeHistoryCommit|null,storageVersion:number)=>void|Promise<void>;
+  readonly readOnlyToolNames?: readonly string[];
+  cancelChild?: (parentRunId: number, childRunId: number) => void;
   readonly historyContract?: 'medclaw.history/p9-v1';
   appendProductTurn?: (input: import('./intent').ProductTurnInput) => Promise<import('./intent').ProductTurnFact>;
   discardProductTurn?: (proof: import('./intent').ProductTurnDiscardProof) => Promise<void>;
@@ -260,10 +265,10 @@ export type AgentRuntimePort<Resolved, Control = unknown> = {
   captureToolProfiles?: (scope: RunScope) => { measurementContext: MeasurementContext; toolProfileSnapshot: ToolProfileSnapshot };
   readBudget?: (runId: number) => RuntimeBudgetView | null;
   describe: (resolved: Resolved) => P2AgentOptions;
-  execute: (input: { runId: number; sessionId: number; inputId?: number | null; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number;
+  execute: (input: { subagents?: import('./subagent').FrozenRunSubagents; runId: number; sessionId: number; inputId?: number | null; text: string; resolved: Resolved; agentOptions: P2AgentOptions; signal: AbortSignal; deadlineAt: number;
     runControl?: Control;
     intentTask?: import('./intent').IntentAgentTask;
-    instanceId?: string;
+    instanceId?: string; operationRef?: string;
     extensions?: import('./extensions').FrozenRunExtensions;
     resources?: import('./resources').FrozenRunResources; inputPlan?: import('./resources').ResourceInputPlan;
     nativeReceiptLimitBytes?: number;
@@ -313,6 +318,7 @@ export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputSt
   isChildFinalSaved?(runId: number, fact: import('./subagent').FinalChildFact): boolean;
   readRunExtensions?(runId: number): import('./extensions').FrozenRunExtensions | null;
   readRunResources?(runId: number): import('./resources').FrozenRunResources | null;
+  readRunSubagents?(runId: number): import('./subagent').FrozenRunSubagents | null;
   readRunResourceScope?(runId: number): RunScope | null;
   readResourceEvidence?(runId: number, page: number, pageSize: number): { items: import('./resources').ResourceEvidence[]; totalRows: number };
   confirmCompactionSaved?(change:NativeHistoryCommit|null,fact:import('./session').CompactionReceipt|import('./session').CompactionSaveFact):number|null;

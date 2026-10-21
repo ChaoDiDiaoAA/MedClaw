@@ -124,12 +124,42 @@ export const FrozenRunResourcesSchema = z.strictObject({ contract: z.literal('me
       && f.skillRequirements.every(s=>f.selection.skills.some(ref=>sameRef(s.resourceRef,ref))
         && f.available.filter(a=>sameRef(a.ref,s.resourceRef)).every(a=>JSON.stringify(a.requiredTools)===JSON.stringify(s.requiredTools)))), 'Frozen selection or capacity mismatch');
 export type FrozenRunResources = z.infer<typeof FrozenRunResourcesSchema>;
-export const ResourceInputPlanSchema = z.strictObject({ kind: z.enum(['plain', 'prompt', 'skill']), resourceRef: ResourceRefSchema.nullable(),
-  dispatchText: z.string().refine(t => t.isWellFormed()) }).refine(p => p.kind === 'plain' ? p.resourceRef === null : p.resourceRef?.kind === p.kind, 'Input plan resource mismatch');
-export const NativeInputReceiptSchema = z.strictObject({ text: z.string().refine(t => t.isWellFormed() && new TextEncoder().encode(t).byteLength <= RESOURCE_LIMITS.nativeBytes) })
+export const SubagentTemplateNameSchema = z.enum(['medclaw-evidence-review', 'parallel-medclaw-review']);
+export type SubagentTemplateName = z.infer<typeof SubagentTemplateNameSchema>;
+const delegationText = z.string().min(1).refine(t => t.isWellFormed() && new TextEncoder().encode(t).byteLength <= RESOURCE_LIMITS.nativeBytes);
+const delegationRole = ResourceIdSchema;
+export const SubagentTemplateSourceSchema = z.strictObject({ templateName: SubagentTemplateNameSchema, file: ResourceFileSchema,
+  content: z.string().min(1).refine(t => t.isWellFormed() && new TextEncoder().encode(t).byteLength <= RESOURCE_LIMITS.fileBytes) });
+export type SubagentTemplateSource = z.infer<typeof SubagentTemplateSourceSchema>;
+export const SubagentCommandSourceSchema = z.strictObject({ name: z.literal('subagent'), roleId: delegationRole, task: delegationText });
+export const ResourceInputPlanSchema = z.union([
+  z.strictObject({ kind: z.enum(['plain', 'prompt', 'skill']), resourceRef: ResourceRefSchema.nullable(),
+    dispatchText: z.string().refine(t => t.isWellFormed()) }).refine(p => p.kind === 'plain' ? p.resourceRef === null : p.resourceRef?.kind === p.kind, 'Input plan resource mismatch'),
+  z.strictObject({ kind: z.literal('subagent_template'), resourceRef: z.null(), dispatchText: delegationText, source: SubagentTemplateSourceSchema }),
+  z.strictObject({ kind: z.literal('subagent_command'), resourceRef: z.null(), dispatchText: delegationText, source: SubagentCommandSourceSchema }),
+]);
+export const SubagentInputReceiptSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('template'), templateName: SubagentTemplateNameSchema, expandedText: delegationText }),
+  z.strictObject({ kind: z.literal('command'), name: z.literal('subagent'), roleId: delegationRole, task: delegationText,
+    operationRef: OpaqueIdSchema, inputId: PositiveIdSchema,
+    owner: z.strictObject({ instanceId: OpaqueIdSchema, sessionId: PositiveIdSchema, runId: PositiveIdSchema, assemblyId: OpaqueIdSchema }), dispatchText: delegationText }),
+]);
+export const NativeInputReceiptSchema = z.strictObject({ text: z.string().refine(t => t.isWellFormed() && new TextEncoder().encode(t).byteLength <= RESOURCE_LIMITS.nativeBytes),
+  subagentReceipt: SubagentInputReceiptSchema.optional() })
+  .refine(r => !r.subagentReceipt || r.text === (r.subagentReceipt.kind === 'template' ? r.subagentReceipt.expandedText : r.subagentReceipt.dispatchText), 'Delegation receipt must match the consumed input')
   .refine(r => new TextEncoder().encode(JSON.stringify(r)).byteLength <= RESOURCE_LIMITS.nativeReceiptBytes, 'Native receipt exceeds JSON budget');
 export type ResourceInputPlan = z.infer<typeof ResourceInputPlanSchema>;
 export type NativeInputReceipt = z.infer<typeof NativeInputReceiptSchema>;
+export type SubagentInputReceipt = z.infer<typeof SubagentInputReceiptSchema>;
+export const InputCommandsListInputSchema = z.strictObject({ sessionId: PositiveIdSchema });
+export const InputCommandsListSchema = z.strictObject({ items: z.array(z.strictObject({
+  group: z.enum(['skills', 'subagents', 'prompt_templates', 'extension_commands']), id: z.string().min(1).max(128),
+  command: z.string().min(1).max(256), description: z.string().max(1024), available: z.boolean(), reasons: z.array(z.string().max(256)).max(64),
+  registered: z.boolean(), owner: z.strictObject({ instanceId: OpaqueIdSchema, sessionId: PositiveIdSchema, runId: PositiveIdSchema, assemblyId: OpaqueIdSchema }).nullable(),
+}).refine(item => item.registered === (item.owner !== null), 'Only live command registrations have an owner')).max(512) })
+  .refine(value => new TextEncoder().encode(JSON.stringify(value)).byteLength <= RESOURCE_LIMITS.replyBytes, 'Command directory exceeds reply capacity');
+export type InputCommandsListInput = z.infer<typeof InputCommandsListInputSchema>;
+export type InputCommandsList = z.infer<typeof InputCommandsListSchema>;
 export const ResourceReadFactSchema = z.strictObject({ resourceRef: ResourceRefSchema, file: ResourceFileSchema,
   coverage: z.enum(['complete', 'partial', 'unknown']), observedAt: TimestampSchema });
 export type ResourceReadFact = z.infer<typeof ResourceReadFactSchema>;
@@ -144,4 +174,5 @@ export const CallResourceContextSchema = z.strictObject({ expected: z.array(Reso
 export type ResourceDeliveryRef = z.infer<typeof ResourceDeliveryRefSchema>;
 export type ResourcePayloadObservation = z.infer<typeof ResourcePayloadObservationSchema>;
 export type CallResourceContext = z.infer<typeof CallResourceContextSchema>;
-export type ResourceSource = { discover(): Promise<{ items: ResourceItem[]; diagnostics: ResourceDiagnostic[] }>; capture(refs: ResourceRef[]): Promise<ResourceSnapshot[]> };
+export type ResourceSource = { discover(): Promise<{ items: ResourceItem[]; diagnostics: ResourceDiagnostic[] }>; capture(refs: ResourceRef[]): Promise<ResourceSnapshot[]>;
+  captureSubagentTemplate?(name: SubagentTemplateName): Promise<SubagentTemplateSource> };

@@ -3,6 +3,58 @@ import {errorMessage} from '../../../../packages/contracts/src/error';
 import type {HostView} from '../../../../packages/contracts/src/model';
 import type {ExtensionsReadResult} from '../../../../packages/contracts/src/protocol';
 import type {ExtensionStatus} from '../../../../packages/contracts/src/extensions';
+import type {SubagentsList} from '../../../../packages/contracts/src/subagent';
+
+type AgentDraft={roleId:string;content:string;expectedContent:string|null;existing:boolean;unknown:boolean};
+export function SubagentManager(props:{host:HostView;sessionId:number|null;visible:boolean}) {
+  const key=JSON.stringify([props.host.instanceId,props.sessionId]),owner=useRef(key);owner.current=key;
+  const drafts=useRef(new Map<string,AgentDraft>()),order=useRef(0),writing=useRef(false);
+  const [view,setView]=useState<{key:string;data:SubagentsList}|null>(null),[draftView,setDraftView]=useState<{key:string;draft:AgentDraft}|null>(null);
+  const [busy,setBusy]=useState(false),[notice,setNotice]=useState<string|null>(null);
+  const draft=draftView?.key===key?draftView.draft:null,ready=props.visible&&props.host.state==='ready'&&!!props.host.instanceId&&props.sessionId!==null;
+  function edit(patch:Partial<AgentDraft>,original=draft){if(!original)return;const next={...original,...patch};drafts.current.set(key,next);setDraftView({key,draft:next});}
+  async function refresh(){
+    if(!ready)return;const target=key,sequence=++order.current;
+    try{const result=await window.medclaw.request('subagents.list',{source:'selection',sessionId:props.sessionId!});if(owner.current!==target||sequence!==order.current)return;
+      if(result.ok)setView({key:target,data:result.data});else setNotice(errorMessage(result.error));
+    }catch{if(owner.current===target)setNotice('Agent list is unconfirmed. Refresh agents.');}
+  }
+  useEffect(()=>{setNotice(null);setBusy(writing.current);setDraftView(drafts.current.has(key)?{key,draft:drafts.current.get(key)!}:null);if(ready)void refresh();return()=>{++order.current;};},[key,ready]);
+  useEffect(()=>()=>{owner.current='unmounted';},[]);
+  async function read(roleId:string){
+    if(!ready||busy)return;const target=key,sequence=++order.current;setBusy(true);setNotice(null);
+    try{const result=await window.medclaw.request('subagents.read',{source:'selection',sessionId:props.sessionId!,roleId});if(owner.current!==target||sequence!==order.current)return;
+      if(!result.ok){setNotice(errorMessage(result.error));return;}
+      if(result.data.roleId!==roleId||!result.data.editable)throw new Error('Agent owner mismatch');
+      const next={roleId,content:result.data.content,expectedContent:result.data.expectedContent,existing:true,unknown:false};drafts.current.set(key,next);setDraftView({key,draft:next});
+    }catch{if(owner.current===target)setNotice('Original agent content is unconfirmed. Read it again.');}finally{if(owner.current===target&&sequence===order.current)setBusy(false);}
+  }
+  function newAgent(){const next={roleId:'new-role',content:'---\nname: new-role\ndescription: Independent supplied-material analysis\ntools: []\n---\nAnalyze only the task materials supplied by the parent.\n',expectedContent:null,existing:false,unknown:false};drafts.current.set(key,next);setDraftView({key,draft:next});setNotice(null);}
+  async function save(){
+    if(!ready||!draft||draft.unknown||writing.current)return;const target=key,original=draft;writing.current=true;setBusy(true);setNotice(null);
+    try{const result=await window.medclaw.request('subagents.save',{sessionId:props.sessionId!,roleId:original.roleId,content:original.content,expectedContent:original.expectedContent});if(owner.current!==target)return;
+      if(!result.ok){edit({unknown:['storage_write_failed','operation_result_unknown'].includes(result.error.code)},original);setNotice(errorMessage(result.error)+' Draft retained.');return;}
+      if(result.data.roleId!==original.roleId||result.data.content!==original.content)throw new Error('Agent save owner mismatch');
+      edit({expectedContent:result.data.content,existing:true,unknown:false},original);setNotice('Agent saved for subsequent Runs.');await refresh();
+    }catch{if(owner.current===target){edit({unknown:true},original);setNotice('Agent save is unconfirmed. Draft retained; verify the saved content before another save.');}}
+    finally{writing.current=false;setBusy(false);}
+  }
+  async function verifySave(){
+    if(!ready||!draft||busy)return;const target=key,original=draft;setBusy(true);
+    try{const result=await window.medclaw.request('subagents.read',{source:'selection',sessionId:props.sessionId!,roleId:original.roleId});if(owner.current!==target)return;
+      if(!result.ok){if(result.error.reason==='resource_missing')edit({unknown:false},original);setNotice(errorMessage(result.error)+' Draft retained.');return;}
+      if(result.data.roleId!==original.roleId)throw new Error('Agent owner mismatch');
+      if(result.data.content===original.content){edit({expectedContent:result.data.content,existing:true,unknown:false},original);setNotice('Agent saved for subsequent Runs.');await refresh();}
+      else{edit({unknown:false},original);setNotice('Saved content differs from this draft. Draft retained. Read the current agent explicitly before replacing it.');}
+    }catch{if(owner.current===target)setNotice('Agent save is still unconfirmed. Draft retained.');}finally{if(owner.current===target)setBusy(false);}
+  }
+  return <section aria-label="Agent management" hidden={!props.visible}><h2>Manage agents</h2><p>Role edits apply to subsequent Runs. Editing a built-in role saves a user override.</p>
+    {!ready?<p>Select a confirmed user Session to manage agents.</p>:<><button disabled={busy} onClick={()=>void refresh()}>Refresh agents</button><button disabled={busy} onClick={newAgent}>New agent</button>
+      {view?.key===key&&view.data.items.map(item=><article key={item.roleId}><strong>{item.roleId}</strong> · {item.source} · {item.available?'Available':'Unavailable'}<p>{item.description??'Invalid role declaration'}</p>{item.reasons.length>0&&<p>{item.reasons.join(', ')}</p>}<button disabled={busy||!item.valid} onClick={()=>void read(item.roleId)}>Edit agent {item.roleId}</button></article>)}
+      {draft&&<><label>Agent ID<input aria-label="Agent ID" value={draft.roleId} disabled={busy||draft.existing||draft.unknown} onChange={event=>edit({roleId:event.target.value})}/></label><label>Agent content<textarea aria-label="Agent content" rows={14} value={draft.content} disabled={busy||draft.unknown} onChange={event=>edit({content:event.target.value})}/></label>
+      <button disabled={busy||draft.unknown||!draft.roleId||!draft.content} onClick={()=>void save()}>Save agent</button><button disabled={busy} onClick={()=>void verifySave()}>Verify agent save</button>{draft.existing&&<button disabled={busy} onClick={()=>void read(draft.roleId)}>Read current agent and replace draft</button>}</>}
+    </>}{notice&&<p role="status">{notice}</p>}</section>;
+}
 
 export function ExtensionsPage(props:{executionBlockReason?:string|null;host:HostView;sessionId:number|null;runId:number|null;activeRunId:number|null;stopping:boolean;onStop:()=>void;onDetails:()=>void;onPublished:()=>void}) {
   const key=JSON.stringify([props.host.instanceId,props.host.state,props.sessionId,props.runId]),current=useRef(key);current.current=key;

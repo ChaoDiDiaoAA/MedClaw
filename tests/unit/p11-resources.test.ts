@@ -127,7 +127,7 @@ test('p11 resource routes validate managed identity and distinguish reads from c
   const frame = { protocolVersion: HOST_PROTOCOL_VERSION, kind: 'request', requestId: 'r', instanceId: 'host', operationRef: 'resource', method: 'resources.select', payload: choice };
   expect(PublicHostRequestSchema.safeParse(frame).success).toBe(true);
   expect(PublicHostRequestSchema.safeParse({ ...frame, protocolVersion: 'medclaw.host/p10-v1' }).success).toBe(false);
-  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p17-v2'); expect(DATABASE_SCHEMA_VERSION).toBe(16);
+  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p17-v3'); expect(DATABASE_SCHEMA_VERSION).toBe(17);
 });
 
 test('p11 resource HTTP observations cannot certify a different or incomplete expected payload', () => {

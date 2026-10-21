@@ -7,7 +7,7 @@ export class ToolRegistry {
   constructor(definitions: readonly AnyToolDefinition[]) {
     this.byName = new Map();
     for (const definition of definitions) {
-      const managedAgent=definition.name==='Agent'&&definition.version==='0.19.0'&&definition.effect==='READ'&&definition.executionMode==='sequential';
+      const managedAgent=definition.name==='Agent'&&definition.version==='0.19.0'&&definition.effect==='READ';
       if ((!/^[a-z][a-z0-9_]*$/.test(definition.name)&&!managedAgent) || !/^\d+\.\d+\.\d+$/.test(definition.version)
         || !definition.label.trim() || !definition.description.trim() || !["PURE", "READ", "LOCAL_WRITE"].includes(definition.effect)
         || !ToolExecutionModeSchema.safeParse(definition.executionMode).success || this.byName.has(definition.name)) throw new Error("invalid_argument");

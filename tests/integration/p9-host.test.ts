@@ -34,7 +34,7 @@ test('p9 real Host restores same-model A/B after restart; checkpoint receipt, fu
     const a=await f.create('create-A'),b=await f.create('create-B');await f.select(a.session.id);const first=await f.send(a.session.id,'ENGINEERING A original','send-A');await f.idle();
     const points=SessionCheckpointPageSchema.parse(unwrap(await f.host.request('session.checkpoints.read',{sessionId:a.session.id})));expect(points.items).toHaveLength(1);
     await f.send(a.session.id,'ENGINEERING A correction','send-A2');await f.idle();await f.select(b.session.id);await f.send(b.session.id,'ENGINEERING B independent','send-B');await f.idle();
-    const old=f.host.read().instanceId!;expect(await f.host.restart(old)).toMatchObject({state:'ready',schemaVersion:16});
+    const old=f.host.read().instanceId!;expect(await f.host.restart(old)).toMatchObject({state:'ready',schemaVersion:17});
     const before=f.sql('SELECT * FROM memories ORDER BY id'),requests=f.requests.length,detail=SessionDetailSchema.parse(unwrap(await f.host.request('session.read',{sessionId:a.session.id})));
     expect(detail).toMatchObject({runtime:{availability:'unloaded'},history:{available:true}});expect(detail.history.messages).toHaveLength(4);
     expect(SessionMessagePageSchema.parse(unwrap(await f.host.request('session.messages.read',{sessionId:a.session.id}))).items.filter(item=>item.displayRole==='user')).toHaveLength(2);

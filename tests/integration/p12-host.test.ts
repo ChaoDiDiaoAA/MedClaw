@@ -22,7 +22,7 @@ test('p12 actual Main publication and Host read prove configuration without crea
   }, (path,value)=>{if(failWrite)throw new Error('ENGINEERING failed write');atomicWriteJson(path,value);});
   settings.read();
   try {
-    expect(await host.start()).toMatchObject({state:'ready',schemaVersion:16});
+    expect(await host.start()).toMatchObject({state:'ready',schemaVersion:17});
     const created=unwrap(await host.request('session.create',{expectedWorkspaceRevision:0},'create-a')) as {session:{id:number}};
     const sessionId=created.session.id;
     const read=ExtensionsReadResultSchema.parse(unwrap(await host.request('extensions.read',{source:'selection',sessionId})));

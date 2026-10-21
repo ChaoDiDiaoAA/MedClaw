@@ -26,7 +26,7 @@ index 1688e534299805699fad79692340a62601039349..d008360e74d0a35fd81bd67a43a0cec0
    }
  }
 diff --git a/src/agent-manager.ts b/src/agent-manager.ts
-index 8c973b6ac4d28b06c9a2c71ef992bec00b96ae2a..324fa6ee04fb3ed3c7201a08e7cf3820be252c50 100644
+index 8c973b6ac4d28b06c9a2c71ef992bec00b96ae2a..9d8bf8bff892af6bebb1e1dbb07868a693b69f77 100644
 --- a/src/agent-manager.ts
 +++ b/src/agent-manager.ts
 @@ -19,7 +19,7 @@ import { statSync } from "node:fs";
@@ -38,15 +38,17 @@ index 8c973b6ac4d28b06c9a2c71ef992bec00b96ae2a..324fa6ee04fb3ed3c7201a08e7cf3820
  import { assignHandle, handleBase } from "./mention.js";
  import { describeModel } from "./model-resolver.js";
  import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
-@@ -167,6 +167,7 @@ interface SpawnArgs {
+@@ -167,6 +167,9 @@ interface SpawnArgs {
  }
  
  interface SpawnOptions {
 +  managedSessionBridge?: ManagedAgentSessionBridge;
++  managedNativeToolCallId?: string;
++  managedRoleId?: string;
    description: string;
    /**
     * Optional memorable name for this instance, becoming a second handle
-@@ -429,6 +430,11 @@ export class AgentManager {
+@@ -429,6 +432,11 @@ export class AgentManager {
      this.cleanupInterval.unref();
    }
  
@@ -58,15 +60,17 @@ index 8c973b6ac4d28b06c9a2c71ef992bec00b96ae2a..324fa6ee04fb3ed3c7201a08e7cf3820
    /** Update the max concurrent background agents limit. */
    setMaxConcurrent(n: number) {
      this.maxConcurrent = Math.max(1, n);
-@@ -761,6 +767,7 @@ export class AgentManager {
+@@ -761,6 +769,9 @@ export class AgentManager {
      const promise = runAgent(ctx, type, prompt, {
        pi,
        agentId: id,
 +      managedSessionBridge: options.managedSessionBridge,
++      managedNativeToolCallId: options.managedNativeToolCallId,
++      managedRoleId: options.managedRoleId,
        model: options.model,
        maxTurns: options.maxTurns,
        isolated: options.isolated,
-@@ -797,7 +804,7 @@ export class AgentManager {
+@@ -797,7 +808,7 @@ export class AgentManager {
          this.onCompact?.(record, info);
          options.onCompaction?.(info);
        },
@@ -75,7 +79,7 @@ index 8c973b6ac4d28b06c9a2c71ef992bec00b96ae2a..324fa6ee04fb3ed3c7201a08e7cf3820
          manager: this,
          parentAgentId: id,
          depth: record.depth ?? 1,
-@@ -1554,6 +1561,30 @@ export class AgentManager {
+@@ -1554,6 +1565,30 @@ export class AgentManager {
     *   cannot be reached through a stored spawn argument at shutdown. Omitting
     *   it (tests, teardown of a manager that never spawned) skips the prune.
     */
@@ -107,25 +111,28 @@ index 8c973b6ac4d28b06c9a2c71ef992bec00b96ae2a..324fa6ee04fb3ed3c7201a08e7cf3820
      clearInterval(this.cleanupInterval);
      // Clear queue — via dequeue, so anyone blocked in spawnAndWait is woken
 diff --git a/src/agent-runner.ts b/src/agent-runner.ts
-index 6752eca0269ce30853a5cf5a3afd0d4bd463614c..f269d94b02caef8f04e448b3e3da6042e202d932 100644
+index 6752eca0269ce30853a5cf5a3afd0d4bd463614c..80deb1a4ba9f6bbc79291109b3a79e7fe18a550e 100644
 --- a/src/agent-runner.ts
 +++ b/src/agent-runner.ts
-@@ -394,7 +394,14 @@ export interface ToolActivity {
+@@ -394,7 +394,17 @@ export interface ToolActivity {
    toolName: string;
  }
  
 +export interface ManagedAgentSessionBridge {
-+  openSession(input: { pluginAgentId: string; prompt: string; signal: AbortSignal }): Promise<AgentSession>;
++  openSession(input: { pluginAgentId: string; nativeToolCallId: string; roleId: string; prompt: string; signal: AbortSignal }): Promise<AgentSession>;
 +  getMaxTurns(): number;
++  onCommand?(input: { roleId: string; task: string }): void;
 +}
 +
  export interface RunOptions {
 +  /** Product-owned creation/binding; bypasses all ambient preparation. */
 +  managedSessionBridge?: ManagedAgentSessionBridge;
++  managedNativeToolCallId?: string;
++  managedRoleId?: string;
    /** ExtensionAPI instance — used for pi.exec() instead of execSync. */
    pi: ExtensionAPI;
    /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
-@@ -607,12 +614,12 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
+@@ -607,12 +617,12 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
    return resolve(cwd, sessionDir);
  }
  
@@ -140,7 +147,7 @@ index 6752eca0269ce30853a5cf5a3afd0d4bd463614c..f269d94b02caef8f04e448b3e3da6042
    const config = getConfig(type);
    const agentConfig = getAgentConfig(type);
  
-@@ -1042,6 +1049,19 @@ export async function runAgent(
+@@ -1042,6 +1052,19 @@ export async function runAgent(
      });
    }
  
@@ -153,14 +160,14 @@ index 6752eca0269ce30853a5cf5a3afd0d4bd463614c..f269d94b02caef8f04e448b3e3da6042
 +  options.signal?.throwIfAborted();
 +  const { session, structuredCapture } = options.managedSessionBridge
 +    ? { session: await options.managedSessionBridge.openSession({
-+        pluginAgentId: options.agentId!, prompt, signal: options.signal!,
++        pluginAgentId: options.agentId!, nativeToolCallId: options.managedNativeToolCallId!, roleId: options.managedRoleId!, prompt, signal: options.signal!,
 +      }), structuredCapture: undefined }
 +    : await prepareAgentSession(ctx, type, prompt, options);
 +  options.signal?.throwIfAborted();
    options.onSessionCreated?.(session);
  
    // Track turns for graceful max_turns enforcement
-@@ -1055,7 +1075,7 @@ export async function runAgent(
+@@ -1055,7 +1078,7 @@ export async function runAgent(
      if (event.type === "turn_end") {
        turnCount++;
        options.onTurnEnd?.(turnCount);
@@ -170,7 +177,7 @@ index 6752eca0269ce30853a5cf5a3afd0d4bd463614c..f269d94b02caef8f04e448b3e3da6042
            softLimitReached = true;
            session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
 diff --git a/src/index.ts b/src/index.ts
-index 4989968c98e186b3c94194ae8c05c7651374fcb6..0bb6d656284041706119144847635210f5760ff3 100644
+index 4989968c98e186b3c94194ae8c05c7651374fcb6..dacc32b69aab6ea82bc03ddb9483cbdd361b8d02 100644
 --- a/src/index.ts
 +++ b/src/index.ts
 @@ -2123,148 +2123,18 @@ Terse command-style prompts produce shallow, generic work.
@@ -334,7 +341,7 @@ index 4989968c98e186b3c94194ae8c05c7651374fcb6..0bb6d656284041706119144847635210
      },
    });
    /**
-@@ -3986,3 +3856,204 @@ Write the file using the write tool. Only write the file, nothing else.`;
+@@ -3986,3 +3856,226 @@ Write the file using the write tool. Only write the file, nothing else.`;
  
    fleet.setWorkflowSource(fleetWorkflows, id => openWorkflowFromFleet(id, workflowMenuDeps));
  }
@@ -352,6 +359,8 @@ index 4989968c98e186b3c94194ae8c05c7651374fcb6..0bb6d656284041706119144847635210
 +    onSessionReady?: (id: string, state: AgentActivity, session: any) => void;
 +    onSpawned?: (id: string) => void; onFinished?: (id: string) => void;
 +    managedSessionBridge?: import("./agent-runner.js").ManagedAgentSessionBridge;
++    managedNativeToolCallId?: string;
++    managedRoleId?: string;
 +  },
 +) {
 +  const { subagentType, model, effectiveMaxTurns, isolated, inheritContext, thinking, isolation,
@@ -432,6 +441,8 @@ index 4989968c98e186b3c94194ae8c05c7651374fcb6..0bb6d656284041706119144847635210
 +      try {
 +        const fgResult = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
 +          managedSessionBridge: hooks.managedSessionBridge,
++          managedNativeToolCallId: hooks.managedNativeToolCallId,
++          managedRoleId: hooks.managedRoleId,
 +          description: params.description,
 +          name: params.name as string | undefined,
 +          model,
@@ -491,16 +502,24 @@ index 4989968c98e186b3c94194ae8c05c7651374fcb6..0bb6d656284041706119144847635210
 +export function createManagedAgentExtension(bridge: import("./agent-runner.js").ManagedAgentSessionBridge) {
 +  const manager = new AgentManager();
 +  manager.retainManagedRecords();
-+  manager.setMaxConcurrentForeground(1);
-+  let occupied = false;
++  manager.setMaxConcurrentForeground(4);
++  const occupied = new Map<string, string | undefined>();
 +  let closed = false;
 +  const factory: import("@earendil-works/pi-coding-agent").ExtensionFactory = pi => {
++    pi.registerCommand("subagent", { description: "Delegate a foreground read-only task to a verified MedClaw role.",
++      async handler(args) {
++        if (closed || !bridge.onCommand) throw new Error("state_conflict");
++        const match = /^([a-z0-9]+(?:-[a-z0-9]+)*)[ \t]+([\s\S]+)$/.exec(args);
++        if (!match || match[1].length > 64 || !match[2].trim() || match[2].length > 65536) throw new Error("invalid_argument");
++        bridge.onCommand({ roleId: match[1], task: match[2] });
++      },
++    });
 +    pi.registerTool(defineTool({
-+      name: "Agent", label: "Agent", description: "Delegate a foreground read-only verification with independent context.",
++      name: "Agent", label: "Agent", description: "Delegate a foreground read-only verification with independent context.", executionMode: "parallel",
 +      parameters: Type.Object({
 +        prompt: Type.String({ minLength: 1, maxLength: 65536 }),
 +        description: Type.String({ minLength: 1, maxLength: 256 }),
-+        subagent_type: Type.Optional(Type.Literal("medclaw-audit")),
++        subagent_type: Type.Optional(Type.String({ minLength: 1, maxLength: 128, pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$" })),
 +        run_in_background: Type.Optional(Type.Literal(false)),
 +      }, { additionalProperties: false }),
 +      async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -508,21 +527,28 @@ index 4989968c98e186b3c94194ae8c05c7651374fcb6..0bb6d656284041706119144847635210
 +        if (keys.some(key => !["prompt", "description", "subagent_type", "run_in_background"].includes(key))
 +          || typeof params.prompt !== "string" || !params.prompt.length || params.prompt.length > 65536
 +          || typeof params.description !== "string" || !params.description.length || params.description.length > 256
-+          || params.subagent_type !== undefined && params.subagent_type !== "medclaw-audit"
++          || params.subagent_type !== undefined && (typeof params.subagent_type !== "string" || params.subagent_type.length > 128 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(params.subagent_type))
 +          || params.run_in_background !== undefined && params.run_in_background !== false) throw new Error("tool_input_invalid");
-+        if (closed || occupied) throw new Error("runtime_busy");
++        if (typeof _toolCallId !== "string" || !_toolCallId.length) throw new Error("tool_input_invalid");
++        if (closed || occupied.size >= 4 || occupied.has(_toolCallId)) throw new Error("runtime_busy");
 +        signal?.throwIfAborted();
 +        const maxTurns = bridge.getMaxTurns();
 +        if (!Number.isSafeInteger(maxTurns) || maxTurns < 1) throw new Error("agent_call_limit");
-+        occupied = true;
++        occupied.set(_toolCallId, undefined);
++        const roleId = params.subagent_type ?? "medclaw-audit";
 +        const invocation: AgentInvocation = { isolated: true, inheritContext: false, runInBackground: false, isolation: "off", maxTurns };
-+        return executeForegroundAgent(manager, pi, ctx, params, {
-+          subagentType: "medclaw-audit", effectiveMaxTurns: maxTurns, isolated: true, inheritContext: false,
++        try { return await executeForegroundAgent(manager, pi, ctx, params, {
++          subagentType: roleId, effectiveMaxTurns: maxTurns, isolated: true, inheritContext: false,
 +          isolation: "off", agentInvocation: invocation, fallbackNote: "", showCost: false,
-+          detailBaseFor: record => ({ displayName: "medclaw-audit", description: record?.description ?? params.description,
-+            subagentType: "medclaw-audit", modelName: record?.invocation?.modelName }),
++          detailBaseFor: record => ({ displayName: roleId, description: record?.description ?? params.description,
++            subagentType: roleId, modelName: record?.invocation?.modelName }),
 +          signal, onUpdate, managedSessionBridge: bridge,
-+        });
++          managedNativeToolCallId: _toolCallId, managedRoleId: roleId,
++          onSpawned: id => occupied.set(_toolCallId, id),
++        }); } catch (error) {
++          if (occupied.get(_toolCallId) === undefined) occupied.delete(_toolCallId);
++          throw error;
++        }
 +      },
 +    }));
 +  };
@@ -535,21 +561,25 @@ index 4989968c98e186b3c94194ae8c05c7651374fcb6..0bb6d656284041706119144847635210
 +      await record.promise;
 +      return record;
 +    },
-+    async release(id: string): Promise<void> { await manager.releaseManaged(id); occupied = false; },
-+    async dispose(): Promise<void> { closed = true; await manager.disposeManaged(); occupied = false; },
++    async release(id: string): Promise<void> {
++      await manager.releaseManaged(id);
++      for (const [nativeId, agentId] of occupied) if (agentId === id) occupied.delete(nativeId);
++    },
++    async dispose(): Promise<void> { closed = true; await manager.disposeManaged(); occupied.clear(); },
 +  } };
 +}
 diff --git a/node_modules/@tintinweb/pi-subagents/src/managed.d.ts b/src/managed.d.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..30b60a5fd8c6a9cdae4c0aec4aee786b58af3341
+index 0000000000000000000000000000000000000000..2f1a9505366f30a7c482caa2ae145a8d65732f2f
 --- /dev/null
 +++ b/src/managed.d.ts
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,17 @@
 +import type { AgentSession, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 +import type { AgentRecord } from "./types.js";
 +export interface ManagedAgentSessionBridge {
-+  openSession(input: { pluginAgentId: string; prompt: string; signal: AbortSignal }): Promise<AgentSession>;
++  openSession(input: { pluginAgentId: string; nativeToolCallId: string; roleId: string; prompt: string; signal: AbortSignal }): Promise<AgentSession>;
 +  getMaxTurns(): number;
++  onCommand?(input: { roleId: string; task: string }): void;
 +}
 +export interface ManagedAgentExtension {
 +  factory: ExtensionFactory;

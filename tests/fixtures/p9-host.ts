@@ -88,7 +88,7 @@ export async function sessionHostFixture(barrier?: SessionHostBarrier, pathPrefi
     atomicWriteJson(host.paths.settingsPath, PublishedSettingsSchema.parse({ ...initial,
       ...(barrier === 'search-process' ? { runtimeConfiguration: { ...initial.runtimeConfiguration, runBudget: { ...initial.runtimeConfiguration.runBudget, singleToolTimeoutMs: 1000 } }, agentPolicy: { ...initial.agentPolicy, singleToolTimeoutMs: 1000 } } : {}),
       model: { provider: 'p9-fixture', modelId: 'fixture' }, customProviders: [{ definition, credentialRef: null }] }));
-    expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion: 16 });
+    expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion: 17 });
   } catch (error) { await close(); throw error; }
   const sql = (query: string) => { const db = new Database(host.paths.databasePath, { readonly: true }); try { return db.query(query).all(); } finally { db.close(); } };
   const workspace = async () => WorkspaceViewSchema.parse(unwrap(await host.request('workspace.read', {})));

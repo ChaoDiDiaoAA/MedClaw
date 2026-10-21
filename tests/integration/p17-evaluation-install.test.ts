@@ -150,7 +150,7 @@ test('installed engineering Trial executes resource selection and saves all five
     expect(await readFile(join(workRoot, 'inputs/materials/engineering.txt'), 'utf8')).toBe(publicText);
     const events = (await readFile(join(trialRoot, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line));
     expect(events.find(row => row.kind === 'ready')).toMatchObject({ instanceId: value.result.instanceId,
-      ready: { instanceId: value.result.instanceId, dataRoot: join(workRoot, 'product'), sdkVersion: '0.87.1', schemaVersion: 16 } });
+      ready: { instanceId: value.result.instanceId, dataRoot: join(workRoot, 'product'), sdkVersion: '0.87.1', schemaVersion: 17 } });
     expect(events.filter(row => row.kind === 'request' && row.method === 'resources.read').map(row => row.payload.file).sort()).toEqual(['SKILL.md', 'references/facts-and-assumptions.md']);
     const resourceReads = events.filter(row => row.kind === 'reply' && row.method === 'resources.read' && row.result.ok);
     expect(resourceReads).toHaveLength(2);

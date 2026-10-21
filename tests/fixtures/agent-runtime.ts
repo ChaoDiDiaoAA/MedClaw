@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
 import { PiModelRuntime } from '../../packages/runtime-pi/src/model-runtime';
 import { PiAgentRuntime } from '../../packages/runtime-pi/src/agent-runtime';
-import { createResourceSource } from '../../packages/runtime-pi/src/resource-loader';
+import { createResourceSource, createSubagentRoleSource } from '../../packages/runtime-pi/src/resource-loader';
 import { ModelCallRecorder } from '../../packages/runtime-pi/src/model-call-recorder';
 import { contextMessageText } from '../../packages/runtime-pi/src/messages';
 import { Application } from '../../packages/core/src/application';
@@ -41,14 +41,14 @@ import { IntentService } from '../../packages/core/src/intent/intent-service';
 import { IntentValidator } from '../../packages/core/src/intent/validate';
 import { SqliteEventStore } from '../../packages/storage/src/event-store';
 
-export async function agentRuntimeFixture(respond?: (index: number, payload: Record<string, unknown>) => Promise<Record<string, unknown> | Response> | Record<string, unknown> | Response, extensions = false, usage?: (index:number)=>{prompt_tokens:number;completion_tokens:number;total_tokens:number}, intents?: { client: IntentModelClient; configuration: IntentModelConfiguration }) {
+export async function agentRuntimeFixture(respond?: (index: number, payload: Record<string, unknown>) => Promise<Record<string, unknown> | Response> | Record<string, unknown> | Response, extensions = false, usage?: (index:number)=>{prompt_tokens:number;completion_tokens:number;total_tokens:number}, intents?: { client: IntentModelClient; configuration: IntentModelConfiguration }, subagents = false) {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p11-runtime-')), author = join(root, 'author'); cpSync(resolve('resources'), author, { recursive: true });
   const db = openDatabase(join(root, 'app.sqlite')), requests: Record<string, unknown>[] = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
-    requests.push(await request.json() as Record<string, unknown>);
-    const delta = await respond?.(requests.length, requests.at(-1)!) ?? { role: 'assistant', content: 'ENGINEERING response; no quality claim.' };
+    const payload = await request.json() as Record<string, unknown>, index = requests.push(payload);
+    const delta = await respond?.(index, payload) ?? { role: 'assistant', content: 'ENGINEERING response; no quality claim.' };
     if(delta instanceof Response)return delta;
-    return new Response(`data: ${JSON.stringify({ id: 'fixture', model: 'fixture', choices: [{ index: 0, delta, finish_reason: 'tool_calls' in delta ? 'tool_calls' : 'stop' }],...(usage?{usage:usage(requests.length)}:{}) })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+    return new Response(`data: ${JSON.stringify({ id: 'fixture', model: 'fixture', choices: [{ index: 0, delta, finish_reason: 'tool_calls' in delta ? 'tool_calls' : 'stop' }],...(usage?{usage:usage(index)}:{}) })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
   } });
   const credentials = new InMemoryCredentialStore(); await credentials.modify('p11-fixture', async () => ({ type: 'api_key', key: 'engineering' }));
   const runtime = await PiModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore() });
@@ -71,7 +71,8 @@ export async function agentRuntimeFixture(respond?: (index: number, payload: Rec
   const source = createResourceSource(author);
   const starter=Object.assign((...args:Parameters<ModelCallStarter>)=>new ModelCallRecorder(repos,...args),{forCompaction:(owner:CompactionCallOwner,time:string)=>ModelCallRecorder.forCompaction(repos,owner,time)});
   const intentService = intents ? new IntentService(repos, contextService, intents.client, new IntentValidator(catalog), new SqliteEventStore(db), SqliteWriteTransactions.forDatabase(db)) : undefined;
-  const app = new Application('host', config, runtime, repos, async (_context, action) => action(), starter, () => {}, error => errors.push(error), agent, undefined, SqliteWriteTransactions.forDatabase(db), source, intentService ? { service: intentService, queries } : undefined);
+  const app = new Application('host', config, runtime, repos, async (_context, action) => action(), starter, () => {}, error => errors.push(error), agent, undefined, SqliteWriteTransactions.forDatabase(db), source, intentService ? { service: intentService, queries } : undefined, null,
+    subagents ? createSubagentRoleSource(join(author, 'subagents'), join(root, 'subagents')) : undefined);
   const request = (text: string): SubmitInput => SubmitInputSchema.parse({ sessionId: 1, clientSequence: repos.readSession(1)!.nextSubmissionSequence, mode: 'send', text, expectedRevision: repos.readWorkspace().revision, expectedBatchIds: repos.readWorkspace().batchRefs.map(ref=>ref.id), expectedQueryId: repos.readWorkspace().queryId, model: { provider: 'p11-fixture', modelId: 'fixture', expectedConfigVersion: app.config.configVersion }, referenceDate: '2026-10-06', timezone: 'Asia/Shanghai' });
   const settle = async () => { for (let i = 0; i < 2000 && app.runs.busy; i++) await Bun.sleep(2); expect(app.runs.busy).toBe(false); };
   const content = (id: number) => InputContentSchema.parse(JSON.parse(db.query<{ content_json: string }, [number]>('SELECT content_json FROM session_inputs WHERE id=?').get(id)!.content_json));

@@ -3,7 +3,7 @@ import { dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { InstallManifestSchema, InstallRelativePathSchema, type InstallManifest } from '../../packages/contracts/src/maintenance';
-import { HOST_PROTOCOL_VERSION } from '../../packages/contracts/src/protocol';
+import { DATABASE_SCHEMA_VERSION, HOST_PROTOCOL_VERSION } from '../../packages/contracts/src/protocol';
 
 export async function buildDesktop(root: string, output: string): Promise<void> {
   for (const part of ['main', 'preload', 'renderer']) {
@@ -126,10 +126,17 @@ export async function buildInstallation(root = resolve(import.meta.dir, '../..')
     outdir: installRoot, naming: 'installer-check.js' });
   if (!checker.success) throw new AggregateError(checker.logs, 'Installer check build failed');
   const catalog = JSON.parse(await readFile(join(runtime, 'resources/catalog.json'), 'utf8'));
+  const { parseFrontmatter } = await import('@earendil-works/pi-coding-agent');
+  for (const [directory,names] of [['subagents',['medclaw-audit','general-analyst']],['subagent-prompts',['medclaw-evidence-review','parallel-medclaw-review']]] as const) {
+    for(const name of names){
+      const {frontmatter,body}=parseFrontmatter(await readFile(join(runtime,'resources',directory,name+'.md'),'utf8'));
+      if(!body.trim()||typeof frontmatter.description!=='string'||!frontmatter.description.trim()||directory==='subagents'&&frontmatter.name!==name)throw new Error('build_subagent_resource_invalid');
+    }
+  }
   const plugin = JSON.parse(await readFile(join(runtime, 'node_modules/@tintinweb/pi-subagents/package.json'), 'utf8'));
   if (plugin.version !== '0.19.0') throw new Error('build_plugin_mismatch');
   const manifest = InstallManifestSchema.parse({ contract: 'medclaw.install/v1', appVersion: '0.1.0', platform: 'win32', arch: 'x64',
-    sdkVersion: '0.87.1', bunVersion: Bun.version, electronVersion: '44.5.1', protocolVersion: HOST_PROTOCOL_VERSION, schemaVersion: 16,
+    sdkVersion: '0.87.1', bunVersion: Bun.version, electronVersion: '44.5.1', protocolVersion: HOST_PROTOCOL_VERSION, schemaVersion: DATABASE_SCHEMA_VERSION,
     hostEntry: 'runtime/apps/host/src/main.ts', maintenanceEntry: 'runtime/apps/host/src/maintenance.ts', resourceRoot: 'runtime/resources',
     resources: catalog.definitions.map(({ kind, id, version }: { kind: string; id: string; version: string }) => ({ kind, id, version })),
     plugins: [{ name: '@tintinweb/pi-subagents', version: plugin.version, patch: 'runtime/patches/@tintinweb%2Fpi-subagents@0.19.0.patch' }], binaries });

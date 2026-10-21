@@ -124,7 +124,7 @@ export async function mainAdmissionFixture(actor: AdmissionActor) {
     finally { server.stop(true); }
   }
   try {
-    expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion: 16 });
+    expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion: 17 });
     const source = join(root, 'payload'), operationRef = crypto.randomUUID(); packageFixture(source);
     const grant = files.issue(1, host.read().instanceId!, operationRef, source);
     expect(ImportPreviewSchema.parse(unwrap(await host.request('import.preview', { operationRef, fileToken: grant.fileToken, mappingVersion: 'medclaw.snapshot/v1' }, operationRef))).canCommit).toBe(true);
@@ -143,7 +143,7 @@ export async function mainAdmissionFixture(actor: AdmissionActor) {
   const diagnostics = async (): Promise<DiagnosticsView> => {
     const snapshot = unwrap(await host.request('diagnostics.read', { categories: ['runtime'] })) as DiagnosticsView;
     diagnosticsReads++; if (actor === 'support export' && 'wait' in write) await write.wait();
-    return { ...snapshot, host: host.read(), versions: { sdkVersion: '0.87.1', protocolVersion: HOST_PROTOCOL_VERSION, schemaVersion: 16, configVersion: settings.read().configVersion, bunVersion: Bun.version, electronVersion: '44.5.1' } };
+    return { ...snapshot, host: host.read(), versions: { sdkVersion: '0.87.1', protocolVersion: HOST_PROTOCOL_VERSION, schemaVersion: 17, configVersion: settings.read().configVersion, bunVersion: Bun.version, electronVersion: '44.5.1' } };
   };
   return { root, dataRoot, backupRoot, external, files, host, settings, maintenance, evaluation, destinations, credentials, inputs: new SecretInputs(),
     write, maintenanceGate, paths, forwarded, diagnostics, diagnosticsReads: () => diagnosticsReads, workspace, submission, idle, sql, close,

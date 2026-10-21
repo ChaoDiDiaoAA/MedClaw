@@ -60,7 +60,7 @@ test('p14 schema12 upgrade preserves every old field, native/Query/tool/Context 
   const f = schema12();
   let db = openDatabase(f.path);
   try {
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(16);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(17);
     for (const [index, table] of f.tables.entries()) {
       const rows = db.query<Record<string, unknown>, []>(`SELECT * FROM ${table} ORDER BY id`).all();
       if (table === 'business_events') expect(rows.every(row => row.export_id === null)).toBe(true);
@@ -77,7 +77,7 @@ test('p14 schema12 upgrade preserves every old field, native/Query/tool/Context 
       VALUES('invalid-compaction',1,'compaction',1,'logical_request',1,'{}','started',?)`).run(contextAt)).toThrow();
     expect(db.query("SELECT name FROM sqlite_schema WHERE type='trigger' AND name LIKE '%child%'").all().length).toBeGreaterThan(0);
     db.close(); db = openDatabase(f.path);
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(16);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(17);
   } finally { db.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 

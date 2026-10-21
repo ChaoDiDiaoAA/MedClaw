@@ -14,6 +14,8 @@ test('installation runtime stages actual source and resource consumers while exc
     const files = await stage(root, target);
     for (const file of ['apps/host/src/main.ts', 'apps/host/src/windows-job.ts', 'apps/host/src/maintenance.ts', 'apps/desktop/src/main/runtime-paths.ts',
       'packages/storage/src/migrations/016_business_identity.sql', 'packages/runtime-pi/package.json', 'agent-eval/src/datasets.ts', 'resources/catalog.json',
+      'packages/storage/src/migrations/017_subagent_parallel.sql', 'resources/subagents/medclaw-audit.md', 'resources/subagents/general-analyst.md',
+      'resources/subagent-prompts/medclaw-evidence-review.md', 'resources/subagent-prompts/parallel-medclaw-review.md',
       'resources/extensions/tool-audit/v1/index.ts', 'patches/@tintinweb%2Fpi-subagents@0.19.0.patch', 'package.json', 'bun.lock']) {
       expect(files).toContain(file); expect(readFileSync(join(target, file))).toEqual(readFileSync(join(root, file)));
     }
@@ -124,7 +126,7 @@ test('upgrade checks both the original root and the root selected by the saved r
   const installation = JSON.parse(readFileSync(join(project, '.build/package-resources/medclaw/install.json'), 'utf8'));
   const operationRef = 'saved-restore';
   writeFileSync(join(selected, 'data/restore-receipt.json'), JSON.stringify({ request: { kind: 'restore', sourceBackup: join(base, 'backup'), targetRoot: selected },
-    sourceOperationRef: 'saved-backup', installation, receipt: { operationRef, kind: 'restore', state: 'completed', appVersion: '0.1.0', sdkVersion: '0.87.1', schemaVersion: 16,
+    sourceOperationRef: 'saved-backup', installation, receipt: { operationRef, kind: 'restore', state: 'completed', appVersion: '0.1.0', sdkVersion: '0.87.1', schemaVersion: 17,
       restoredAt: '2026-10-17T00:00:00.000Z', configVersion: '2' } }));
   writeFileSync(join(root, 'launch.json'), JSON.stringify({ contract: 'medclaw.launch/v1', activeDataRoot: selected, restoreOperationRef: operationRef }));
   const { requestMaintenance } = await import('../../apps/desktop/src/main/maintenance-controller');

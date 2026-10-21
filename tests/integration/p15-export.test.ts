@@ -433,7 +433,7 @@ test('p15 Host exports through the private Main capability, blocks concurrent wr
   db.close();
   const data = <T>(result: import('../../packages/contracts/src/error').Result<T>) => { if (!result.ok) throw result.error; return result.data; };
   try {
-    expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion: 16 });
+    expect(await host.start()).toMatchObject({ state: 'ready', schemaVersion: 17 });
     const source = { operationRef: 'host:export', queryId: seeded.current.id, answerId: null, format: 'csv' as const };
     const target = join(external, 'query-bundle'), grant = destinations.issue(7, host.read().instanceId!, source, target);
     const request = { ...source, destinationToken: grant.destinationToken, };
@@ -512,7 +512,7 @@ test('p15 migration preserves all schema13 facts and import artifact bytes with 
   const f = schema13();
   let db = openDatabase(f.path);
   try {
-    expect(db.query('SELECT MAX(version) AS n FROM schema_migrations').get()).toEqual({ n: 16 });
+    expect(db.query('SELECT MAX(version) AS n FROM schema_migrations').get()).toEqual({ n: 17 });
     preserved(db, f);
     expect(db.query('SELECT export_id,query_id FROM artifacts WHERE id=51').get()).toEqual({ export_id: null, query_id: null });
     expect(db.query('SELECT export_id FROM business_events WHERE export_id IS NOT NULL').all()).toEqual([]);
@@ -538,7 +538,7 @@ for (const phase of ['p15_copy', 'p15_rename', 'p15_marker']) test(`p15 migratio
       for (const [table, rows] of f.before) expect(raw.query(`SELECT * FROM ${table} ORDER BY id`).all()).toEqual(rows);
     } finally { raw.close(); }
     const recovered = openDatabase(f.path);
-    try { preserved(recovered, f); expect(recovered.query('SELECT MAX(version) AS n FROM schema_migrations').get()).toEqual({ n: 16 }); }
+    try { preserved(recovered, f); expect(recovered.query('SELECT MAX(version) AS n FROM schema_migrations').get()).toEqual({ n: 17 }); }
     finally { recovered.close(); }
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });

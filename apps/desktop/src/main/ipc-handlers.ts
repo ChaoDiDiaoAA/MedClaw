@@ -139,9 +139,17 @@ export function registerIpc(options: { window: BrowserWindow; host: HostControll
         const dir = await request("model.read", {}) as { selection: unknown }; return { configVersion: s.configVersion, selection: dir.selection };
       }
       case "model.policy.update": { await synchronize(); const p = raw as PublicPayload<'model.policy.update'>; const s = await publish(p.expectedConfigVersion, { ...(p.policy ? { requestPolicy: p.policy } : {}), ...(p.agentPolicy ? { agentPolicy: p.agentPolicy } : {}), ...(p.runtimeConfiguration ? { runtimeConfiguration: p.runtimeConfiguration } : {}), ...(p.toolConfiguration ? { toolConfiguration: p.toolConfiguration } : {}) }, "policy"); return { configVersion: s.configVersion, policy: s.requestPolicy, agentPolicy: s.agentPolicy, runtimeConfiguration: s.runtimeConfiguration, toolConfiguration: s.toolConfiguration }; }
-      case 'resources.list': case 'resources.read': case 'extensions.read': {
-        const p = raw as PublicPayload<'resources.list' | 'resources.read' | 'extensions.read'>;
+      case 'resources.list': case 'resources.read': case 'extensions.read': case 'subagents.list': case 'subagents.read': {
+        const p = raw as PublicPayload<'resources.list' | 'resources.read' | 'extensions.read' | 'subagents.list' | 'subagents.read'>;
         if (p.source === 'selection') await synchronize(); else requireHost();
+        return request(method, raw, operationRef);
+      }
+      case 'subagents.save': {
+        await synchronize();
+        return request(method, raw, operationRef);
+      }
+      case 'input.commands.list': {
+        await synchronize();
         return request(method, raw, operationRef);
       }
       case 'resources.select': {

@@ -47,7 +47,7 @@ for (const phase of [null,'p15_plan_copy','p15_plan_rename','p15_plan_marker']) 
     }
     const db=openDatabase(f.path);
     try {
-      expect(db.query('SELECT MAX(version) AS n FROM schema_migrations').get()).toEqual({n:16});
+      expect(db.query('SELECT MAX(version) AS n FROM schema_migrations').get()).toEqual({n:17});
       for(const [i,name] of f.tables.entries()) {
         const actual=db.query<Record<string,unknown>,[]>(`SELECT * FROM ${name} ORDER BY id`).all();
         const retired=['preview_request_hash','commit_request_hash','fingerprint','source_lock_hash','content_hash','cohort_hash','params_hash','result_hash','scope_batch_hashes_json','sha256','metadata_sha256','request_hash','published_hash'];

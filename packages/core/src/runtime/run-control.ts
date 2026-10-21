@@ -113,6 +113,10 @@ export class RunControl {
     this.previews.set(preview,{allowTools,convergence,episodeUsed,recoveryAttempts,stopReason:!allowTools && this.episodeId && episodeUsed >= this.runtimeSnapshot.runBudget.maxRecoveryAttempts ? 'tool_recovery_limit' : this.stopReason,budgetRevision:this.totals.revision});
     return preview;
   }
+  isModelCallPreviewCurrent(preview: ModelAdmissionPreview): boolean {
+    const decision = this.previews.get(preview);
+    return !!decision && preview.revision === this.revision && decision.budgetRevision === this.totals.revision;
+  }
   admitModelCall(preview?: ModelAdmissionPreview): { allowTools: boolean; feedback: string } {
     this.checkActive();
     if (!preview && this.totals.modelCalls >= this.modelLimit) { this.modelAdmissionsRejected++; this.stopReason='agent_call_limit'; throw new Error('agent_call_limit'); }

@@ -15,7 +15,7 @@ test('original evaluation replay after app restart precedes production admission
   await saveReportFixture(archive, report); const original = await readFile(join(archive, 'report.json'), 'utf8');
   let productionRequests = 0;
   const controller = new EvaluationController({ paths, workerEntry: join(sourceRoot, 'agent-eval/src/desktop/controller.ts'), bunExecutable: process.execPath,
-    production: { read: () => ({ instanceId: 'busy-production', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion: 16, error: null }),
+    production: { read: () => ({ instanceId: 'busy-production', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion: 17, error: null }),
       request: async () => { productionRequests++; throw new Error('Original lookup must precede production admission'); } } });
   try {
     const payload = { datasetId: 'controlled-fixture', selection: 'smoke' as const, trials: 1, preflightId: operationRef };

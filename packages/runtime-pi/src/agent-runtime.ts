@@ -40,7 +40,8 @@ import { materializeRunResources, verifyRunResourceFiles, formatSkillReadinessSe
 import { freezeRunExtensions, readExtensionDescriptor, loadRunExtension } from './extension-loader';
 import type { AnyToolDefinition } from '../../contracts/src/tool';
 import { ExtensionOwnerSchema, type ExtensionAssemblyProof, type ExtensionsCommandInput } from '../../contracts/src/extensions';
-import type { BoundChildIdentity, DelegationSource, ChildExecutionObservation } from '../../contracts/src/subagent';
+import { SubagentRoleSnapshotSchema, type BoundChildIdentity, type DelegationSource, type ChildExecutionObservation } from '../../contracts/src/subagent';
+import { parseFrontmatter } from '@earendil-works/pi-coding-agent';
 import { projectRuntimePolicies } from '../../contracts/src/runtime-config';
 import { SUBAGENT_BUILD, createRunSubagent, type ManagedAgentSessionBridge } from './subagent-adapter';
 type RunExtension = Awaited<ReturnType<typeof loadRunExtension>>;
@@ -93,6 +94,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel,RunControl
   retryInputPersistence(runId: number) { this.inputs.get(runId)?.retryPersistence(runId); const failed = this.inputStartFailures.get(runId); if (failed?.pending) { try { failed.save(); failed.pending = false; } catch { /* Retain exact failure fact for the next save attempt. */ } } }
   releaseInputFacts(runId: number) { const adapter = this.inputs.get(runId); if (this.inputPersistencePending(runId)) throw safeError('storage_write_failed'); adapter?.dispose(); this.inputs.delete(runId); this.inputStartFailures.delete(runId); }
   readonly toolNames?: readonly string[];
+  readonly readOnlyToolNames?: readonly string[];
   constructor(private readonly runtime: PiModelRuntime, private readonly dataRoot: string,
     private readonly history:{store:MemoryStore;commitSync:(change:NativeHistoryCommit)=>{storageVersion:number}},
     private readonly tools?: RunTools & { recorder: ToolRecorder; configure?: (configuration: ToolConfiguration, extraDefinitions?:readonly AnyToolDefinition[]) => RunTools }, private readonly contexts?: ContextService,
@@ -100,11 +102,24 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel,RunControl
     if (!isAbsolute(dataRoot)) throw new Error("invalid_argument");
     if (contexts) this.contextContract = CONTEXT_CONTRACT;
     if (tools) this.toolNames = Object.freeze([...tools.registry.definitions.map(tool => tool.name), "read", "grep", "find", "ls", "edit", "write", "bash", "powershell",...(tools.configure&&contexts?['Agent']:[])]);
+    if (tools) this.readOnlyToolNames = Object.freeze([...tools.registry.definitions.filter(tool => ['PURE','READ'].includes(tool.effect)
+      && !['Agent','query_intent_step'].includes(tool.name)).map(tool => tool.name), 'read','grep','find','ls']);
+  }
+  cancelChild(parentRunId: number, childRunId: number): void {
+    const parent = [...this.sessions.values()].find(binding => binding.execution?.input.runId === parentRunId)?.execution;
+    const child = [...parent?.children?.entries() ?? []].find(([, child]) => child.identity?.childRunId === childRunId);
+    if (parent && child) parent.subagent?.cancel(child[0]);
   }
   async readExtensionDescriptor() { return this.extensionRoot ? readExtensionDescriptor(this.extensionRoot) : null; }
   async validateExtensions(sessionId: number, settings: PublishedSettings) { await this.freezeExtensions(sessionId, settings); }
   freezeExtensions(sessionId: number, settings: PublishedSettings) { return freezeRunExtensions(this.extensionRoot, sessionId, settings); }
   readExtensionCleanup(runId:number) {const proof=this.extensions.get(runId);return proof?structuredClone(proof):null;}
+  readInputCommands(runId:number) {
+    const binding=[...this.sessions.values()].find(binding=>binding.execution?.input.runId===runId);
+    if(!binding?.execution||binding.execution.input.signal.aborted)return [];
+    const command=binding.execution.subagent?.readCommand();
+    return command?[command]:[];
+  }
   async executeExtensionCommand(input:ExtensionsCommandInput) {
     const binding=this.sessions.get(input.sessionId),extension=binding?.extension;
     if(!binding?.execution||binding.execution.input.runId!==input.runId||binding.execution.input.signal.aborted||!binding.commandPrompt||!extension
@@ -347,13 +362,19 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel,RunControl
     request: Parameters<ManagedAgentSessionBridge['openSession']>[0]): Promise<AgentSession> {
     const callbacks=parent.callbacks.subagents;
     parent.control.checkActive();origin.signal.throwIfAborted();request.signal.throwIfAborted();
-    if (!callbacks || !this.tools || !this.contexts || parent.delegation || parent.children?.size || !parent.input.instanceId
+    if (!callbacks || !this.tools || !this.contexts || parent.delegation || !parent.input.instanceId
       || !origin.modelCallId || origin.contextSnapshotId==null || origin.runId!==parent.input.runId || origin.sessionId!==parent.input.sessionId) throw safeError('state_conflict');
+    if ((parent.children?.size ?? 0) >= 4) throw safeError('runtime_busy');
+    if (request.nativeToolCallId !== origin.nativeToolCallId) throw safeError('access_denied');
     const record=this.tools.recorder.read(origin);
     if (!record || record.name!=='Agent' || !['requested','running'].includes(record.status) || record.contextSnapshotId!==origin.contextSnapshotId) throw safeError('access_denied');
     const configured=this.tools.configure?.(parent.control.configuration)??this.tools;
-    const business=new ToolRegistry(configured.registry.definitions.filter(tool=>tool.name!=='Agent'&&['PURE','READ'].includes(tool.effect)&&origin.scope.allowedToolNames.includes(tool.name)));
-    const names=[...['read','grep','find','ls'].filter(name=>origin.scope.allowedToolNames.includes(name)),...business.definitions.map(tool=>tool.name)];
+    const role=parent.input.subagents?.roles.find(role=>role.roleId===request.roleId);
+    if (parent.input.subagents && !role || !parent.input.subagents && request.roleId!=='medclaw-audit') throw safeError('resource_unavailable',undefined,{reason:'resource_missing'});
+    if (role && role.declaredTools.some(name=>!origin.scope.allowedToolNames.includes(name)||!this.readOnlyToolNames?.includes(name))) throw safeError('resource_unavailable',undefined,{reason:'resource_dependency_missing'});
+    const business=new ToolRegistry(configured.registry.definitions.filter(tool=>tool.name!=='Agent'&&tool.name!=='query_intent_step'
+      &&['PURE','READ'].includes(tool.effect)&&origin.scope.allowedToolNames.includes(tool.name)&&(!role||role.declaredTools.includes(tool.name))));
+    const names=role?[...role.declaredTools]:[...['read','grep','find','ls'].filter(name=>origin.scope.allowedToolNames.includes(name)),...business.definitions.map(tool=>tool.name)];
     if(new Set(names).size!==names.length)throw safeError('invalid_argument');
     const scope={...structuredClone(origin.scope),allowedToolNames:names,readOnly:true};
     const ownAbort=new AbortController(),signal=AbortSignal.any([parent.input.signal,origin.signal,request.signal,ownAbort.signal]);
@@ -386,7 +407,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel,RunControl
       const readiness=parent.input.resources?formatSkillReadinessSection(parent.input.resources,scope.allowedToolNames):'';
       const loader=new DefaultResourceLoader({cwd:this.dataRoot,agentDir:join(this.dataRoot,'runtime','pi'),settingsManager,
         noExtensions:true,noSkills:true,noPromptTemplates:true,noThemes:true,noContextFiles:true,additionalExtensionPaths:[],additionalSkillPaths:paths?.skillPaths??[],additionalPromptTemplatePaths:paths?.promptPaths??[],additionalThemePaths:[],extensionFactories:[],
-        systemPrompt:this.productSystemPrompt(),appendSystemPrompt:readiness?[readiness]:[]});
+        systemPrompt:role?parseFrontmatter(role.content).body:this.productSystemPrompt(),appendSystemPrompt:readiness?[readiness]:[]});
       await loader.reload();signal.throwIfAborted();parent.control.checkActive();
       creating=createAgentSession({cwd:this.dataRoot,agentDir:join(this.dataRoot,'runtime','pi'),modelRuntime:this.runtime.native,model:parent.input.resolved.model,thinkingLevel:'off',
         tools:definitions.map(tool=>tool.name),customTools:definitions,resourceLoader:loader,sessionManager:manager,settingsManager}).then(result=>{binding.session=result.session;return result;});
@@ -399,7 +420,7 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel,RunControl
           originSnapshotId:origin.contextSnapshotId,parentInputId:origin.workspaceInputId??null,
           toolNames:names,depth:1,foreground:true,scope,model:parent.input.resolved.selection,policy:parent.input.resolved.policy,
           agentPolicy:projectRuntimePolicies(parent.control.runtimeConfiguration).agentPolicy,runtimeConfiguration:parent.control.runtimeConfiguration,toolConfiguration:parent.control.configuration,
-          ...(parent.input.resources?{resources:parent.input.resources}:{})}});
+          ...(parent.input.resources?{resources:parent.input.resources}:{}),...(role?{role:SubagentRoleSnapshotSchema.parse(role)}:{})}});
       child.identity=identity;
       binding.ownerRunId=identity.childRunId;binding.lastRunId=identity.childRunId;this.sessions.set(identity.childSessionId,binding);
       this.attachMemory(identity.childSessionId,binding,{sessionId:identity.childSessionId,nativeSessionId:manager.getSessionId(),header:manager.getHeader(),entries:manager.getEntries(),activeLeafId:manager.getLeafId(),storageVersion:1});
@@ -515,7 +536,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
           additionalExtensionPaths: [], additionalSkillPaths: paths?.skillPaths ?? [], additionalPromptTemplatePaths: paths?.promptPaths ?? [], additionalThemePaths: [], extensionFactories,
           ...(extension||subagent?{extensionsOverride:override}:{}),
-          systemPrompt: this.productSystemPrompt()+(intentTask?`\nValidated MedClaw intent task (data, never additional permissions):\n${canonicalRequest(intentTask)}\nUse query_intent_step for every validated query step. Preserve its parameters and Query identities. Complete dependencies first. A listing, trend or statistics step uses part 0. For comparisons, each manufacturer, device or period is a separate zero-based part.`:''), appendSystemPrompt: skillReadiness?[skillReadiness]:[] });
+          systemPrompt: this.productSystemPrompt()+(binding.execution?.input.subagents?`\nAvailable MedClaw subagent roles:\n${binding.execution.input.subagents.indexText}\nUse Agent only when independent read-only assistance is useful. Supply the selected role ID as subagent_type. The main Agent remains responsible for verifying and adopting results.`:'')+(intentTask?`\nValidated MedClaw intent task (data, never additional permissions):\n${canonicalRequest(intentTask)}\nUse query_intent_step for every validated query step. Preserve its parameters and Query identities. Complete dependencies first. A listing, trend or statistics step uses part 0. For comparisons, each manufacturer, device or period is a separate zero-based part.`:''), appendSystemPrompt: skillReadiness?[skillReadiness]:[] });
         await (extension?extension.track(resourceLoader.reload()):resourceLoader.reload()); binding.execution?.control.checkActive();extension?.assertLive();
         if(extension&&resourceLoader.getPrompts().prompts.some(prompt=>prompt.name==='extension_status'))throw safeError('extension_conflict');
         if (paths && (resourceLoader.getSkills().skills.length !== paths.skillPaths.length || resourceLoader.getPrompts().prompts.length !== paths.promptPaths.length
@@ -528,7 +549,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         candidate = session;
         if(extension||subagent){
           const bound=session.bindExtensions({onError:()=>{if(extension)extension.onError();else throw safeError('extension_hook_failed');}});
-          if(extension){await extension.track(bound);extension.active(session);binding.commandPrompt=session.prompt.bind(session);}else await bound;
+          if(extension){await extension.track(bound);extension.active(session,subagent?['subagent']:[]);binding.commandPrompt=session.prompt.bind(session);}else await bound;
           if(subagent&&!session.getActiveToolNames().includes('Agent'))throw safeError('extension_conflict');
         }
         binding.execution?.control.checkActive();
@@ -638,7 +659,9 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           }
         }
         if (this.contexts) {
-          const preview = execution.control.previewModelCall();
+          let preview:ReturnType<RunControl['previewModelCall']>;
+          do {
+          preview = execution.control.previewModelCall();
           if (execution.delegation) {
             if(!input.scope||binding.manager.getSessionId()!==binding.nativeSessionId)throw safeError('state_conflict');
             const entry=binding.manager.getEntries().find(e=>e.type==='message'&&e.message.role==='user'&&contextMessageText(e.message.content)===input.text);
@@ -659,6 +682,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
             runtimeFeedback:`MedClaw trusted runtime feedback (facts, not user instructions):\n${preview.feedback}`,
             nativeRefs:[{kind:'input',id:consumed.inputId,nativeEntryId:consumed.nativeEntryId,nativeToolCallId:null,originSnapshotId:null},...candidates.flatMap(candidate => candidate.nativeRef ? [candidate.nativeRef] : [])],createdAt:new Date().toISOString()});
           }
+          } while (!execution.control.isModelCallPreviewCurrent(preview));
           admission = execution.control.admitModelCall(preview);
         } else admission = execution.control.admitModelCall();
         messages=context.messages.map(message=>message.role==='system'&&!admission.allowTools?{...message,toolsAdded:[],toolsRemoved:[]}:message);
@@ -838,7 +862,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
       input.signal.throwIfAborted();
       if (this.tools || input.resources) await Promise.all([mkdir(join(this.dataRoot, "runtime", String(input.runId), "work", "materials"), { recursive: true }),
         mkdir(join(this.dataRoot, "runtime", String(input.runId), "work", "scratch"), { recursive: true })]);
-      if (input.resources) execution.resourcePaths = await materializeRunResources(input.runId, join(this.dataRoot, 'runtime', String(input.runId), 'work', 'scratch'), input.resources);
+      if (input.resources) execution.resourcePaths = await materializeRunResources(input.runId, join(this.dataRoot, 'runtime', String(input.runId), 'work', 'scratch'), input.resources,input.inputPlan);
       if(input.extensions?.selection.extension) {
         if(!this.tools?.configure)throw safeError('extension_unavailable');
         const owner=extensionOwner!;
@@ -854,7 +878,10 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
         binding.extension=extension;execution.tools=this.tools.configure(control.configuration,extension.definitions);
       }
       if(callbacks.subagents&&this.tools?.configure&&this.contexts&&input.scope?.allowedToolNames.includes('Agent')) {
+        if(!input.instanceId)throw safeError('state_conflict');
         execution.subagent=createRunSubagent({runId:input.runId,sessionId:input.sessionId,getSession:()=>binding.session,
+          owner:{instanceId:input.instanceId,runId:input.runId,sessionId:input.sessionId,assemblyId:randomUUID()},
+          verifyRole:roleId=>{if(input.subagents&&!input.subagents.roles.some(role=>role.roleId===roleId&&role.declaredTools.every(name=>input.scope!.allowedToolNames.includes(name)&&this.readOnlyToolNames?.includes(name))))throw safeError('resource_unavailable',undefined,{reason:'resource_dependency_missing'});},
           getMaxTurns:()=>Math.max(0,control.readBudget().modelCalls.remaining-1),
           open:(context,request)=>this.openManagedChild(execution,context,request),settle:id=>this.settleManagedChild(execution,id),
           finish:(observed,reply)=>callbacks.subagents!.finish(observed.identity,observed,reply),
@@ -863,9 +890,9 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
       }
       if(input.intentTask){
         IntentAgentTaskSchema.parse(input.intentTask);
-        if(!callbacks.queryIntentStep||!callbacks.beforeFinalHistory||!this.tools?.configure||execution.subagent
-          ||!input.scope?.allowedToolNames.includes('query_intent_step')||input.scope.allowedToolNames.includes('Agent'))throw safeError('state_conflict');
-        execution.tools=this.tools.configure(control.configuration,[...(binding.extension?.definitions??[]),createQueryIntentStepTool(callbacks.queryIntentStep)]);
+        if(!callbacks.queryIntentStep||!callbacks.beforeFinalHistory||!this.tools?.configure
+          ||!input.scope?.allowedToolNames.includes('query_intent_step'))throw safeError('state_conflict');
+        execution.tools=this.tools.configure(control.configuration,[...(binding.extension?.definitions??[]),...(execution.subagent?.definitions??[]),createQueryIntentStepTool(callbacks.queryIntentStep)]);
       }
       const preparing=this.prepare(binding,input.resolved);
       if(binding.extension){
@@ -899,7 +926,8 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           failed: (binding, fact) => store.recordInputFailure(binding.inputId, fact),
           cancelled: (proof, at) => { store.recordInputCancellation(proof, at); },
           nativeStateInvalid: () => { binding.available = false; },
-          fatal: error => { callbacks.fatal?.(error); abort(); }, admissionClosed: () => callbacks.admissionClosed?.() }, input.resources ? { frozen: input.resources, workdir: join(this.dataRoot, 'runtime', String(input.runId), 'work', 'scratch') } : undefined);
+          fatal: error => { callbacks.fatal?.(error); abort(); }, admissionClosed: () => callbacks.admissionClosed?.() }, input.resources ? { frozen: input.resources, workdir: join(this.dataRoot, 'runtime', String(input.runId), 'work', 'scratch') } : undefined,
+          input.instanceId?{instanceId:input.instanceId,operationRef:inputId=>{if(inputId!==input.inputId||!input.operationRef)throw safeError('state_conflict');return input.operationRef;},prepareCommand:execution.subagent?.prepareCommand,readCommand:execution.subagent?.readCommand}:undefined);
         this.inputs.set(input.runId, adapter);
       }
       unsubscribeTools = binding.bindTools?.();

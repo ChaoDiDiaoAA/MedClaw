@@ -1,11 +1,13 @@
-import { parseSkillBlock, type AgentSession, type SessionManager } from '@earendil-works/pi-coding-agent';
+import { parseFrontmatter, parseSkillBlock, type AgentSession, type SessionManager } from '@earendil-works/pi-coding-agent';
 import { AppErrorSchema, safeError, type AppError } from '../../contracts/src/error';
 import type { InputAdapterPort, InputBinding, InputCancelProof, InputControl, InputSettlementProof, InputStore } from '../../contracts/src/session';
 import type { WorkspaceContext } from '../../contracts/src/workspace';
 import { join } from 'node:path';
-import { NativeInputReceiptSchema, RESOURCE_LIMITS, resourceRefKey, type FrozenRunResources, type NativeInputReceipt } from '../../contracts/src/resources';
+import { isDeepStrictEqual } from 'node:util';
+import { NativeInputReceiptSchema, SubagentInputReceiptSchema, RESOURCE_LIMITS, resourceRefKey, type FrozenRunResources, type NativeInputReceipt, type SubagentInputReceipt } from '../../contracts/src/resources';
 import { contextMessageText } from './messages';
-import { verifyRunResourceFiles } from './resource-loader';
+import { readText, verifyRunResourceFiles } from './resource-loader';
+import type { createRunSubagent } from './subagent-adapter';
 
 type Message = Parameters<AgentSession['agent']['steer']>[0];
 type Failure = Parameters<InputStore['recordInputFailure']>[1];
@@ -22,7 +24,8 @@ export interface PiInputAdapterCallbacks {
   nativeStateInvalid?(): void;
   admissionClosed(): void;
 }
-type Record = { input: InputBinding; message?: Message; nativeInput?: NativeInputReceipt; started: boolean; entryId?: string; appendOrder?: number; removed?: Removal; unknown: boolean; failed: boolean };
+type Record = { input: InputBinding; message?: Message; nativeInput?: NativeInputReceipt; delegationReceipt?: SubagentInputReceipt; started: boolean; entryId?: string; appendOrder?: number; removed?: Removal; unknown: boolean; failed: boolean };
+export interface DelegationInputOptions { instanceId: string; operationRef(inputId: number): string; prepareCommand?: ReturnType<typeof createRunSubagent>['prepareCommand']; readCommand?: ReturnType<typeof createRunSubagent>['readCommand'] }
 function latch<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; }
 
 /** Composes public Pi methods. Pi retains exclusive ownership of its scheduling loop. */
@@ -48,7 +51,7 @@ export class PiInputAdapter implements InputAdapterPort {
   private readonly sessionInstalled: Pick<AgentSession, 'prompt' | 'steer' | 'followUp'>;
   private readonly unsubscribe: () => void;
 
-  constructor(private readonly session: AgentSession, private readonly manager: SessionManager, private readonly callbacks: PiInputAdapterCallbacks, private readonly resources?: { frozen: FrozenRunResources; workdir: string }) {
+  constructor(private readonly session: AgentSession, private readonly manager: SessionManager, private readonly callbacks: PiInputAdapterCallbacks, private readonly resources?: { frozen: FrozenRunResources; workdir: string }, private readonly delegation?: DelegationInputOptions) {
     const agent = session.agent;
     this.sessionOriginals = { prompt: session.prompt.bind(session), steer: session.steer.bind(session), followUp: session.followUp.bind(session) };
     const rejectUncontrolled = () => {
@@ -149,13 +152,26 @@ export class PiInputAdapter implements InputAdapterPort {
       const reject = (): never => { throw safeError('resource_unavailable', undefined, { reason: 'resource_expansion_failed' }); };
       if (text === null || !this.resources || this.resources.frozen.sessionId !== record.input.sessionId) reject();
       if (plan.kind === 'plain') { if (text !== plan.dispatchText) reject(); }
+      else if (plan.kind === 'subagent_command') {
+        const receipt = record.delegationReceipt;
+        if (!receipt || receipt.kind !== 'command' || receipt.inputId !== record.input.inputId || receipt.operationRef !== this.delegation?.operationRef(record.input.inputId)
+          || receipt.owner.instanceId !== this.delegation?.instanceId || receipt.owner.sessionId !== record.input.sessionId || receipt.owner.runId !== record.input.targetRunId
+          || !isDeepStrictEqual(receipt.owner, this.delegation?.readCommand?.()?.owner)
+          || receipt.roleId !== plan.source.roleId || receipt.task !== plan.source.task || text !== receipt.dispatchText) reject();
+      }
+      else if (plan.kind === 'subagent_template') {
+        const location = join(this.resources!.workdir, 'subagent-prompts', `${plan.source.templateName}.md`);
+        const template = this.session.promptTemplates.filter(item => item.name === plan.source.templateName);
+        if (template.length !== 1 || template[0]!.filePath !== location || template[0]!.content !== parseFrontmatter(plan.source.content).body || text === plan.dispatchText) reject();
+        record.delegationReceipt = { kind: 'template', templateName: plan.source.templateName, expandedText: text! };
+      }
       else {
         const snapshot = this.resources!.frozen.available.find(s => resourceRefKey(s.ref) === resourceRefKey(plan.resourceRef!)); if (!snapshot) reject();
         const location = join(this.resources!.workdir, 'resources', snapshot!.entry);
         if (plan.kind === 'skill') { const block = parseSkillBlock(text!); if (!block || block.name !== snapshot!.name || block.location !== location) reject(); }
         else if (!this.session.promptTemplates.some(p => p.name === snapshot!.name && p.filePath === location) || text === plan.dispatchText) reject();
       }
-      const receipt = NativeInputReceiptSchema.safeParse({ text });
+      const receipt = NativeInputReceiptSchema.safeParse({ text, ...(record.delegationReceipt ? { subagentReceipt: record.delegationReceipt } : {}) });
       const limit = record.input.nativeReceiptLimitBytes ?? RESOURCE_LIMITS.nativeReceiptBytes;
       if (!receipt.success || !Number.isSafeInteger(limit) || limit < 0 || Buffer.byteLength(JSON.stringify(receipt.data), 'utf8') > limit) throw safeError('resource_unavailable', undefined, { reason: 'resource_too_large' });
       record.nativeInput = receipt.data;
@@ -181,8 +197,20 @@ export class PiInputAdapter implements InputAdapterPort {
       let task: Promise<void>;
       try {
         if (this.resources) await verifyRunResourceFiles(this.resources.workdir, this.resources.frozen);
-        const text = input.inputPlan?.dispatchText ?? input.text;
-        task = input.mode === 'send' ? this.sessionOriginals.prompt(text, { expandPromptTemplates: !!input.inputPlan })
+        let text = input.inputPlan?.dispatchText ?? input.text;
+        if (input.inputPlan?.kind === 'subagent_template') {
+          if (input.mode !== 'send' || !this.resources || (await readText(join(this.resources.workdir, 'subagent-prompts'), `${input.inputPlan.source.templateName}.md`)).content !== input.inputPlan.source.content) throw safeError('resource_unavailable', undefined, { reason: 'resource_snapshot_invalid' });
+        }
+        if (input.inputPlan?.kind === 'subagent_command') {
+          if (input.mode !== 'send' || !this.delegation?.prepareCommand || !this.delegation.readCommand?.()) throw safeError('extension_unavailable');
+          const receipt = SubagentInputReceiptSchema.parse(await this.delegation.prepareCommand({ inputId: input.inputId,
+            operationRef: this.delegation.operationRef(input.inputId), instanceId: this.delegation.instanceId, sessionId: input.sessionId, runId: input.targetRunId,
+            text, roleId: input.inputPlan.source.roleId, task: input.inputPlan.source.task,
+            invoke: command => this.sessionOriginals.prompt(command, { expandPromptTemplates: true }) }));
+          if (receipt.kind !== 'command' || record.message) throw safeError('extension_command_failed');
+          record.delegationReceipt = receipt; text = receipt.dispatchText;
+        }
+        task = input.mode === 'send' ? this.sessionOriginals.prompt(text, { expandPromptTemplates: !!input.inputPlan && input.inputPlan.kind !== 'subagent_command' })
           : input.mode === 'steer' ? this.sessionOriginals.steer(text) : this.sessionOriginals.followUp(text);
       } catch (error) { task = Promise.reject(error); }
       // Completion of a handled/rejected preflight also releases the short latch.

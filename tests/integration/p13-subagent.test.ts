@@ -303,7 +303,7 @@ test('p13 real child automatic compaction saves its own native summary and count
   }finally{await f.close();}
 },30000);
 
-test('p13 child failed compaction retries its original owner marker before final save without another model request',async()=>{
+for(const storageFailure of [false,true])test(`p13 child failed compaction ${storageFailure?'blocks the root until its original owner marker is saved':'isolates its failure while the parent finishes'}`,async()=>{
   const prompt={...p13AgentInput,prompt:'ENGINEERING child context '.repeat(100)};
   const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'failed-compact-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(prompt)}}]}:
     index===2?{role:'assistant',tool_calls:[{index:0,id:'failed-compact-read',type:'function',function:{name:'read_data_scope',arguments:'{}'}}]}:
@@ -311,12 +311,14 @@ test('p13 child failed compaction retries its original owner marker before final
     index=>({prompt_tokens:index===3?32600:10,completion_tokens:2,total_tokens:index===3?32602:12}));
   const describe=f.agent.describe.bind(f.agent);f.agent.describe=resolved=>({...describe(resolved),compaction:{contract:'medclaw.compaction/v1',enabled:true,reserveTokens:256,keepRecentTokens:128}});
   const finish=f.repos.finishAutoCompaction.bind(f.repos);let writes=0;
-  f.repos.finishAutoCompaction=(...args)=>{if(++writes===1)throw new Error('ENGINEERING once storage failure');return finish(...args);};
+  f.repos.finishAutoCompaction=(...args)=>{if(++writes===1&&storageFailure)throw new Error('ENGINEERING once storage failure');return finish(...args);};
   try{
     const accepted=await f.app.runs.submitAgent(f.request('ENGINEERING child failed compaction'),{instanceId:'host',operationRef:'p13-failed-compaction'});if(!accepted.ok||!accepted.data.runId)throw new Error('No Run');
-    await Reflect.get(f.app.runs,'execution').task;expect(f.app.runs.busy).toBe(true);expect(f.requests).toHaveLength(4);
-    expect(await f.app.runs.retrySave(accepted.data.runId)).toMatchObject({ok:true,data:{status:'failed',cleanup:{requiredPersistenceComplete:true,resourcesReleased:true}}});
-    expect(f.app.runs.busy).toBe(false);expect(writes).toBe(2);expect(f.requests).toHaveLength(4);
+    await Reflect.get(f.app.runs,'execution').task;
+    if(storageFailure){expect(f.app.runs.busy).toBe(true);expect(f.requests).toHaveLength(4);
+      expect(await f.app.runs.retrySave(accepted.data.runId)).toMatchObject({ok:true,data:{status:'failed',cleanup:{requiredPersistenceComplete:true,resourcesReleased:true}}});}
+    else expect(f.repos.read({runId:accepted.data.runId})).toMatchObject({kind:'one',run:{status:'completed'}});
+    expect(f.app.runs.busy).toBe(false);expect(writes).toBe(storageFailure?2:1);expect(f.requests).toHaveLength(storageFailure?4:5);
     const child=f.db.query<{id:number;status:string;child_result_json:string},[]>("SELECT id,status,child_result_json FROM runs WHERE kind='child'").get()!;
     expect(child.child_result_json).not.toBeNull();expect(['failed','cancelled']).toContain(child.status);
     expect(f.db.query("SELECT run_id,json_extract(model_json,'$.compaction.operationEndedAt') ended,json_extract(model_json,'$.compaction.operationError.code') code FROM model_calls WHERE kind='compaction'").get()).toMatchObject({run_id:child.id,ended:expect.any(String),code:expect.any(String)});
@@ -508,10 +510,12 @@ test('p13 child ToolCall persistence failure immediately closes the original roo
   const f=await agentRuntimeFixture(index=>index===1?{role:'assistant',tool_calls:[{index:0,id:'save-Agent',type:'function',function:{name:'Agent',arguments:JSON.stringify(p13AgentInput)}}]}:
     index===2?{role:'assistant',tool_calls:[{index:0,id:'save-child-tool',type:'function',function:{name:'read_data_scope',arguments:'{}'}}]}:{role:'assistant',content:'ENGINEERING must not continue across save failure'});
   const transition=f.toolStore.transition.bind(f.toolStore);
+  const fatal=f.app.runs.failToolPersistence.bind(f.app.runs);let acceptingAtFailure:boolean|undefined;
+  f.app.runs.failToolPersistence=(...args)=>{fatal(...args);acceptingAtFailure??=f.app.runs.readInputControl(1)?.acceptingInputs;};
   try{
     f.toolStore.transition=(...args)=>{if(reject&&args[2]==='succeeded'&&f.db.query<{native_tool_call_id:string},[number]>('SELECT native_tool_call_id FROM tool_calls WHERE id=?').get(args[0])?.native_tool_call_id==='save-child-tool')throw new Error('ENGINEERING child ToolCall save fault');return transition(...args);};
     const result=await f.app.runs.submitAgent(f.request('ENGINEERING child tool save gate'),{instanceId:'host',operationRef:'p13-child-tool-save'});if(!result.ok||!result.data.runId)throw new Error('No Run');
-    await Reflect.get(f.app.runs,'execution').task;expect(f.requests).toHaveLength(2);expect(f.app.runs.busy).toBe(true);
+    await Reflect.get(f.app.runs,'execution').task;expect(acceptingAtFailure).toBe(false);expect(f.requests).toHaveLength(2);expect(f.app.runs.busy).toBe(true);
     expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:false});reject=false;
     expect(await f.app.runs.retrySave(result.data.runId)).toMatchObject({ok:true});expect(f.app.runs.busy).toBe(false);expect(f.requests).toHaveLength(2);
     expect(f.db.query("SELECT status,json_extract(result_json,'$.scope.readOnly') AS read_only FROM tool_calls WHERE native_tool_call_id='save-child-tool'").get()).toEqual({status:'succeeded',read_only:1});
@@ -645,14 +649,14 @@ test('p13 product child factory binds SQLite identity, explicit SDK and business
     const parent={input,control,callbacks:{fatal:(error:unknown)=>errors.push(error),subagents:callbacks},children:new Map()};
     const open=Reflect.get(agent,'openManagedChild');expect(typeof open).toBe('function');
     db.exec("CREATE TEMP TRIGGER fail_child_registration BEFORE INSERT ON runs WHEN NEW.kind='child' BEGIN SELECT RAISE(ABORT,'ENGINEERING registration failure'); END;");
-    await expect(open.call(agent,parent,context,{pluginAgentId:'failed-factory-fixture',prompt:p13AgentInput.prompt,signal:controller.signal})).rejects.toMatchObject({code:'storage_write_failed'});
+    await expect(open.call(agent,parent,context,{pluginAgentId:'failed-factory-fixture',nativeToolCallId:context.nativeToolCallId,roleId:'medclaw-audit',prompt:p13AgentInput.prompt,signal:controller.signal})).rejects.toMatchObject({code:'storage_write_failed'});
     expect(requests).toHaveLength(0);expect(owned.size).toBe(0);expect(parent.children.size).toBe(0);
     expect(db.query("SELECT id FROM runs WHERE kind='child'").all()).toEqual([]);expect(db.query("SELECT id FROM sessions WHERE kind='child'").all()).toEqual([]);
     db.exec('DROP TRIGGER fail_child_registration');
     // Lost return after COMMIT: reconcile by exact original identity and frozen initial history, never by recency.
     const register=repos.registerChild.bind(repos);let lost=true;
     repos.registerChild=request=>{const identity=register(request);if(lost){lost=false;throw new Error('ENGINEERING lost registration return');}return identity;};
-    const pending=open.call(agent,parent,context,{pluginAgentId:'real-factory-fixture',prompt:p13AgentInput.prompt,signal:controller.signal});
+    const pending=open.call(agent,parent,context,{pluginAgentId:'real-factory-fixture',nativeToolCallId:context.nativeToolCallId,roleId:'medclaw-audit',prompt:p13AgentInput.prompt,signal:controller.signal});
     expect(requests).toHaveLength(0);child=await pending;
     expect(child!.getAllTools().map(t=>t.name).sort()).toEqual(['read','read_data_scope']);
     expect(child!.getActiveToolNames().sort()).toEqual(['read','read_data_scope']);
@@ -696,7 +700,7 @@ function frozenFixture(f: ReturnType<typeof acceptContextInput>, origin: { id: n
   return FrozenChildConfigSchema.parse({
     contract: 'medclaw.subagent/v1', instanceId: 'host', parentRunId: f.input.runId, parentSessionId: f.input.sessionId,
     originToolCallId: origin.id, originNativeToolCallId: origin.nativeToolCallId, pluginAgentId, nativeSessionId: native.header.id, childRunId, childSessionId,
-    originSnapshotId: snapshotId, parentInputId: f.input.inputId,  pluginVersion: '0.19.0', pluginGitHead: '4f572eaa04c09d3dbc16e4a5f13a16b295e84e14', pluginIntegrity: 'sha512-fixture', patchHash: 'b'.repeat(64),
+    originSnapshotId: snapshotId, parentInputId: f.input.inputId,  pluginVersion: '0.19.0', pluginGitHead: '4f572eaa04c09d3dbc16e4a5f13a16b295e84e14', pluginIntegrity: 'sha512-fixture', patchRevision: 'medclaw-managed/2026-10-21',
     toolNames: f.input.scope.allowedToolNames, depth: 1, foreground: true, scope: { ...f.input.scope, readOnly: true }, model: f.run.model, policy: f.run.policy, agentPolicy: DEFAULT_AGENT_POLICY,
     runtimeConfiguration: normalizeRuntimeConfiguration(), toolConfiguration: normalizeToolConfiguration(),
   });
@@ -763,8 +767,8 @@ test('p13 schema11 migration preserves original data and rejects partial upgrade
       db.close();
     }
     db = openDatabase(path);
-    expect(SCHEMA_VERSION).toBe(16);
-    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(16);
+    expect(SCHEMA_VERSION).toBe(17);
+    expect(db.query('SELECT version FROM schema_migrations').all()).toHaveLength(17);
     for (const name of tables.filter(n => n !== 'schema_migrations')) {
       const rows = db.query<Record<string, unknown>, []>(`SELECT * FROM ${name} ORDER BY id`).all();
       expect(rows.map((row, i) => Object.fromEntries(Object.keys(retainedFields(before.get(name)![i]!)).map(key => [key, row[key]])))).toEqual(before.get(name)!.map(retainedFields));
@@ -831,14 +835,13 @@ test('p13 child DDL binds an original parent Agent call, freezes identity and is
     const nextSession = Number(db.query("INSERT INTO sessions(native_session_id,kind,creation_operation_ref,creation_request_json,creation_result_json,title,storage_version,native_header_json,history_format_version,created_at,updated_at) VALUES(?,'child',?,?,NULL,'ENGINEERING second child',1,?,'pi-session/3;pi-sdk/0.87.1',?,?)")
       .run(nextNative.header.id, `internal-child:${nextOrigin.id}`, JSON.stringify({ contract: 'medclaw.child-creation/v1', parentRunId: f.input.runId, originToolCallId: nextOrigin.id, pluginAgentId: 'plugin-child-2' }), JSON.stringify(nextNative.header), contextAt, contextAt).lastInsertRowid);
     const next = { childRunId: childRunId + 1, childSessionId: nextSession, nativeSessionId: nextNative.header.id, originToolCallId: nextOrigin.id, originNativeToolCallId: nextOrigin.nativeToolCallId, pluginAgentId: 'plugin-child-2' };
-    expect(() => insert(next)).toThrow('UNIQUE constraint failed');
+    insert(next);
     db.query("UPDATE runs SET status='failed' WHERE id=?").run(childRunId);
     const wrongOrigin = tools.request({ name: 'read', version: 'fixture', effect: 'READ', executionMode: 'sequential' }, { path: 'fixture' }, { ...context, nativeToolCallId: 'parent-read' });
     const wrongNative = memoryNativeFixture(root);
     const wrongSession = Number(db.query("INSERT INTO sessions(native_session_id,kind,creation_operation_ref,creation_request_json,creation_result_json,title,storage_version,native_header_json,history_format_version,created_at,updated_at) VALUES(?,'child',?,?,NULL,'ENGINEERING invalid origin',1,?,'pi-session/3;pi-sdk/0.87.1',?,?)")
       .run(wrongNative.header.id, `internal-child:${wrongOrigin.id}`, JSON.stringify({ contract: 'medclaw.child-creation/v1', parentRunId: f.input.runId, originToolCallId: wrongOrigin.id, pluginAgentId: 'invalid-plugin' }), JSON.stringify(wrongNative.header), contextAt, contextAt).lastInsertRowid);
-    expect(() => insert({ childRunId: childRunId + 1, childSessionId: wrongSession, originToolCallId: wrongOrigin.id, originNativeToolCallId: wrongOrigin.nativeToolCallId, pluginAgentId: 'invalid-plugin', nativeSessionId: wrongNative.header.id })).toThrow('child_owner_mismatch');
-    insert(next);
+    expect(() => insert({ childRunId: childRunId + 2, childSessionId: wrongSession, originToolCallId: wrongOrigin.id, originNativeToolCallId: wrongOrigin.nativeToolCallId, pluginAgentId: 'invalid-plugin', nativeSessionId: wrongNative.header.id })).toThrow('child_owner_mismatch');
     expect(f.repos.active()).toMatchObject({ runId: f.input.runId, kind: 'agent' });
     const updated = f.repos.read({ recent: true, parentRunId: f.input.runId });
     expect(updated.kind === 'recent' && updated.runs.map(r => r.id)).toEqual([next.childRunId, childRunId]);
@@ -934,6 +937,7 @@ test('p13 real parent Agent call awaits binding before child SDK request and ret
     expect(record.status).toBe('completed');
     expect(record.session).toBe(trace.children[0]);
     expect(record.result).toBe('ENGINEERING_CHILD_RESULT');
+    expect(trace.events.find(event=>event.type==='awaited_factory_enter')).toMatchObject({nativeToolCallId:'parent_1',roleId:'medclaw-audit'});
     expect(trace.childRequests).toBe(1);
     expect(trace.parentRequests).toBe(2);
     const reply = parent.messages.find(message => message.role === 'toolResult');
@@ -944,21 +948,22 @@ test('p13 real parent Agent call awaits binding before child SDK request and ret
   }, { beforeReturn: async () => { entered.resolve(); await bound.promise; } });
 });
 
-test('p13 next real delegation is refused until child release and then creates fresh plugin and SDK identities', async () => {
+test('p13 fifth real delegation is refused until one of four children releases and then creates fresh plugin and SDK identities', async () => {
   await withP13Plugin(async (parent, trace) => {
     await parent.prompt('ENGINEERING first delegation');
     const firstId = trace.ids[0]!, first = await trace.extension.control.waitForSettled(firstId);
+    for(let index=1;index<4;index++)await parent.prompt('ENGINEERING another owned terminal child '+index);
     await parent.prompt('ENGINEERING cannot reuse an unreleased child');
-    expect(trace.children).toHaveLength(1);
+    expect(trace.children).toHaveLength(4);
     const rejected = parent.messages.filter(message => message.role === 'toolResult').at(-1);
     expect(rejected).toMatchObject({ isError: true });
     await trace.extension.control.release(firstId);
     await parent.prompt('ENGINEERING fresh delegation');
-    expect(trace.children).toHaveLength(2);
-    const second = await trace.extension.control.waitForSettled(trace.ids[1]!);
+    expect(trace.children).toHaveLength(5);
+    const second = await trace.extension.control.waitForSettled(trace.ids[4]!);
     expect(second.id).not.toBe(first.id);
     expect(second.session!.sessionManager.getSessionId()).not.toBe(first.session!.sessionManager.getSessionId());
-    expect(trace.childRequests).toBe(2);
+    expect(trace.childRequests).toBe(5);
     await trace.extension.control.release(second.id);
   });
 });
@@ -984,20 +989,21 @@ test('p13 cancellation does not treat plugin stopped as settled while the real f
   }, { beforeReturn: async () => { entered.resolve(); await bound.promise; } });
 });
 
-test('p13 child shutdown must finish before release allows a second real Agent call', async () => {
+test('p13 child shutdown must finish before four occupied slots allow a fifth real Agent call', async () => {
   const entered = Promise.withResolvers<void>(), released = Promise.withResolvers<void>();
   await withP13Plugin(async (parent, trace) => {
     await parent.prompt('ENGINEERING first');
+    for(let index=1;index<4;index++)await parent.prompt('ENGINEERING fill another owned slot '+index);
     const release = trace.extension.control.release(trace.ids[0]!);
     try {
       await entered.promise;
       await parent.prompt('ENGINEERING release still pending');
-      expect(trace.children).toHaveLength(1);
+      expect(trace.children).toHaveLength(4);
       expect(parent.messages.filter(message => message.role === 'toolResult').at(-1)).toMatchObject({ isError: true });
     } finally { released.resolve(); await release; }
     await parent.prompt('ENGINEERING release confirmed');
-    expect(trace.children).toHaveLength(2);
-    await trace.extension.control.release(trace.ids[1]!);
+    expect(trace.children).toHaveLength(5);
+    await trace.extension.control.release(trace.ids[4]!);
   }, { childFactory: pi => { pi.on('session_shutdown', async () => { entered.resolve(); await released.promise; }); } });
 });
 

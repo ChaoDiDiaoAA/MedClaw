@@ -132,7 +132,7 @@ test('P17 development desktop creates a stopped-root backup and reads its origin
     await page.getByRole('button', { name: 'Read original result', exact: true }).click();
     await expect(page.getByText('Original operation: ' + record.receipt.operationRef, { exact: true })).toBeVisible({ timeout: 10000 });
     expect(readStartupFacts(desktop.dataRoot)).toMatchObject({ runs: 0, calls: 0 });
-    expect(record.receipt).toMatchObject({ kind: 'create', state: 'completed', sdkVersion: '0.87.1', schemaVersion: 16 });
+    expect(record.receipt).toMatchObject({ kind: 'create', state: 'completed', sdkVersion: '0.87.1', schemaVersion: 17 });
   } finally { await desktop.dispose(); }
 });
 

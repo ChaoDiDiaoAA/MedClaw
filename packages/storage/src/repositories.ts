@@ -18,7 +18,7 @@ import { verifyPriorContextFacts } from './context-store';
 import { ModelCallContextSchema, ContextSnapshotBodySchema, type StartCallContext } from '../../contracts/src/context';
 import { FrozenRunResourcesSchema, ResourceEvidenceSchema, ResourceReadFactSchema, resourceRefKey, type FrozenRunResources, type ResourceEvidence } from '../../contracts/src/resources';
 import { FrozenRunExtensionsSchema, type FrozenRunExtensions } from '../../contracts/src/extensions';
-import { FrozenChildConfigSchema, ChildResultSchema, BoundChildIdentitySchema, childScopeWithin, type BoundChildIdentity, type RegisterChildInput, type FinalChildFact, type ChildResult, type CommittedChildExecutionProof } from '../../contracts/src/subagent';
+import { FrozenChildConfigSchema, FrozenRunSubagentsSchema, ChildResultSchema, BoundChildIdentitySchema, childScopeWithin, type BoundChildIdentity, type FrozenRunSubagents, type RegisterChildInput, type FinalChildFact, type ChildResult, type CommittedChildExecutionProof } from '../../contracts/src/subagent';
 import type { ToolExecutionContext } from '../../contracts/src/tool';
 import { readFrozenChild, canReadRelatedQuery } from './child-identity';
 import type { EventWriter, RegisteredEventDraft, RegisteredEventPayload } from '../../contracts/src/event';
@@ -84,6 +84,7 @@ const agentConfigSchema = z.strictObject({ selection: ModelSelectionSchema, poli
   toolProfileSnapshot: ToolProfileSnapshotSchema.optional(),
   referenceDate: z.string(), timezone: z.string(), agent: P2AgentOptionsSchema.extend({ stage: z.enum(["P2", "P3"]), nativeSessionId: OpaqueIdSchema,
     resources: FrozenRunResourcesSchema.optional(),
+    subagents: FrozenRunSubagentsSchema.optional(),
     extensions: FrozenRunExtensionsSchema.optional(),
     tools: z.array(z.string()), autoCompaction: z.boolean(), autoRetry: z.literal(false), cacheWarming: z.literal("off"), contextContract: z.literal('medclaw.context/v1').optional(),historyContract:z.literal('medclaw.history/p9-v1').optional() }) })
   .refine(config => config.agent.autoCompaction === (config.agent.compaction?.enabled ?? false), 'Frozen compaction configuration mismatch');
@@ -319,6 +320,14 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       return config.agent.resources ? this.checkedResources(config.agent.resources, row.session_id!, config.selection.configVersion) : null;
     });
   }
+  readRunSubagents(runId: number): FrozenRunSubagents | null {
+    id(runId); return this.inputRead(() => {
+      const row=this.row(runId);if(!row)fail('run_not_found');
+      if(row.kind!=='agent')return null;
+      const config=checked(agentConfigSchema,legacyRunConfig(decoded(row.config_json)),'storage_read_failed');
+      return config.agent.subagents??null;
+    });
+  }
   readRunResourceScope(runId: number): RunScope | null {
     id(runId);return this.inputRead(()=>{
       const row=this.row(runId);if(!row)fail('run_not_found');
@@ -497,7 +506,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       const inputId=Number(saved.lastInsertRowid);
       if(plan.execution.mode==='send'){
         const run=plan.execution.run;checked(OpaqueIdSchema,run.instanceId);timestamp(run.createdAt);
-        const config=checked(agentConfigSchema,{selection:run.model,policy:run.policy,referenceDate:run.referenceDate,timezone:run.timezone,...(run.intentAdmission?{intentAdmission:run.intentAdmission}:{}),...(run.agentPolicy?{agentPolicy:run.agentPolicy}:{}),...(run.runtimeConfiguration?{runtimeConfiguration:run.runtimeConfiguration}:{}),...(run.toolConfiguration?{toolConfiguration:run.toolConfiguration}:{}),...(run.measurementContext?{measurementContext:run.measurementContext}:{}),...(run.toolProfileSnapshot?{toolProfileSnapshot:run.toolProfileSnapshot}:{}),agent:{...run.agentOptions,stage:run.scope.allowedToolNames.length?'P3':'P2',nativeSessionId:session.nativeSessionId,tools:run.scope.allowedToolNames,autoCompaction:run.agentOptions.compaction?.enabled??false,autoRetry:false,cacheWarming:'off',...(run.resources?{resources:run.resources}:{}),...(run.extensions?{extensions:run.extensions}:{}),...(run.contextContract?{contextContract:run.contextContract}:{}),...(run.historyContract?{historyContract:run.historyContract}:{})}});
+        const config=checked(agentConfigSchema,{selection:run.model,policy:run.policy,referenceDate:run.referenceDate,timezone:run.timezone,...(run.intentAdmission?{intentAdmission:run.intentAdmission}:{}),...(run.agentPolicy?{agentPolicy:run.agentPolicy}:{}),...(run.runtimeConfiguration?{runtimeConfiguration:run.runtimeConfiguration}:{}),...(run.toolConfiguration?{toolConfiguration:run.toolConfiguration}:{}),...(run.measurementContext?{measurementContext:run.measurementContext}:{}),...(run.toolProfileSnapshot?{toolProfileSnapshot:run.toolProfileSnapshot}:{}),agent:{...run.agentOptions,stage:run.scope.allowedToolNames.length?'P3':'P2',nativeSessionId:session.nativeSessionId,tools:run.scope.allowedToolNames,autoCompaction:run.agentOptions.compaction?.enabled??false,autoRetry:false,cacheWarming:'off',...(run.resources?{resources:run.resources}:{}),...(run.subagents?{subagents:run.subagents}:{}),...(run.extensions?{extensions:run.extensions}:{}),...(run.contextContract?{contextContract:run.contextContract}:{}),...(run.historyContract?{historyContract:run.historyContract}:{})}});
         const r=this.db.query("INSERT INTO runs(session_id,input_id,kind,instance_id,submission_operation_ref,submission_client_sequence,submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at) VALUES(?,?,'agent',?,NULL,NULL,NULL,'created','answer',?,?,?,?,?,?,?)").run(session.id,inputId,run.instanceId,content.text,JSON.stringify(config),JSON.stringify(run.scope),JSON.stringify(frozenWorkspace),run.referenceDate,run.timezone,run.createdAt);target=Number(r.lastInsertRowid);
         this.db.query('UPDATE session_inputs SET target_run_id=? WHERE id=? AND target_run_id IS NULL').run(target,inputId);
         this.runLifecycle(this.row(target)!, 'run_created', run.createdAt);
@@ -575,6 +584,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       output,
       calls: row.kind === "provider" ? calls : calls.slice(callOffset, callOffset + callLimit), persistence: "committed",
       ...(child ? { parentRunId: child.parentRunId, originToolCallId: child.originToolCallId, pluginAgentId: child.pluginAgentId, nativeSessionId: child.nativeSessionId,originSnapshotId:child.originSnapshotId,parentInputId:child.parentInputId,
+        ...(child.role ? { role: { roleId: child.role.roleId, description: child.role.description } } : {}),
         nextCallOffset: callOffset + callLimit < calls.length ? callOffset + callLimit : null,
         childResult: childResult ? (() => { const { originalReply, ...view } = childResult,preview=safePreview(view.text,32768);return { ...view,truncated:view.truncated||preview.truncated,text:childResult.outcome === 'completed' ? preview.text : AppErrorSchema.safeParse(decoded(row.error_json)).data?.message ?? 'Child execution did not complete.' }; })() : null,
         delivery: delivery ? { resultRecorded: delivery.resultRecorded, sdkReturned: delivery.sdkReturned,sdkResultIsError:delivery.message?.isError??null,nativeEntryId: delivery.nativeEntryId, nextModelCallId: delivery.nextModelCallId, consumedAt: delivery.consumedAt,consumptionEvidence:delivery.consumptionEvidence??null,error: delivery.error } : null } : {}),
@@ -1531,7 +1541,7 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         ...(input.measurementContext ? { measurementContext: input.measurementContext } : {}),
         ...(input.toolProfileSnapshot ? { toolProfileSnapshot: input.toolProfileSnapshot } : {}),
         timezone: request.timezone, agent: { ...input.agentOptions, stage: input.scope.allowedToolNames.length ? "P3" : "P2", nativeSessionId: session.nativeSessionId, tools: input.scope.allowedToolNames,
-          autoCompaction: input.agentOptions.compaction?.enabled ?? false, autoRetry: false, cacheWarming: "off", ...(input.extensions?{extensions:input.extensions}:{}), ...(input.contextContract ? {contextContract:input.contextContract} : {}),...(input.historyContract?{historyContract:input.historyContract}:{}) } });
+          autoCompaction: input.agentOptions.compaction?.enabled ?? false, autoRetry: false, cacheWarming: "off", ...(input.subagents?{subagents:input.subagents}:{}), ...(input.extensions?{extensions:input.extensions}:{}), ...(input.contextContract ? {contextContract:input.contextContract} : {}),...(input.historyContract?{historyContract:input.historyContract}:{}) } });
       const result = this.db.query(`INSERT INTO runs(session_id,input_id,kind,instance_id,submission_operation_ref,submission_client_sequence,
         submission_request_json,status,goal,input_text,config_json,scope_json,workspace_json,reference_date,timezone,created_at)
         VALUES(?,NULL,'agent',?,?,?,?,'created','answer',?,?,?,?,?,?,?)`)
@@ -1553,7 +1563,16 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       if(!parent||parent.kind!=='agent'||parent.session_id===null)fail('access_denied');
       if(!['created','running'].includes(parent.status)||parent.cancel_requested_at!==null)fail('state_conflict');
       if(this.db.query('SELECT id FROM runs WHERE origin_tool_call_id=?').get(input.originToolCallId))fail('state_conflict');
-      if(this.db.query("SELECT id FROM runs WHERE parent_run_id=? AND status IN ('created','running')").get(parent.id))fail('runtime_busy');
+      const owned=this.db.query<RunRow,[number]>("SELECT * FROM runs WHERE kind='child' AND parent_run_id=?").all(parent.id).filter(child=>{
+        if(['created','running'].includes(child.status))return true;
+        const cleanup=RunCleanupRecordSchema.safeParse(decoded(child.cleanup_json));
+        const result=ChildResultSchema.safeParse(legacyChildResult(decoded(child.child_result_json??null)));
+        return !cleanup.success||cleanup.data.stopConfirmed!==true||cleanup.data.requiredPersistenceComplete!==true
+          ||cleanup.data.resourcesReleased!==true||cleanup.data.inputsSettled!==true||cleanup.data.unconfirmedItems.length!==0
+          ||!result.success||result.data.childRunId!==child.id||result.data.childSessionId!==child.session_id
+          ||result.data.parentRunId!==parent.id||result.data.originToolCallId!==child.origin_tool_call_id||result.data.outcome!==child.status;
+      });
+      if(owned.length>=4)fail('runtime_busy');
       const origin=this.db.query<{native_tool_call_id:string;context_snapshot_id:number;input_id:number|null;args_json:string},[number,number,number]>(`SELECT t.native_tool_call_id,t.context_snapshot_id,s.input_id,t.args_json FROM tool_calls t JOIN context_snapshots s ON s.id=t.context_snapshot_id
         WHERE t.id=? AND t.run_id=? AND t.session_id=? AND t.tool_name='Agent' AND t.status IN ('requested','running') AND s.run_id=t.run_id AND s.session_id=t.session_id`).get(input.originToolCallId,parent.id,parent.session_id);
       const childRunId=(this.db.query<{n:number},[]>('SELECT COALESCE(MAX(id),0)+1 n FROM runs').get()!).n;
@@ -1566,6 +1585,13 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
         ||JSON.parse(origin.args_json).prompt!==input.prompt
         ||!isDeepStrictEqual(frozen.model,this.config(parent).selection)||!isDeepStrictEqual(frozen.policy,this.config(parent).policy)
         ||!childScopeWithin(frozen.scope,checked(RunScopeSchema,legacyRunScope(decoded(parent.scope_json)),'storage_read_failed')))fail('access_denied');
+      const roles=checked(agentConfigSchema,legacyRunConfig(decoded(parent.config_json)),'storage_read_failed').agent.subagents;
+      if(roles||frozen.role){
+        const role=frozen.role;
+        if(!role||!roles?.roles.some(saved=>isDeepStrictEqual(saved,role))
+          ||(JSON.parse(origin.args_json).subagent_type??'medclaw-audit')!==role.roleId
+          ||frozen.toolNames.length!==role.declaredTools.length||!frozen.toolNames.every(name=>role.declaredTools.includes(name)))fail('access_denied');
+      }
       const header=checked(z.object({type:z.literal('session'),version:z.literal(3),id:OpaqueIdSchema,timestamp:TimestampSchema,cwd:z.string()}).passthrough(),input.initialHistory.header,'session_history_invalid');
       if(header.id!==input.nativeSessionId||!Array.isArray(input.initialHistory.entries)
         ||input.initialHistory.entries.some(entry=>!entry||typeof entry!=='object'||Reflect.get(entry,'type')==='message'))fail('session_history_invalid');

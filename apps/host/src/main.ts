@@ -3,7 +3,7 @@ import { createHostJob, type HostJob } from './windows-job';
 import { acquireWriterLock, type WriterLease } from './writer-lock';
 import { prepareNativeDependencies } from './native-dependencies';
 import type { NativeDependency } from '@medclaw/contracts/maintenance';
-import { createResourceSource } from '@medclaw/runtime-pi/resource-loader';
+import { createResourceSource, createSubagentRoleSource } from '@medclaw/runtime-pi/resource-loader';
 import { dirname, isAbsolute, relative, resolve, sep, join } from "node:path";
 import { HostHelloSchema, HostRequestSchema, HostPrivateRequestSchema, PrivateCredentialReplySchema, NoticeFrameSchema, encodeHostFrame, publicMethodSchemas, createPublicMethodSchemas, hostPrivateMethodSchemas, privateCredentialMethodSchemas, isReadOnlyMethod, MAX_FRAME_BYTES, HOST_PROTOCOL_VERSION, type HostHello, type HostRequest, type RuntimeNotice, type PrivateCredentialMethod } from "../../../packages/contracts/src/protocol.ts";
 import { PublishedSettingsSchema } from "../../../packages/contracts/src/model.ts";
@@ -232,7 +232,8 @@ async function initialize(raw: unknown) {
     Object.assign((...args:Parameters<ModelCallStarter>) => new ModelCallRecorder(repositories, ...args),
       {forCompaction:(owner:CompactionCallOwner,time:string)=>ModelCallRecorder.forCompaction(repositories!,owner,time)}),
     notice, error => errorLog.add(error), agent, events,transactions, createResourceSource(config.resourceRoot),
-    {service:new IntentService(repositories,contexts,new OllamaIntentClient({classify:CLASSIFY_PROMPT,verify:VERIFY_PROMPT}),new IntentValidator(catalogService),events,transactions),queries}, exports);
+    {service:new IntentService(repositories,contexts,new OllamaIntentClient({classify:CLASSIFY_PROMPT,verify:VERIFY_PROMPT}),new IntentValidator(catalogService),events,transactions),queries}, exports,
+    createSubagentRoleSource(join(config.resourceRoot, 'subagents'), join(config.paths.dataRoot, 'subagents')));
   await exports.recoverInterrupted();
   application.runs.recoverInterrupted(true, writerLease?.processTreeProof ?? undefined);
   sessions = new SessionService(config.instanceId, repositories, agent, (input, context) => application!.runs.submitAgent(input, context),
@@ -294,6 +295,10 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case 'context.read': return unwrap(contexts.read(request.payload));
     case 'resources.list': return app.resources!.list(request.payload);
     case 'resources.read': return app.resources!.read(request.payload);
+    case 'subagents.list': return app.resources!.listSubagents(request.payload);
+    case 'subagents.read': return app.resources!.readSubagent(request.payload);
+    case 'subagents.save': return app.resources!.saveSubagent(request.payload);
+    case 'input.commands.list': return app.listInputCommands(request.payload);
     case 'extensions.read': return app.readExtensions(request.payload);
     case 'extensions.command': return app.executeExtensionCommand(request.payload);
     case 'event.read': return unwrap(events!.read(request.payload));

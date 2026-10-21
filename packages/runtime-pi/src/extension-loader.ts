@@ -6,7 +6,7 @@ import type { PublishedSettings } from '@medclaw/contracts/model';
 import { ExtensionManifestSchema, FrozenRunExtensionsSchema, EXTENSION_LIMITS, type FrozenRunExtensions, type ExtensionDescriptor } from '@medclaw/contracts/extensions';
 import { managedPath, readText } from './resource-loader';
 import { z } from 'zod';
-import { wrapRegisteredTool, type AgentSession, type ExtensionAPI, type ExtensionFactory, type RegisteredTool, type DefaultResourceLoader } from '@earendil-works/pi-coding-agent';
+import { wrapRegisteredTool, type AgentSession, type ExtensionAPI, type ExtensionFactory, type RegisteredTool, type RegisteredCommand, type DefaultResourceLoader } from '@earendil-works/pi-coding-agent';
 import { ExtensionOwnerSchema, ExtensionAssemblyProofSchema, ExtensionStatusSchema, type ExtensionOwner, type ExtensionAssemblyProof, type ExtensionStatus } from '@medclaw/contracts/extensions';
 import type { AnyToolDefinition } from '@medclaw/contracts/tool';
 import type { AppError } from '@medclaw/contracts/error';
@@ -81,7 +81,7 @@ export async function loadRunExtension(workdir: string, frozen: FrozenRunExtensi
   if(typeof instance?.factory!=='function'||typeof instance.readStatus!=='function'||typeof instance.close!=='function')throw unavailable();
   let lease=true, registering=false, fatal:AppError|null=null, closing:Promise<void>|undefined, closeWait:Promise<void>|undefined, commandPending=false, captured:ExtensionStatus|null=null, commandError:AppError|null=null;
   const tasks=new Set<Promise<unknown>>(), subscriptions:Array<()=>void>=[], hooks=new Set<string>(), tools=new Set<string>(), commands=new Set<string>();
-  let registered:RegisteredTool|undefined, nativeSession:AgentSession|undefined;
+  let registered:RegisteredTool|undefined, registeredCommand:RegisteredCommand|undefined, nativeSession:AgentSession|undefined;
   const track=async<T>(task:Promise<T>):Promise<T>=>{tasks.add(task);try{return await task;}finally{tasks.delete(task);}};
   const diagnose=(error:AppError)=>{if(proof.diagnostics.length<8)proof.diagnostics.push(error);};
   const fail=(code='extension_unavailable')=>{const error=safeError(code,undefined,{runId:owner.runId,sessionId:owner.sessionId});diagnose(error);return error;};
@@ -131,6 +131,7 @@ export async function loadRunExtension(workdir: string, frozen: FrozenRunExtensi
   const override:NonNullable<ConstructorParameters<typeof DefaultResourceLoader>[0]['extensionsOverride']>=base=>{
     if(base.errors.length||base.extensions.length!==1)throw fail();
     registered=base.extensions[0]!.tools.get('extension_runtime_status');if(!registered)throw fail('extension_conflict');
+    registeredCommand=base.extensions[0]!.commands.get('extension_status');if(!registeredCommand)throw fail('extension_conflict');
     return {...base,extensions:base.extensions.map(extension=>({...extension,tools:new Map()}))};
   };
   const definitions:readonly AnyToolDefinition[]=[{name:'extension_runtime_status',label:'Extension runtime status',description:'Read the original Run extension identity and observed hook counters.',
@@ -164,9 +165,12 @@ export async function loadRunExtension(workdir: string, frozen: FrozenRunExtensi
     bindSession:(session:AgentSession)=>{if(nativeSession&&nativeSession!==session)throw fail();nativeSession=session;assertLive();},
     assertLive,
     failed:()=>{if(proof.state==='loading')proof.state='load_failed';},
-    active:(session:AgentSession)=>{
-      assertLive();if(!session.getActiveToolNames().includes('extension_runtime_status')||!session.extensionRunner?.getCommand('extension_status')
-        ||session.extensionRunner.getRegisteredCommands().length!==1||session.extensionRunner.getCommandDiagnostics().length)throw fail('extension_conflict');
+    active:(session:AgentSession,additionalCommands:readonly string[]=[])=>{
+      assertLive();const commands=session.extensionRunner?.getRegisteredCommands(),command=session.extensionRunner?.getCommand('extension_status');
+      if(!session.getActiveToolNames().includes('extension_runtime_status')||!registeredCommand||command?.handler!==registeredCommand.handler
+        ||command.sourceInfo!==registeredCommand.sourceInfo||additionalCommands.some(name=>name!=='subagent')||new Set(additionalCommands).size!==additionalCommands.length
+        ||!isDeepStrictEqual(commands?.map(item=>item.name).sort(),['extension_status',...additionalCommands].sort())
+        ||session.extensionRunner.getCommandDiagnostics().length)throw fail('extension_conflict');
       proof.state='active';proof.loadedAt=new Date().toISOString();proof.callableTools=['extension_runtime_status'];proof.callableCommands=['extension_status'];ExtensionAssemblyProofSchema.parse(proof);callbacks.proof(proof);
     },
     onError:()=>{diagnose(safeError('extension_hook_failed',undefined,{runId:owner.runId,sessionId:owner.sessionId}));},
