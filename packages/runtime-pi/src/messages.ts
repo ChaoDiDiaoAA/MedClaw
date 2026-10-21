@@ -18,7 +18,7 @@ import { ProductResultDetailsSchema } from '../../contracts/src/intent';
 export type ExpectedResource = {fact:ResourceDeliveryRef;text:string;userIndex?:number;toolIndex?:number};
 
 /** Verify only the SDK's known wire slots; ordinals preserve equal historical entries and transformed Tool IDs. */
-export function matchProviderResources(payload: unknown, api: string, expected: readonly ExpectedResource[]): ResourcePayloadObservation {
+export function matchProviderResources(payload: unknown, api: string, expected: readonly ExpectedResource[], readiness?: string): ResourcePayloadObservation {
   const body = object(payload), users: string[] = [], systems: string[] = [], tools: {id:unknown;text:string|null}[] = [], calls: {id:unknown;name:unknown}[] = [];
   let messages: unknown;
   const system = (value:unknown) => {const text = contextMessageText(value);if(text !== null)systems.push(text);};
@@ -75,7 +75,8 @@ export function matchProviderResources(payload: unknown, api: string, expected: 
     } else verified = e.userIndex !== undefined && users[e.userIndex] === e.text;
     if (!verified) throw safeError('context_payload_mismatch');
   }
-  return ResourcePayloadObservationSchema.parse({verified:expected.map(e => e.fact)});
+  if(readiness!==undefined&&systems.reduce((count,text)=>count+text.split(readiness).length-1,0)!==1)throw safeError('context_payload_mismatch');
+  return ResourcePayloadObservationSchema.parse({verified:expected.map(e => e.fact),...(readiness!==undefined?{readiness}:{})});
 }
 
 const encoder = new TextEncoder();

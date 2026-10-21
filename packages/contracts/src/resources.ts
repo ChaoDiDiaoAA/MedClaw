@@ -14,6 +14,38 @@ export type ResourceRef = z.infer<typeof ResourceRefSchema>;
 export type ResourceKind = ResourceRef['kind'];
 export const resourceRefKey = (ref: ResourceRef): string => `${ref.kind}:${ref.id}@${ref.version}`;
 const names = z.array(z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/)).max(32).refine(a => new Set(a).size === a.length, 'Duplicate dependency');
+export const SkillReadinessSchema = z.strictObject({
+  state: z.enum(['ready','partial','unavailable','no_requirements','unknown']), basis: z.enum(['configuration','run_scope']),
+  requiredTools: names.nullable(), matchedCount: z.number().int().min(0).max(32).nullable(), totalCount: z.number().int().min(0).max(32).nullable(),
+  missingTools: z.array(z.strictObject({name:z.string().min(1).max(64),reason:z.literal('tool_not_available')})).max(32),
+}).refine(r => {
+  if(r.totalCount !== (r.requiredTools?.length ?? null))return false;
+  if(r.state==='unknown')return r.matchedCount===null&&r.missingTools.length===0;
+  if(r.requiredTools===null||r.matchedCount===null||r.totalCount===null||r.matchedCount>r.totalCount)return false;
+  const missing=r.missingTools.map(t=>t.name);
+  if(new Set(missing).size!==missing.length||missing.some(name=>!r.requiredTools!.includes(name))||missing.length!==r.totalCount-r.matchedCount)return false;
+  if(r.totalCount===0)return r.state==='no_requirements';
+  if(r.matchedCount===r.totalCount)return r.state==='ready';
+  if(r.matchedCount===0)return r.state==='unavailable';
+  return r.state==='partial';
+},'Readiness counts must describe the declared Tool matches');
+export type SkillReadiness = z.infer<typeof SkillReadinessSchema>;
+export function getSkillReadiness(requiredTools: readonly string[] | null, availableTools: readonly string[] | null, basis: SkillReadiness['basis']): SkillReadiness {
+  const required=names.nullable().parse(requiredTools), common={basis,requiredTools:required,totalCount:required?.length??null};
+  if(required===null||availableTools===null&&required.length>0)return {...common,state:'unknown',matchedCount:null,missingTools:[]};
+  const available=new Set(availableTools??[]), missingTools=required.filter(name=>!available.has(name)).map(name=>({name,reason:'tool_not_available' as const}));
+  const matchedCount=required.length-missingTools.length;
+  let state:SkillReadiness['state']='partial';
+  if(required.length===0)state='no_requirements';
+  else if(missingTools.length===0)state='ready';
+  else if(matchedCount===0)state='unavailable';
+  return {...common,state,matchedCount,missingTools};
+}
+export function resourceCommand(text: string, promptNames: readonly string[]): {kind:'skill'|'prompt';id:string} | null {
+  const command=text.startsWith('/')?text.slice(1).split(/\s/,1)[0]!:'';
+  if(command.startsWith('skill:'))return {kind:'skill',id:command.slice(6)};
+  return command&&promptNames.includes(command)?{kind:'prompt',id:command}:null;
+}
 const keywords = z.array(z.string().min(1).max(64)).max(32).refine(a => new Set(a).size === a.length, 'Duplicate keyword');
 export const ResourceDefinitionSchema = ResourceRefSchema.extend({ entry: ResourceFileSchema, files: z.array(ResourceFileSchema).min(1).max(RESOURCE_LIMITS.files),
   keywords, requiredTools: names, requiredExtensions: names }).refine(d =>
@@ -36,7 +68,7 @@ export type ResourceDiagnosticReason = ResourceDiagnostic['reason'];
 const fileMetadata = z.strictObject({ file: ResourceFileSchema, bytes: z.number().int().nonnegative().max(RESOURCE_LIMITS.fileBytes) });
 export const ResourceItemSchema = z.strictObject({ ref: ResourceRefSchema, name: ResourceIdSchema.nullable(), description: z.string().max(1024).nullable(), keywords,
   enabled: z.boolean(), availability: z.enum(['ready', 'missing', 'conflict', 'invalid', 'dependency_missing', 'content_changed']), disableModelInvocation: z.boolean().nullable(),
-  files: z.array(fileMetadata).max(RESOURCE_LIMITS.files), requiredTools: names.nullable(), requiredExtensions: names.nullable(), diagnostics: z.array(ResourceDiagnosticSchema).max(256) });
+  files: z.array(fileMetadata).max(RESOURCE_LIMITS.files), requiredTools: names.nullable(), requiredExtensions: names.nullable(), diagnostics: z.array(ResourceDiagnosticSchema).max(256), readiness: SkillReadinessSchema.optional() });
 export type ResourceItem = z.infer<typeof ResourceItemSchema>;
 const sourceSelection = z.strictObject({ source: z.literal('selection'), sessionId: PositiveIdSchema });
 const sourceRun = z.strictObject({ source: z.literal('run'), runId: PositiveIdSchema });
@@ -81,11 +113,16 @@ export type ResourceSnapshot = z.infer<typeof ResourceSnapshotSchema>;
 const sameRef = (a: ResourceRef, b: ResourceRef) => a.kind === b.kind && a.id === b.id && a.version === b.version;
 export const FrozenRunResourcesSchema = z.strictObject({ contract: z.literal('medclaw.run-resources/v1'), sdkVersion: z.literal('0.87.1'), sessionId: PositiveIdSchema,
   configVersion: ConfigVersionSchema, selection: ResourceSelectionSchema, available: z.array(ResourceSnapshotSchema).max(RESOURCE_LIMITS.skills + 1),
-  knownPromptNames: z.array(ResourceIdSchema).max(RESOURCE_LIMITS.catalog), omitted: z.array(ResourceDiagnosticSchema).max(1000) })
+  knownPromptNames: z.array(ResourceIdSchema).max(RESOURCE_LIMITS.catalog), omitted: z.array(ResourceDiagnosticSchema).max(1000),
+  skillRequirements: z.array(z.strictObject({resourceRef:ResourceRefSchema.refine(r=>r.kind==='skill'),requiredTools:names.nullable(),disableModelInvocation:z.boolean().nullable().optional()})).max(RESOURCE_LIMITS.skills).optional() })
   .refine(f => new Set(f.available.map(s => `${s.ref.kind}:${s.ref.id}`)).size === f.available.length
     && f.available.every(s => [f.selection.prompt, ...f.selection.skills].some(ref => ref !== null && sameRef(ref, s.ref)))
     && f.available.reduce((sum, s) => sum + s.files.reduce((n, file) => n + file.bytes, 0), 0) <= RESOURCE_LIMITS.runBytes
-    && new TextEncoder().encode(JSON.stringify(f)).byteLength <= RESOURCE_LIMITS.runBytes, 'Frozen selection or capacity mismatch');
+    && new TextEncoder().encode(JSON.stringify(f)).byteLength <= RESOURCE_LIMITS.runBytes
+    && (f.skillRequirements===undefined || f.skillRequirements.length===f.selection.skills.length
+      && new Set(f.skillRequirements.map(s=>resourceRefKey(s.resourceRef))).size===f.skillRequirements.length
+      && f.skillRequirements.every(s=>f.selection.skills.some(ref=>sameRef(s.resourceRef,ref))
+        && f.available.filter(a=>sameRef(a.ref,s.resourceRef)).every(a=>JSON.stringify(a.requiredTools)===JSON.stringify(s.requiredTools)))), 'Frozen selection or capacity mismatch');
 export type FrozenRunResources = z.infer<typeof FrozenRunResourcesSchema>;
 export const ResourceInputPlanSchema = z.strictObject({ kind: z.enum(['plain', 'prompt', 'skill']), resourceRef: ResourceRefSchema.nullable(),
   dispatchText: z.string().refine(t => t.isWellFormed()) }).refine(p => p.kind === 'plain' ? p.resourceRef === null : p.resourceRef?.kind === p.kind, 'Input plan resource mismatch');
@@ -100,9 +137,10 @@ export const ResourceDeliveryRefSchema = z.strictObject({ ...evidenceIdentity, k
   .refine(f => f.kind === 'skill_index' ? f.resourceRef.kind === 'skill' && f.file === null && f.inputId === null && f.nativeEntryId === null && f.toolCallId === null && f.coverage === 'index'
     : f.kind === 'native_read' ? f.file !== null && f.toolCallId !== null && f.nativeEntryId !== null && f.inputId === null && f.coverage !== 'index'
     : f.resourceRef.kind === (f.kind === 'prompt_expansion' ? 'prompt' : 'skill') && f.file !== null && f.inputId !== null && f.nativeEntryId !== null && f.toolCallId === null && f.coverage === 'complete', 'Resource delivery identity mismatch');
-export const ResourcePayloadObservationSchema = z.strictObject({ verified: z.array(ResourceDeliveryRefSchema).max(1000) });
-export const CallResourceContextSchema = z.strictObject({ expected: z.array(ResourceDeliveryRefSchema).max(1000), payload: ResourcePayloadObservationSchema.nullable() })
-  .refine(c => c.payload === null || JSON.stringify(c.expected) === JSON.stringify(c.payload.verified), 'Resource payload must verify every expected identity in order');
+const readinessText=z.string().min(1).refine(t=>t.isWellFormed()&&new TextEncoder().encode(t).byteLength<=RESOURCE_LIMITS.replyBytes);
+export const ResourcePayloadObservationSchema = z.strictObject({ verified: z.array(ResourceDeliveryRefSchema).max(1000),readiness:readinessText.optional() });
+export const CallResourceContextSchema = z.strictObject({ expected: z.array(ResourceDeliveryRefSchema).max(1000), payload: ResourcePayloadObservationSchema.nullable(),readiness:readinessText.optional() })
+  .refine(c => c.payload === null || JSON.stringify(c.expected) === JSON.stringify(c.payload.verified)&&c.readiness===c.payload.readiness, 'Resource payload must verify every expected identity and readiness in order');
 export type ResourceDeliveryRef = z.infer<typeof ResourceDeliveryRefSchema>;
 export type ResourcePayloadObservation = z.infer<typeof ResourcePayloadObservationSchema>;
 export type CallResourceContext = z.infer<typeof CallResourceContextSchema>;

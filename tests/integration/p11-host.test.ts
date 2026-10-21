@@ -75,7 +75,10 @@ async function setup() {
 hostTest('p11 real Main Preload Host publish per-session choices without authentication or model side effects', async () => {
   const f = await setup(); try {
     const list = ResourceListSchema.parse(unwrap(await f.client.request('resources.list', { source: 'selection', sessionId: f.first })));
-    expect(list.items).toHaveLength(2); const prompt = list.items.find(i => i.ref.kind === 'prompt')!.ref, skill = list.items.find(i => i.ref.kind === 'skill')!.ref;
+    expect(list.items).toHaveLength(17);
+    const skills = list.items.filter(item => item.ref.kind === 'skill'), added = skills.filter(item => item.ref.id !== 'query');
+    expect(skills).toHaveLength(16); expect(added).toHaveLength(15); expect(added.every(item => !item.enabled && item.availability === 'ready')).toBe(true);
+    const prompt = list.items.find(i => i.ref.kind === 'prompt')!.ref, skill = skills.find(item => item.ref.id === 'query')!.ref;
     const selection: ResourceSelection = { prompt, skills: [skill] };
     const receipt = ResourceSelectionReceiptSchema.parse(unwrap(await f.client.request('resources.select', { sessionId: f.first, expectedConfigVersion: '1', selection }, 'select-a')));
     expect(receipt).toEqual({ sessionId: f.first, configVersion: '2', selection }); expect(f.settings.read().resources?.bySession[String(f.first)]).toEqual(selection);

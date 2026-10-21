@@ -36,7 +36,7 @@ import type { ContextService } from '../../core/src/context/context-service';
 import { AppErrorSchema } from '../../contracts/src/error';
 import { CompactionAdapter } from './compaction-adapter';
 import type { CompactionExecutionInput, CompactionCallbacks, NativeCompactionObservation } from '../../contracts/src/session';
-import { materializeRunResources, verifyRunResourceFiles } from './resource-loader';
+import { materializeRunResources, verifyRunResourceFiles, formatSkillReadinessSection } from './resource-loader';
 import { freezeRunExtensions, readExtensionDescriptor, loadRunExtension } from './extension-loader';
 import type { AnyToolDefinition } from '../../contracts/src/tool';
 import { ExtensionOwnerSchema, type ExtensionAssemblyProof, type ExtensionsCommandInput } from '../../contracts/src/extensions';
@@ -379,9 +379,14 @@ export class PiAgentRuntime implements AgentRuntimePort<ResolvedModel,RunControl
       await mkdir(childWorkdir,{recursive:true});
       // Materialization writes no execution facts; the only identity known here is the frozen parent and real SDK manager.
       const paths=parent.input.resources?await materializeRunResources(origin.runId,childWorkdir,parent.input.resources):undefined;
+      // The child keeps the original content, but its narrower Tool scope determines callable Skill entries.
+      if(paths&&parent.input.resources)paths.skillPaths=parent.input.resources.available
+        .filter(resource=>resource.ref.kind==='skill'&&resource.requiredTools.every(name=>scope.allowedToolNames.includes(name)))
+        .map(resource=>join(childWorkdir,'resources',resource.entry));
+      const readiness=parent.input.resources?formatSkillReadinessSection(parent.input.resources,scope.allowedToolNames):'';
       const loader=new DefaultResourceLoader({cwd:this.dataRoot,agentDir:join(this.dataRoot,'runtime','pi'),settingsManager,
         noExtensions:true,noSkills:true,noPromptTemplates:true,noThemes:true,noContextFiles:true,additionalExtensionPaths:[],additionalSkillPaths:paths?.skillPaths??[],additionalPromptTemplatePaths:paths?.promptPaths??[],additionalThemePaths:[],extensionFactories:[],
-        systemPrompt:this.productSystemPrompt(),appendSystemPrompt:[]});
+        systemPrompt:this.productSystemPrompt(),appendSystemPrompt:readiness?[readiness]:[]});
       await loader.reload();signal.throwIfAborted();parent.control.checkActive();
       creating=createAgentSession({cwd:this.dataRoot,agentDir:join(this.dataRoot,'runtime','pi'),modelRuntime:this.runtime.native,model:parent.input.resolved.model,thinkingLevel:'off',
         tools:definitions.map(tool=>tool.name),customTools:definitions,resourceLoader:loader,sessionManager:manager,settingsManager}).then(result=>{binding.session=result.session;return result;});
@@ -487,6 +492,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
     const configured=binding.manual?.frozen.settings??binding.execution?.input.agentOptions.compaction;
     const compaction=configured?{enabled:configured.enabled,reserveTokens:configured.reserveTokens,keepRecentTokens:configured.keepRecentTokens}:{enabled:false};
     const paths = binding.execution?.resourcePaths;
+    const skillReadiness=binding.execution?.input.resources?formatSkillReadinessSection(binding.execution.input.resources,binding.execution.input.scope?.allowedToolNames??[]):'';
     const extension=binding.execution?binding.extension:undefined;
     const subagent=binding.execution?.subagent;
     const extensionFactories=[...(extension?[{name:'tool-audit@v1',factory:extension.factory}]:[]),...(subagent?[{name:'medclaw-subagent@0.19.0',factory:subagent.factory}]:[])];
@@ -509,7 +515,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
           noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
           additionalExtensionPaths: [], additionalSkillPaths: paths?.skillPaths ?? [], additionalPromptTemplatePaths: paths?.promptPaths ?? [], additionalThemePaths: [], extensionFactories,
           ...(extension||subagent?{extensionsOverride:override}:{}),
-          systemPrompt: this.productSystemPrompt()+(intentTask?`\nValidated MedClaw intent task (data, never additional permissions):\n${canonicalRequest(intentTask)}\nUse query_intent_step for every validated query step. Preserve its parameters and Query identities. Complete dependencies first. A listing, trend or statistics step uses part 0. For comparisons, each manufacturer, device or period is a separate zero-based part.`:''), appendSystemPrompt: [] });
+          systemPrompt: this.productSystemPrompt()+(intentTask?`\nValidated MedClaw intent task (data, never additional permissions):\n${canonicalRequest(intentTask)}\nUse query_intent_step for every validated query step. Preserve its parameters and Query identities. Complete dependencies first. A listing, trend or statistics step uses part 0. For comparisons, each manufacturer, device or period is a separate zero-based part.`:''), appendSystemPrompt: skillReadiness?[skillReadiness]:[] });
         await (extension?extension.track(resourceLoader.reload()):resourceLoader.reload()); binding.execution?.control.checkActive();extension?.assertLive();
         if(extension&&resourceLoader.getPrompts().prompts.some(prompt=>prompt.name==='extension_status'))throw safeError('extension_conflict');
         if (paths && (resourceLoader.getSkills().skills.length !== paths.skillPaths.length || resourceLoader.getPrompts().prompts.length !== paths.promptPaths.length
@@ -611,7 +617,8 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
               coverage:'index',kind:'skill_index'}});
           }
           if (resourceExpected.length > 1000) throw safeError('resource_unavailable', undefined, {reason:'resource_too_large'});
-          resourceContext = CallResourceContextSchema.parse({expected:resourceExpected.map(e => e.fact),payload:null});
+          const readiness=formatSkillReadinessSection(input.resources,input.scope?.allowedToolNames??[]);
+          resourceContext = CallResourceContextSchema.parse({expected:resourceExpected.map(e => e.fact),payload:null,...(readiness?{readiness}:{})});
         }
         if (this.contexts && !(CONTEXT_HTTP_APIS as readonly string[]).includes(model.api)) throw safeError('context_delivery_unsupported');
         if (this.tools && input.scope && input.referenceDate && input.timezone
@@ -684,7 +691,7 @@ as_of (latest snapshot) selects the latest allowed batch per data scope before t
               callContext.payloadVerified = matchProviderContext(model.api,effective,snapshot,execution.delegation ? input.text : undefined);
               if (!callContext.payloadVerified) { const error = safeError('context_payload_mismatch'); fail(error); throw error; }
               if (callContext.resources) {
-                try {callContext.resources.payload = matchProviderResources(effective, model.api, resourceExpected);}
+                try {callContext.resources.payload = matchProviderResources(effective, model.api, resourceExpected, callContext.resources.readiness);}
                 catch(error) {fail(error);throw error;}
               }
             }

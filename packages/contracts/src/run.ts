@@ -313,6 +313,7 @@ export interface RuntimeRunStore extends ProviderRunStore, SessionStore, InputSt
   isChildFinalSaved?(runId: number, fact: import('./subagent').FinalChildFact): boolean;
   readRunExtensions?(runId: number): import('./extensions').FrozenRunExtensions | null;
   readRunResources?(runId: number): import('./resources').FrozenRunResources | null;
+  readRunResourceScope?(runId: number): RunScope | null;
   readResourceEvidence?(runId: number, page: number, pageSize: number): { items: import('./resources').ResourceEvidence[]; totalRows: number };
   confirmCompactionSaved?(change:NativeHistoryCommit|null,fact:import('./session').CompactionReceipt|import('./session').CompactionSaveFact):number|null;
   verifyPriorCompactionFacts?(runId:number,previousProcessExited?:boolean,time?:string):{requiredPersistenceComplete:boolean;unconfirmedItems:string[]};

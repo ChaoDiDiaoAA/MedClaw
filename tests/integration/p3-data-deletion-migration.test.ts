@@ -31,7 +31,7 @@ test('batch deletion migration failure rolls back all tables and marker before r
  const f=legacy();try{const old=f.db.query('SELECT * FROM batches').all();f.db.close();let attempted:Database|undefined;try{expect(()=>{attempted=openDatabase(f.path,phase=>{if(phase==='batch_deletion_marker')throw new Error('fixture');});}).toThrow('storage_migration_failed');}finally{attempted?.close();}const raw=new Database(f.path);try{expect(raw.query('SELECT COUNT(*) n FROM schema_migrations').get()).toEqual({n:6});expect(raw.query('SELECT * FROM batches').all()).toEqual(old);}finally{raw.close();}const recovered=openDatabase(f.path);try{expect(recovered.query('SELECT COUNT(*) n FROM schema_migrations').get()).toEqual({n:16});}finally{recovered.close();}}finally{rmSync(f.root,{recursive:true,force:true});}
 });
 test('batch deletion public methods are typed, read-only classification is precise and handshake is versioned',()=>{
- expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p17-v1');expect(DATABASE_SCHEMA_VERSION).toBe(16);
+ expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p17-v2');expect(DATABASE_SCHEMA_VERSION).toBe(16);
  for(const method of ['data.delete.preview','data.delete.commit','data.delete.read','data.delete.recover'])expect(Object.hasOwn(publicMethodSchemas,method)).toBe(true);
  expect(isReadOnlyMethod('data.delete.read')).toBe(true);expect(isReadOnlyMethod('data.delete.preview')).toBe(false);expect(isReadOnlyMethod('data.delete.recover')).toBe(false);
 });

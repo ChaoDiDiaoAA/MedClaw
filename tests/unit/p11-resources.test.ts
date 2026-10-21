@@ -90,7 +90,7 @@ test('p11 managed versions reject junction escape and cannot treat directory lin
 test('p11 shipped query resources have actual SDK metadata and complete source contents', async () => {
   const source = (await resourceLoader()).createResourceSource(join(import.meta.dir, '../../resources'));
   const result = await source.discover();
-  expect(result.items.map(i => [i.ref.kind, i.ref.id, i.ref.version, i.availability])).toEqual([['prompt', 'query', 'v1', 'ready'], ['skill', 'query', 'v1', 'ready']]);
+  expect(result.items.filter(i=>i.ref.id==='query').map(i => [i.ref.kind, i.ref.id, i.ref.version, i.availability])).toEqual([['prompt', 'query', 'v1', 'ready'], ['skill', 'query', 'v1', 'ready']]);
   const snapshots = await source.capture(result.items.map(i => i.ref));
   expect(snapshots[1]?.files.map(f => f.file)).toEqual(['SKILL.md', 'references/facts-and-assumptions.md']);
   expect(snapshots[1]?.requiredTools).toEqual(['check_data_coverage', 'read', 'read_data_scope']);
@@ -127,7 +127,7 @@ test('p11 resource routes validate managed identity and distinguish reads from c
   const frame = { protocolVersion: HOST_PROTOCOL_VERSION, kind: 'request', requestId: 'r', instanceId: 'host', operationRef: 'resource', method: 'resources.select', payload: choice };
   expect(PublicHostRequestSchema.safeParse(frame).success).toBe(true);
   expect(PublicHostRequestSchema.safeParse({ ...frame, protocolVersion: 'medclaw.host/p10-v1' }).success).toBe(false);
-  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p17-v1'); expect(DATABASE_SCHEMA_VERSION).toBe(16);
+  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p17-v2'); expect(DATABASE_SCHEMA_VERSION).toBe(16);
 });
 
 test('p11 resource HTTP observations cannot certify a different or incomplete expected payload', () => {

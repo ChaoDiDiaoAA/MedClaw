@@ -296,7 +296,7 @@ describe("P1 public and private protocol", () => {
 
   test("private hello paths and SDK/schema handshake versions are strict", async () => {
     const { HostHelloSchema, HostReadySchema } = await import("../../packages/contracts/src/protocol");
-    const hello = { protocolVersion: HOST_PROTOCOL_VERSION, instanceId: "instance-1", startupToken: "startup-token-1", sdkVersion: "0.87.1", expectedSchemaVersion: DATABASE_SCHEMA_VERSION,
+    const hello = { protocolVersion: HOST_PROTOCOL_VERSION, instanceId: "instance-1", startupToken: "startup-token-1", sdkVersion: "0.87.1", expectedSchemaVersion: DATABASE_SCHEMA_VERSION, resourceRoot:'D:/isolated/resources',installManifestPath:'D:/isolated/install.json',
       paths: { dataRoot: "D:/isolated", databasePath: "D:/isolated/data/app.sqlite", settingsPath: "D:/isolated/data/settings.json",
         cachePath: "D:/isolated/data/pi-model-cache.json", lockPath: "D:/isolated/runtime/host.lock" } };
     expect(HostHelloSchema.safeParse(hello).success).toBe(true);

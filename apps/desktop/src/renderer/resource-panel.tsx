@@ -9,6 +9,7 @@ export function ResourcePanel(props:{host:HostView;source:ResourceSourceInput|nu
   const [view,setView]=useState<{key:string;data:ResourceList}|null>(null),[body,setBody]=useState<{key:string;data:ResourceText}|null>(null);
   const [notice,setNotice]=useState<{key:string;text:string}|null>(null),[busy,setBusy]=useState<string|null>(null),[search,setSearch]=useState('');
   const [versions,setVersions]=useState<Record<string,string>>({});
+  const [filter,setFilter]=useState('All'),[detail,setDetail]=useState<string|null>(null);
   const [activeExpanded,setActiveExpanded]=useState(false);
   const data=view?.key===key?view.data:null, text=body?.key===key?body.data:null, ready=props.host.state==='ready'&&!!props.host.instanceId&&!!props.source;
   const sameSource=(value:ResourceSourceInput,source:ResourceSourceInput)=>value.source===source.source&&(source.source==='run'?value.source==='run'&&value.runId===source.runId:value.source==='selection'&&value.sessionId===source.sessionId);
@@ -23,7 +24,7 @@ export function ResourcePanel(props:{host:HostView;source:ResourceSourceInput|nu
     }catch{if(current.current===owner&&order===readOrder.current)setNotice({key:owner,text:'Resource status is unconfirmed. Refresh resources to verify the saved selection.'});}
     finally{if(current.current===owner&&order===readOrder.current)setBusy(null);}
   }
-  useEffect(()=>{setView(null);setBody(null);setNotice(null);setBusy(null);setVersions({});setSearch('');setActiveExpanded(false);void refresh();return()=>{++readOrder.current;++bodyOrder.current;};},[key,props.refreshToken]);
+  useEffect(()=>{setView(null);setBody(null);setNotice(null);setBusy(null);setVersions({});setSearch('');setFilter('All');setDetail(null);setActiveExpanded(false);void refresh();return()=>{++readOrder.current;++bodyOrder.current;};},[key,props.refreshToken]);
   async function publish(selection:ResourceSelection) {
     if(!ready||!data||props.source?.source!=='selection'||saveBusy.current===key)return;
     const owner=key,source=props.source;saveBusy.current=owner;setBusy(owner);setNotice(null);++bodyOrder.current;setBody(null);
@@ -39,6 +40,9 @@ export function ResourcePanel(props:{host:HostView;source:ResourceSourceInput|nu
   const selected=(ref:ResourceRef)=>!!data&&(ref.kind==='prompt'?data.selection.prompt!==null&&resourceRefKey(data.selection.prompt)===resourceRefKey(ref):data.selection.skills.some(s=>resourceRefKey(s)===resourceRefKey(ref)));
   function choose(ref:ResourceRef,enabled:boolean) {
     if(!data)return;void publish(ref.kind==='prompt'?{...data.selection,prompt:enabled?ref:null}:{...data.selection,skills:[...data.selection.skills.filter(s=>s.id!==ref.id),...(enabled?[ref]:[])]});
+  }
+  function showDetail(ref:ResourceRef) {
+    ++bodyOrder.current;setBody(null);setDetail(old=>old===resourceRefKey(ref)?null:resourceRefKey(ref));
   }
   async function read(source:ResourceSourceInput,resourceRef:ResourceRef,file:string) {
     if(!ready)return;const owner=key,order=++bodyOrder.current;setBody(null);setNotice(null);
@@ -64,17 +68,39 @@ export function ResourcePanel(props:{host:HostView;source:ResourceSourceInput|nu
         {data.catalogError&&<p role="alert">Resource catalog unavailable: {errorMessage(data.catalogError)}. Published choices are retained.</p>}
         {!!data.diagnostics.length&&<details><summary>Resource diagnostics</summary>{data.diagnostics.map((d,i)=><p key={i}>{d.resourceRef?.id??'Catalog'} · {d.reason} · {d.message}</p>)}</details>}
         <label>Search resources<input value={search} onChange={e=>setSearch(e.target.value)} /></label>
+        {props.kind!=='prompt'&&<div role="group" aria-label="Skill status">{['All','Ready','Partial','Disabled'].map(value=><button key={value} aria-pressed={filter===value} onClick={()=>setFilter(value)}>{value}</button>)}</div>}
         {props.source.source==='selection'&&<button disabled={!ready||busy===key} onClick={()=>void publish(props.kind==='prompt'?{...data.selection,prompt:null}:props.kind==='skill'?{...data.selection,skills:[]}:{prompt:null,skills:[]})}>Clear selection</button>}
         {[...groups].map(([id,items])=>{
           const enabled=items.find(item=>selected(item.ref)), item=enabled??items.find(item=>JSON.stringify(item.ref)===versions[id])??items[0]!;
-          return <article key={id}><h3>{item.ref.id}</h3><p>{item.description??'Description unavailable'}</p>
-            <label>{item.ref.id} version<select value={JSON.stringify(item.ref)} disabled={props.source?.source==='run'||busy===key} onChange={e=>{setVersions(old=>({...old,[id]:e.target.value}));const next=items.find(i=>JSON.stringify(i.ref)===e.target.value)!;if(enabled)choose(next.ref,true);}}>
+          let state='Disabled';
+          if(enabled)state=item.availability==='ready'&&(item.readiness?.state==='ready'||item.readiness?.state==='no_requirements')?'Ready':'Partial';
+          if(item.ref.kind==='skill'&&filter!=='All'&&filter!==state)return null;
+          const expanded=detail===resourceRefKey(item.ref),readiness=item.readiness;
+          let readinessLabel='Unknown';
+          if(readiness&&readiness.state!=='unknown')readinessLabel=readiness.state==='no_requirements'?'No requirements':`${readiness.matchedCount}/${readiness.totalCount} capabilities`;
+          return <article key={id} data-testid="resource-row">
+            <div className="resource-summary"><div className="resource-description">
+              <h3><button aria-expanded={expanded} onClick={()=>showDetail(item.ref)}>{item.name??item.ref.id}</button></h3>
+              <p>{item.description??'Description unavailable'}</p>
+              <p>{enabled?'Enabled':'Disabled'} · {item.ref.kind==='skill'?state:item.availability} · {item.ref.version}</p>
+              {item.ref.kind==='skill'&&<p aria-label={`${item.ref.id} readiness`}>
+                {readinessLabel}
+                {readiness&&<span> · {readiness.basis==='run_scope'?'Run scope':'Configuration preview'}</span>}
+                {readiness?.missingTools.map(tool=><span key={tool.name} className="resource-missing">Missing {tool.name} · Tool not available</span>)}
+              </p>}
+              {item.availability!=='ready'&&<p>Resource unavailable: {item.availability}</p>}
+            </div>
+              {props.source?.source==='selection'&&<button disabled={!ready||busy===key||!enabled&&item.availability!=='ready'} onClick={()=>choose(item.ref,!enabled)}>{enabled?'Disable':'Enable'} {item.ref.id}</button>}
+            </div>
+            {expanded&&<section aria-label={`${item.ref.id} details`}>
+            <label>{item.ref.id} version<select value={JSON.stringify(item.ref)} disabled={props.source?.source==='run'||busy===key} onChange={e=>{setVersions(old=>({...old,[id]:e.target.value}));const next=items.find(i=>JSON.stringify(i.ref)===e.target.value)!;++bodyOrder.current;setBody(null);setDetail(resourceRefKey(next.ref));if(enabled)choose(next.ref,true);}}>
               {items.map(i=><option key={resourceRefKey(i.ref)} value={JSON.stringify(i.ref)} disabled={i.availability!=='ready'&&!selected(i.ref)}>{i.ref.version} · {i.availability}</option>)}
             </select></label><p>{enabled?'Enabled':'Disabled'} · {item.availability}</p>
             {item.disableModelInvocation&&<p>Automatic discovery hidden; explicit Skill invocation remains available.</p>}
             <p>Required tools: {item.requiredTools===null?'Unknown':item.requiredTools.join(', ')||'None'} · Required extensions: {item.requiredExtensions===null?'Unknown':item.requiredExtensions.join(', ')||'None'}</p>
-            {props.source?.source==='selection'&&<button disabled={!ready||busy===key||!enabled&&item.availability!=='ready'} onClick={()=>choose(item.ref,!enabled)}>{enabled?'Disable':'Enable'} {item.ref.id}</button>}
+            {!!item.diagnostics.length&&<div aria-label={`${item.ref.id} diagnostics`}>{item.diagnostics.map((diagnostic,index)=><p key={index}>{diagnostic.reason} · {diagnostic.message}</p>)}</div>}
             {item.files.map(file=><button key={file.file} disabled={!ready||busy===key||props.source?.source==='selection'&&!selected(item.ref)} onClick={()=>props.source&&void read(props.source,item.ref,file.file)}>Read {item.ref.id} {file.file}</button>)}
+            </section>}
           </article>;
         })}
         {props.source.source==='run'&&<><h3>Actual resource evidence</h3><p>Following instructions has not been evaluated</p>{!data.evidence.length&&<p>No recorded resource use on this page. Delivery is unconfirmed.</p>}

@@ -34,7 +34,7 @@ import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, Even
 import { IntentBaseUrlSchema, IntentModelConfigurationSchema, IntentModelInspectionSchema, IntentReadResultSchema, ReadIntentInputSchema } from './intent';
 import { ExportDestinationSchema, ExportDestinationCopySchema, ExportCopyReceiptSchema, ExportReferenceSchema, ExportRequestSchema, ExportOperationSchema, ExportArtifactSchema, ExportListInputSchema, ExportListSchema, ActivityListInputSchema, ActivityListSchema } from './export';
 
-export const HOST_PROTOCOL_VERSION = "medclaw.host/p17-v1" as const;
+export const HOST_PROTOCOL_VERSION = "medclaw.host/p17-v2" as const;
 export const DATABASE_SCHEMA_VERSION = 16 as const;
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export const SECRET_INPUT_TTL_MS = 300000;

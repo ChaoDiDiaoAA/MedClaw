@@ -40,7 +40,7 @@ async function backupFixture(withQuery = false) {
   writeFileSync(join(sourceRoot, 'data/settings.json'), JSON.stringify({ ...settings, configVersion: '9007199254740993', credentialRefs: { openai: 'secret-ref' } }));
   writeFileSync(join(sourceRoot, 'data/credentials.enc.json'), 'DO NOT BACK UP');
   mkdirSync(join(directory, 'installation')); const installManifestPath = join(directory, 'installation/install.json');
-  writeFileSync(installManifestPath, JSON.stringify({ contract: 'medclaw.install/v1', appVersion: '0.1.0', platform: 'win32', arch: 'x64', sdkVersion: '0.87.1', bunVersion: '1.4.0', electronVersion: '44.5.1', protocolVersion: 'medclaw.host/p17-v1', schemaVersion: 16,
+  writeFileSync(installManifestPath, JSON.stringify({ contract: 'medclaw.install/v1', appVersion: '0.1.0', platform: 'win32', arch: 'x64', sdkVersion: '0.87.1', bunVersion: '1.4.0', electronVersion: '44.5.1', protocolVersion: 'medclaw.host/p17-v2', schemaVersion: 16,
     hostEntry: 'runtime/apps/host/src/main.ts', maintenanceEntry: 'runtime/apps/host/src/maintenance.ts', resourceRoot: 'runtime/resources', resources: [], plugins: [], binaries: [{ name: 'bun', version: '1.4.0', source: 'ENGINEERING fixture', path: 'bin/bun.exe' }] }));
   const input = { operationRef: 'backup-original', sourceRoot, destinationRoot, installManifestPath, validateHistory: validateNativeHistory };
   return { directory, sourceRoot, destinationRoot, database, memory, repo, session, artifactId, query, input, close() { database.close(); rmSync(directory, { recursive: true, force: true }); } };
@@ -462,8 +462,8 @@ test('restore rechecks installation combinations and manifest boundaries while h
     expect(readFileSync(manifestPath, 'utf8')).toBe(original);
     expect(readFileSync(join(f.sourceRoot, 'data/credentials.enc.json'), 'utf8')).toBe('DO NOT BACK UP');
   } finally { f.close(); }
-  // The timeout covers the whole serial matrix, including each Windows directory pin.
-}, 60000);
+  // Each case pins real Windows directories; allow the whole serial matrix to finish.
+}, 120000);
 
 test('disk-full failure and cancellation leave the previous backup and source facts intact', async () => {
   const { createBackup } = await import('../../packages/storage/src/backup');

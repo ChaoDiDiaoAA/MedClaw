@@ -40,6 +40,372 @@
         "SKILL.md",
         "references/facts-and-assumptions.md"
       ]
+    },
+    {
+      "kind": "skill",
+      "id": "data-scope-review",
+      "version": "v1",
+      "entry": "skills/data-scope-review/v1/SKILL.md",
+      "keywords": [
+        "scope",
+        "batches",
+        "dates"
+      ],
+      "requiredTools": [
+        "list_batches",
+        "read",
+        "read_batch",
+        "read_data_scope"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/scope-checklist.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "data-coverage-check",
+      "version": "v1",
+      "entry": "skills/data-coverage-check/v1/SKILL.md",
+      "keywords": [
+        "coverage",
+        "dates",
+        "predecessor"
+      ],
+      "requiredTools": [
+        "check_data_coverage",
+        "read",
+        "read_batch",
+        "read_data_scope"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/coverage-interpretation.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "device-identity-resolve",
+      "version": "v1",
+      "entry": "skills/device-identity-resolve/v1/SKILL.md",
+      "keywords": [
+        "device",
+        "identity",
+        "ambiguity"
+      ],
+      "requiredTools": [
+        "read",
+        "read_data_scope",
+        "read_device",
+        "resolve_device"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/identity-matching.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "device-detail-review",
+      "version": "v1",
+      "entry": "skills/device-detail-review/v1/SKILL.md",
+      "keywords": [
+        "device",
+        "details",
+        "sources"
+      ],
+      "requiredTools": [
+        "list_query_evidence",
+        "query_current_devices",
+        "read",
+        "read_data_scope",
+        "read_device",
+        "read_query",
+        "read_query_page",
+        "read_source_metadata",
+        "resolve_device"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/device-detail-evidence.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "current-device-search",
+      "version": "v1",
+      "entry": "skills/current-device-search/v1/SKILL.md",
+      "keywords": [
+        "search",
+        "current",
+        "filters"
+      ],
+      "requiredTools": [
+        "check_data_coverage",
+        "list_filter_values",
+        "query_current_devices",
+        "read",
+        "read_data_scope",
+        "read_query_page"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/current-search-basis.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "manufacturer-device-list",
+      "version": "v1",
+      "entry": "skills/manufacturer-device-list/v1/SKILL.md",
+      "keywords": [
+        "manufacturer",
+        "devices",
+        "list"
+      ],
+      "requiredTools": [
+        "check_data_coverage",
+        "list_filter_values",
+        "query_current_devices",
+        "read",
+        "read_data_scope",
+        "read_query",
+        "read_query_page"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/manufacturer-list-basis.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "device-status-screen",
+      "version": "v1",
+      "entry": "skills/device-status-screen/v1/SKILL.md",
+      "keywords": [
+        "status",
+        "screen",
+        "sources"
+      ],
+      "requiredTools": [
+        "check_data_coverage",
+        "list_filter_values",
+        "list_query_evidence",
+        "query_current_devices",
+        "read",
+        "read_data_scope",
+        "read_query_page",
+        "read_source_metadata"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/status-meaning.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "new-device-records",
+      "version": "v1",
+      "entry": "skills/new-device-records/v1/SKILL.md",
+      "keywords": [
+        "added",
+        "changes",
+        "predecessor"
+      ],
+      "requiredTools": [
+        "check_data_coverage",
+        "list_query_evidence",
+        "query_device_changes",
+        "read",
+        "read_data_scope",
+        "read_query_evidence",
+        "read_query_page"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/added-event-basis.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "missing-device-records",
+      "version": "v1",
+      "entry": "skills/missing-device-records/v1/SKILL.md",
+      "keywords": [
+        "missing",
+        "changes",
+        "predecessor"
+      ],
+      "requiredTools": [
+        "check_data_coverage",
+        "list_query_evidence",
+        "query_device_changes",
+        "read",
+        "read_data_scope",
+        "read_query_evidence",
+        "read_query_page"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/missing-event-basis.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "price-change-review",
+      "version": "v1",
+      "entry": "skills/price-change-review/v1/SKILL.md",
+      "keywords": [
+        "price",
+        "changes",
+        "units"
+      ],
+      "requiredTools": [
+        "check_data_coverage",
+        "list_query_evidence",
+        "query_device_changes",
+        "read",
+        "read_data_scope",
+        "read_evidence_rows",
+        "read_query_page"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/price-change-interpretation.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "device-status-change",
+      "version": "v1",
+      "entry": "skills/device-status-change/v1/SKILL.md",
+      "keywords": [
+        "status",
+        "changes",
+        "evidence"
+      ],
+      "requiredTools": [
+        "check_data_coverage",
+        "list_query_evidence",
+        "query_device_changes",
+        "read",
+        "read_data_scope",
+        "read_query_evidence",
+        "read_query_page"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/status-change-basis.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "distributor-change-review",
+      "version": "v1",
+      "entry": "skills/distributor-change-review/v1/SKILL.md",
+      "keywords": [
+        "distributor",
+        "changes",
+        "sources"
+      ],
+      "requiredTools": [
+        "check_data_coverage",
+        "list_query_evidence",
+        "query_device_changes",
+        "read",
+        "read_data_scope",
+        "read_query_page",
+        "read_source_metadata"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/distributor-change-basis.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "price-threshold-review",
+      "version": "v1",
+      "entry": "skills/price-threshold-review/v1/SKILL.md",
+      "keywords": [
+        "price",
+        "threshold",
+        "ratio"
+      ],
+      "requiredTools": [
+        "check_data_coverage",
+        "list_query_evidence",
+        "query_device_changes",
+        "read",
+        "read_data_scope",
+        "read_query_evidence",
+        "read_query_page"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/threshold-semantics.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "query-evidence-audit",
+      "version": "v1",
+      "entry": "skills/query-evidence-audit/v1/SKILL.md",
+      "keywords": [
+        "query",
+        "audit",
+        "evidence"
+      ],
+      "requiredTools": [
+        "list_query_evidence",
+        "read",
+        "read_data_scope",
+        "read_evidence_rows",
+        "read_query",
+        "read_query_evidence",
+        "read_query_page",
+        "read_source_metadata"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/query-audit-checklist.md"
+      ]
+    },
+    {
+      "kind": "skill",
+      "id": "data-freshness-review",
+      "version": "v1",
+      "entry": "skills/data-freshness-review/v1/SKILL.md",
+      "keywords": [
+        "freshness",
+        "dates",
+        "snapshot"
+      ],
+      "requiredTools": [
+        "list_batches",
+        "read",
+        "read_batch",
+        "read_data_scope"
+      ],
+      "requiredExtensions": [],
+      "files": [
+        "SKILL.md",
+        "references/freshness-checklist.md"
+      ]
     }
   ]
 }

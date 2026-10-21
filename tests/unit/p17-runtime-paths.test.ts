@@ -52,6 +52,8 @@ test('a missing or escaping installation resource fails without falling back to 
     expect(() => resolvePaths(input)).toThrow('host_protocol_mismatch');
     writeFileSync(join(installRoot, 'install.json'), JSON.stringify({ ...manifest, sdkVersion: '0.87.2' }));
     expect(() => resolvePaths(input)).toThrow('host_protocol_mismatch');
+    writeFileSync(join(installRoot, 'install.json'), JSON.stringify({ ...manifest, protocolVersion:'medclaw.host/p17-v1' }));
+    expect(() => resolvePaths(input)).toThrow('host_protocol_mismatch');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 test('invalid persisted data-root selection is preserved and blocks initialization', async () => {
@@ -64,13 +66,13 @@ test('invalid persisted data-root selection is preserved and blocks initializati
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('a persisted root selection consumes the exact restore record written by maintenance', async () => {
+for(const protocolVersion of [HOST_PROTOCOL_VERSION,'medclaw.host/p17-v1'])test(`a persisted root selection consumes its original restore record with ${protocolVersion}`, async () => {
   const resolvePaths = await resolver(), root = mkdtempSync(join(tmpdir(), 'medclaw-restored-launch-'));
   try {
     const { appPath, manifest } = installation(root), defaultUserData = join(root, 'data'), targetRoot = join(root, 'restored');
     mkdirSync(defaultUserData); mkdirSync(join(targetRoot, 'data'), { recursive: true });
     const operationRef = 'original-restore';
-    writeFileSync(join(targetRoot, 'data/restore-receipt.json'), JSON.stringify({ request: { kind: 'restore', sourceBackup: join(root, 'backup'), targetRoot }, sourceOperationRef: 'original-backup', installation: manifest,
+    writeFileSync(join(targetRoot, 'data/restore-receipt.json'), JSON.stringify({ request: { kind: 'restore', sourceBackup: join(root, 'backup'), targetRoot }, sourceOperationRef: 'original-backup', installation: {...manifest,protocolVersion},
       receipt: { operationRef, kind: 'restore', state: 'completed', appVersion: '0.1.0', sdkVersion: '0.87.1', schemaVersion: 16, restoredAt: '2026-10-17T00:00:00.000Z', configVersion: '2' } }));
     writeFileSync(join(defaultUserData, 'launch.json'), JSON.stringify({ contract: 'medclaw.launch/v1', activeDataRoot: targetRoot, restoreOperationRef: operationRef }));
     const input = { isPackaged: true, resourcesPath: join(root, 'resources'), appPath, defaultUserData };

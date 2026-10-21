@@ -4,10 +4,24 @@ import { lstat, mkdir, open, opendir, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DefaultResourceLoader, SettingsManager } from '@earendil-works/pi-coding-agent';
 import { AppErrorSchema, PositiveIdSchema, safeError } from '@medclaw/contracts/error';
-import { FrozenRunResourcesSchema, ResourceCatalogueSchema, ResourceFileSchema, ResourceRefSchema, ResourceSnapshotSchema, RESOURCE_LIMITS,
+import { FrozenRunResourcesSchema, ResourceCatalogueSchema, ResourceFileSchema, ResourceRefSchema, ResourceSnapshotSchema, RESOURCE_LIMITS, getSkillReadiness, resourceRefKey,
   type FrozenRunResources, type ResourceDefinition, type ResourceDiagnostic, type ResourceDiagnosticReason, type ResourceFileSnapshot, type ResourceItem, type ResourceRef, type ResourceSnapshot, type ResourceSource } from '@medclaw/contracts/resources';
 
 type ResourceFailureReason = Exclude<ResourceDiagnosticReason, 'not_recorded' | 'sdk_warning'>;
+export function formatSkillReadinessSection(frozen: FrozenRunResources, allowedTools: readonly string[]): string {
+  const rows=(frozen.skillRequirements??[]).filter(declaration=>{
+    const snapshot=frozen.available.find(s=>resourceRefKey(s.ref)===resourceRefKey(declaration.resourceRef));
+    return declaration.disableModelInvocation===false || declaration.disableModelInvocation===undefined&&snapshot?.disableModelInvocation===false;
+  }).map(declaration=>{
+    const readiness=getSkillReadiness(declaration.requiredTools,allowedTools,'run_scope');
+    let count=`${readiness.matchedCount}/${readiness.totalCount} capabilities`;
+    if(readiness.state==='unknown')count='Unknown';
+    else if(readiness.state==='no_requirements')count='No requirements';
+    const available=frozen.available.some(s=>resourceRefKey(s.ref)===resourceRefKey(declaration.resourceRef));
+    return `${declaration.resourceRef.id}@${declaration.resourceRef.version}: ${readiness.state} (${count}); resource=${available?'available':'unavailable'}${readiness.missingTools.length?`; missing Tools: ${readiness.missingTools.map(t=>t.name).join(', ')}`:''}`;
+  });
+  return rows.length?`<skill_readiness>\nTool matches describe capabilities, not permission or instruction adherence. Read Skill guidance only when needed.\n${rows.join('\n')}\n</skill_readiness>`:'';
+}
 function fail(reason: ResourceFailureReason): never { throw safeError('resource_unavailable', undefined, { reason }); }
 function reason(error: unknown): ResourceFailureReason {
   const parsed = AppErrorSchema.safeParse(error);

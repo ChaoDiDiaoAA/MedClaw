@@ -10,7 +10,7 @@ export const InstallRelativePathSchema = z.string().min(1).max(1024).refine(valu
 export const InstallManifestSchema = z.strictObject({
   contract: z.literal('medclaw.install/v1'), appVersion: z.literal('0.1.0'), platform: z.literal('win32'), arch: z.literal('x64'),
   sdkVersion: z.literal('0.87.1'), bunVersion: z.literal('1.4.0'), electronVersion: z.literal('44.5.1'),
-  protocolVersion: z.literal('medclaw.host/p17-v1'), schemaVersion: z.literal(16),
+  protocolVersion: z.literal('medclaw.host/p17-v2'), schemaVersion: z.literal(16),
   hostEntry: InstallRelativePathSchema, maintenanceEntry: InstallRelativePathSchema, resourceRoot: InstallRelativePathSchema,
   resources: z.array(z.strictObject({ kind: z.enum(['prompt', 'skill']), id: OpaqueIdSchema, version: OpaqueIdSchema })).max(1000),
   plugins: z.array(z.strictObject({ name: z.string().min(1).max(256), version: OpaqueIdSchema, patch: InstallRelativePathSchema })).max(100),
@@ -40,7 +40,8 @@ export const MaintenanceOperationRefSchema = OpaqueIdSchema.max(128).refine(valu
 export const BackupRecordSchema = z.strictObject({ request: z.strictObject({ kind: z.literal('create'), sourceRoot: AbsolutePathSchema, destinationRoot: AbsolutePathSchema }), receipt: BackupReceiptSchema });
 export const RestoreRecordSchema = z.strictObject({
   request: z.strictObject({ kind: z.literal('restore'), sourceBackup: AbsolutePathSchema, targetRoot: AbsolutePathSchema }),
-  sourceOperationRef: MaintenanceOperationRefSchema, installation: InstallManifestSchema, receipt: RestoreReceiptSchema,
+  // A saved receipt identifies an already restored root; it does not negotiate the active Host protocol.
+  sourceOperationRef: MaintenanceOperationRefSchema, installation: InstallManifestSchema.extend({protocolVersion:z.enum(['medclaw.host/p17-v1','medclaw.host/p17-v2'])}), receipt: RestoreReceiptSchema,
 });
 export const MaintenanceSelectionSchema = z.strictObject({
   sourceToken: OpaqueIdSchema.optional(), destinationToken: OpaqueIdSchema.optional(), targetRootToken: OpaqueIdSchema.optional(), resultToken: OpaqueIdSchema.optional(),

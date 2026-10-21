@@ -32,10 +32,10 @@ test('p11 English resource entrances, versions and confirmed publication stay di
   expect((await requests(page,'resources.select'))[0]!.input).toMatchObject({sessionId:1,expectedConfigVersion:'1',selection:{skills:[ref()]}});
   await reply(page,'resources.select',{ok:true,data:{sessionId:1,configVersion:'2',selection:{prompt:null,skills:[ref()]}}});await reply(page,'resources.list',{ok:true,data:list(1,'2',true)});
   await expect(page.getByText('Published configuration 2',{exact:true})).toBeVisible();await expect(page.getByRole('button',{name:'Disable query',exact:true})).toBeVisible();
-  await page.getByLabel('query version').selectOption(JSON.stringify(ref('v2')));await reply(page,'resources.select',{ok:false,error:{code:'config_version_conflict'}});
+  await page.getByRole('button',{name:'query',exact:true}).click();await page.getByLabel('query version').selectOption(JSON.stringify(ref('v2')));await reply(page,'resources.select',{ok:false,error:{code:'config_version_conflict'}});
   await expect(page.getByRole('alert')).toBeVisible();await expect(page.getByRole('button',{name:'Disable query',exact:true})).toBeVisible();
   await page.getByRole('button',{name:'Refresh resources',exact:true}).click();const broken={...list(1,'3',true),catalogError:{code:'resource_unavailable'},items:[{...list(1,'3',true).items[0]!,name:null,description:null,requiredTools:null,requiredExtensions:null,availability:'invalid',files:[],disableModelInvocation:null}]};await reply(page,'resources.list',{ok:true,data:broken});
-  await expect(page.getByText('Required tools: Unknown · Required extensions: Unknown',{exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'query',exact:true}).click();await expect(page.getByText('Required tools: Unknown · Required extensions: Unknown',{exact:true})).toBeVisible();
   await page.getByRole('button',{name:'Clear selection',exact:true}).click();await reply(page,'resources.select',{ok:false,error:{code:'operation_result_unknown'}});
   await expect(page.getByRole('alert').filter({hasText:'Refresh'})).toBeVisible();expect(await page.evaluate(()=>Reflect.get(globalThis,'__published'))).toBe(1);
 });
@@ -44,7 +44,7 @@ test('p11 delayed source, Host and file replies cannot replace the current selec
   await page.goto(url);await expect.poll(async()=>(await requests(page,'resources.list')).length).toBe(1);await page.evaluate(()=>Reflect.get(globalThis,'__render')({source:'selection',sessionId:2}));
   await reply(page,'resources.list',{ok:true,data:list(1,'old',true)});await reply(page,'resources.list',{ok:true,data:list(2,'2',true)});
   await expect(page.getByTestId('resource-panel')).toContainText('Session 2');await expect(page.getByTestId('resource-panel')).not.toContainText('old');
-  await page.getByRole('button',{name:'Read query SKILL.md',exact:true}).click();await page.evaluate(()=>Reflect.get(globalThis,'__render')({source:'selection',sessionId:2},'HostB'));
+  await page.getByRole('button',{name:'query',exact:true}).click();await page.getByRole('button',{name:'Read query SKILL.md',exact:true}).click();await page.evaluate(()=>Reflect.get(globalThis,'__render')({source:'selection',sessionId:2},'HostB'));
   await reply(page,'resources.read',{ok:true,data:{source:'selection',sessionId:2,configVersion:'2',resourceRef:ref(),file:'SKILL.md',content:'OLD HOST CONTENT',bytes:16}});
   await reply(page,'resources.list',{ok:true,data:list(2,'3',true)});await expect(page.getByTestId('resource-panel')).not.toContainText('OLD HOST CONTENT');
   const count=(await requests(page,'resources.list')).length;await page.evaluate(()=>Reflect.get(globalThis,'__render')(null));await expect(page.getByTestId('resource-panel')).toContainText('Select a Session');

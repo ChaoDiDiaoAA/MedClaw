@@ -200,6 +200,18 @@ legend { padding: 0 6px; font-weight: 600; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
 .resource-panel article { border-top: 1px solid var(--line); padding: 12px 0; }
 .resource-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 420px; overflow: auto; }
+.resource-panel h3 button { text-align: left; overflow-wrap: anywhere; }
+.resource-summary { display: flex; align-items: center; gap: 12px; }
+.resource-description { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.resource-missing { display: inline-block; margin-left: 8px; overflow-wrap: anywhere; }
+.resource-panel [aria-label$="readiness"] { overflow-wrap: anywhere; }
+.resource-input-menu { max-height: 240px; overflow-y: auto; border: 1px solid var(--line); padding: 10px; border-radius: 6px; background: #fff; }
+.resource-input-menu [role="group"] { display: grid; gap: 6px; margin: 6px 0; }
+.resource-input-menu button { text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.resource-input-menu [aria-selected="true"] { outline: 2px solid var(--accent); }
+.prompt-workbench { display: grid; gap: 12px; }
+.prompt-workbench textarea { width: 100%; min-width: 0; resize: vertical; padding: 12px; }
+.prompt-workbench pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; }
 /* The chart shares the saved result table and remains usable in a narrow panel. */
 .query-trend { margin: 1rem 0; }
 .query-trend svg { display: block; width: 100%; height: auto; min-height: 160px; }

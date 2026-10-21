@@ -17,6 +17,8 @@ import { SettingsPage } from "./settings-page";
 import { RunDetails } from "./run-details";
 import type { IntentAction } from './intent-panel';
 import { ResourcePanel } from './resource-panel';
+import { PromptWorkbench } from './prompt-workbench';
+import {resourceCommand} from '../../../../packages/contracts/src/resources';
 import { ExtensionsPage } from './extensions-page';
 import { DataWorkspace } from "./data-workspace";
 import { QueryHistory } from "./query-history";
@@ -680,14 +682,27 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     if (!retry && (!draft.model || draft.pending || mode === 'send' && !controlRef.current?.acceptingNewRuns
       || mode !== 'send' && (!originalControl?.acceptingInputs || root?.id !== originalControl.runId || root.kind !== 'agent')
       || !draft.text.trim() || !draft.referenceDate || !draft.timezone.trim())) return;
+    sendBusy.current = sessionId;setSending(sessionId);setError(null);
+    try {
+    let routing=draft.routing;
+    if(!retry&&mode==='send'&&draft.text.startsWith('/')){
+      let names:string[]=[];
+      if(!resourceCommand(draft.text,[])){
+        const resources=await window.medclaw.request('resources.list',{source:'selection',sessionId});
+        if(!resources.ok){setError(errorMessage(resources.error));return;}
+        if(resources.data.source!=='selection'||resources.data.sessionId!==sessionId){setError('Resource command owner is unconfirmed.');return;}
+        names=resources.data.items.filter(item=>item.ref.kind==='prompt').map(item=>item.ref.id);
+      }
+      if(resourceCommand(draft.text,names))routing=null;
+      if(instance!==hostRef.current.instanceId||workspaceRef.current?.sessionId!==sessionId||!confirmedWorkspace.current||workspaceMutation.current||deletedSessions.current.has(sessionId)||(!preparedDraft&&draftsRef.current[sessionId]!==draft))return;
+    }
     const fields = { sessionId, clientSequence: detailsRef.current[sessionId]?.session.nextSubmissionSequence ?? 0, text: draft.text,
       expectedRevision: workspaceRef.current!.revision, expectedBatchIds: workspaceRef.current!.batchRefs.map(batch => batch.id), expectedQueryId: workspaceRef.current!.queryId,
       model: mode === 'send' ? draft.model! : { provider: root!.model.provider, modelId: root!.model.modelId, expectedConfigVersion: root!.model.configVersion },
       referenceDate: mode === 'send' ? draft.referenceDate : root!.referenceDate, timezone: mode === 'send' ? draft.timezone : root!.timezone };
-    const pending = retry ? draft.pending : { operationRef: crypto.randomUUID(), input: mode === 'send' ? { ...fields, mode, ...(draft.routing ? { routing: draft.routing } : {}) } : { ...fields, mode, targetRunId: originalControl!.runId } satisfies SubmitInput };
+    const pending = retry ? draft.pending : { operationRef: crypto.randomUUID(), input: mode === 'send' ? { ...fields, mode, ...(routing ? { routing } : {}) } : { ...fields, mode, targetRunId: originalControl!.runId } satisfies SubmitInput };
     if (!pending) return;
-    editDraft(sessionId, { pending, mode: pending.input.mode, resendConfirmed: false, confirmedFailure: false }); sendBusy.current = sessionId; setSending(sessionId); setError(null);
-    try {
+    editDraft(sessionId, { pending, mode: pending.input.mode, resendConfirmed: false, confirmedFailure: false });
       const result = await window.medclaw.request("session.submit", pending.input, pending.operationRef);
       if (instance !== hostRef.current.instanceId || !ownsPending(sessionId, pending)) return;
       if (result.ok) await acceptedAgent(result.data, pending);
@@ -763,6 +778,12 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     if(runRef.current?.kind!=='child'||runRef.current.id!==runId){void readSession(sessionId);void refreshInputs(sessionId);}
   });
   const runningSession = sessions.find(s => s.id === active?.sessionId);
+  const usePromptInChat=(text:string)=>{
+    const id=workspaceRef.current?.sessionId,original=id?draftsRef.current[id]:null;
+    if(!id||!original||!text.trim()||hostRef.current.state!=='ready'||!confirmedWorkspace.current||selectBusy.current||workspaceMutation.current||sendBusy.current||deletedSessions.current.has(id)||detailsRef.current[id]?.session.status!=='active'||original.pending)return false;
+    editDraft(id,{text:original.text?original.text+'\n\n'+text:text});setPage('chat');return true;
+  };
+  const promptDraftReady=!!current&&!!draft&&currentDetail?.session.status==='active'&&workspaceConfirmed&&!selecting&&host.state==='ready'&&!draft.pending&&sending===null;
   const queueRun = current && currentDetail?.session.inputControl ? selectedRuns.current.get(current) ?? null : null;
   const queueRootInput = queueRun?.inputId && current ? inputQueue.snapshots[current]?.items.find(value => value.id === queueRun.inputId) ?? null : null;
   const frozenRun = active?.kind === 'agent' && active.sessionId ? selectedRuns.current.get(active.sessionId) : run?.kind === 'agent' ? run : null;
@@ -799,10 +820,11 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
       <section className="page-content" hidden={page !== "models"}><ModelsPage executionBlockReason={executionBlockReason} directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control}
         sessionTarget={workspaceConfirmed && !selecting && current && currentDetail && host.instanceId ? { instanceId: host.instanceId, sessionId: current } : null} onUseForSession={useForSession}
         prompt={prompt} notification={authNotify} attempt={authAttempt} onChanged={changed} onAccepted={acceptedProvider} onError={setError} /></section>
-      <section className="page-content" hidden={page !== "settings"}><SettingsPage executionBlockReason={executionBlockReason} ui={ui} uiAvailable={uiAvailable} onReadUi={readUi} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost} /></section>
+      <section className="page-content" hidden={page !== "settings"}><SettingsPage executionBlockReason={executionBlockReason} ui={ui} uiAvailable={uiAvailable} onReadUi={readUi} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost} />{page==='settings'&&<section aria-label="Business prompt"><h2>Business prompt</h2><ResourcePanel host={host} source={workspaceConfirmed&&!selecting&&current?{source:'selection',sessionId:current}:null} kind="prompt" activeRunId={active?.sessionId===current?active?.runId:null} onPublished={()=>void readDirectory()}/></section>}</section>
       <section className="page-content" hidden={page !== 'evaluation'}><EvaluationPage visible={page === 'evaluation'} evaluation={evaluation}
         productionBlockReason={productionBlockReason} /></section>
-      {(page==='prompt'||page==='skills')&&<section className="page-content"><ResourcePanel host={host} source={workspaceConfirmed&&!selecting&&current?{source:'selection',sessionId:current}:null} kind={page==='prompt'?'prompt':'skill'} activeRunId={active?.sessionId===current?active?.runId:null} onPublished={()=>void readDirectory()} /></section>}
+      <section className="page-content" hidden={page!=='prompt'}><PromptWorkbench host={host} directory={directory} directoryCurrent={directoryCurrent} control={control} executionBlockReason={executionBlockReason} visible={page==='prompt'} canUseInChat={promptDraftReady} useInChatReason="Confirm the current active Session and its original submission before filling the draft." onUseInChat={usePromptInChat} onAccepted={()=>void readActive()}/></section>
+      {page==='skills'&&<section className="page-content"><ResourcePanel host={host} source={workspaceConfirmed&&!selecting&&current?{source:'selection',sessionId:current}:null} kind="skill" activeRunId={active?.sessionId===current?active?.runId:null} onPublished={()=>void readDirectory()} /></section>}
       {page==='extensions'&&<section className="page-content"><ExtensionsPage executionBlockReason={executionBlockReason} host={host} sessionId={workspaceConfirmed&&!selecting?current:null} runId={run?.kind==='agent'&&run.sessionId===current?run.id:null} activeRunId={active?.runId??null} stopping={!!active?.stopPending||!!active?.persistencePending} onStop={()=>void stop()} onDetails={()=>void updateUi({detailOpen:true})} onPublished={()=>void readDirectory()} /></section>}
     </main>
     {ui.detailOpen && <RunDetails inputs={inputQueue.snapshots[run?.kind === "agent" ? run.sessionId : current ?? 0] ?? null} onRefreshInputs={() => { const id=run?.kind === "agent" ? run.sessionId : current; if(id)void refreshInputs(id,true); }} onMoreInputs={() => { const id=run?.kind === "agent" ? run.sessionId : current; if(id)void readInputPage(id,"more"); }} cancellingInputs={cancellingInputs} onCancelInput={original => void cancelInput(original)} run={run} host={host} viewSessionId={current} tab={ui.detailTab} active={active} control={control} events={runEvents.state} onResumeGap={runEvents.resumeGap} onTab={tab => void updateUi({ detailTab: tab })} onClose={() => void closeDetails()} onError={setError}

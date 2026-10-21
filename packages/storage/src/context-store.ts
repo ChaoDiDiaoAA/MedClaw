@@ -273,7 +273,7 @@ export class SqliteContextStore implements ContextStore {
   private matchesObservation(call: CallRow, snapshot: SnapshotRow, observation: RegisterContextDeliveryInput['observation']): boolean {
     const model = JSON.parse(call.model_json), context = checked(ModelCallContextSchema,legacyModelCallContext(model.context)), body = this.body(snapshot);
     const resources = 'resources' in observation ? observation.resources : undefined;
-    const resourceMatch = context.resources ? resources !== undefined && CallResourceContextSchema.safeParse({expected:context.resources.expected,payload:resources}).success : resources === undefined;
+    const resourceMatch = context.resources ? resources !== undefined && CallResourceContextSchema.safeParse({...context.resources,payload:resources}).success : resources === undefined;
     return resourceMatch && isDeepStrictEqual(context.intentSource,body.intentSource) && isDeepStrictEqual(context.delegationSource,body.delegationSource) && call.run_id === snapshot.run_id && call.session_id === snapshot.session_id && call.input_id === snapshot.input_id && context.snapshotId === snapshot.id && context.inputId === snapshot.input_id && model.selection?.api === observation.api && observation.verifiedNativeRefs.every(ref => body.nativeRefs.some(native => native.kind === ref.kind && native.id === ref.id));
   }
   private delivery(call: CallRow, row: {snapshot_id:number;run_id:number;session_id:number;delivered_at:string}): ContextDelivery {
@@ -297,7 +297,7 @@ export class SqliteContextStore implements ContextStore {
       if (prior) { const saved = this.delivery(call,prior); if (!isDeepStrictEqual(saved.observation,input.observation)) fail('state_conflict'); return saved; }
       if (context.observation !== null) fail('state_conflict');
       this.db.query('INSERT INTO context_deliveries(model_call_id,snapshot_id,run_id,session_id,delivered_at) VALUES(?,?,?,?,?)').run(call.id,snapshot.id,input.runId,input.sessionId,input.observation.observedAt);
-      model.context = checked(ModelCallContextSchema,{...context,payloadVerified:true,responseStatus:input.observation.httpStatus,observation:input.observation,...(context.resources ? {resources:{expected:context.resources.expected,payload:'resources' in input.observation ? input.observation.resources : undefined}} : {})});
+      model.context = checked(ModelCallContextSchema,{...context,payloadVerified:true,responseStatus:input.observation.httpStatus,observation:input.observation,...(context.resources ? {resources:{...context.resources,payload:'resources' in input.observation ? input.observation.resources : undefined}} : {})});
       this.db.query('UPDATE model_calls SET model_json=? WHERE id=?').run(JSON.stringify(model),call.id);
       if (['created','running'].includes(run.status)) this.events.appendInTransaction({type:'context_delivered',payload:{contract:'medclaw.event/v1',snapshotId:snapshot.id,callId:call.call_id},runId:input.runId,sessionId:input.sessionId,source:call.kind === 'intent' ? 'intent' : 'pi',sourceConnection:null,sourceSequence:null,toolCallId:null,occurredAt:input.observation.observedAt,receivedAt:new Date().toISOString()});
       return this.delivery({...call,model_json:JSON.stringify(model)},{snapshot_id:snapshot.id,run_id:input.runId,session_id:input.sessionId,delivered_at:input.observation.observedAt});

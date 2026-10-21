@@ -13,6 +13,7 @@ import { type InputQueueSnapshot } from "./input-queue";
 import { finalDisplaySource, resolveReadingAnchor, shouldRecordScroll, type ReadingAnchor, type RunEventProjectionState } from './use-run-events';
 import type { DirectoryReadStatus } from './models-page';
 import { QueryConditions } from './intent-panel';
+import { ResourceInput } from './resource-input';
 
 // Each public page stays bounded; the displayed collection is independent of that DTO.
 type MessageAvailability = { available: boolean; hasPage: boolean; hasHistory: boolean; hasMore: boolean; unavailable: boolean; runCovered: boolean };
@@ -294,7 +295,7 @@ export function Chat(props: { executionBlockReason?:string|null;compactionProgre
   queueRun: RunView | null; queueRootInput: SessionInput | null; frozenInput?: SessionInput | null; frozenRunId?: number; inputs: InputQueueSnapshot | null; cancellingInputs: number[];
   onRefreshInputs: () => void; onMoreInputs: () => void; onCancelInput: (input: SessionInput) => void;
   onUseForSession: (target: { instanceId: string; sessionId: number }, choice: ModelChoice) => void }) {
-  const [following, setFollowing] = useState(true), input = useRef<HTMLTextAreaElement>(null), scroll = useRef<HTMLDivElement>(null);
+  const [following, setFollowing] = useState(true), scroll = useRef<HTMLDivElement>(null);
   const positions = useRef(new Map<string, { following: boolean; top: number; anchor: ReadingAnchor | null; offset: number }>()), followingRef = useRef(following);
   const restoring = useRef(false), restorationFrame = useRef<number | null>(null), readingTarget = useRef<string | null>(null);
   const scrollIntent = useRef<{ key: string; height: number; viewport: number; until: number } | null>(null);
@@ -415,7 +416,6 @@ export function Chat(props: { executionBlockReason?:string|null;compactionProgre
     if (positions.current.size > 50) positions.current.delete(positions.current.keys().next().value!);
     followingRef.current = follows; setFollowing(follows);
   }
-  useEffect(() => { if (input.current) { input.current.style.height = "auto"; input.current.style.height = Math.min(160, input.current.scrollHeight + input.current.offsetHeight - input.current.clientHeight) + "px"; } }, [draft?.text, props.session?.session.id]);
   return <div className="chat-layout">
     <div className="session-heading"><strong data-testid="current-session">{props.session ? "Viewing: " + sessionDisplayTitle(props.session.session) : "No session selected"}</strong>
       {props.active && <span data-testid="running-session" className="status-chip">Running: {props.runningTitle ?? "Provider"} · Run {props.active.runId}</span>}</div>
@@ -434,9 +434,9 @@ export function Chat(props: { executionBlockReason?:string|null;compactionProgre
         </section>}
         {events?.finalSource === 'unavailable' && <p className="evidence-gap" data-testid="final-content-unavailable">Final content is unavailable. Run and Answer saving remains unconfirmed; read the original facts again.</p>}
         {props.session && !props.session.history.available && <button onClick={props.onCreate}>Create new session</button>}
-        {run && (run.kind === 'provider' || showRunBody || !events) && <>{run.kind === "provider" && <p className="muted">Provider diagnostic · Run {run.id}</p>}{showRunBody && <div className="user-message"><span className="message-label">User</span><div>{run.inputText}</div></div>}
+        {run && (run.kind === 'provider' || showRunBody || !events) && <>{run.kind === "provider" && <p className="muted">{run.goal==='verify'?'Provider diagnostic':'Single-turn model request'} · Run {run.id}</p>}{showRunBody && <div className="user-message"><span className="message-label">User</span><div>{run.inputText}</div></div>}
           <article className="model-answer" data-testid={showRunBody && savedFinal ? 'saved-final-area' : undefined} data-run-id={run.id}><div className="answer-heading"><strong>Assistant</strong><span className="status-chip">{status}</span></div>
-            <p className="tiny muted">{temporary ? 'Temporary output · Run and Answer saving unconfirmed' : historyUnavailable ? 'Saved run output; native history unavailable' : run.kind === 'provider' ? 'Saved diagnostic output · Review Run details' : currentAvailability?.hasMore ? 'Native history page incomplete. Load more messages to read this leaf. Read the full saved output in Run details.' : currentAvailability?.hasPage ? 'Native history: in memory. Read the full saved output in Run details.' : 'Native history coverage unconfirmed. Read the full saved output in Run details.'}</p>
+            <p className="tiny muted">{temporary ? 'Temporary output · Run and Answer saving unconfirmed' : historyUnavailable ? 'Saved run output; native history unavailable' : run.kind === 'provider' ? 'Saved model output · Review Run details' : currentAvailability?.hasMore ? 'Native history page incomplete. Load more messages to read this leaf. Read the full saved output in Run details.' : currentAvailability?.hasPage ? 'Native history: in memory. Read the full saved output in Run details.' : 'Native history coverage unconfirmed. Read the full saved output in Run details.'}</p>
             {showRunBody && <div className="answer-text" data-testid="run-output">{props.preview?.text ?? (run.output.text || "Waiting for model output")}</div>}
             {props.preview?.truncated && <p className="muted">The live preview was truncated. Read the full saved output in Run details.</p>}
             {showRunBody && run.output.nextOffset !== null && !props.preview && <p className="muted">Showing {run.output.text.length} / {run.output.totalChars} characters. Read the full output in Run details.</p>}
@@ -464,9 +464,7 @@ export function Chat(props: { executionBlockReason?:string|null;compactionProgre
       {props.active && <p className="tiny muted">Model changes apply to the next message. The current run uses its frozen configuration.</p>}
       <label>Message routing<select aria-label="Message routing" value={draft?.routing?.mode === 'intent' ? 'intent' : 'main_agent'} disabled={!draft || !!draft.pending || props.sending || mode !== 'send' || !props.directoryCurrent} onChange={event => props.onDraft({ routing: event.target.value === 'intent' ? { mode: 'intent', originRunId: null } : null })}><option value="intent">Intent routing</option><option value="main_agent">Main Agent</option></select></label>
       {mode !== 'send' && queueRun && <p className="tiny muted">Queueing for original Run {queueRun.id} · {queueRun.model.provider} / {queueRun.model.modelId} · {queueRun.referenceDate} · {queueRun.timezone}</p>}
-      <label className="sr-only" htmlFor="message-text">Message text</label><textarea id="message-text" ref={input} value={draft?.text ?? ""} disabled={!draft} placeholder="Type a message…" onChange={event => props.onDraft({ text: event.target.value })} onKeyDown={event => {
-        if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); if (!reason && !props.sending && draft?.text.trim()) props.onSend(); }
-      }} />
+      <ResourceInput host={props.host} source={mode!=='send'&&inputControl?{source:'run',runId:inputControl.runId}:props.sessionId?{source:'selection',sessionId:props.sessionId}:null} configVersion={props.directory?.configVersion} visible={props.visible} value={draft?.text??''} disabled={!draft||!!draft.pending||props.selecting} onChange={text=>props.onDraft({text})} canSend={!reason&&!props.sending} onSend={props.onSend}/>
       <div className="composer-bottom"><span className="tiny muted">Shift+Enter for a new line</span><div className="actions">
         {draft?.pending && <><button disabled={props.sending} onClick={props.onLookup}>Read original submission</button><button disabled={props.sending || !draft.resendConfirmed || !props.workspaceConfirmed || props.selecting || (draft.pending.input.mode === 'send' ? !props.control?.acceptingNewRuns : !inputControl?.acceptingInputs || inputControl.runId !== draft.pending.input.targetRunId)} onClick={props.onResend}>Resend original submission</button>{draft.confirmedFailure && <button disabled={props.sending || props.selecting || props.host.state !== 'ready' || !props.workspaceConfirmed} onClick={() => props.onNewAttempt(draft.pending!)}>Start a new attempt</button>}</>}
         {props.active && <><button className="danger" disabled={props.host.state !== "ready"} onClick={props.onStop}>Stop generating</button><span className="tiny" data-testid="stop-target">Stops {props.active.sessionId ? `Session ${props.active.sessionId}` : 'Provider'} · Run {props.active.runId}</span></>}

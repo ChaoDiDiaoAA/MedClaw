@@ -2,7 +2,7 @@ import { AppErrorSchema, safeError } from '@medclaw/contracts/error';
 import type { PublishedSettings } from '@medclaw/contracts/model';
 import { SubmitInputSchema, type SubmitInput } from '@medclaw/contracts/session';
 import type { RunScope, RuntimeRunStore } from '@medclaw/contracts/run';
-import { FrozenRunResourcesSchema, ResourceInputPlanSchema, ResourceItemSchema, ResourceListInputSchema, ResourceListSchema, ResourceReadInputSchema, ResourceSelectionSchema, ResourceSnapshotSchema, ResourceTextSchema, resourceRefKey,
+import { FrozenRunResourcesSchema, ResourceInputPlanSchema, ResourceItemSchema, ResourceListInputSchema, ResourceListSchema, ResourceReadInputSchema, ResourceSelectionSchema, ResourceSnapshotSchema, ResourceTextSchema, resourceRefKey, getSkillReadiness, resourceCommand,
   type FrozenRunResources, type ResourceDiagnostic, type ResourceDiagnosticReason, type ResourceInputPlan, type ResourceItem, type ResourceList, type ResourceListInput, type ResourceReadInput, type ResourceRef, type ResourceSelection, type ResourceSnapshot, type ResourceSource, type ResourceText } from '@medclaw/contracts/resources';
 
 const emptySelection = (): ResourceSelection => ({ prompt: null, skills: [] });
@@ -22,7 +22,7 @@ function asItem(snapshot: ResourceSnapshot): ResourceItem {
 /** Published selection, immutable Run content and native evidence share the existing stores. */
 export class ResourceService {
   constructor(private readonly readSettings: () => PublishedSettings,
-    private readonly store: Pick<RuntimeRunStore, 'readSession' | 'read' | 'readRunResources' | 'readResourceEvidence'>,
+    private readonly store: Pick<RuntimeRunStore, 'readSession' | 'read' | 'readRunResources' | 'readResourceEvidence' | 'readRunResourceScope'>,
     private readonly source: ResourceSource, private readonly configuredToolNames: (settings: PublishedSettings) => readonly string[]) {}
   private session(sessionId: number) {
     const session = this.store.readSession(sessionId); if (!session) throw safeError('input_invalid', undefined, { reason: 'session_not_found' });
@@ -33,17 +33,18 @@ export class ResourceService {
   private selection(settings: PublishedSettings, sessionId: number) { return ResourceSelectionSchema.parse(settings.resources?.bySession[String(sessionId)] ?? emptySelection()); }
   private decorate(item: ResourceItem, selection: ResourceSelection, allowedTools: readonly string[]): ResourceItem {
     const enabled = refs(selection).some(ref => sameRef(item.ref, ref));
-    if (item.availability !== 'ready') return { ...item, enabled };
+    const readiness=item.ref.kind==='skill'?{readiness:getSkillReadiness(item.requiredTools,allowedTools,'configuration')}:{};
+    if (item.availability !== 'ready') return { ...item, enabled, ...readiness };
     const missing = item.requiredTools === null || item.requiredExtensions === null || item.requiredExtensions.length > 0 || item.requiredTools.some(name => !allowedTools.includes(name));
-    return { ...item, enabled, ...(missing ? { availability: 'dependency_missing' as const, diagnostics: [...item.diagnostics, diagnostic(item.ref, 'resource_dependency_missing')] } : {}) };
+    return { ...item, enabled, ...readiness, ...(missing ? { availability: 'dependency_missing' as const, diagnostics: [...item.diagnostics, diagnostic(item.ref, 'resource_dependency_missing')] } : {}) };
   }
   private async discover(selection: ResourceSelection, allowedTools: readonly string[]) {
     try {
       const catalog = await this.source.discover(), items = catalog.items.map(i => this.decorate(ResourceItemSchema.parse(i), selection, allowedTools));
-      for (const ref of refs(selection)) if (!items.some(i => sameRef(i.ref, ref))) items.push(placeholder(ref, items.some(i => i.ref.kind === ref.kind && i.ref.id === ref.id && i.ref.version === ref.version) ? 'resource_changed' : 'resource_missing'));
+      for (const ref of refs(selection)) if (!items.some(i => sameRef(i.ref, ref))) items.push(this.decorate(placeholder(ref, 'resource_missing'),selection,allowedTools));
       return { items, diagnostics: items.flatMap(i => i.diagnostics), catalogError: null, promptNames: [...new Set(catalog.items.filter(i => i.ref.kind === 'prompt').map(i => i.ref.id))].sort() };
     } catch {
-      const items = refs(selection).map(ref => placeholder(ref, 'resource_catalog_invalid'));
+      const items = refs(selection).map(ref => this.decorate(placeholder(ref, 'resource_catalog_invalid'),selection,allowedTools));
       return { items, diagnostics: items.flatMap(i => i.diagnostics), catalogError: safeError('resource_unavailable', undefined, { reason: 'resource_catalog_invalid' }), promptNames: [] };
     }
   }
@@ -66,8 +67,16 @@ export class ResourceService {
     const { run, frozen } = this.run(input.runId);
     if (!this.store.readResourceEvidence) throw safeError('storage_read_failed');
     const evidence = this.store.readResourceEvidence(input.runId, page, pageSize);
+    const tools=this.store.readRunResourceScope?.(input.runId)?.allowedToolNames??null;
+    const items=frozen?.available.map(asItem)??[];
+    for(const ref of frozen?.selection.skills??[])if(!items.some(i=>sameRef(i.ref,ref))){
+      const requirement=frozen?.skillRequirements?.find(s=>sameRef(s.resourceRef,ref));
+      const omitted=frozen?.omitted.filter(d=>d.resourceRef&&sameRef(d.resourceRef,ref))??[];
+      items.push({...placeholder(ref,'resource_missing'),requiredTools:requirement?.requiredTools??null,availability:omitted.some(d=>d.reason==='resource_dependency_missing')?'dependency_missing':'invalid',diagnostics:omitted});
+    }
+    for(const item of items)if(item.ref.kind==='skill')item.readiness=getSkillReadiness(frozen?.skillRequirements?.find(s=>sameRef(s.resourceRef,item.ref))?.requiredTools??null,tools,'run_scope');
     return ResourceListSchema.parse({ source: 'run', runId: run.id, sessionId: run.sessionId, configVersion: run.model.configVersion,
-      selection: frozen?.selection ?? emptySelection(), items: frozen?.available.map(asItem) ?? [], diagnostics: frozen?.omitted ?? [diagnostic(null, 'not_recorded')], catalogError: null,
+      selection: frozen?.selection ?? emptySelection(), items, diagnostics: frozen?.omitted ?? [diagnostic(null, 'not_recorded')], catalogError: null,
       evidence: evidence.items, evidenceInfo: { page, pageSize, totalRows: evidence.totalRows, hasMore: page * pageSize < evidence.totalRows } });
   }
   async read(raw: ResourceReadInput): Promise<ResourceText> {
@@ -106,9 +115,9 @@ export class ResourceService {
   }
   async freeze(sessionId: number, settings: PublishedSettings, scope: RunScope): Promise<FrozenRunResources> {
     this.session(sessionId); const selection = this.selection(settings, sessionId), available: ResourceSnapshot[] = [], omitted: ResourceDiagnostic[] = [];
-    let knownPromptNames: string[] = [];
+    const catalog=await this.discover(selection,scope.allowedToolNames), knownPromptNames=catalog.promptNames;
+    const skillRequirements=selection.skills.map(resourceRef=>{const item=catalog.items.find(i=>sameRef(i.ref,resourceRef));return {resourceRef,requiredTools:item?.requiredTools??null,disableModelInvocation:item?.disableModelInvocation??null};});
     if (refs(selection).length) {
-      const catalog = await this.discover(selection, scope.allowedToolNames); knownPromptNames = catalog.promptNames;
       for (const ref of refs(selection)) try {
         const item = catalog.items.find(i => sameRef(i.ref, ref)); if (!item || item.availability !== 'ready') this.unavailable(item);
         const captured = await this.source.capture([ref]), snapshot = ResourceSnapshotSchema.parse(captured[0]);
@@ -117,7 +126,7 @@ export class ResourceService {
         const parsed = AppErrorSchema.safeParse(error), code = parsed.success && parsed.data.reason?.startsWith('resource_') ? parsed.data.reason as ResourceDiagnosticReason : 'resource_invalid'; omitted.push(diagnostic(ref, code));
       }
     }
-    const frozen = FrozenRunResourcesSchema.safeParse({ contract: 'medclaw.run-resources/v1', sdkVersion: '0.87.1', sessionId, configVersion: settings.configVersion, selection, available, knownPromptNames, omitted });
+    const frozen = FrozenRunResourcesSchema.safeParse({ contract: 'medclaw.run-resources/v1', sdkVersion: '0.87.1', sessionId, configVersion: settings.configVersion, selection, available, knownPromptNames, omitted, skillRequirements });
     if (!frozen.success) failure('resource_too_large'); return frozen.data;
   }
   planInput(raw: FrozenRunResources, request: SubmitInput): ResourceInputPlan {
@@ -132,9 +141,10 @@ export class ResourceService {
       }
       return ref;
     };
-    const command = input.text.startsWith('/') ? input.text.slice(1).split(' ')[0]! : '';
-    if (command.startsWith('skill:')) return ResourceInputPlanSchema.parse({ kind: 'skill', resourceRef: required(frozen.selection.skills.find(ref => 'skill:' + ref.id === command)), dispatchText: input.text });
-    if (command && frozen.knownPromptNames.includes(command)) return ResourceInputPlanSchema.parse({ kind: 'prompt', resourceRef: required(frozen.selection.prompt?.id === command ? frozen.selection.prompt : null), dispatchText: input.text });
+    const command=resourceCommand(input.text,frozen.knownPromptNames);
+    if(command&&input.mode==='send'&&input.routing?.mode==='intent')throw safeError('invalid_argument');
+    if (command?.kind==='skill') return ResourceInputPlanSchema.parse({ kind: 'skill', resourceRef: required(frozen.selection.skills.find(ref => ref.id===command.id)), dispatchText: input.text });
+    if (command?.kind==='prompt') return ResourceInputPlanSchema.parse({ kind: 'prompt', resourceRef: required(frozen.selection.prompt?.id === command.id ? frozen.selection.prompt : null), dispatchText: input.text });
     if (input.mode === 'send' && frozen.selection.prompt) return ResourceInputPlanSchema.parse({ kind: 'prompt', resourceRef: required(frozen.selection.prompt),
       dispatchText: '/' + frozen.selection.prompt.id + ' ' + input.text.split('"').map(part => '"' + part + '"').join("'\"'") });
     return { kind: 'plain', resourceRef: null, dispatchText: input.text };

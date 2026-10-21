@@ -26,7 +26,7 @@ function fixture() {
   for (const path of [join(dataRoot, 'data'), selectionRoot, destination, targetParent]) mkdirSync(path, { recursive: true });
   const db = openDatabase(join(dataRoot, 'data/app.sqlite')); db.close(); new MainSettings(join(dataRoot, 'data/settings.json')).read();
   mkdirSync(join(root, 'install')); const installManifestPath = join(root, 'install/install.json');
-  writeFileSync(installManifestPath, JSON.stringify({ contract: 'medclaw.install/v1', appVersion: '0.1.0', platform: 'win32', arch: 'x64', sdkVersion: '0.87.1', bunVersion: '1.4.0', electronVersion: '44.5.1', protocolVersion: 'medclaw.host/p17-v1', schemaVersion: 16,
+  writeFileSync(installManifestPath, JSON.stringify({ contract: 'medclaw.install/v1', appVersion: '0.1.0', platform: 'win32', arch: 'x64', sdkVersion: '0.87.1', bunVersion: '1.4.0', electronVersion: '44.5.1', protocolVersion: 'medclaw.host/p17-v2', schemaVersion: 16,
     hostEntry: 'runtime/apps/host/src/main.ts', maintenanceEntry: 'runtime/apps/host/src/maintenance.ts', resourceRoot: 'runtime/resources', resources: [], plugins: [], binaries: [{ name: 'bun', version: '1.4.0', source: 'ENGINEERING fixture', path: 'bin/bun.exe' }] }));
   let view: HostView = { instanceId: 'source-host', state: 'ready', canStart: false, sdkVersion: '0.87.1', schemaVersion: 16, error: null };
   let check!: (value: Result<unknown>) => void, stops = 0, writesBusy = false;

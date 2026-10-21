@@ -87,7 +87,7 @@ test('run cleanup accepts an explicit owner-bound stop proof without inventing o
 });
 
 test('the P17 handshake accepts trusted resource roots and rejects old or mismatched SDK frames', () => {
-  const hello = { protocolVersion: 'medclaw.host/p17-v1', instanceId: 'h', startupToken: 'start-1',
+  const hello = { protocolVersion: 'medclaw.host/p17-v2', instanceId: 'h', startupToken: 'start-1',
     sdkVersion: '0.87.1', expectedSchemaVersion: 16, resourceRoot: 'C:/Program Files/MedClaw/resources',
     installManifestPath: 'C:/Program Files/MedClaw/install.json',
     paths: { dataRoot: 'C:/用户/Med Claw', databasePath: 'C:/用户/Med Claw/data/app.sqlite',

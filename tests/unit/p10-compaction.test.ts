@@ -40,7 +40,7 @@ test('p10 compact routes strictly separate command identity, reads and the three
   const frame = { protocolVersion: HOST_PROTOCOL_VERSION, kind: 'request', requestId: 'request', instanceId: 'host', operationRef: 'manual', method: 'session.compact', payload: input };
   expect(PublicHostRequestSchema.safeParse(frame).success).toBe(true);
   expect(PublicHostRequestSchema.safeParse({ ...frame, protocolVersion: 'medclaw.host/p9-v1' }).success).toBe(false);
-  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p17-v1'); expect(DATABASE_SCHEMA_VERSION).toBe(16);
+  expect(HOST_PROTOCOL_VERSION).toBe('medclaw.host/p17-v2'); expect(DATABASE_SCHEMA_VERSION).toBe(16);
   const receipt = { contract: 'medclaw.compaction/v1', operationRef: 'manual', sessionId: 1, runId: null, reason: 'manual', status: 'no_op', nativeGenerated: false, nativeSaved: false,
     nativeEntryId: null, firstKeptEntryId: null, tokensBefore: null, estimatedTokensAfter: null, baseStorageVersion: 2, storageVersion: null, activeLeafId: 'original', callIds: [],
     continuationEligibleAtCommit: true, cancelRequestedAt: null, stoppedAt: '2026-10-06T00:00:00.000Z', finishedAt: '2026-10-06T00:00:00.000Z', noOpReason: 'nothing_to_compact', error: null };

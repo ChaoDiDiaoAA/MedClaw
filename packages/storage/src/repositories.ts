@@ -319,6 +319,12 @@ export class Repositories implements ProviderRunStore, SessionStore, WorkspaceSt
       return config.agent.resources ? this.checkedResources(config.agent.resources, row.session_id!, config.selection.configVersion) : null;
     });
   }
+  readRunResourceScope(runId: number): RunScope | null {
+    id(runId);return this.inputRead(()=>{
+      const row=this.row(runId);if(!row)fail('run_not_found');
+      return row.kind==='agent'?checked(RunScopeSchema,legacyRunScope(decoded(row.scope_json)),'storage_read_failed'):null;
+    });
+  }
   private checkedExtensions(value: unknown, sessionId: number, configVersion: string): FrozenRunExtensions {
     const frozen = checked(FrozenRunExtensionsSchema, legacyRunExtensions(value), 'storage_read_failed');
     if (frozen.sessionId !== sessionId || frozen.configVersion !== configVersion) fail('storage_read_failed');
