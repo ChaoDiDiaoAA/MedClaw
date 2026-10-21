@@ -764,68 +764,68 @@
     "sourceReferences": {
       "procurement-queries": {
         "kind": "product-spec",
-        "path": "docs/spec/03_MedClaw_P3_ToolRuntime_目标方案_v1.md",
-        "section": "5.5 四种查询的生产口径",
+        "path": "docs/architecture/behavior-contracts.md",
+        "section": "Procurement queries",
         "rationale": "Hand-authored synthetic tasks exercise existing current, aggregate, trend and change-query semantics; no production trace is claimed."
       },
       "tool-runtime": {
         "kind": "product-spec",
-        "path": "docs/spec/03_MedClaw_P3_ToolRuntime_目标方案_v1.md",
-        "section": "4.3 错误和取消规则",
+        "path": "docs/architecture/behavior-contracts.md",
+        "section": "Tool errors and cancellation",
         "rationale": "Hand-authored cases exercise actual tool parameters, saved results, retry and read-only constraints rather than a fabricated historical incident."
       },
       "query-skill": {
         "kind": "product-spec",
-        "path": "docs/spec/11_MedClaw_P11_PromptSkills_目标方案_v1.md",
-        "section": "6.5 Skill 正文与支撑文件的渐进读取",
+        "path": "docs/architecture/behavior-contracts.md",
+        "section": "Progressive query Skill loading",
         "rationale": "Hand-authored cases use the installed query/v1 Skill and its real reference; discovery, delivery and rule adoption are distinct checks."
       },
       "resource-boundaries": {
         "kind": "product-spec",
-        "path": "docs/spec/08_MedClaw_P8_ContextEngineering_目标方案_v1.md",
-        "section": "4.4 权限和资料注入的可证明边界",
+        "path": "docs/architecture/behavior-contracts.md",
+        "section": "Resource and material boundaries",
         "rationale": "Synthetic source guidance tests actual material reads, bounded local scope and separation between untrusted content and authorization."
       },
       "workspace-context": {
         "kind": "product-spec",
-        "path": "docs/spec/08_MedClaw_P8_ContextEngineering_目标方案_v1.md",
-        "section": "4.1 固定输入与可用数据源",
+        "path": "docs/architecture/behavior-contracts.md",
+        "section": "Consumed workspace input",
         "rationale": "Hand-authored workspace selections and corrections exercise recorded consumed input; runtime identities must come from real receipts."
       },
       "session-memory": {
         "kind": "product-spec",
-        "path": "docs/spec/09_MedClaw_P9_Memory_目标方案_v1.md",
-        "section": "3. 原生历史的保存、读取与恢复",
+        "path": "docs/architecture/behavior-contracts.md",
+        "section": "Native history persistence",
         "rationale": "Synthetic multi-turn inputs establish actual history through registered actions and test effective conditions and session separation."
       },
       "compaction-history": {
         "kind": "product-spec",
-        "path": "docs/spec/10_MedClaw_P10_ContextCompaction_目标方案_v1.md",
-        "section": "4.4 三个事实与放行条件",
+        "path": "docs/architecture/behavior-contracts.md",
+        "section": "Compaction facts",
         "rationale": "Hand-authored follow-ups require persisted native compaction and subsequent use of retained facts; no simulated SDK history is supplied."
       },
       "subagent-read-only": {
         "kind": "product-spec",
-        "path": "docs/spec/13_MedClaw_P13_Subagent_目标方案_v1.md",
-        "section": "4.3 三种只读边界（C04）",
+        "path": "docs/architecture/behavior-contracts.md",
+        "section": "Read-only subagents",
         "rationale": "Hand-authored delegation tasks exercise inherited read-only scope, real parent/child identities, result adoption and stop boundaries."
       },
       "intent-routing": {
         "kind": "product-spec",
-        "path": "docs/spec/14_MedClaw_P14_IntentRouting_目标方案_v1.md",
-        "section": "4. 意图、校验、条件与路由契约（C03、C04、C05）",
+        "path": "docs/architecture/behavior-contracts.md",
+        "section": "Intent recognition and routing",
         "rationale": "Synthetic resolved, ambiguous and unsupported requests exercise the existing intent contract without claiming to reproduce real user traces."
       },
       "safe-authorization": {
         "kind": "product-spec",
-        "path": "docs/spec/08_MedClaw_P8_ContextEngineering_目标方案_v1.md",
-        "section": "4.4 权限和资料注入的可证明边界",
+        "path": "docs/architecture/behavior-contracts.md",
+        "section": "Authorization boundaries",
         "rationale": "Synthetic privacy, deletion, sending and funds scenarios test actual scope and real-user confirmation boundaries; these are not production incidents."
       },
       "saved-query-export": {
         "kind": "product-spec",
-        "path": "docs/spec/15_MedClaw_P15_QueryProduct_目标方案_v1.md",
-        "section": "6.1 唯一导出范围及内容",
+        "path": "docs/architecture/behavior-contracts.md",
+        "section": "Saved-query export",
         "rationale": "Hand-authored export tasks test complete saved-query results and actual generated, saved and delivered artifacts rather than merely promised files."
       },
       "badcase-intent-expression": {

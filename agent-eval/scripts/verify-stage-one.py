@@ -74,8 +74,8 @@ def verify_sources(snapshot, supplementary=False):
         issue = supplementary and reference['kind'] == 'historical-issue'
         check((reference['kind'] == 'product-spec' or issue) and bool(reference['rationale']), 'Truthful hand-authored source reference: ' + identity)
         relative = Path(reference['path'])
-        prefix = 'agent-eval/records/' if issue else 'docs/spec/'
-        check(not relative.is_absolute() and '..' not in relative.parts and reference['path'].startswith(prefix), 'Source reference stays in its declared scope')
+        in_scope = reference['path'].startswith('agent-eval/records/') if issue else reference['path'] == 'docs/architecture/behavior-contracts.md'
+        check(not relative.is_absolute() and '..' not in relative.parts and in_scope, 'Source reference stays in its declared scope')
         path = REPOSITORY / relative
         check(path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(REPOSITORY.resolve()), 'Business reference file exists')
         check(reference['section'] in source_text(path), 'Business reference section exists: ' + identity)

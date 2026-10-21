@@ -298,7 +298,7 @@ Judge配置去重后的本批受控验证见05《MedClaw Agent评测分阶段实
 
 移除未参与执行的 history fixture 与历史说明 JSON。每题通过 `prompt/turns` 的真实注册动作建立历史、纠正、恢复和压缩，不伪造 SDK 历史。重试题 `mc-v1-tool-retry-transient` 使用 query-timeout-once：预算上限8、maxRetries=1，并以 `tool.failure_handling` 核验真实故障后的有界重试，不把两次成功查询冒充故障覆盖。公开输入不含 Gold、未来步骤、审核内容、评分代码或控制器 canary；canary 准备完成不证明 OS 隔离成立。
 
-参考：[LangSmith Evaluation types](https://docs.langchain.com/langsmith/evaluation-types)、[Anthropic Agent evals](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents)、[OpenAI Graders](https://developers.openai.com/api/docs/guides/graders)。章节、操作和后续阶段见 docs/evals（../docs/evals）。
+参考：[LangSmith Evaluation types](https://docs.langchain.com/langsmith/evaluation-types)、[Anthropic Agent evals](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents)、[OpenAI Graders](https://developers.openai.com/api/docs/guides/graders)。公开操作与证据边界见[评测说明](../docs/evaluation/overview.zh-CN.md)（[English](../docs/evaluation/overview.md)），意图识别见[独立专题](../docs/intent/overview.zh-CN.md)。数据制作使用的产品依据见[公开行为契约](../docs/architecture/behavior-contracts.md)；本地内部资料不是公开文档依赖。
 
 数据与评测工程交付历史验证（证据日期2026-10-13）：根目录与agent-eval类型检查通过，评测工程测试193/193通过；Python普通和`-O`各19,876项核验通过，覆盖50题、62组阶段真值和24行源数据，核验脚本可从不同工作目录执行。Case含63次真实注册用户输入，声明24–31行。总方案恢复完整章节和附录、15篇外部资料及正文落点；当时本地链接和章节锚点检查通过（仅历史工程事实）。数据制作和后续阶段职责见05《MedClaw Agent评测分阶段实施与操作手册》§4–6。
 

@@ -2,6 +2,25 @@ import {test,expect} from 'bun:test';
 import {mkdtemp,rm,readFile,writeFile} from 'node:fs/promises';import {tmpdir} from 'node:os';import {join} from 'node:path';
 import {recordDataChecks} from '../../scripts/record-data-checks.ts';
 import {loadDataset} from '../../src/datasets.ts';
+test('business source verification accepts public contracts and rejects private or unrelated documents',async()=>{
+  const snapshot=(await loadDataset()).snapshot;
+  const program=`import copy,importlib.util,json,sys
+spec=importlib.util.spec_from_file_location('verifier',sys.argv[1]);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+original=json.load(sys.stdin)
+module.verify_sources(original)
+for path,section in [('docs/spec/private.md','Procurement queries'),('docs/architecture/overview.md','System architecture')]:
+    changed=copy.deepcopy(original)
+    reference=next(iter(changed['sourceReferences'].values()))
+    reference.update(path=path,section=section)
+    try:module.verify_sources(changed)
+    except ValueError:continue
+    raise RuntimeError('unpublished or unrelated source accepted: '+path)
+print('rejected 2')`;
+  const proc=Bun.spawn(['python','-O','-c',program,join(import.meta.dir,'../../scripts/verify-stage-one.py')],{
+    stdin:new Blob([JSON.stringify(snapshot)]),stdout:'pipe',stderr:'pipe'});
+  const output=await new Response(proc.stdout).text(),error=await new Response(proc.stderr).text();
+  expect(await proc.exited).toBe(0);expect(error).toBe('');expect(output.trim()).toBe('rejected 2');
+},30000);
 test('independent Python verifier is read-only and retains checks under optimization',async()=>{
   const source=join(import.meta.dir,'../../src/datasets/medclaw-agent-v1.review.json'),before=await readFile(source,'utf8');
   const cwd=await mkdtemp(join(tmpdir(),'mc-verify-cwd-'));

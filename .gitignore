@@ -9,6 +9,11 @@ node_modules/
 /.codegraph/
 /.zread/
 /.codex/config.toml
+/docs/evals/
+/docs/plans/
+/docs/prompt/
+/docs/PT/
+/docs/spec/
 /test-results/
 /playwright-report/
 **/credentials.enc.json
