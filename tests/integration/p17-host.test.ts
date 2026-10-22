@@ -3,8 +3,8 @@ import { dlopen, ptr } from 'bun:ffi';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { dirname, join, resolve, sep } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { HostController } from '../../apps/desktop/src/main/host-controller';
 import { MainSettings } from '../../apps/desktop/src/main/settings';
 import type { Result } from '../../packages/contracts/src/error';
@@ -26,18 +26,25 @@ test('concurrent stopped-Host proof reads share one real owner check and retain 
   const { fixture, finishHostFixture, createHostDiagnostics } = await import('../fixtures/p1-host');
   const maintenance = await import('../../apps/desktop/src/main/maintenance-controller');
   const { root, entry } = await fixture(), diagnostic = createHostDiagnostics();
+  const notices: ReturnType<HostController['read']>[] = [];
   const host = new HostController({ dataRoot: root, hostEntry: entry, bunExecutable: process.execPath,
     onStarting: instanceId => diagnostic.starting(instanceId, (host as unknown as { child: ChildProcessWithoutNullStreams }).child),
-    onNotice: diagnostic.onNotice, onError: diagnostic.onError, onExit: diagnostic.onExit });
+    onNotice: notice => { diagnostic.onNotice(notice); if (notice.type === 'host.status') notices.push(notice.host); },
+    onError: diagnostic.onError, onExit: diagnostic.onExit });
   let observer: ReturnType<typeof spyOn> | undefined, failed = false;
   try {
     const ready = await host.start(); expect(ready.state).toBe('ready');
     expect(await host.stop(ready.instanceId!)).toMatchObject({ state: 'stopped', canStart: true });
+    notices.length = 0;
     observer = spyOn(maintenance, 'requestMaintenance');
-    await Promise.all([host.refreshStopProof(), host.refreshStopProof(), host.refreshStopProof()]);
+    const checking = Promise.all([host.refreshStopProof(), host.refreshStopProof(), host.refreshStopProof()]);
+    expect(host.read()).toMatchObject({ state: 'stopped', canStart: false });
+    await checking;
     expect(observer.mock.calls).toHaveLength(1);
     expect(observer.mock.calls[0]?.[1]).toMatchObject({ action: 'process.check' });
     expect(host.read()).toMatchObject({ state: 'stopped', canStart: true, shutdown: { processTreeStopped: true } });
+    expect(notices.at(-1)).toMatchObject({ instanceId: ready.instanceId, state: 'stopped', canStart: true,
+      shutdown: { executionStopped: true, requiredPersistenceComplete: true, databaseClosed: true, processExited: true, processTreeStopped: true } });
   } catch (error) { failed = true; throw error; }
   finally { observer?.mockRestore(); await finishHostFixture(host, root, entry, diagnostic, failed); }
 }, 30000);
@@ -367,6 +374,47 @@ test('a real Job query access denial keeps a cleanly exited Host stopping until 
     }
   }
 }, 45000);
+
+for (const mode of ['alias', 'missing'] as const) test(`PowerShell ${mode === 'alias' ? 'uses the original SDK path when realpath is denied' : 'must execute successfully before SQLite opens or Host becomes ready'}`, async () => {
+  const { finishHostFixture, createHostDiagnostics } = await import('../fixtures/p1-host');
+  const root = mkdtempSync(join(tmpdir(), 'medclaw-p17-powershell-')), entry = join(root, 'host-entry.ts'), diagnostic = createHostDiagnostics();
+  const shellModule = pathToFileURL(join(dirname(fileURLToPath(import.meta.resolve('@earendil-works/pi-coding-agent'))), 'utils/shell.js')).href;
+  const selected = (await import(shellModule)).getPowerShellConfig();
+  // Mock only this owned Host process; the successful case still executes real PowerShell with SDK arguments.
+  writeFileSync(entry, `import {mock} from 'bun:test';
+const fs = await import('node:fs/promises'), originalRealpath = fs.realpath;
+const shell = await import(${JSON.stringify(shellModule)}), selected = shell.getPowerShellConfig();
+${mode === 'alias' ? `mock.module('node:fs/promises', () => ({...fs, realpath: async (path, options) => {
+  if (String(path) === selected.shell) throw Object.assign(new Error('ENGINEERING alias cannot be canonicalized'), {code:'EACCES'});
+  return originalRealpath(path, options);
+}}));` : `mock.module(${JSON.stringify(shellModule)}, () => ({...shell, getPowerShellConfig: () => ({...selected, shell:${JSON.stringify(join(root, 'missing-pwsh.exe'))}})}));`}
+await import(${JSON.stringify(pathToFileURL(resolve(import.meta.dir, '../../apps/host/src/main.ts')).href)});
+`);
+  const failures: unknown[] = [];
+  const host = new HostController({ dataRoot: root, hostEntry: entry, bunExecutable: process.execPath,
+    onStartupFailure: value => failures.push(value), onNotice: diagnostic.onNotice, onError: diagnostic.onError, onExit: diagnostic.onExit,
+    onStarting: instanceId => diagnostic.starting(instanceId, (host as unknown as { child: ChildProcessWithoutNullStreams }).child),
+    onCredentialRequest: async frame => ({ ok: true, data: frame.method === 'credential.list' ? [] : frame.method === 'export.destination.settlePrevious' ? { stopped: true } : null }) });
+  let failed = false;
+  try {
+    new MainSettings(host.paths.settingsPath).read();
+    const state = await host.start();
+    if (mode === 'alias') {
+      expect(state).toMatchObject({ state: 'ready', error: null });
+      expect(await host.request('diagnostics.read', { categories: ['versions'] })).toMatchObject({ ok: true, data: { dependencies: [
+        { name: 'rg', source: 'installed_bundle' }, { name: 'fd', source: 'installed_bundle' },
+        { name: 'bash', source: 'sdk_standard_discovery' }, { name: 'powershell', path: selected.shell, source: 'sdk_standard_discovery' },
+      ] } });
+      expect(failures).toEqual([]);
+    } else {
+      expect(state).toMatchObject({ state: 'failed', error: { code: 'host_dependency_unavailable', reason: 'dependency_powershell_unavailable' } });
+      expect(failures).toMatchObject([{ phase: 'native_dependencies', error: { code: 'host_dependency_unavailable', reason: 'dependency_powershell_unavailable' } }]);
+      expect(await Bun.file(host.paths.databasePath).exists()).toBe(false);
+      expect(diagnostic.transitions.some(value => value.state === 'ready')).toBe(false);
+    }
+  } catch (error) { failed = true; throw error; }
+  finally { await finishHostFixture(host, root, entry, diagnostic, failed); }
+}, 30000);
 
 test('missing bundled native tools fail before opening SQLite and report a safe dependency reason', async () => {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p17-missing-dependency-')), manifestPath = join(root, 'install.json');

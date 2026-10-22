@@ -54,6 +54,12 @@ Labels are declared in `INTENT_TAXONOMY`. Actual admission is governed by the [c
 
 Invalid structured output, identity mismatch, network failure and cancellation are execution facts rather than extra semantic statuses. The [routing policy](../../packages/core/src/intent/route-policy.ts) refuses invalid or still-reviewable validation. Under current policy, supported resolved tasks can become a program execution plan, including multiple queries and dependencies. Query results preserve adopted conditions, dates and evidence identities.
 
+## Main-Agent assistance and explicit delegation
+
+When an admitted intent task takes the main-Agent route, the parent can use a [read-only subagent](../agents/subagents.md) for independent analysis. Validated query steps and final Answer ownership remain on the parent; child instructions and output do not replace accepted intent parameters, QueryContext or authorization.
+
+Explicit `/subagent`, `/medclaw-evidence-review` and `/parallel-medclaw-review` inputs use the delegation path instead of local intent classification. They require a new Send and the corresponding available roles. Their command/template source and actual child calls are checked separately. See [input types](../guides/prompts-and-skills.md#choose-an-input-type).
+
 ## Follow-ups and explicit conditions
 
 The [validator](../../packages/core/src/intent/validate.ts) grounds entities and constraints in the admitted data scope. Explicit user corrections must be retained. Prior context can be inherited only through a valid adopted context; multiple unresolved query objects must not silently produce one chosen scope. Delivery-only tasks must not replace the business query context.

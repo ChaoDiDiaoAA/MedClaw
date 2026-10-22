@@ -6,7 +6,7 @@
 
 当前打包目标为 Windows x64。[构建配置](../../apps/desktop/electron-builder.config.ts)使用 Electron `44.5.1` 与按用户安装的 NSIS 安装包，允许选择安装目录、不请求提权、不在安装后自动启动，并在卸载时保留应用数据。当前配置关闭可执行文件签名，不能把结果称为已签名构建。
 
-项目声明的 `@tintinweb/pi-subagents@0.19.0` 补丁目前缺少已跟踪文件。宣称干净依赖安装或完整可复现构建前须处理这一既有前置；现成开发环境和工程夹具不能代替干净机器验收。
+项目声明的 `@tintinweb/pi-subagents@0.19.0` [受控子代理补丁](../../patches/@tintinweb%252Fpi-subagents@0.19.0.patch)已跟踪，安装时应与锁文件配套保留。现成开发环境或补丁存在不能证明干净依赖安装、可复现构建或干净机器验收通过。
 
 依赖与构建前置可用后执行：
 
@@ -16,6 +16,20 @@ bun run package:desktop
 ```
 
 [构建脚本](../../apps/desktop/build.ts)准备桌面代码、生产运行资源与随包工具。Electron-builder 读取 `.build/package-app` 和 `.build/package-resources/medclaw`，安装包输出到 `.build/installers`。运行资源准备可能需要网络，构建文件和安装包不是业务数据备份。
+
+## 运行版本与升级
+
+| 契约 | 当前值 |
+| --- | --- |
+| Host 协议 | `medclaw.host/p17-v3` |
+| 数据库 Schema | `17` |
+| Pi SDK / 受控子代理插件 | `0.87.1` / `0.19.0` |
+
+安装清单、桌面与 Host 须使用一致的当前协议和 Schema。Schema 17 移除数据库的单子任务索引，由产品准入执行四个占用中子任务的上限及必要的保存、释放检查。参见[迁移](../../packages/storage/src/migrations/017_subagent_parallel.sql)和[子代理行为](../agents/subagents.zh-CN.md)。升级有价值的数据根前保留已核验备份，并使用与该数据根兼容的安装版本。
+
+已保存的恢复记录可读取协议 `p17-v1`、`p17-v2` 与 Schema 16，以及当前版本记录，用于保留已经完成的恢复身份；活动 Host 仍使用当前协议。旧备份能否恢复应另按快照校验结果确认。源码：[协议契约](../../packages/contracts/src/protocol.ts)、[维护契约](../../packages/contracts/src/maintenance.ts)。
+
+随包资源包含 `resources/subagents/` 内置角色与 `resources/subagent-prompts/` 委派模板，用户角色覆盖保存在所选可写数据根中。安装资源与用户覆盖有不同所有权，参见[角色管理](../agents/subagents.zh-CN.md#管理角色文件)。
 
 ## Host 所有权与退出
 

@@ -23,7 +23,7 @@ test('P17 unpacked Windows application restores through Main relaunch into an in
       return window.medclaw.request('session.create', { expectedWorkspaceRevision: workspace.data.revision }, 'packaged-original-session');
     });
     expect(created.ok).toBe(true); if (!created.ok) throw new Error('ENGINEERING Session creation failed');
-    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();await page.getByRole('button',{name:'Backup and restore',exact:true}).click();
     desktop.choose([destination]);
     await page.getByRole('button', { name: 'Choose backup destination', exact: true }).click();
     await page.getByRole('alertdialog', { name: 'Confirm data backup' }).getByRole('button', { name: 'Confirm backup', exact: true }).click();
@@ -221,6 +221,7 @@ test('P17 unpacked Main reads external evaluation configuration and original rep
     writeFileSync(join(datasets, 'medclaw-agent-v1/snapshot.json'), datasetBytes); expect(await check()).toMatchObject({ ok: true, data: { readiness: 'reviewed', blockers: [] } });
     await page.getByRole('button', { name: 'Evaluation', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Evaluation', level: 1, exact: true })).toBeVisible();
+    await page.getByRole('region', { name: 'Evaluation reports', exact: true }).locator('summary').filter({ hasText: /^Report identity$/ }).click();
     await expect(page.getByText(prepared.executionId, { exact: true }).first()).toBeVisible();
     await info.attach('p17-unpacked-evaluation-paths.json', { body: JSON.stringify({ origin: running.origin, executable: running.executable, profile, configs, runs, datasets, runtime, processes, ready, reports, feedback }), contentType: 'application/json' });
     expect(['report.json', 'snapshot.json', 'review.json'].map(name => readFileSync(join(archive, name)))).toEqual(originals);

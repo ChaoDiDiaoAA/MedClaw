@@ -74,19 +74,23 @@ test('p16 real production chat, queued input and manual compaction block fresh e
     await expect.poll(async () => { const value = await page.evaluate(() => window.medclaw.request('session.listInputs', { sessionId: 1, afterClientSequence: null, limit: 50 })); return value.ok && value.data.items.some(item => item.status === 'queued'); }).toBe(true); await blocked();
     await page.getByLabel('Message text', { exact: true }).fill('ENGINEERING retained draft');
     const navigation = page.getByRole('navigation', { name: 'Main navigation' });
-    await navigation.getByRole('button', { name: 'Evaluation', exact: true }).click(); await page.getByRole('button', { name: 'Check evaluation', exact: true }).click();
+    await navigation.getByRole('button', { name: 'Evaluation', exact: true }).click(); await page.getByRole('button', { name: 'New evaluation', exact: true }).click(); await page.getByRole('button', { name: 'Check evaluation', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Run evaluation', exact: true })).toBeDisabled(); await navigation.getByRole('button', { name: 'Chat', exact: true }).click();
     await expect(page.getByLabel('Message text', { exact: true })).toHaveValue('ENGINEERING retained draft'); releaseChat();
     const idle = async () => { await expect.poll(async () => { const value = await page.evaluate(() => window.medclaw.request('run.control.read', {})); return value.ok && value.data.acceptingNewRuns; }, { timeout: 15000 }).toBe(true); };
     await idle();
     for (let i = 0; i < 3; i++) { const before = mainCalls; await page.getByLabel('Message text', { exact: true }).fill('ENGINEERING history ' + i + ' ' + 'z'.repeat(500)); await page.getByRole('button', { name: 'Send', exact: true }).click(); await expect.poll(() => mainCalls).toBeGreaterThan(before); await idle(); }
     await page.getByLabel('Message text', { exact: true }).fill('ENGINEERING retained draft');
-    const compaction = page.getByTestId('session-compaction'); await compaction.getByRole('button', { name: 'Compact context', exact: true }).click();
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Settings tasks' }).getByRole('button', { name: 'Runtime', exact: true }).click();
+    const compaction = page.getByTestId('session-compaction'); if (!await compaction.getByRole('button', { name: 'Compact context', exact: true }).isVisible()) await compaction.getByText('Context tools', { exact: true }).click(); await compaction.getByRole('button', { name: 'Compact context', exact: true }).click();
     await expect.poll(() => summaryEntered).toBe(true);
     expect(await page.evaluate(() => window.medclaw.request('run.control.read', {}))).toMatchObject({ ok: true, data: { activeRootRun: null, acceptingNewRuns: false } }); await blocked();
-    await navigation.getByRole('button', { name: 'Evaluation', exact: true }).click(); await expect(page.getByRole('button', { name: 'Run evaluation', exact: true })).toBeDisabled();
+    await navigation.getByRole('button', { name: 'Evaluation', exact: true }).click(); await page.getByRole('button', { name: 'New evaluation', exact: true }).click(); await expect(page.getByRole('button', { name: 'Run evaluation', exact: true })).toBeDisabled();
     await page.screenshot({ path: info.outputPath('p16-production-compaction-blocks-evaluation.png') });
     await navigation.getByRole('button', { name: 'Chat', exact: true }).click(); await expect(page.getByLabel('Message text', { exact: true })).toHaveValue('ENGINEERING retained draft');
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Settings tasks' }).getByRole('button', { name: 'Runtime', exact: true }).click();
     await compaction.getByRole('button', { name: 'Cancel compaction', exact: true }).click(); releaseSummary();
     await expect(compaction).toContainText('Compaction · cancelled', { timeout: 15000 }); await compaction.getByRole('button', { name: 'Restore compaction session', exact: true }).click(); await idle();
     expect(desktop.requests.filter(request => request.kind === 'agent' || request.kind === 'judge')).toHaveLength(0);
@@ -99,7 +103,7 @@ for (const phase of ['Judge', 'collection', 'save'] as const) test('p16 cancella
   try {
     const { page } = desktop;
     await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
-    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click(); await page.getByRole('button', { name: 'New evaluation', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Run evaluation', exact: true })).toBeEnabled();
     await page.getByRole('button', { name: 'Run evaluation', exact: true }).click();
     if (phase === 'Judge') await expect.poll(() => desktop.requests.filter(item => item.kind === 'judge').length, { timeout: 30000 }).toBe(1);
@@ -112,6 +116,7 @@ for (const phase of ['Judge', 'collection', 'save'] as const) test('p16 cancella
     await expect(current.getByTestId('evaluation-control-state')).toHaveText('Finished', { timeout: 30000 });
     await expect(current.getByTestId('evaluation-saved-trials')).toHaveText('10');
     desktop.releaseJudge();
+    await current.getByText('Current execution identity', { exact: true }).click();
     const executionId = (await current.locator('code').first().innerText()).trim(), root = join(desktop.runsRoot, 'business', executionId);
     const report = JSON.parse(readFileSync(join(root, 'report.json'), 'utf8'));
     expect(report.plan).toHaveLength(10); expect(report.trials).toHaveLength(10);
@@ -131,7 +136,7 @@ test('p16 an actual independent configuration edit rejects the stale Check witho
   try {
     const { page } = desktop;
     await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
-    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click(); await page.getByRole('button', { name: 'New evaluation', exact: true }).click();
     const setup = page.getByRole('region', { name: 'Evaluation setup' }); await expect(setup.getByRole('button', { name: 'Run evaluation', exact: true })).toBeEnabled();
     const configPath = join(desktop.temporary, 'evaluation-configs/agent.json'), config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.policy.maxRetries = 1; writeFileSync(configPath, JSON.stringify(config));
@@ -151,7 +156,7 @@ test('p16 a changed runtime descriptor stays blocked after Check while original 
   try {
     const { page } = desktop;
     await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
-    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click(); await page.getByRole('button', { name: 'New evaluation', exact: true }).click();
     const setup = page.getByRole('region', { name: 'Evaluation setup' }); await expect(setup.getByRole('button', { name: 'Run evaluation', exact: true })).toBeEnabled();
     writeFileSync(desktop.sourceChange, 'changed descriptor at the existing sourceInventory port');
     await setup.getByRole('button', { name: 'Run evaluation', exact: true }).click();
@@ -181,7 +186,7 @@ for (const fault of ['after_trial_save', 'scoring_save', 'worker_exit'] as const
   try {
     let page = desktop.page;
     await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
-    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click(); await page.getByRole('button', { name: 'New evaluation', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Run evaluation', exact: true })).toBeEnabled();
     await page.getByRole('button', { name: 'Run evaluation', exact: true }).click();
     await expect.poll(() => existsSync(desktop.faultWindow), { timeout: 30000 }).toBe(true);
@@ -227,7 +232,9 @@ for (const fault of ['after_trial_save', 'scoring_save', 'worker_exit'] as const
     expect(existsSync(join(root, 'report.json'))).toBe(false); expect(desktop.requests).toHaveLength(requests);
     expect(readdirSync(join(root, 'evidence'), { withFileTypes: true }).filter(item => item.isDirectory())).toHaveLength(1);
     cpSync(root, info.outputPath('evaluation-runs', 'business', window.executionId), { recursive: true, errorOnExist: true, force: false });
-    await page.screenshot({ path: info.outputPath('p16-original-partial-' + fault + '.png') });
+    await test.step('Capture the original partial report after ' + fault, async () => {
+      await page.screenshot({ path: info.outputPath('p16-original-partial-' + fault + '.png'), timeout: 15000 });
+    });
     await desktop.crashMain();
     console.log('ENGINEERING abnormal-application root retained: ' + desktop.temporary);
   } finally { await desktop.close(); }
@@ -236,11 +243,12 @@ for (const fault of ['after_trial_save', 'scoring_save', 'worker_exit'] as const
 test('p16 complete desktop Smoke uses the actual SDK response and saves the original ten-Trial archive', async ({}, info) => {
   test.setTimeout(120000);
   const desktop = await launchEvaluationDesktop({ configured: true });
+  const failures: unknown[] = [];
   try {
     const { page } = desktop;
     await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
     const before = readStartupFacts(desktop.dataRoot);
-    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click(); await page.getByRole('button', { name: 'New evaluation', exact: true }).click();
     const setup = page.getByRole('region', { name: 'Evaluation setup' });
     await expect(setup.getByRole('button', { name: 'Run evaluation', exact: true })).toBeEnabled();
     expect(desktop.requests).toEqual([]);
@@ -248,6 +256,7 @@ test('p16 complete desktop Smoke uses the actual SDK response and saves the orig
     const current = page.getByRole('region', { name: 'Current evaluation' });
     await expect(current.getByTestId('evaluation-control-state')).toHaveText('Finished', { timeout: 90000 });
     await expect(current.getByTestId('evaluation-saved-trials')).toHaveText('10');
+    await current.getByText('Current execution identity', { exact: true }).click();
     const executionId = (await current.locator('code').first().innerText()).trim(), root = join(desktop.runsRoot, 'business', executionId);
     const reportBytes = readFileSync(join(root, 'report.json')), snapshotBytes = readFileSync(join(root, 'snapshot.json'));
     const report = JSON.parse(reportBytes.toString()), snapshot = JSON.parse(snapshotBytes.toString());
@@ -273,8 +282,18 @@ test('p16 complete desktop Smoke uses the actual SDK response and saves the orig
     expect(existsSync(join(desktop.runsRoot, 'business', '.active-execution.json'))).toBe(false);
     const after = readStartupFacts(desktop.dataRoot); expect(after.runs).toBe(before.runs); expect(after.calls).toBe(before.calls);
     cpSync(root, info.outputPath('evaluation-runs', 'business', executionId), { recursive: true, errorOnExist: true, force: false });
-    await page.screenshot({ path: info.outputPath('p16-complete-smoke-original-scores.png') });
-  } finally { await desktop.close(); }
+    await test.step('Capture the original ten-Trial Scores', async () => {
+      const before = await page.evaluate(() => ({ visibility: document.visibilityState, focused: document.hasFocus() }));
+      await page.bringToFront();
+      const after = await page.evaluate(() => ({ visibility: document.visibilityState, focused: document.hasFocus() }));
+      await info.attach('score-capture-focus', { body: JSON.stringify({ before, after }), contentType: 'application/json' });
+      await page.screenshot({ path: info.outputPath('p16-complete-smoke-original-scores.png'), timeout: 15000 });
+    });
+  } catch (error) { failures.push(error); }
+  finally {
+    try { await desktop.close(); } catch (error) { failures.push(error); }
+  }
+  if (failures.length) throw failures.length === 1 ? failures[0] : new AggregateError(failures, 'P16 ten-Trial Smoke body and shutdown failed: ' + desktop.temporary);
 });
 
 test('p16 original source conflicts remain two visible human reviews and do not change automatic Scores', async ({}, info) => {
@@ -291,7 +310,10 @@ test('p16 original source conflicts remain two visible human reviews and do not 
     await expect(details.getByText('Preserved conflicting engineering review', { exact: true })).toBeVisible();
     await expect(details.getByText('Both versions were preserved.', { exact: true })).toBeVisible();
     for (const [path, original] of desktop.originals) expect(readFileSync(path).equals(original)).toBe(true);
-    expect(desktop.requests).toEqual([]); await page.screenshot({ path: info.outputPath('p16-feedback-conflict-preserved.png') });
+    expect(desktop.requests).toEqual([]);
+    await test.step('Capture both original conflicting human reviews', async () => {
+      await page.screenshot({ path: info.outputPath('p16-feedback-conflict-preserved.png'), timeout: 15000 });
+    });
   } finally { await desktop.close(); }
 });
 
@@ -334,6 +356,7 @@ test('p16 real local feedback preserves the Score and explicitly delivers existi
     await expect(details.getByTestId('evaluation-section-total')).toHaveText('2');
     await expect(details.getByText('Saved item count changed. This page reflects the latest read; refresh other pages.', { exact: true })).toBeVisible();
     expect(desktop.requests).toEqual([]); expect(existsSync(join(archive, 'export.json'))).toBe(false);
+    await page.getByRole('button', { name: 'Report delivery', exact: true }).click();
     const delivery = page.getByRole('region', { name: 'Report delivery' });
     await expect(delivery.getByRole('button', { name: 'Upload / Resend', exact: true })).toBeEnabled();
     await delivery.getByRole('button', { name: 'Upload / Resend', exact: true }).dblclick();
@@ -357,6 +380,7 @@ test('p16 real local feedback preserves the Score and explicitly delivers existi
     const count = desktop.requests.length; await page.reload();
     await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
     await page.getByRole('region', { name: 'Evaluation reports' }).getByRole('button', { name: 'Open current-report', exact: true }).click();
+    await page.getByRole('button', { name: 'Report delivery', exact: true }).click();
     await delivery.getByRole('button', { name: 'Read feedback sync status', exact: true }).click();
     await expect(delivery.getByTestId('evaluation-delivery-state')).toHaveText('complete'); expect(desktop.requests).toHaveLength(count);
     expect(desktop.requests.every(item => item.kind === 'platform')).toBe(true);
@@ -417,6 +441,7 @@ test('p16 report pages shrink without losing reachable Scores and an oversized s
       if (number < 3) await details.getByRole('button', { name: 'Next section page', exact: true }).click();
     }
     expect(reachable).toHaveLength(69); expect(new Set(reachable).size).toBe(69);
+    await page.getByRole('button', { name: 'Back to report list', exact: true }).click();
     await reports.getByRole('button', { name: 'Open oversized-item-report', exact: true }).click();
     await details.getByRole('combobox', { name: 'Report section', exact: true }).selectOption('scores');
     for (let count = 0; count < 5; count++) { const smaller = details.getByRole('button', { name: 'Load smaller page', exact: true }); await expect(smaller).toBeVisible(); await smaller.click(); }
@@ -427,7 +452,9 @@ test('p16 report pages shrink without losing reachable Scores and an oversized s
     await expect(details.getByTestId('evaluation-section-total')).toHaveText('23');
     expect(desktop.requests).toEqual([]);
     for (const [path, original] of desktop.originals) expect(readFileSync(path).equals(original)).toBe(true);
-    await page.screenshot({ path: info.outputPath('p16-single-item-size-gap.png') });
+    await test.step('Capture the explicit single-item report size gap', async () => {
+      await page.screenshot({ path: info.outputPath('p16-single-item-size-gap.png'), timeout: 15000 });
+    });
   } finally { await desktop.close(); }
 });
 
@@ -439,16 +466,22 @@ for (const delayed of ['legacy-report', 'corrupt-report']) test('p16 a late ' + 
     await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
     const reports = page.getByRole('region', { name: 'Evaluation reports' }), details = page.getByRole('region', { name: 'Report details' });
     await reports.getByRole('button', { name: 'Open ' + delayed, exact: true }).click(); await expect.poll(() => existsSync(desktop.reportEntered)).toBe(true);
+    await page.getByRole('button', { name: 'Back to report list', exact: true }).click();
     await reports.getByRole('button', { name: 'Open current-report', exact: true }).click();
+    await details.getByText('Report identity and metric catalog', { exact: true }).click();
     await expect(details.getByText('Catalog v2', { exact: true })).toBeVisible(); desktop.releaseReport();
     await details.getByRole('combobox', { name: 'Report section', exact: true }).selectOption('scores');
     await expect(details.getByTestId('evaluation-section-total')).toHaveText('23');
     await expect(details.getByRole('alert')).toHaveCount(0);
     await details.getByRole('button', { name: 'Read evidence query:42:page:1', exact: true }).click();
     const evidence = details.getByRole('region', { name: 'Selected evidence' });
+    await evidence.getByText('Evidence data', { exact: true }).click();
     await expect(evidence.getByText(/selected-original-evidence/)).toBeVisible();
     expect(await evidence.innerText()).not.toContain('never-show-provider-key');
-    expect(desktop.requests).toEqual([]); await page.screenshot({ path: info.outputPath('p16-report-identity-' + delayed + '.png') });
+    expect(desktop.requests).toEqual([]);
+    await test.step('Capture the selected report after the late ' + delayed + ' reply', async () => {
+      await page.screenshot({ path: info.outputPath('p16-report-identity-' + delayed + '.png'), timeout: 15000 });
+    });
   } finally { await desktop.close(); }
 });
 
@@ -460,6 +493,7 @@ for (const method of ['eval.compare', 'eval.evidence.read'] as const) test('p16 
     await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
     const reports = page.getByRole('region', { name: 'Evaluation reports' }), details = page.getByRole('region', { name: 'Report details' }), comparison = page.getByRole('region', { name: 'Compare reports' });
     if (method === 'eval.compare') {
+      await page.getByRole('button', { name: 'Compare reports', exact: true }).click();
       await comparison.getByRole('combobox', { name: 'Baseline report', exact: true }).selectOption('current-report');
       await comparison.getByRole('combobox', { name: 'Candidate report', exact: true }).selectOption('compatible-report');
       await comparison.getByRole('button', { name: 'Compare saved reports', exact: true }).click();
@@ -473,13 +507,21 @@ for (const method of ['eval.compare', 'eval.evidence.read'] as const) test('p16 
       await details.getByRole('combobox', { name: 'Report section', exact: true }).selectOption('scores');
       await details.getByRole('button', { name: 'Read evidence query:42:page:1', exact: true }).click();
       await expect.poll(() => existsSync(desktop.reportEntered)).toBe(true);
+      await page.getByRole('button', { name: 'Back to report list', exact: true }).click();
       await reports.getByRole('button', { name: 'Open legacy-report', exact: true }).click();
+      await details.getByText('Report identity and metric catalog', { exact: true }).click();
       await expect(details.getByText('Catalog v1', { exact: true })).toBeVisible(); desktop.releaseReport();
-      await expect(details.getByRole('region', { name: 'Selected evidence' })).toHaveCount(0);
+      await test.step('Confirm the late evidence stays with its original report', async () => {
+        await expect(details.getByRole('region', { name: 'Selected evidence' })).toHaveCount(0);
+      });
     }
-    for (const [path, original] of desktop.originals) expect(readFileSync(path).equals(original)).toBe(true);
-    expect(desktop.requests).toEqual([]); await page.screenshot({ path: info.outputPath('p16-late-' + method + '.png') });
-  } finally { await desktop.close(); }
+    await test.step('Verify the original report archive bytes', async () => {
+      for (const [path, original] of desktop.originals) expect(readFileSync(path).equals(original)).toBe(true);
+    });
+    await test.step('Capture the final report state without model requests', async () => {
+      expect(desktop.requests).toEqual([]); await page.screenshot({ path: info.outputPath('p16-late-' + method + '.png') });
+    });
+  } finally { await test.step('Close the isolated evaluation desktop', async () => { await desktop.close(); }); }
 });
 
 test('p16 saved reports preserve catalogs, partial facts and original comparison rules without configuration', async ({}, info) => {
@@ -492,13 +534,16 @@ test('p16 saved reports preserve catalogs, partial facts and original comparison
     const reports = page.getByRole('region', { name: 'Evaluation reports' }); await expect(reports).toBeVisible();
     await reports.getByRole('button', { name: 'Open legacy-report', exact: true }).click();
     const details = page.getByRole('region', { name: 'Report details' });
+    await details.getByText('Report identity and metric catalog', { exact: true }).click();
     await expect(details.getByText('Catalog v1', { exact: true })).toBeVisible();
     await details.getByRole('combobox', { name: 'Report section', exact: true }).selectOption('coverage');
     await expect(details.getByTestId('evaluation-section-total')).toHaveText('39');
+    await page.getByRole('button', { name: 'Back to report list', exact: true }).click();
     await reports.getByRole('button', { name: 'Open current-report', exact: true }).click();
     await details.getByRole('combobox', { name: 'Report section', exact: true }).selectOption('coverage');
     await expect(details.getByTestId('evaluation-section-total')).toHaveText('50');
     const compare = page.getByRole('region', { name: 'Compare reports' });
+    await page.getByRole('button', { name: 'Compare reports', exact: true }).click();
     await compare.getByRole('combobox', { name: 'Baseline report', exact: true }).selectOption('current-report');
     await compare.getByRole('combobox', { name: 'Candidate report', exact: true }).selectOption('compatible-report');
     await compare.getByRole('button', { name: 'Compare saved reports', exact: true }).click();
@@ -506,6 +551,7 @@ test('p16 saved reports preserve catalogs, partial facts and original comparison
     await compare.getByRole('combobox', { name: 'Candidate report', exact: true }).selectOption('legacy-report');
     await compare.getByRole('button', { name: 'Compare saved reports', exact: true }).click();
     await expect(compare.getByRole('alert')).toBeVisible();
+    await page.getByRole('button', { name: 'Back to report list', exact: true }).click();
     await reports.getByRole('button', { name: 'Open partial-report', exact: true }).click();
     await expect(details.getByText('Partial results', { exact: true })).toBeVisible();
     await expect(details.getByText('Recorded Trials: 1 of 2', { exact: true })).toBeVisible();
@@ -527,7 +573,7 @@ test('p16 offline preflight invalidates changed options and preserves independen
   try {
     const { page } = desktop;
     await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
-    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click(); await page.getByRole('button', { name: 'New evaluation', exact: true }).click();
     const setup = page.getByRole('region', { name: 'Evaluation setup' }); await expect(setup).toBeVisible();
     await expect(setup.getByTestId('evaluation-planned-trials')).toHaveText('10');
     await expect(setup.getByRole('button', { name: 'Run evaluation', exact: true })).toBeEnabled();
@@ -544,6 +590,7 @@ test('p16 offline preflight invalidates changed options and preserves independen
     await setup.getByRole('button', { name: 'Check evaluation', exact: true }).click();
     await expect(setup.getByTestId('evaluation-planned-trials')).toHaveText('9');
     await expect(setup.getByRole('button', { name: 'Run evaluation', exact: true })).toBeDisabled();
+    await setup.getByText('Independent configuration', { exact: true }).click();
     expect(await page.locator('body').innerText()).not.toContain('controlled-agent-key');
     expect(await page.locator('body').innerText()).not.toContain('controlled-judge-key');
     expect(desktop.requests).toEqual([]); expect(existsSync(desktop.runsRoot)).toBe(false);
@@ -558,7 +605,7 @@ test('p16 a delayed preflight reply cannot reenable Run after the selection has 
   try {
     const { page } = desktop;
     await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
-    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click(); await page.getByRole('button', { name: 'New evaluation', exact: true }).click();
     const setup = page.getByRole('region', { name: 'Evaluation setup' }); await expect(setup).toBeVisible();
     await expect.poll(() => existsSync(desktop.preflightEntered)).toBe(true);
     await setup.getByLabel('Trials per Case', { exact: true }).fill('2'); desktop.releasePreflight();
@@ -582,7 +629,7 @@ test('p16 unavailable recovery storage blocks Run before a Trial or model reques
       return original.call(this, key, value);
     }; });
     await page.reload(); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
-    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click(); await page.getByRole('button', { name: 'New evaluation', exact: true }).click();
     const setup = page.getByRole('region', { name: 'Evaluation setup' }); await expect(setup).toBeVisible();
     await expect(setup.getByRole('button', { name: 'Run evaluation', exact: true })).toBeEnabled();
     await setup.getByRole('button', { name: 'Run evaluation', exact: true }).click();
@@ -604,7 +651,7 @@ test('p16 Run reaches an isolated actual Trial, preserves a chat draft and cance
     await page.getByRole('button', { name: 'New Session', exact: true }).click();
     await expect(page.getByLabel('Message text', { exact: true })).toBeEnabled();
     await page.getByLabel('Message text', { exact: true }).fill('Retained draft during independent evaluation');
-    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click(); await page.getByRole('button', { name: 'New evaluation', exact: true }).click();
     const setup = page.getByRole('region', { name: 'Evaluation setup' }); await expect(setup).toBeVisible();
     await expect(setup.getByRole('button', { name: 'Run evaluation', exact: true })).toBeEnabled();
     await setup.getByRole('button', { name: 'Run evaluation', exact: true }).dblclick();
@@ -612,6 +659,7 @@ test('p16 Run reaches an isolated actual Trial, preserves a chat draft and cance
     const current = page.getByRole('region', { name: 'Current evaluation' });
     await expect(current.getByTestId('evaluation-control-state')).toHaveText('Running');
     await expect(setup.getByRole('button', { name: 'Run evaluation', exact: true })).toBeDisabled();
+    await current.getByText('Current execution identity', { exact: true }).click();
     const identity = (await current.locator('code').first().innerText()).trim();
     expect(identity).toMatch(/^desktop-[0-9a-f-]{36}$/);
     await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Chat', exact: true }).click();
@@ -621,6 +669,7 @@ test('p16 Run reaches an isolated actual Trial, preserves a chat draft and cance
     const blocked = await page.evaluate(() => window.medclaw.request('model.diagnose', { model: { provider: 'fixture', modelId: 'fixture', expectedConfigVersion: '0' }, referenceDate: '2026-01-01', timezone: 'UTC' }));
     expect(blocked).toMatchObject({ ok: false, error: { code: 'runtime_busy' } });
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('button', { name: 'Runtime', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Restart Host', exact: true })).toBeDisabled();
     await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
     await current.getByRole('button', { name: 'Cancel evaluation', exact: true }).click(); desktop.releaseAgent();
@@ -657,9 +706,10 @@ test('p16 navigation and status use the actual Evaluation page with keyboard acc
     await entry.focus(); await page.keyboard.press('Enter');
     await expect(entry).toHaveAttribute('aria-current', 'page');
     await expect(page.getByRole('heading', { name: 'Evaluation', exact: true })).toBeVisible();
-    const current = page.getByRole('region', { name: 'Current evaluation' });
+    const current = page.getByRole('region', { name: 'Current evaluation', includeHidden: true });
+    await expect(current).toBeHidden();
     await expect(current.getByTestId('evaluation-control-state')).toHaveText('Idle');
-    await current.getByRole('button', { name: 'Refresh evaluation status' }).click();
+    await page.getByRole('button', { name: 'Refresh evaluation status' }).click();
     await expect(current.getByTestId('evaluation-control-state')).toHaveText('Idle');
     const after = readStartupFacts(desktop.dataRoot);
     expect(after.runs).toBe(0); expect(after.calls).toBe(0);
@@ -681,7 +731,7 @@ test('p16 reload only looks up a pending original and cannot let its unknown his
     await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Evaluation', exact: true }).click();
     await page.getByRole('button', { name: 'Check original evaluation' }).click();
     await expect(page.getByText('Original action unconfirmed', { exact: true })).toBeVisible();
-    await expect(page.getByRole('region', { name: 'Current evaluation' }).getByTestId('evaluation-control-state')).toHaveText('Idle');
+    await expect(page.getByRole('region', { name: 'Current evaluation', includeHidden: true }).getByTestId('evaluation-control-state')).toHaveText('Idle');
     expect(await page.evaluate(() => JSON.parse(sessionStorage.getItem('medclaw.evaluation.pending.v1')!))).toEqual(pending);
     const facts = readStartupFacts(desktop.dataRoot); expect(facts.runs).toBe(0); expect(facts.calls).toBe(0);
     expect(existsSync(desktop.runsRoot)).toBe(false);

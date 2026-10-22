@@ -249,7 +249,7 @@ test('a positive delete waits for the current Workspace read and a failed read k
   await rules([{ method: 'workspace.read', hold: 'delete-fresh-workspace', project: { ok: false, error: safeError('storage_read_failed') } }]); await action(a, 'Delete'); await editor().getByRole('button', { name: 'Delete session', exact: true }).click(); await entered('delete-fresh-workspace');
   await expect(row(a)).toHaveCount(0); await expect(page.getByRole('button', { name: 'New Session', exact: true })).toBeDisabled(); await expect(row(b).locator('button[aria-pressed]')).toBeDisabled();
   await release('delete-fresh-workspace'); await expect(editor()).toHaveCount(0); await expect(page.getByRole('heading', { name: 'Create a session', exact: true })).toBeVisible(); await expect(page.getByRole('button', { name: 'New Session', exact: true })).toBeDisabled();
-  await page.getByRole('button', { name: 'Data Workspace', exact: true }).click(); await page.getByRole('button', { name: 'Verify saved selection', exact: true }).click(); await expect(page.getByRole('button', { name: 'New Session', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Data Workspace', exact: true }).click(); await page.getByRole('button', { name: 'Verify saved selection', exact: true }).click(); await page.getByRole('button', { name: 'Chat', exact: true }).click(); await expect(page.getByRole('button', { name: 'New Session', exact: true })).toBeEnabled();
   await select(b); await expect(composer()).toHaveValue('B survives failed fresh Workspace'); save('positive-delete-fresh-read-failure', { a, b, workspace: await workspace(), deleted: await session(a) });
 });
 
@@ -269,7 +269,7 @@ test('historical positive and null management lookups cannot waive a newer expli
     if (!committed) { await expect(editor()).toBeVisible(); await expect(editor().getByRole('alert')).toContainText('not found after Host restart'); await editor().getByRole('button', { name: 'Cancel', exact: true }).click(); }
     else await expect(page.getByRole('button', { name: 'Read original delete', exact: true })).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'New Session', exact: true })).toBeDisabled(); await expect(composer()).toHaveValue('B retains its read failure draft');
-    await page.getByRole('button', { name: 'Data Workspace', exact: true }).click(); await page.getByRole('button', { name: 'Verify saved selection', exact: true }).click(); await expect(page.getByRole('button', { name: 'New Session', exact: true })).toBeEnabled(); await page.getByRole('button', { name: 'Chat', exact: true }).click();
+    await page.getByRole('button', { name: 'Data Workspace', exact: true }).click(); await page.getByRole('button', { name: 'Verify saved selection', exact: true }).click(); await page.getByRole('button', { name: 'Chat', exact: true }).click(); await expect(page.getByRole('button', { name: 'New Session', exact: true })).toBeEnabled();
     expect((await calls()).filter(call => call.method === 'session.delete' && call.operationRef === original.operationRef)).toHaveLength(1); save(`historical-${committed ? 'positive' : 'null'}-lookup-read-failure`, { a, b, original, workspace: await workspace(), current: await session(a) });
   }
 });
@@ -281,6 +281,7 @@ test('deleting the current query owner clears query and selection while retainin
   await page.getByRole('button', { name: 'Confirm import', exact: true }).click(); await expect(page.getByTestId('import-state')).toHaveText('imported');
   await page.getByRole('button', { name: 'Select batches on this page', exact: true }).click(); await page.getByRole('button', { name: 'Apply 2 selected batches', exact: true }).click();
   const devices = sql('SELECT id FROM devices ORDER BY id') as { id: number }[];
+  await page.getByRole('button', { name: 'Edit selection', exact: true }).click();
   await page.locator('.page-content:not([hidden])').getByLabel('Selected device IDs', { exact: true }).fill(String(devices[0]!.id)); await page.locator('.page-content:not([hidden])').getByRole('button', { name: 'Apply devices', exact: true }).click();
   await expect.poll(async () => (await workspace()).deviceIds).toEqual([devices[0]!.id]);
   await page.getByRole('button', { name: 'Chat', exact: true }).click(); queryFlow = true; const beforePhysical = physicalCalls;
@@ -293,6 +294,7 @@ test('deleting the current query owner clears query and selection while retainin
   await page.getByRole('button', { name: `Select Query ${queryId} ${savedQuery.data.page.rowKeys[0]} field deltaCents`, exact: true }).click(); await expect.poll(async () => (await workspace()).selection?.field).toBe('deltaCents');
   const before = await workspace(), history = sql(`SELECT (SELECT COUNT(*) FROM runs WHERE session_id=${a}) AS runs,(SELECT COUNT(*) FROM session_inputs WHERE session_id=${a}) AS inputs,(SELECT COUNT(*) FROM queries WHERE session_id=${a}) AS queries,(SELECT COUNT(*) FROM runtime_events WHERE run_id=${runId}) AS events`), physical = physicalCalls;
   expect(before.sessionId).toBe(a); expect(before.queryId).toBe(queryId); expect(before.activeView).toBe('query'); expect(before.selection?.kind).toBe('query-row');
+  await page.getByRole('button', { name: 'Chat', exact: true }).click();
   await remove(a); await page.getByRole('button', { name: 'Chat', exact: true }).click(); await expect(page.getByRole('heading', { name: 'Create a session', exact: true })).toBeVisible();
   const after = await workspace(); expect(after).toEqual({ ...before, revision: before.revision + 1, sessionId: null, queryId: null, selection: null, activeView: 'data' });
   expect(sql(`SELECT (SELECT COUNT(*) FROM runs WHERE session_id=${a}) AS runs,(SELECT COUNT(*) FROM session_inputs WHERE session_id=${a}) AS inputs,(SELECT COUNT(*) FROM queries WHERE session_id=${a}) AS queries,(SELECT COUNT(*) FROM runtime_events WHERE run_id=${runId}) AS events`)).toEqual(history);

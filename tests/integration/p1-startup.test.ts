@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -130,6 +130,8 @@ test('Host startup retains only the validated phase and error code from split fa
 async function mainFailure(mode: 'load' | 'preload') {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p1-main-startup-'));
   const script = join(root, 'main-fixture.ts'), entry = join(root, 'host.ts'), electron = join(root, 'electron.ts');
+  for (const directory of ['preload', 'renderer', 'configs', 'runs']) mkdirSync(join(root, directory));
+  writeFileSync(join(root, 'preload/index.cjs'), ''); writeFileSync(join(root, 'renderer/index.html'), '<!doctype html>');
   writeFileSync(entry, `process.stdin.once('data', () => { process.stderr.write('MedClaw Host terminated: hello/host_start_failed.\\n'); process.exit(1); });`);
   writeFileSync(electron, `export const {app,BrowserWindow,ipcMain,safeStorage,shell,dialog}=globalThis.__startupFixture;`);
   const build = await Bun.build({ entrypoints: [join(import.meta.dir, '../../apps/desktop/src/main/index.ts')], target: 'bun', outdir: join(root, 'bundle'), plugins: [{ name: 'electron-startup-boundary', setup(builder) { builder.onResolve({ filter: /^electron$/ }, () => ({ path: electron })); } }] });
@@ -139,9 +141,9 @@ async function mainFailure(mode: 'load' | 'preload') {
 const handlers=new Map(), app=new EventEmitter(); let window, unhandled=false;
 Object.defineProperty(process.versions,'electron',{value:'44.5.1'});
 process.on('unhandledRejection',()=>{unhandled=true;});
-Object.assign(app,{setName(){},getAppPath:()=>${JSON.stringify(join(root, 'main'))},getPath:()=>${JSON.stringify(root)},setPath(){},requestSingleInstanceLock:()=>true,whenReady:()=>Promise.resolve(),exit(){},quit(){}});
+Object.assign(app,{setName(){},getAppPath:()=>${JSON.stringify(join(root, 'main'))},getPath:()=>${JSON.stringify(root)},setPath(){},requestSingleInstanceLock:()=>true,whenReady:()=>Promise.resolve(),exit(){},quit:()=>app.emit('before-quit',{preventDefault(){}})});
 class BrowserWindow extends EventEmitter {
-  id=1; webContents=Object.assign(new EventEmitter(),{id:1,mainFrame:{url:'file:///startup.html'},send(){},setWindowOpenHandler(){}});
+  id=1; webContents=Object.assign(new EventEmitter(),{id:1,mainFrame:{url:'file:///startup.html'},isDestroyed(){return false;},send(){},setWindowOpenHandler(){}});
   constructor(){super();window=this;} isDestroyed(){return false;}
   async loadFile(){
     if(${JSON.stringify(mode)}==='preload')this.webContents.emit('preload-error',{},'SECRET-CANARY-path',new Error('SECRET-CANARY-preload'));
@@ -154,9 +156,11 @@ await import(${JSON.stringify(main)});
 await Bun.sleep(250);
 const diagnostics=await handlers.get('medclaw:request')({sender:window.webContents,senderFrame:window.webContents.mainFrame},{method:'diagnostics.read',payload:{categories:['errors','runtime','host']},operationRef:'startup-diagnostics'});
 process.stdout.write(JSON.stringify({diagnostics,unhandled}));
+app.quit();
 `);
   try {
-    const child = Bun.spawn([process.execPath, script], { env: { ...process.env, MEDCLAW_HOST_ENTRY: entry, MEDCLAW_BUN_EXECUTABLE: process.execPath }, stdout: 'pipe', stderr: 'pipe' });
+    const child = Bun.spawn([process.execPath, script], { env: { ...process.env, MEDCLAW_HOST_ENTRY: entry, MEDCLAW_BUN_EXECUTABLE: process.execPath,
+      MEDCLAW_EVALUATION_SOURCE_ROOT: join(import.meta.dir, '../..'), MEDCLAW_EVALUATION_CONFIGS_ROOT: join(root, 'configs'), MEDCLAW_EVALUATION_RUNS_ROOT: join(root, 'runs') }, stdout: 'pipe', stderr: 'pipe' });
     const [exitCode, output, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     if (exitCode !== 0) throw new Error(stderr.replaceAll('SECRET-CANARY', '[redacted fixture]'));
     expect(stderr).not.toContain('SECRET-CANARY');

@@ -2,7 +2,7 @@ import { AppErrorSchema, safeError } from '@medclaw/contracts/error';
 import type { PublishedSettings } from '@medclaw/contracts/model';
 import { SubmitInputSchema, type SubmitInput } from '@medclaw/contracts/session';
 import type { RunScope, RuntimeRunStore } from '@medclaw/contracts/run';
-import { FrozenRunResourcesSchema, ResourceInputPlanSchema, ResourceItemSchema, ResourceListInputSchema, ResourceListSchema, ResourceReadInputSchema, ResourceSelectionSchema, ResourceSnapshotSchema, ResourceTextSchema, SubagentTemplateNameSchema, InputCommandsListInputSchema, InputCommandsListSchema, resourceRefKey, getSkillReadiness, resourceCommand,
+import { FrozenRunResourcesSchema, ResourceCatalogReadResultSchema, ResourceInputPlanSchema, ResourceItemSchema, ResourceListInputSchema, ResourceListSchema, ResourceReadInputSchema, ResourceSelectionSchema, ResourceSnapshotSchema, ResourceTextSchema, SubagentTemplateNameSchema, InputCommandsListInputSchema, InputCommandsListSchema, resourceRefKey, getSkillReadiness, resourceCommand,
   type FrozenRunResources, type InputCommandsList, type InputCommandsListInput, type ResourceDiagnostic, type ResourceDiagnosticReason, type ResourceInputPlan, type ResourceItem, type ResourceList, type ResourceListInput, type ResourceReadInput, type ResourceRef, type ResourceSelection, type ResourceSnapshot, type ResourceSource, type ResourceText } from '@medclaw/contracts/resources';
 import { FrozenRunSubagentsSchema, SubagentsListInputSchema, SubagentsListSchema, SubagentsReadInputSchema, SubagentsReadSchema, SubagentsSaveInputSchema,
   type FrozenRunSubagents, type SubagentRoleItem, type SubagentRoleSnapshot, type SubagentRoleSource, type SubagentsList, type SubagentsListInput, type SubagentsRead, type SubagentsReadInput, type SubagentsSaveInput } from '@medclaw/contracts/subagent';
@@ -59,6 +59,11 @@ export class ResourceService {
     const raw = this.store.readRunResources(runId), frozen = raw === null ? null : FrozenRunResourcesSchema.parse(raw);
     if (frozen && (frozen.sessionId !== result.run.sessionId || frozen.configVersion !== result.run.model.configVersion)) failure('resource_snapshot_invalid');
     return { run: result.run, frozen };
+  }
+  async readCatalog() {
+    const settings = this.readSettings(), catalog = await this.discover(emptySelection(), this.configuredToolNames(settings));
+    return ResourceCatalogReadResultSchema.parse({ configVersion: settings.configVersion,
+      items: catalog.items.map(({ enabled, ...item }) => item), diagnostics: catalog.diagnostics, catalogError: catalog.catalogError });
   }
   async list(raw: ResourceListInput): Promise<ResourceList> {
     const input = ResourceListInputSchema.parse(raw), page = input.evidencePage ?? 1, pageSize = input.evidencePageSize ?? 50;

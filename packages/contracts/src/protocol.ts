@@ -26,9 +26,9 @@ import { ReadSessionMessagesRequestSchema, SessionMessagePageSchema } from "./me
 import { ReadContextInputSchema, ContextReadResultSchema } from './context';
 import { ReadSessionCheckpointsInputSchema, RestoreSessionCheckpointInputSchema, SessionCheckpointPageSchema, SessionCheckpointReceiptSchema, RestoreSessionInputSchema } from './session';
 import { CompactSessionInputSchema, ReadCompactionInputSchema, CompactionOperationViewSchema, CancelCompactionResultSchema, CompactionPhaseSchema } from './session';
-import { InputCommandsListInputSchema, InputCommandsListSchema, ResourceListInputSchema, ResourceListSchema, ResourceSelectInputSchema, ResourceSelectionReceiptSchema, ResourceReadInputSchema, ResourceTextSchema } from './resources';
+import { InputCommandsListInputSchema, InputCommandsListSchema, ResourceCatalogReadResultSchema, ResourceListInputSchema, ResourceListSchema, ResourceSelectInputSchema, ResourceSelectionReceiptSchema, ResourceReadInputSchema, ResourceTextSchema } from './resources';
 import { ExtensionAssemblyProofSchema, ExtensionDescriptorSchema, ExtensionSelectionSchema, ExtensionStatusSchema, FrozenExtensionSummarySchema,
-  ExtensionsReadInputSchema, ExtensionsSelectInputSchema, ExtensionsSelectResultSchema, ExtensionsCommandInputSchema } from './extensions';
+  ExtensionsCatalogReadResultSchema, ExtensionsReadInputSchema, ExtensionsSelectInputSchema, ExtensionsSelectResultSchema, ExtensionsCommandInputSchema } from './extensions';
 import { SubagentsListInputSchema, SubagentsListSchema, SubagentsReadInputSchema, SubagentsReadSchema, SubagentsSaveInputSchema } from './subagent';
 
 import { ReadEventsInputSchema, EventPageSchema, EventSubscribeInputSchema, EventSubscribeResultSchema, EventAvailableNoticeSchema, EventStreamNoticeSchema } from './event';
@@ -117,6 +117,8 @@ export const ExtensionsReadResultSchema = z.discriminatedUnion('source', [
 ]);
 export type ExtensionsReadResult = z.infer<typeof ExtensionsReadResultSchema>;
 export const publicMethodSchemas = {
+  'resources.catalog.read': { input: EmptyPayloadSchema, output: ResourceCatalogReadResultSchema },
+  'extensions.catalog.read': { input: EmptyPayloadSchema, output: ExtensionsCatalogReadResultSchema },
   'extensions.read': { input: ExtensionsReadInputSchema, output: ExtensionsReadResultSchema },
   'extensions.select': { input: ExtensionsSelectInputSchema, output: ExtensionsSelectResultSchema },
   'extensions.command': { input: ExtensionsCommandInputSchema, output: ExtensionStatusSchema },
@@ -327,6 +329,8 @@ export const PublicHostRequestSchema = z.discriminatedUnion("method", [
   hostRequest('extensions.read', publicMethodSchemas['extensions.read'].input),
   hostRequest('extensions.select', publicMethodSchemas['extensions.select'].input),
   hostRequest('extensions.command', publicMethodSchemas['extensions.command'].input),
+  hostRequest('resources.catalog.read', publicMethodSchemas['resources.catalog.read'].input),
+  hostRequest('extensions.catalog.read', publicMethodSchemas['extensions.catalog.read'].input),
   hostRequest('resources.list', publicMethodSchemas['resources.list'].input),
   hostRequest('resources.select', publicMethodSchemas['resources.select'].input),
   hostRequest('resources.read', publicMethodSchemas['resources.read'].input),

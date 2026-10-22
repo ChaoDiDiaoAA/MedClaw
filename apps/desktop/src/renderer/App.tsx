@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { errorMessage, safeError, type Result } from "../../../../packages/contracts/src/error";
 import type {DataDeleteCommitRequest,DataDeleteOperation} from '../../../../packages/contracts/src/data-deletion';
@@ -9,8 +9,9 @@ import { RenameSessionInputSchema, DeleteSessionInputSchema, type NewSessionInpu
 import type { WorkspaceChange, WorkspaceView } from "../../../../packages/contracts/src/workspace";
 import type { RestoreSessionCheckpointInput, RestoreSessionInput, SessionCheckpointReceipt } from '../../../../packages/contracts/src/session';
 import { Sidebar } from "./sidebar";
+import { Icon } from "./icons";
 import { SessionList, sessionDisplayTitle, newSessionDraft, selectSessionModelDraft, acceptSubmissionDraft, type SessionDraft, type SessionManagementEditor } from "./session-list";
-import { Chat } from "./chat";
+import { Chat, SessionCheckpoints, SessionCompaction } from "./chat";
 import { useInputQueue } from "./input-queue";
 import { ModelsPage, type DirectoryReadStatus } from "./models-page";
 import { SettingsPage } from "./settings-page";
@@ -20,7 +21,7 @@ import { ResourcePanel } from './resource-panel';
 import { PromptWorkbench } from './prompt-workbench';
 import {resourceCommand} from '../../../../packages/contracts/src/resources';
 import { ExtensionsPage, SubagentManager } from './extensions-page';
-import { DataWorkspace } from "./data-workspace";
+import { DataWorkspace, type CatalogReadStatus } from "./data-workspace";
 import { QueryHistory } from "./query-history";
 import { EvaluationPage, evaluationExecutionBlockReason, useEvaluationControl } from './evaluation';
 import { useRunEvents } from "./use-run-events";
@@ -54,18 +55,36 @@ function StartupFailure() {
 }
 export function App() {
   const [failed, setFailed] = useState(false), fail = useCallback(() => setFailed(true), []);
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    try { return localStorage.getItem('medclaw.theme') === 'dark' ? 'dark' : 'light'; }
+    catch { return 'light'; }
+  });
+  useLayoutEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try { localStorage.setItem('medclaw.theme', theme); }
+    catch { /* The switch still works when local preferences cannot be saved. */ }
+  }, [theme]);
   const bridge = window.medclaw;
   if (failed || !bridge || ['request', 'subscribe', 'secretInput', 'discardSecret', 'openAuthLink', 'pickImportDirectory'].some(key => typeof bridge[key as keyof DesktopBridge] !== 'function')) return <StartupFailure />;
-  return <ConnectedApp onBridgeFailure={fail} />;
+  return <ConnectedApp onBridgeFailure={fail} theme={theme} onTheme={() => setTheme(value => value === 'light' ? 'dark' : 'light')} />;
 }
-function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
+function ConnectedApp({ onBridgeFailure, theme, onTheme }: { onBridgeFailure: () => void; theme: 'light' | 'dark'; onTheme: () => void }) {
   const evaluation = useEvaluationControl();
   const executionBlockReason = evaluationExecutionBlockReason(evaluation.control), executionBlockRef = useRef(executionBlockReason);
   executionBlockRef.current = executionBlockReason;
   const [page, setPage] = useState<ViewPage>("chat"), [ui, setUi] = useState(initialUi), [uiVersion, setUiVersion] = useState("0");
+  const [wideChat, setWideChat] = useState(() => window.innerWidth >= 1200), [sessionsVisible, setSessionsVisible] = useState<boolean | null>(null);
+  useEffect(() => {
+    const media = matchMedia('(min-width: 1200px)');
+    const change = () => setWideChat(media.matches);
+    change(); media.addEventListener('change', change);
+    return () => media.removeEventListener('change', change);
+  }, []);
   const [uiAvailable, setUiAvailable] = useState(false);
+  const [uiUpdating, setUiUpdating] = useState(false);
   const uiConfigVersion = useRef('0'), uiReadOrder = useRef(0), uiUpdates = useRef(Promise.resolve(true));
-  const [host, setHost] = useState(initialHost), [directory, setDirectory] = useState<ModelDirectoryView | null>(null), [directoryCurrent, setDirectoryCurrent] = useState(false);
+  const [host, setHost] = useState(initialHost), [directory, setDirectory] = useState<ModelDirectoryView | null>(null), [directoryVerified, setDirectoryCurrent] = useState(false);
+  const directoryCurrent = directoryVerified && !uiUpdating;
   const [directoryStatus, setDirectoryStatus] = useState<DirectoryReadStatus>({ state: 'unread', error: null });
   const intentDefaults = useRef<{ instanceId: string | null; enabled: boolean } | null>(null);
   const [error, setError] = useState<string | null>(null), [active, setActive] = useState<ActiveRunView | null>(null), [control, setControl] = useState<RuntimeControlView | null>(null);
@@ -73,10 +92,15 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   const [compactionProgress,setCompactionProgress]=useState<Extract<DesktopNotice,{type:'compaction.progress'}>|null>(null),compactionRevisions=useRef(new Map<string,number>());
   const [workspace, setWorkspace] = useState<WorkspaceView | null>(null), [workspaceConfirmed, setWorkspaceConfirmed] = useState(false), [selecting, setSelecting] = useState(false);
   const [catalog, setCatalog] = useState<PublicReturn<"data.read"> | null>(null), catalogRead = useRef(0);
+  const [catalogStatus,setCatalogStatus]=useState<CatalogReadStatus>({state:'unread',error:null});
+  const [extensionsTask,setExtensionsTask]=useState<'extensions'|'agents'>('extensions');
+  const [businessPromptNotice,setBusinessPromptNotice]=useState<string|null>(null);
+  const [extensionNotice,setExtensionNotice]=useState<string|null>(null),[agentNotice,setAgentNotice]=useState<string|null>(null);
   const [requestedQuery, setRequestedQuery] = useState<{ queryId: number; ownerSessionId: number } | null>(null);
   const [queryFormRun,setQueryFormRun]=useState<{sessionId:number;runId:number;inputId:number}|null>(null);
   const [sessions, setSessions] = useState<SessionView[]>([]), [nextSession, setNextSession] = useState<number | null>(null);
   const [details, setDetails] = useState<Record<number, SessionDetail>>({}), [drafts, setDrafts] = useState<Record<number, SessionDraft>>({});
+  const [unassignedText, setUnassignedText] = useState('');
   const [management, setManagement] = useState<ManagementEditor | null>(null), managementRef = useRef(management);
   const metadata = useRef(new Map<number, SessionMetadataView>()), deletedSessions = useRef(new Set<number>());
   const sessionListGeneration = useRef(0), sessionListRead = useRef(0);
@@ -90,7 +114,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   const inspectedRun = useRef<number | null>(null);
   const previews = useRef(new Map<number, { sessionId: number | null; sequence: number; text: string; truncated: boolean }>());
   const selectBusy = useRef(false), desiredSession = useRef<number | null>(null), sendBusy = useRef<number | null>(null), createBusy = useRef(false);
-  const creation = useRef<{ operationRef: string; input: NewSessionInput; model: ModelChoice | null } | null>(null);
+  const creation = useRef<{ operationRef: string; input: NewSessionInput; model: ModelChoice | null; draftText: string | null } | null>(null);
   const directoryRead = useRef(0), activeRead = useRef(0), detailsButton = useRef<HTMLButtonElement>(null);
   const workspaceChangeBusy = useRef(false);
   const workspaceMutation = useRef<{ instance: string | null; kind: 'create' | 'select' | 'update' | 'restore' } | { instance: string; kind: 'delete' | 'batch-delete'; operationRef: string } | {instance:string;kind:'checkpoint';operationRef:string;input:RestoreSessionCheckpointInput} | null>(null);
@@ -133,14 +157,19 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   const defaultModel = () => directoryRef.current?.selection ? { provider: directoryRef.current.selection.provider, modelId: directoryRef.current.selection.modelId, expectedConfigVersion: directoryRef.current.configVersion } : null;
   const ensureDraft = useCallback((sessionId: number, model?: ModelChoice | null) => {
     if (!draftsRef.current[sessionId]) {
-      const draft = newSessionDraft(model ?? defaultModel(), catalogRef.current, intentDefault());
-      // Unknown imported facts cannot be treated as an empty catalog. Only the
-      // first confirmed catalog may initialize fields the user has not edited.
-      if (!catalogRef.current) { draft.referenceDate = ''; draft.timezone = ''; }
-      editDraft(sessionId, draft);
-      if (!catalogRef.current) pendingDraftTime.current.set(sessionId, new Set(['referenceDate', 'timezone']));
+      setDrafts(old => {
+        if (old[sessionId]) return old;
+        const draft = newSessionDraft(model ?? defaultModel(), catalogRef.current, intentDefault());
+        // Unknown imported facts cannot be treated as an empty catalog. Only the
+        // first confirmed catalog may initialize fields the user has not edited.
+        if (!catalogRef.current) {
+          draft.referenceDate = ''; draft.timezone = '';
+          pendingDraftTime.current.set(sessionId, new Set(['referenceDate', 'timezone']));
+        }
+        const next = { ...old, [sessionId]: draft }; draftsRef.current = next; return next;
+      });
     }
-  }, [editDraft]);
+  }, []);
   const readUi = useCallback(async () => {
     const order = ++uiReadOrder.current;
     try {
@@ -178,10 +207,14 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     if (current.ok) { activeRef.current = current.data; setActive(current.data); } else setError(errorMessage(current.error));
   }, []);
   const readCatalog = useCallback(async (page = 1) => {
+    if(hostRef.current.state!=='ready')return;
     const instance = hostRef.current.instanceId, order = ++catalogRead.current;
+    setCatalogStatus({state:'loading',error:null});
+    try {
     const result = await window.medclaw.request("data.read", { page });
-    if (instance !== hostRef.current.instanceId || order !== catalogRead.current) return;
+    if (!mounted.current||hostRef.current.state!=='ready'||instance !== hostRef.current.instanceId || order !== catalogRead.current) return;
     if (result.ok) {
+      setCatalogStatus({state:'ready',error:null});
       catalogRef.current = result.data; setCatalog(result.data);
       const defaults = newSessionDraft(null, result.data);
       setDrafts(old => {
@@ -193,7 +226,8 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
         }
         draftsRef.current = next; return next;
       });
-    } else setError(errorMessage(result.error));
+    } else {const message=errorMessage(result.error);setCatalogStatus({state:'error',error:message});setError(message);}
+    } catch {if(mounted.current&&instance===hostRef.current.instanceId&&order===catalogRead.current)setCatalogStatus({state:'error',error:'Imported data could not be read. Refresh imported data to try again.'});}
   }, []);
   const readRun = useCallback(async (runId: number): Promise<RunView | null> => {
     const instance = hostRef.current.instanceId, result = await window.medclaw.request("run.read", { runId });
@@ -355,7 +389,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     if (notice.type === "host.status") {
       hostNoticeEpoch.current++;
       const prior = hostRef.current.instanceId; hostRef.current = notice.host; setHost(notice.host);
-      if (notice.host.state !== "ready") { directoryRead.current++; setDirectoryStatus({ state: 'unread', error: null }); setDirectoryCurrent(false); setControl(null); confirmedWorkspace.current = false; setWorkspaceConfirmed(false); }
+      if (notice.host.state !== "ready") { directoryRead.current++; catalogRead.current++;setCatalogStatus({state:'unread',error:null});setDirectoryStatus({ state: 'unread', error: null }); setDirectoryCurrent(false); setControl(null); confirmedWorkspace.current = false; setWorkspaceConfirmed(false); }
       if (notice.host.instanceId !== prior) {
         setCompactionProgress(null);compactionRevisions.current.clear();
         sessionListGeneration.current++;
@@ -368,7 +402,7 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
         // Keep read-only, previously verified facts visible during reconnection.
         // Admission still requires fresh Host/control/workspace confirmation.
         setActive(null); setControl(null);
-        setCatalog(null); catalogRef.current = null; catalogRead.current++;
+        setCatalogStatus({state:'unread',error:null});catalogRead.current++;
         previews.current.clear(); settled.current.clear(); setPreview(null);
         sessionReadOrder.current.clear(); sessionReads.current.clear(); sessionReadAgain.current.clear(); cancelBusy.current.clear(); setCancellingInputs([]);
       } return;
@@ -488,19 +522,28 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     } finally { if (workspaceMutation.current?.instance === instance && workspaceMutation.current.kind === 'update') { workspaceMutation.current = null; workspaceChangeBusy.current = false; setSelecting(false); if (confirmedWorkspace.current && desiredSession.current !== null && !desiredSessionNeedsConfirmation.current) void selectSession(desiredSession.current); } }
   }
   async function createSession(retry = false) {
-    if (workspaceMutation.current || !workspaceRef.current || hostRef.current.state !== 'ready' || successfulRestoreInstance.current !== hostRef.current.instanceId
+    if (uiUpdating || workspaceMutation.current || !workspaceRef.current || hostRef.current.state !== 'ready' || successfulRestoreInstance.current !== hostRef.current.instanceId
       || unknownWorkspaceInstance.current === hostRef.current.instanceId || !retry && !confirmedWorkspace.current) return;
     if (!retry && creation.current) { setError("Recover the original creation first."); return; }
-    creation.current ??= { operationRef: crypto.randomUUID(), input: { expectedWorkspaceRevision: workspaceRef.current.revision, selectOnCreate: true }, model: defaultModel() };
+    creation.current ??= { operationRef: crypto.randomUUID(), input: { expectedWorkspaceRevision: workspaceRef.current.revision, selectOnCreate: true }, model: defaultModel(), draftText: workspaceRef.current.sessionId === null ? unassignedText : null };
     setRequestedQuery(null); const original = creation.current, instance = hostRef.current.instanceId; workspaceMutation.current = { instance, kind: 'create' }; createBusy.current = true; setCreating(true); setSelecting(true); setError(null);
     try {
       const result = await window.medclaw.request("session.create", original.input, original.operationRef);
       if (instance !== hostRef.current.instanceId) { setCreationUnknown(true); return; }
       if (result.ok) {
         creation.current = null; setCreationUnknown(false);
-        await Promise.all([readSessions(), readWorkspace(), readSession(result.data.session.id)]);
-        if (instance === hostRef.current.instanceId && !deletedSessions.current.has(result.data.session.id) && detailsRef.current[result.data.session.id]?.session.status === 'active') ensureDraft(result.data.session.id, original.model);
+        await Promise.all([readSessions(), readWorkspace()]);
+        await readSession(result.data.session.id);
+        if (instance === hostRef.current.instanceId && !deletedSessions.current.has(result.data.session.id) && result.data.session.status === 'active') {
+          ensureDraft(result.data.session.id, original.model);
+          const draft = draftsRef.current[result.data.session.id];
+          if (original.draftText && !draft?.text && !draft?.pending) {
+            editDraft(result.data.session.id, { text: original.draftText });
+            setUnassignedText(text => text === original.draftText ? '' : text);
+          }
+        }
         setPage("chat");
+        return result.data.session.id;
       } else { setError(errorMessage(result.error)); if (result.error.code === "operation_result_unknown") { setCreationUnknown(true); confirmedWorkspace.current = false; setWorkspaceConfirmed(false); } else { creation.current = null; setCreationUnknown(false); } }
     } finally { if (workspaceMutation.current?.instance === instance && workspaceMutation.current.kind === 'create') { workspaceMutation.current = null; createBusy.current = false; setCreating(false); setSelecting(false); if (confirmedWorkspace.current && desiredSession.current !== null && !desiredSessionNeedsConfirmation.current) void selectSession(desiredSession.current); } }
   }
@@ -672,10 +715,23 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     if(!draft)return;
     await sendSession(false,{...draft,text:'Query form: '+canonicalRequest(params),mode:'send',routing:{mode:'user_form',params}});
   }
-  async function sendSession(retry = false,preparedDraft?:SessionDraft) {
+  async function sendSession(retry = false,preparedDraft?:SessionDraft): Promise<void> {
     if(!retry&&executionBlockRef.current){setError(executionBlockRef.current);return;}
+    if (!retry && !preparedDraft && workspaceRef.current?.sessionId === null) {
+      const instance = hostRef.current.instanceId, initial = { ...newSessionDraft(defaultModel(), catalogRef.current, intentDefault()), text: unassignedText };
+      const directory = directoryRef.current, model = directory?.models.find(model => model.provider === initial.model?.provider && model.id === initial.model?.modelId);
+      const provider = directory?.providers.find(provider => provider.id === initial.model?.provider);
+      if (!directoryCurrent || !catalogRef.current || !model?.input.includes('text') || !model.maxTokens
+        || initial.routing?.mode !== 'intent' && provider?.auth.state !== 'available' || !initial.text.trim() || !initial.referenceDate || !initial.timezone.trim() || !controlRef.current?.acceptingNewRuns) return;
+      const created = await createSession();
+      if (!created || instance !== hostRef.current.instanceId || workspaceRef.current?.sessionId !== created || desiredSession.current !== null) return;
+      const currentDraft = draftsRef.current[created];
+      if (currentDraft?.pending || currentDraft?.text && currentDraft.text !== initial.text) return;
+      await sendSession(false, initial);
+      return;
+    }
     const sessionId = workspaceRef.current?.sessionId, draft = preparedDraft??(sessionId ? draftsRef.current[sessionId] : null), instance = hostRef.current.instanceId;
-    if (!sessionId || !draft || !instance || deletedSessions.current.has(sessionId) || detailsRef.current[sessionId]?.session.status !== 'active' || hostRef.current.state !== 'ready' || sendBusy.current || workspaceMutation.current || !confirmedWorkspace.current) return;
+    if (uiUpdating || !sessionId || !draft || !instance || deletedSessions.current.has(sessionId) || detailsRef.current[sessionId]?.session.status !== 'active' || hostRef.current.state !== 'ready' || sendBusy.current || workspaceMutation.current || !confirmedWorkspace.current) return;
     const originalControl = detailsRef.current[sessionId]?.session.inputControl, root = selectedRuns.current.get(sessionId);
     const mode = originalControl ? draft.mode ?? 'send' : 'send';
     if (retry && !draft.resendConfirmed) return;
@@ -735,14 +791,16 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   async function updateUi(patch: Partial<DesktopDisplayPreferences>) {
     const update = uiUpdates.current.then(async () => {
       if (!mounted.current || bridgeFailed.current) return false;
+      setUiUpdating(true); ++directoryRead.current; setDirectoryCurrent(false);
       ++uiReadOrder.current;
       try {
         const result = await window.medclaw.request("settings.ui.update", { expectedConfigVersion: uiConfigVersion.current, patch });
         if (!mounted.current || bridgeFailed.current) return false;
         ++uiReadOrder.current;
-        if (result.ok) { uiConfigVersion.current = result.data.configVersion; setUi(result.data.ui); setUiVersion(result.data.configVersion); if (hostRef.current.state === "ready") void readDirectory(); return true; }
+        if (result.ok) { uiConfigVersion.current = result.data.configVersion; setUi(result.data.ui); setUiVersion(result.data.configVersion); if (hostRef.current.state === "ready") await readDirectory(); return true; }
         setError(errorMessage(result.error)); await readUi(); return false;
       } catch { failBridge(); return false; }
+      finally { setUiUpdating(false); }
     });
     uiUpdates.current = update;
     return update;
@@ -773,6 +831,16 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
   }
   async function closeDetails() { await updateUi({ detailOpen: false }); detailsButton.current?.focus(); }
   const current = workspace?.sessionId && !deletedSessions.current.has(workspace.sessionId) ? workspace.sessionId : null, currentDetail = current ? details[current] ?? null : null, draft = current ? drafts[current] ?? null : null;
+  const initialDraft = current === null ? { ...newSessionDraft(defaultModel(), catalog, intentDefault()), text: unassignedText } : null;
+  const sessionToolModel = directory?.models.find(value => value.provider === draft?.model?.provider && value.id === draft.model.modelId);
+  const sessionToolProvider = directory?.providers.find(value => value.id === draft?.model?.provider);
+  const sessionToolReason = executionBlockReason ?? (selecting || uiUpdating || sending !== null && sending === current || !workspaceConfirmed || draft?.pending
+    ? 'Verify the current session and original input first.' : !currentDetail ? 'Create or select a session.'
+    : currentDetail.runtime.availability === 'blocked' ? 'Restore the session before compacting.'
+    : !directoryCurrent ? 'Reload the model directory in Models' : !draft?.model ? 'Configure a model in Models before sending'
+    : !sessionToolModel || !sessionToolModel.input.includes('text') ? 'The session model is unavailable. Select another model.'
+    : !sessionToolModel.maxTokens ? 'Confirm the model output limit' : draft.routing?.mode !== 'intent' && sessionToolProvider?.auth.state !== 'available' ? 'Authenticate the provider first'
+    : !control ? 'Run availability is unconfirmed' : !control.acceptingNewRuns ? control.blockReasons[0] ? errorMessage(control.blockReasons[0]) : 'Wait for the original run to stop and be saved' : null);
   const runEvents = useRunEvents(host, run, page === 'chat' || ui.detailOpen && ui.detailTab === 'runtime', (runId, sessionId) => {
     void readActive();void readRun(runId);
     if(runRef.current?.kind!=='child'||runRef.current.id!==runId){void readSession(sessionId);void refreshInputs(sessionId);}
@@ -793,39 +861,48 @@ function ConnectedApp({ onBridgeFailure }: { onBridgeFailure: () => void }) {
     if (host.state !== 'ready' || !control || control.instanceId !== host.instanceId) productionBlockReason = 'Chat execution readiness is unconfirmed.';
     else if (!control.acceptingNewRuns || control.activeRootRun || control.blockReasons.length) productionBlockReason = 'A chat action is running or still requires stopping or saving.';
   }
+  const sessionsOpen = (sessionsVisible ?? wideChat) || !!management?.visible;
   return <div className={"desktop " + (ui.navCollapsed ? "nav-collapsed " : "") + (ui.detailOpen ? "has-details" : "")}>
-    <Sidebar page={page} onPage={page => { setRequestedQuery(null); setPage(page); }} collapsed={ui.navCollapsed} onCollapse={() => void updateUi({ navCollapsed: true })} host={host}>
-      <SessionList sessions={sessions} current={current} running={active?.sessionId ?? null} creating={creating} canCreate={host.state === "ready" && workspaceConfirmed && !selecting} canSelect={host.state === 'ready' && workspaceConfirmed} canRecoverCreate={host.state === 'ready' && !selecting && workspaceRecovery !== 'restart' && successfulRestoreInstance.current === host.instanceId}
+    <Sidebar page={page} onPage={page => { setRequestedQuery(null);if(page==='extensions')setExtensionsTask('extensions');setPage(page); }} collapsed={ui.navCollapsed} onCollapse={() => void updateUi({ navCollapsed: !ui.navCollapsed })} host={host} />
+    <main className="workspace">
+      <header className="page-header"><div className="header-title">{page === 'chat' && <button className="quiet icon-button" aria-label={sessionsOpen ? 'Hide sessions' : 'Show sessions'} title={sessionsOpen ? 'Hide sessions' : 'Show sessions'} aria-controls="conversation-history" aria-expanded={sessionsOpen} disabled={!!management?.visible} onClick={() => setSessionsVisible(!sessionsOpen)}><Icon name="history" /></button>}<h1>{{ chat: "Chat", data: "Data Workspace", queries: "Query History", models: "Models", prompt:"Prompt", skills:"Skills", extensions:"Extensions", evaluation: 'Evaluation', settings: "Settings" }[page]}</h1>
+        <span className="current-session" hidden={page !== 'chat'} data-testid="current-session" title={currentDetail ? sessionDisplayTitle(currentDetail.session) : undefined}>{currentDetail ? 'Viewing: ' + sessionDisplayTitle(currentDetail.session) : 'No session selected'}</span>
+        {active && <span data-testid="running-session" className="status-chip">Running: {runningSession ? sessionDisplayTitle(runningSession) : 'Provider'} · Run {active.runId}</span>}
+      </div><div className="header-actions"><button className="quiet icon-button theme-toggle" aria-label="Dark mode" aria-pressed={theme === 'dark'} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} onClick={onTheme}><Icon name={theme === 'dark' ? 'sun' : 'moon'} /></button><button ref={detailsButton} className="quiet details-toggle" onClick={() => void updateUi({ detailOpen: true })}><Icon name="panel" /><span>View run details</span></button></div></header>
+      {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="Dismiss notice" onClick={() => setError(null)}>×</button></div>}
+      <section className="page-content chat-page" hidden={page !== "chat"}><div className="chat-workspace">
+      <aside id="conversation-history" className="session-sidebar" aria-label="Conversation history" hidden={!sessionsOpen}>
+      <div className="session-sidebar-heading"><span className="eyebrow">YOUR WORKSPACE</span><h2>Conversations</h2><p className="tiny muted">Your questions, context and saved history.</p></div>
+      <SessionList sessions={sessions} current={current} running={active?.sessionId ?? null} creating={creating} canCreate={host.state === "ready" && workspaceConfirmed && !selecting && !uiUpdating} canSelect={host.state === 'ready' && workspaceConfirmed} canRecoverCreate={host.state === 'ready' && !selecting && workspaceRecovery !== 'restart' && successfulRestoreInstance.current === host.instanceId}
         management={management} canManage={host.state === 'ready' && !management?.pending} canDelete={host.state === 'ready' && workspaceConfirmed && !selecting} onManage={openManagement}
         onManagementTitle={title => { if (managementRef.current && !managementRef.current.pending) showManagement({ ...managementRef.current, title, error: null }); }} onManagementSave={() => void saveManagement()}
         onManagementClose={() => { if (managementRef.current && !managementRef.current.busy) showManagement(managementRef.current.pending ? { ...managementRef.current, visible: false } : null); }} onManagementRead={() => void readManagement()} onRefresh={() => void readSessions()}
         creationUnknown={creationUnknown} nextBefore={nextSession} onCreate={() => void createSession()} onRecoverCreate={() => void createSession(true)} onSelect={id => void selectSession(id)} onMore={() => void readSessions(nextSession!)} />
       {pendingSessionChoice !== null && <p role="status">Session {pendingSessionChoice} is still your requested selection. <button disabled={!workspaceConfirmed || selecting} onClick={() => void selectSession(pendingSessionChoice)}>Confirm Session {pendingSessionChoice}</button></p>}
-    </Sidebar>
-    <main className="workspace">
-      <header className="page-header"><div className="header-title">{ui.navCollapsed && <button className="quiet" onClick={() => void updateUi({ navCollapsed: false })}>Expand navigation</button>}<h1>{{ chat: "Chat", data: "Data Workspace", queries: "Query History", models: "Models", prompt:"Prompt", skills:"Skills", extensions:"Extensions", evaluation: 'Evaluation', settings: "Settings" }[page]}</h1></div><button ref={detailsButton} className="quiet" onClick={() => void updateUi({ detailOpen: true })}>View run details</button></header>
-      {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="Dismiss notice" onClick={() => setError(null)}>×</button></div>}
-      <section className="page-content chat-page" hidden={page !== "chat"}><Chat executionBlockReason={executionBlockReason} compactionProgress={compactionProgress} visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control} run={run} preview={preview} events={runEvents.state} onFinalSource={runEvents.setFinalSource}
+      <div className="session-sidebar-note"><Icon name="chat" /><p>Each conversation keeps its own context. Review saved runs for the details.</p></div>
+      </aside>
+      <Chat executionBlockReason={executionBlockReason} compactionProgress={compactionProgress} visible={page === 'chat'} sessionId={current} onCreate={() => void createSession()} onData={() => setPage('data')} directory={directory} directoryCurrent={directoryCurrent} host={host} active={active} control={control} run={run} preview={preview} events={runEvents.state} onFinalSource={runEvents.setFinalSource}
         workspace={workspace} workspaceConfirmed={workspaceConfirmed} workspacePending={selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} onWorkspace={updateWorkspace} dataDefaults={catalog}
-        session={currentDetail} draft={draft} selecting={selecting || !workspaceConfirmed} sending={sending !== null && sending === current} runningTitle={runningSession ? sessionDisplayTitle(runningSession) : null}
+        session={currentDetail} draft={draft} initialDraft={initialDraft} creationUnknown={creationUnknown} unassignedText={unassignedText} selecting={selecting || !workspaceConfirmed || uiUpdating} sending={sending !== null && sending === current} runningTitle={runningSession ? sessionDisplayTitle(runningSession) : null}
         queueRun={queueRun} queueRootInput={queueRootInput} frozenInput={frozenInput} frozenRunId={frozenRun?.id} inputs={current ? inputQueue.snapshots[current] ?? null : null} cancellingInputs={cancellingInputs}
         onRefreshInputs={() => { if (current) void refreshInputs(current, true); }} onMoreInputs={() => { if (current) void readInputPage(current, 'more'); }} onCancelInput={original => void cancelInput(original)}
-        onResumeCheckpoint={resumeCheckpoint} onRestoreSession={restoreSession} onHistoryVerified={refreshHistory}
-        onDraft={patch => { if (current) editDraft(current, patch); }} onUseForSession={useForSession} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onNewAttempt={pending => { if (current) startNewAttempt({ instanceId: host.instanceId, sessionId: current, pending }); }} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} onManageAgents={()=>setPage('extensions')} onChildDetails={async id=>{const instance=hostRef.current.instanceId,sessionId=workspaceRef.current?.sessionId;inspectedRun.current=id;const value=await readRun(id);if(!value||value.kind!=='child'||value.id!==id||inspectedRun.current!==id||hostRef.current.instanceId!==instance||workspaceRef.current?.sessionId!==sessionId)return;runRef.current=value;setRun(value);setPreview(null);void updateUi({detailOpen:true,detailTab:'runtime'});}} /></section>
-      <section className="page-content" hidden={page !== "data"}><DataWorkspace host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} onDeleteCommit={commitDataDeletion} onDeleteResult={confirmDataDeletion} catalog={catalog} batches={catalog?.batches ?? []} onRefresh={page => void readCatalog(page)} onUpdate={updateWorkspace} onError={setError} /></section>
-      <section className="page-content" hidden={page !== "queries"}><QueryHistory visible={page === "queries"} requestedQuery={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} writable={!!control?.acceptingNewRuns&&!executionBlockReason} active={active} onUpdate={updateWorkspace} onError={setError}
+        onDraft={patch => { if (current) editDraft(current, patch); else if (patch.text !== undefined) setUnassignedText(patch.text); }} onSend={() => void sendSession()} onResend={() => void sendSession(true)} onNewAttempt={pending => { if (current) startNewAttempt({ instanceId: host.instanceId, sessionId: current, pending }); }} onLookup={() => void lookupSubmission()} onStop={() => void stop()} onModels={() => setPage("models")} onManageAgents={()=>{setExtensionsTask('agents');setPage('extensions');}} onChildDetails={async id=>{const instance=hostRef.current.instanceId,sessionId=workspaceRef.current?.sessionId;inspectedRun.current=id;const value=await readRun(id);if(!value||value.kind!=='child'||value.id!==id||inspectedRun.current!==id||hostRef.current.instanceId!==instance||workspaceRef.current?.sessionId!==sessionId)return;runRef.current=value;setRun(value);setPreview(null);void updateUi({detailOpen:true,detailTab:'runtime'});}} /></div></section>
+      <section className="page-content" hidden={page !== "data"}><DataWorkspace host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} workspaceRecovery={workspaceRecovery} onVerifyWorkspace={() => void restoreWorkspace()} onDeleteCommit={commitDataDeletion} onDeleteResult={confirmDataDeletion} catalog={catalog} catalogStatus={catalogStatus} batches={catalog?.batches ?? []} onRefresh={page => void readCatalog(page)} onUpdate={updateWorkspace} onError={setError} /></section>
+      <section className="page-content" hidden={page !== "queries"}><QueryHistory onData={()=>setPage('data')} onChat={()=>setPage('chat')} visible={page === "queries"} requestedQuery={requestedQuery} host={host} workspace={workspace} confirmed={workspaceConfirmed && !selecting} writable={!!control?.acceptingNewRuns&&!executionBlockReason} active={active} onUpdate={updateWorkspace} onError={setError}
         formRun={queryFormRun} formPending={draft?.pending??null} formResendConfirmed={!!draft?.resendConfirmed} onSubmitForm={submitQueryForm}
         onReadSubmission={lookupSubmission} onResendSubmission={()=>sendSession(true)}
          formReason={executionBlockReason??(sending!==null?'A submission is being confirmed.':draft?.pending?'Read the original submission before starting another query.':!control?.acceptingNewRuns?'Wait for execution and saving to settle.':!draft?.model?'Select valid model metadata for this Session.':!draft.referenceDate||!draft.timezone?'Set the reference date and timezone in the Session.':null)}/></section>
       <section className="page-content" hidden={page !== "models"}><ModelsPage executionBlockReason={executionBlockReason} directory={directory} directoryCurrent={directoryCurrent} directoryStatus={directoryStatus} host={host} active={active} control={control}
         sessionTarget={workspaceConfirmed && !selecting && current && currentDetail && host.instanceId ? { instanceId: host.instanceId, sessionId: current } : null} onUseForSession={useForSession}
         prompt={prompt} notification={authNotify} attempt={authAttempt} onChanged={changed} onAccepted={acceptedProvider} onError={setError} /></section>
-      <section className="page-content" hidden={page !== "settings"}><SettingsPage executionBlockReason={executionBlockReason} ui={ui} uiAvailable={uiAvailable} onReadUi={readUi} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost} />{page==='settings'&&<section aria-label="Business prompt"><h2>Business prompt</h2><ResourcePanel host={host} source={workspaceConfirmed&&!selecting&&current?{source:'selection',sessionId:current}:null} kind="prompt" activeRunId={active?.sessionId===current?active?.runId:null} onPublished={()=>void readDirectory()}/></section>}</section>
+      <section className="page-content" hidden={page !== "settings"}><SettingsPage executionBlockReason={executionBlockReason} ui={ui} uiAvailable={uiAvailable} onReadUi={readUi} host={host} configVersion={uiVersion} onUi={updateUi} onChanged={changed} onError={setError} onHost={setHost}
+        sessionTools={runtimeVisible => <><SessionCheckpoints collapsed host={host} session={currentDetail} workspace={workspace} visible={page === 'chat' || page === 'settings' && runtimeVisible} blocked={!!executionBlockReason || selecting || uiUpdating || sending !== null && sending === current || !workspaceConfirmed || !!draft?.pending || control?.acceptingNewRuns !== true || host.state !== 'ready'} onResumeCheckpoint={resumeCheckpoint} onRestoreSession={restoreSession} onHistoryVerified={refreshHistory} /><SessionCompaction collapsed host={host} session={currentDetail} model={draft?.model ?? null} visible={page === 'chat' || page === 'settings' && runtimeVisible} blockedReason={sessionToolReason} control={control} onHistoryVerified={refreshHistory} onRestoreSession={restoreSession} /></>}
+        businessPromptNotice={businessPromptNotice} businessPrompt={<ResourcePanel host={host} source={workspaceConfirmed&&!selecting&&current?{source:'selection',sessionId:current}:null} selectionPending={!workspaceConfirmed||selecting} kind="prompt" refreshToken={directory?.configVersion} onNotice={setBusinessPromptNotice} onSettings={()=>setPage('settings')} onChat={()=>setPage('chat')} activeRunId={active?.sessionId===current?active?.runId:null} onPublished={()=>void readDirectory()}/>} /></section>
       <section className="page-content" hidden={page !== 'evaluation'}><EvaluationPage visible={page === 'evaluation'} evaluation={evaluation}
         productionBlockReason={productionBlockReason} /></section>
-      <section className="page-content" hidden={page!=='prompt'}><PromptWorkbench host={host} directory={directory} directoryCurrent={directoryCurrent} control={control} executionBlockReason={executionBlockReason} visible={page==='prompt'} canUseInChat={promptDraftReady} useInChatReason="Confirm the current active Session and its original submission before filling the draft." onUseInChat={usePromptInChat} onAccepted={()=>void readActive()}/></section>
-      {page==='skills'&&<section className="page-content"><ResourcePanel host={host} source={workspaceConfirmed&&!selecting&&current?{source:'selection',sessionId:current}:null} kind="skill" activeRunId={active?.sessionId===current?active?.runId:null} onPublished={()=>void readDirectory()} /></section>}
-      <section className="page-content" hidden={page!=='extensions'}><SubagentManager host={host} sessionId={workspaceConfirmed&&!selecting?current:null} visible={page==='extensions'}/>{page==='extensions'&&<ExtensionsPage executionBlockReason={executionBlockReason} host={host} sessionId={workspaceConfirmed&&!selecting?current:null} runId={run?.kind==='agent'&&run.sessionId===current?run.id:null} activeRunId={active?.runId??null} stopping={!!active?.stopPending||!!active?.persistencePending} onStop={()=>void stop()} onDetails={()=>void updateUi({detailOpen:true})} onPublished={()=>void readDirectory()} />}</section>
+      <section className="page-content" hidden={page!=='prompt'}><PromptWorkbench onModels={()=>setPage('models')} host={host} directory={directory} directoryCurrent={directoryCurrent} control={control} executionBlockReason={executionBlockReason} visible={page==='prompt'} canUseInChat={promptDraftReady} useInChatReason="Confirm the current active Session and its original submission before filling the draft." onUseInChat={usePromptInChat} onAccepted={()=>void readActive()}/></section>
+      <section className="page-content" hidden={page!=='skills'}><ResourcePanel host={host} source={workspaceConfirmed&&!selecting&&current?{source:'selection',sessionId:current}:null} selectionPending={!workspaceConfirmed||selecting} kind="skill" refreshToken={directory?.configVersion} onSettings={()=>setPage('settings')} onChat={()=>setPage('chat')} activeRunId={active?.sessionId===current?active?.runId:null} onPublished={()=>void readDirectory()} /></section>
+      <section className="page-content" hidden={page!=='extensions'}><div className="task-nav" role="group" aria-label="Extension workspace"><button aria-pressed={extensionsTask==='extensions'} onClick={()=>setExtensionsTask('extensions')}>Extension catalog</button><button aria-pressed={extensionsTask==='agents'} onClick={()=>setExtensionsTask('agents')}>Manage agents</button></div>{extensionsTask!=='agents'&&agentNotice&&<p role="status">{agentNotice}</p>}{extensionsTask!=='extensions'&&extensionNotice&&<p role="status">{extensionNotice}</p>}<SubagentManager onNotice={setAgentNotice} host={host} sessionId={workspaceConfirmed&&!selecting?current:null} visible={page==='extensions'&&extensionsTask==='agents'}/><div hidden={extensionsTask!=='extensions'}><ExtensionsPage refreshToken={directory?.configVersion} onNotice={setExtensionNotice} onSettings={()=>setPage('settings')} onChat={()=>setPage('chat')} executionBlockReason={executionBlockReason} host={host} sessionId={workspaceConfirmed&&!selecting?current:null} runId={run?.kind==='agent'&&run.sessionId===current?run.id:null} activeRunId={active?.runId??null} stopping={!!active?.stopPending||!!active?.persistencePending} onStop={()=>void stop()} onDetails={()=>void updateUi({detailOpen:true})} onPublished={()=>void readDirectory()} /></div></section>
     </main>
     {ui.detailOpen && <RunDetails inputs={inputQueue.snapshots[run?.kind === "agent" ? run.sessionId : current ?? 0] ?? null} onRefreshInputs={() => { const id=run?.kind === "agent" ? run.sessionId : current; if(id)void refreshInputs(id,true); }} onMoreInputs={() => { const id=run?.kind === "agent" ? run.sessionId : current; if(id)void readInputPage(id,"more"); }} cancellingInputs={cancellingInputs} onCancelInput={original => void cancelInput(original)} run={run} host={host} viewSessionId={current} tab={ui.detailTab} active={active} control={control} events={runEvents.state} onResumeGap={runEvents.resumeGap} onTab={tab => void updateUi({ detailTab: tab })} onClose={() => void closeDetails()} onError={setError}
       onIntentAction={(source,mode)=>void startIntentAction(source,mode)} intentActionsDisabled={!run||!canStartIntentAction(run)}

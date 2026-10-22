@@ -8,7 +8,7 @@ const terminal = (state: string) => ['completed', 'failed', 'cancelled', 'interr
 export const exportDeliveryLabel = (operation: ExportOperation) => operation.state === 'completed' && operation.copyState === 'verified' ? 'Delivery verified'
   : operation.copyState === 'unknown' ? 'Delivery result unknown' : operation.artifact ? 'Artifact registered; delivery incomplete' : 'Artifact not registered';
 
-export function ExportPanel(props: { visible: boolean; host: HostView; query: PublicReturn<'query.read'>['query']; writable: boolean; onChanged: () => void }) {
+export function ExportPanel(props: { expanded?: boolean; visible: boolean; host: HostView; query: PublicReturn<'query.read'>['query']; writable: boolean; onChanged: () => void }) {
   const [format, setFormat] = useState<ExportFormat>('csv'), [includeAnswer, setIncludeAnswer] = useState(false);
   const [answer, setAnswer] = useState<PublicReturn<'answer.read'>>(null), [run, setRun] = useState<PublicReturn<'run.read'> | null>(null);
   const [operations, setOperations] = useState<PublicReturn<'export.list'> | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null);
@@ -17,7 +17,7 @@ export function ExportPanel(props: { visible: boolean; host: HostView; query: Pu
   const owner = `${props.host.instanceId}:${props.query.sessionId}:${props.query.id}`, current = useRef(owner), mounted = useRef(true), order = useRef(0), work = useRef(false);
   const chooseButton = useRef<HTMLButtonElement>(null);
   const restoreFocus = useRef(false);
-  useEffect(()=>{if(!busy&&restoreFocus.current){restoreFocus.current=false;if(props.visible)chooseButton.current?.focus();}},[busy,owner,props.visible]);
+  useEffect(()=>{if(!busy&&restoreFocus.current){restoreFocus.current=false;if(props.visible && props.expanded !== false)chooseButton.current?.focus();}},[busy,owner,props.visible,props.expanded]);
   current.current = owner;
   const owns = (key: string) => mounted.current && key === current.current;
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; order.current++; }; }, []);
@@ -108,26 +108,28 @@ export function ExportPanel(props: { visible: boolean; host: HostView; query: Pu
     finally { work.current = false; if (owns(key)) setBusy(false); }
   }
   const ownerRun = run?.kind === 'one' ? run.run : null;
-  return <section className="panel" aria-label="Export saved result"><h2>Export saved result</h2>
-    <p>Query {props.query.id} is committed. Export includes every saved result row in its original order, including its original top groups limit.</p>
+  const attention = busy || !!pending || !!error || !!unfinished || operations?.items.some(operation => operation.state !== 'completed' || operation.copyState !== 'verified' || !!operation.error);
+  return <section className="panel workspace-tool" aria-label="Export saved result" hidden={props.expanded === false && !attention}><h2>Export saved result</h2>
+    <p hidden={props.expanded === false}>Query {props.query.id} is committed. Export includes every saved result row in its original order, including its original top groups limit.</p>
     <p role="status">{answer ? `Answer ${answer.id} committed · Run ${props.query.runId}` : ownerRun && terminal(ownerRun.status) ? `Run ${ownerRun.status}; no committed answer references this Query.` : 'Query committed; final answer pending.'}</p>
-    <div className="form-grid"><label>Export format<select value={format} onChange={event => setFormat(event.target.value as ExportFormat)}><option value="csv">CSV bundle with metadata</option><option value="json">JSON</option><option value="markdown">Markdown</option></select></label>
+    <div hidden={props.expanded === false}><div className="form-grid"><label>Export format<select value={format} onChange={event => setFormat(event.target.value as ExportFormat)}><option value="csv">CSV bundle with metadata</option><option value="json">JSON</option><option value="markdown">Markdown</option></select></label>
       <label><input type="checkbox" checked={includeAnswer} disabled={!answer} onChange={event => setIncludeAnswer(event.target.checked)} />Include committed answer</label></div>
-    <button ref={chooseButton} disabled={busy || !props.writable || !!pending && !pending.confirmedAbsent || props.host.state !== 'ready'} onClick={() => void create()}>Choose destination and export</button>
-    {pending && <div role="status"><p>Original export · <code>{pending.request.operationRef}</code></p><button disabled={busy || props.host.state !== 'ready'} onClick={() => void readOriginal()}>Read original export</button>
+    <button ref={chooseButton} disabled={busy || !props.writable || !!pending && !pending.confirmedAbsent || props.host.state !== 'ready'} onClick={() => void create()}>Choose destination and export</button></div>
+    {pending && <div role="status"><p>Original export retained.</p><details className="advanced-section"><summary>Original export identity</summary><p>Original export · <code>{pending.request.operationRef}</code></p></details><button disabled={busy || props.host.state !== 'ready'} onClick={() => void readOriginal()}>Read original export</button>
       <button disabled={busy || !pending.confirmedAbsent || pending.instanceId !== props.host.instanceId || props.host.state !== 'ready'} onClick={() => { work.current = true; setBusy(true); void send(pending).finally(() => { work.current = false; if (owns(owner)) setBusy(false); }); }}>Resend original export</button></div>}
     {error && <p role="alert" className="error-text">{error}</p>}
-    <button disabled={busy || props.host.state !== 'ready'} onClick={() => void refresh()}>Refresh exports</button>
-    {operations?.items.map(operation => <article key={operation.operationRef}><p><strong>{exportDeliveryLabel(operation)}</strong> · {operation.format} · {operation.state} · Copy {operation.copyState}</p>
-      <p className="tiny">Operation <code>{operation.operationRef}</code>{operation.priorOperationRef && <> · Prior <code>{operation.priorOperationRef}</code></>}</p>
+    <button hidden={props.expanded === false} disabled={busy || props.host.state !== 'ready'} onClick={() => void refresh()}>Refresh exports</button>
+    {operations?.items.map(operation => <article key={operation.operationRef} hidden={props.expanded === false && operation.state === 'completed' && operation.copyState === 'verified' && !operation.error}><p><strong>{exportDeliveryLabel(operation)}</strong> · {operation.format} · {operation.state} · Copy {operation.copyState}</p>
+      <details className="advanced-section"><summary>Export identifiers</summary><p className="tiny">Operation <code>{operation.operationRef}</code>{operation.priorOperationRef && <> · Prior <code>{operation.priorOperationRef}</code></>}</p>
       {operation.artifact && <p>Artifact {operation.artifact.id} registered</p>}
+      </details>
       {operation.error && <p role="status">{errorMessage(operation.error)}</p>}
       <div className="actions"><button disabled={busy || props.host.state !== 'ready'} onClick={() => void action('export.read', operation)}>Read export result</button>
         {!terminal(operation.state) ? <button disabled={busy || props.host.state !== 'ready'} onClick={() => void action('export.cancel', operation)}>Cancel export</button> : <>
           {operation.state !== 'completed' && <button disabled={busy || props.host.state !== 'ready'} onClick={() => void action('export.recover', operation)}>Verify and recover artifact</button>}
           <button disabled={busy || !props.writable || props.host.state !== 'ready' || !!pending && !pending.confirmedAbsent} onClick={() => void create(operation)}>Choose destination for new attempt</button></>}
       </div></article>)}
-    {operations && !operations.items.length && <p>No exports for this Query.</p>}
-    {operations?.nextBeforeExportId && <button disabled={busy} onClick={() => void refresh(operations.nextBeforeExportId!)}>More exports</button>}
+    {props.expanded !== false && operations && !operations.items.length && <p>No exports for this Query.</p>}
+    {props.expanded !== false && operations?.nextBeforeExportId && <button disabled={busy} onClick={() => void refresh(operations.nextBeforeExportId!)}>More exports</button>}
   </section>;
 }

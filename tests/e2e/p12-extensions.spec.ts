@@ -19,11 +19,28 @@ async function send(page:Page,text:string) {
   await page.getByRole('button',{name:'Chat',exact:true}).click();await page.getByLabel('Message text',{exact:true}).fill(text);
   const lookup=page.getByRole('button',{name:'Read original submission',exact:true});
   const fresh=page.getByRole('button',{name:'Start a new attempt',exact:true});
-  await expect.poll(async()=>{if(await fresh.isVisible()&&await fresh.isEnabled())await fresh.click();else if(await lookup.isVisible()&&await lookup.isEnabled())await lookup.click();return page.getByRole('button',{name:'Send',exact:true}).isEnabled();},{timeout:15000}).toBe(true);
+  await expect.poll(async()=>{
+    for(const recovery of [fresh,lookup]) {
+      const ready=await recovery.evaluateAll(buttons=>buttons.some(button=>{
+        const {width,height}=button.getBoundingClientRect();
+        return width>0&&height>0&&getComputedStyle(button).visibility==='visible'&&button.matches(':enabled');
+      }));
+      if(!ready)continue;
+      try{await recovery.click({timeout:1000});}
+      catch(error){if(await recovery.count()!==0)throw error;}
+      break;
+    }
+    return page.getByRole('button',{name:'Send',exact:true}).evaluateAll(buttons=>buttons.some(button=>button.matches(':enabled')));
+  },{timeout:15000}).toBe(true);
   await expect(page.getByRole('button',{name:'Send',exact:true})).toBeEnabled();await page.getByRole('button',{name:'Send',exact:true}).click();
 }
 async function select(page:Page) {
-  await page.getByRole('button',{name:'Extensions',exact:true}).click();await expect(page.getByLabel('Enable tool-audit')).toBeEnabled();
+  await page.getByRole('button',{name:'Extensions',exact:true}).click();
+  // Fault injection changes author files; reread the validated directory before configuring.
+  await page.getByRole('button',{name:'Refresh extensions',exact:true}).click({timeout:15000});
+  const configure=page.getByRole('button',{name:'Configure extension',exact:true});
+  await expect(configure).toBeVisible({timeout:15000});await expect(configure).toBeEnabled({timeout:15000});
+  if(await configure.getAttribute('aria-expanded')!=='true')await configure.click();await expect(page.getByLabel('Enable tool-audit')).toBeEnabled();
   await page.getByLabel('Enable tool-audit').uncheck();await page.getByLabel('Enable tool-audit').check();await page.getByRole('button',{name:'Save extension selection',exact:true}).click();
   await expect(page.getByTestId('extensions-panel')).toContainText('Saved for the next assembly.');
 }
@@ -55,13 +72,13 @@ test('p12 actual Electron selects, changes final page arguments, invokes origina
     expect(received[4]!.messages.findLast((m:any)=>m.role==='tool').content).toContain('"pageSize":20');
     await page.getByRole('button',{name:'Extensions',exact:true}).click();await expect(page.getByRole('button',{name:'Read extension status',exact:true})).toBeEnabled();
     await page.getByRole('button',{name:'Read extension status',exact:true}).click();await expect(page.getByTestId('extension-command')).toContainText('"seenToolCalls": 5');expect(received).toHaveLength(6);
-    await page.getByRole('button',{name:'New Session',exact:true}).click();await page.getByRole('button',{name:'Extensions',exact:true}).click();await expect(page.getByTestId('extensions-panel')).toContainText('Session 2');await expect(page.getByTestId('extensions-panel')).toContainText('No assembly evidence');
-    await page.locator('[data-session-id="1"]').getByRole('button').first().click();await page.getByRole('button',{name:'Extensions',exact:true}).click();await expect(page.getByTestId('extensions-panel')).toContainText('Session 1');await expect(page.getByRole('button',{name:'Read extension status',exact:true})).toBeEnabled();
+    await page.getByRole('button',{name:'Chat',exact:true}).click();await page.getByRole('button',{name:'New Session',exact:true}).click();await page.getByRole('button',{name:'Extensions',exact:true}).click();await expect(page.getByTestId('extensions-panel')).toContainText('Session 2');await expect(page.getByTestId('extensions-panel')).toContainText('No assembly evidence');
+    await page.getByRole('button',{name:'Chat',exact:true}).click();await page.locator('[data-session-id="1"]').getByRole('button').first().click();await page.getByRole('button',{name:'Extensions',exact:true}).click();await expect(page.getByTestId('extensions-panel')).toContainText('Session 1');await expect(page.getByRole('button',{name:'Read extension status',exact:true})).toBeEnabled();
     await page.getByRole('button',{name:'Stop active Run',exact:true}).click();await expect.poll(async()=>{const read=await page.evaluate(runId=>window.medclaw.request('extensions.read',{source:'run',runId}),original.id);return read.ok&&read.data.source==='run'&&read.data.assembly?.resourcesReleased;},{timeout:30000}).toBe(true);
     const proof=await page.evaluate(runId=>window.medclaw.request('extensions.read',{source:'run',runId}),original.id);expect(proof).toMatchObject({ok:true,data:{assembly:{state:'disposed',runId:original.id,sessionId:1},cleanup:{resourcesReleased:true}}});
     await page.getByRole('button',{name:'Refresh extensions',exact:true}).click();await expect(page.getByTestId('extensions-panel')).toContainText('Recorded disposed');await page.screenshot({path:info.outputPath('p12-original-release.png'),fullPage:true});
     await page.getByLabel('Enable tool-audit').uncheck();await page.getByRole('button',{name:'Save extension selection',exact:true}).click();await expect(page.getByTestId('extensions-panel')).toContainText('Selection: Disabled');
-    const host=await page.evaluate(()=>window.medclaw.request('host.read',{}));await page.getByRole('button',{name:'Settings',exact:true}).click();await page.getByRole('button',{name:'Restart Host',exact:true}).click();
+    const host=await page.evaluate(()=>window.medclaw.request('host.read',{}));await page.getByRole('button',{name:'Settings',exact:true}).click();await page.getByRole('button',{name:'Runtime',exact:true}).click();await page.getByRole('button',{name:'Restart Host',exact:true}).click();
     await expect.poll(async()=>{const now=await page.evaluate(()=>window.medclaw.request('host.read',{}));return now.ok&&host.ok&&now.data.state==='ready'&&now.data.instanceId!==host.data.instanceId;},{timeout:30000}).toBe(true);
     expect(await page.evaluate(runId=>window.medclaw.request('extensions.read',{source:'run',runId}),original.id)).toEqual(proof);expect(received).toHaveLength(6);
     await info.attach('p12-engineering-evidence',{body:JSON.stringify({externalProvider:'NOT_RUN',originalRun:original.id,requests:received.length,proof,tools:tools.data.items,sqlite:readStartupFacts(dataRoot)}),contentType:'application/json'});
@@ -82,7 +99,7 @@ test('p12 actual desktop exposes trusted engineering load, Hook and cleanup faul
     const name=mode==='schema'?'read_query_page':'extension_runtime_status',args=mode==='schema'?{queryId:1,page:1,pageSize:100}:{};
     const delta=call?{role:'assistant',tool_calls:[{index:0,id:'p12-fault-'+received.length,type:'function',function:{name,arguments:JSON.stringify(args)}}]}:{role:'assistant',content:'ENGINEERING'};
     response.writeHead(200,{'content-type':'text/event-stream'});response.end(`data: ${JSON.stringify({id:'ENGINEERING',model:'fixture',choices:[{index:0,delta,finish_reason:call?'tool_calls':'stop'}]})}\n\ndata: [DONE]\n\n`);
-  });await new Promise<void>(done=>provider.listen(0,'127.0.0.1',done));let desktop:Awaited<ReturnType<typeof launchActualDev>>|undefined;
+  });await new Promise<void>(done=>provider.listen(0,'127.0.0.1',done));let desktop:Awaited<ReturnType<typeof launchActualDev>>|undefined,passed=false;
   try {
     desktop=await launchActualDev(root,dataRoot,undefined,undefined,hostEntry);const page=desktop.page;
     await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible({timeout:30000});await configure(page,`http://127.0.0.1:${(provider.address() as {port:number}).port}/v1`);await page.getByRole('button',{name:'New Session',exact:true}).click();
@@ -104,23 +121,30 @@ test('p12 actual desktop exposes trusted engineering load, Hook and cleanup faul
       if(mode==='schema'){const tools=await page.evaluate(runId=>window.medclaw.request('tool.read',{runId}),run.id);if(!tools.ok)throw new Error(tools.error.code);expect(tools.data.items[0]?.error?.code).toBe('tool_input_invalid');}
       if(mode==='cleanup') {
         expect(proof.data.assembly.resourcesReleased).toBe(false);await expect(page.getByTestId('extensions-panel')).toContainText('extension_cleanup_failed');await expect(page.getByRole('button',{name:'Save extension selection',exact:true})).toBeDisabled();
-        await page.screenshot({path:info.outputPath('p12-cleanup-unconfirmed.png'),fullPage:true});rmSync(hold);
+        await test.step('Capture the unconfirmed extension cleanup state',async()=>{
+          await page.screenshot({path:info.outputPath('p12-cleanup-unconfirmed.png'),fullPage:true,timeout:15000});
+        });rmSync(hold);
         await expect.poll(async()=>{const p=await page.evaluate(runId=>window.medclaw.request('extensions.read',{source:'run',runId}),run.id);return p.ok&&p.data.source==='run'&&p.data.assembly?.resourcesReleased;},{timeout:10000}).toBe(true);
         expect(await page.evaluate(runId=>window.medclaw.request('run.retrySave',{runId}),run.id)).toMatchObject({ok:true,data:{status:'completed',cleanup:{resourcesReleased:true}}});
       }
       if(mode==='close_throw') {
         expect(proof.data.assembly.resourcesReleased).toBe(false);const old=await page.evaluate(()=>window.medclaw.request('host.read',{}));
-        await page.getByRole('button',{name:'Settings',exact:true}).click();await page.getByRole('button',{name:'Restart Host',exact:true}).click();
+        await page.getByRole('button',{name:'Settings',exact:true}).click();await page.getByRole('button',{name:'Runtime',exact:true}).click();await page.getByRole('button',{name:'Restart Host',exact:true}).click();
         await expect.poll(async()=>{const h=await page.evaluate(()=>window.medclaw.request('host.read',{}));return h.ok&&old.ok&&h.data.state==='ready'&&h.data.instanceId!==old.data.instanceId;},{timeout:30000}).toBe(true);
         expect(await page.evaluate(runId=>window.medclaw.request('extensions.read',{source:'run',runId}),run.id)).toMatchObject({ok:true,data:{assembly:{assemblyId:proof.data.assembly.assemblyId,state:'disposed',resourcesReleased:true},cleanup:{resourcesReleased:true}}});
         expect((await recent(page))?.status).toBe('completed');
       }
     }
+    await page.getByRole('button',{name:'Extensions',exact:true}).click();
+    const configureBeforeRemoval=page.getByRole('button',{name:'Configure extension',exact:true});
+    if(await configureBeforeRemoval.getAttribute('aria-expanded')==='true')await configureBeforeRemoval.click();
+    await expect(configureBeforeRemoval).toHaveAttribute('aria-expanded','false');
     rmSync(entry);
     await page.getByRole('button',{name:'Extensions',exact:true}).click();await page.getByRole('button',{name:'Refresh extensions',exact:true}).click();
-    const enabled=page.getByRole('checkbox',{name:'Enable tool-audit',exact:true});await expect(enabled).toBeChecked();await expect(enabled).toBeEnabled();await enabled.uncheck();
+    const configureButton=page.getByRole('button',{name:'Configure extension',exact:true});if(await configureButton.getAttribute('aria-expanded')!=='true')await configureButton.click();const enabled=page.getByRole('switch',{name:'Enable tool-audit',exact:true});await expect(enabled).toBeChecked();await expect(enabled).toBeEnabled();await enabled.uncheck();
     await page.getByRole('button',{name:'Save extension selection',exact:true}).click();await expect(page.getByTestId('extensions-panel')).toContainText('Selection: Disabled');await expect(enabled).toBeDisabled();
     expect(await page.evaluate(()=>window.medclaw.request('extensions.read',{source:'selection',sessionId:1}))).toMatchObject({ok:true,data:{selection:{extension:null},available:null}});
     await info.attach('p12-desktop-fault-evidence',{body:JSON.stringify({kind:'ENGINEERING_FIXTURES',thirdPartyCompatibility:'NOT_RUN',proofs,unavailableSelectionDisabled:true}),contentType:'application/json'});
-  } finally {rmSync(hold,{force:true});await desktop?.close();provider.closeAllConnections();await new Promise<void>(done=>provider.close(()=>done()));if(!desktop||existsSync(join(root,'dev-exit-confirmed')))rmSync(root,{recursive:true,force:true});}
+    passed=true;
+  } finally {if(!passed)console.log('P12_FAULT_ROOT_RETAINED '+root);rmSync(hold,{force:true});await desktop?.close();provider.closeAllConnections();await new Promise<void>(done=>provider.close(()=>done()));if(passed&&existsSync(join(root,'dev-exit-confirmed')))rmSync(root,{recursive:true,force:true});}
 });

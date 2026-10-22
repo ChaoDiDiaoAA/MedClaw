@@ -16,7 +16,7 @@ test('p13 actual desktop manages role overrides and four command groups without 
     const page = desktop.page;
     await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
     await page.getByRole('button', { name: 'New Session', exact: true }).click();
-    await page.getByRole('button', { name: 'Extensions', exact: true }).click();
+    await page.getByRole('button', { name: 'Extensions', exact: true }).click();await page.getByRole('button',{name:'Manage agents',exact:true}).click();
     await expect(page.getByRole('heading', { name: 'Manage agents', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Edit agent general-analyst', exact: true }).click();
     const editor = page.getByLabel('Agent content', { exact: true });
@@ -36,6 +36,13 @@ test('p13 actual desktop manages role overrides and four command groups without 
     await expect(page.getByRole('button', { name: 'Save agent', exact: true })).toBeDisabled();
     await expect(editor).toHaveValue(unknownContent);
     expect(readFileSync(join(dataRoot, 'subagents/general-analyst.md'), 'utf8')).toBe(unknownContent);
+    await page.getByRole('button', { name: 'Extension catalog', exact: true }).click();
+    await expect(page.getByText('Agent save is unconfirmed. Verify the saved content before another save.', { exact: true }).filter({visible:true})).toBeVisible();
+    await page.getByRole('button', { name: 'Manage agents', exact: true }).click();
+    await expect(page.getByText('Agent save is unconfirmed. Verify the saved content before another save.', { exact: true }).filter({visible:true})).toBeVisible();
+    await expect(editor).toHaveValue(unknownContent);
+    await expect(page.getByRole('button', { name: 'Save agent', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Verify agent save', exact: true })).toBeEnabled();
     await page.getByRole('button', { name: 'Verify agent save', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Save agent', exact: true })).toBeEnabled();
     const conflictDraft=unknownContent+'\nENGINEERING conflicting draft.\n',externalContent=unknownContent+'\nENGINEERING other editor.\n';
@@ -52,13 +59,15 @@ test('p13 actual desktop manages role overrides and four command groups without 
     for (const group of ['Skills', 'Subagents', 'Prompt Templates', 'Extension Commands']) await expect(page.getByRole('group', { name: group, exact: true })).toBeVisible();
     await page.getByRole('option', { name: '/subagent general-analyst', exact: false }).click();
     await expect(input).toHaveValue('/subagent general-analyst ');
-    await page.getByRole('button', { name: 'Extensions', exact: true }).click();
+    await page.getByRole('button', { name: 'Extensions', exact: true }).click();await page.getByRole('button',{name:'Manage agents',exact:true}).click();
     await expect(page.getByLabel('Agent content', { exact: true })).toHaveValue(conflictDraft);
     const facts = readStartupFacts(dataRoot);
     expect(facts.runs).toBe(0);
     expect(facts.calls).toBe(0);
     const result = await page.evaluate(() => window.medclaw.request('session.listInputs', { sessionId: 1 }));
     expect(result).toMatchObject({ ok: true, data: { items: [] } });
+  } catch (error) {
+    console.error('P13 role management failed before cleanup:', error); throw error;
   } finally { await desktop.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -88,30 +97,34 @@ test('p13 actual desktop stops one of four child cards, preserves original roles
     },`http://127.0.0.1:${(provider.address() as {port:number}).port}/v1`);
     expect(configured.ok).toBe(true);
     await page.getByRole('button',{name:'New Session',exact:true}).click();
+    if(!await page.getByLabel('Message routing',{exact:true}).isVisible())await page.getByText('Message options',{exact:true}).click();
     await page.getByLabel('Message routing',{exact:true}).selectOption('main_agent');
     await page.getByLabel('Message text',{exact:true}).fill('ENGINEERING review four independent supplied materials.');
     await expect(page.getByRole('button',{name:'Send',exact:true})).toBeEnabled();await page.getByRole('button',{name:'Send',exact:true}).click();
     await expect.poll(()=>children,{timeout:30000}).toBe(4);
-    const cards=page.getByTestId('chat-subagent-card');await expect(cards).toHaveCount(4);await expect(cards.first()).toContainText('general-analyst');
     const original=await page.evaluate(()=>window.medclaw.request('run.read',{recent:true}));if(!original.ok||original.data.kind!=='recent'||original.data.runs[0]?.kind!=='agent')throw Error('Missing original root');const parent=original.data.runs[0];
     const childRead=await page.evaluate(parentRunId=>window.medclaw.request('run.read',{recent:true,parentRunId}),parent.id);if(!childRead.ok||childRead.data.kind!=='recent')throw Error('Missing children');const ids=childRead.data.runs.map(child=>child.id);
-    const stoppedId=Number(await cards.first().getAttribute('data-child-run-id'));await cards.first().getByRole('button',{name:`Stop Subagent Run ${stoppedId}`,exact:true}).click();
+    await page.getByRole('button',{name:'View run details',exact:true}).click();await page.getByRole('tab',{name:'Run details',exact:true}).click();await page.getByRole('button',{name:`View Run ${parent.id}`,exact:true}).click();
+    const childrenList=page.getByTestId('subagent-list'),childButtons=childrenList.getByRole('button',{name:/^View Subagent Run /});await expect(childButtons).toHaveCount(4);
+    const stoppedId=ids[0]!;await childrenList.getByRole('button',{name:`View Subagent Run ${stoppedId}`,exact:true}).click();await expect(page.getByTestId('subagent-details')).toContainText('general-analyst');await page.getByTestId('subagent-details').getByRole('button',{name:`Stop Subagent Run ${stoppedId}`,exact:true}).click();
     await expect.poll(async()=>{const result=await page.evaluate(runId=>window.medclaw.request('run.read',{runId}),stoppedId);return result.ok&&result.data.kind==='one'&&result.data.run?.status;}).toBe('cancelled');
     await expect.poll(()=>disconnected.size).toBe(1);
     for(const runId of [parent.id,...ids.filter(id=>id!==stoppedId)])expect(await page.evaluate(runId=>window.medclaw.request('run.read',{runId}),runId)).toMatchObject({ok:true,data:{run:{status:'running',cancelRequestedAt:null}}});
     const role=await page.evaluate(sessionId=>window.medclaw.request('subagents.read',{source:'selection',sessionId,roleId:'general-analyst'}),parent.sessionId);if(!role.ok)throw Error('Missing original role');
     const laterContent=role.data.content.replace(role.data.description,'ENGINEERING later role description');expect(await page.evaluate(({sessionId,content,expectedContent})=>window.medclaw.request('subagents.save',{sessionId,roleId:'general-analyst',content,expectedContent}),{sessionId:parent.sessionId,content:laterContent,expectedContent:role.data.content})).toMatchObject({ok:true});
-    await page.getByRole('button',{name:'New Session',exact:true}).click();await expect(cards).toHaveCount(0);
+    await page.getByRole('button',{name:`View parent Run ${parent.id}`,exact:true}).click();await expect(childButtons).toHaveCount(4);
+    await page.getByRole('button',{name:'New Session',exact:true}).click();await expect(childButtons).toHaveCount(0);
     release();await expect.poll(async()=>{const result=await page.evaluate(runId=>window.medclaw.request('run.read',{runId}),parent.id);return result.ok&&result.data.kind==='one'&&result.data.run?.status;},{timeout:30000}).toBe('completed');
-    await expect(cards).toHaveCount(0);expect(parents).toBe(2);expect(children).toBe(4);expect(await page.locator('[data-session-id]').count()).toBe(2);
-    await page.locator(`[data-session-id="${parent.sessionId}"]`).getByRole('button').first().click();await expect(cards).toHaveCount(4);
-    writeFileSync(hold,String(stoppedId));await cards.getByRole('button',{name:`View Subagent Run ${stoppedId}`,exact:true}).click();await expect.poll(()=>existsSync(entered)).toBe(true);
-    const newerId=ids.find(id=>id!==stoppedId)!;await cards.getByRole('button',{name:`View Subagent Run ${newerId}`,exact:true}).click();await expect(page.getByTestId('subagent-details')).toContainText(`Subagent · Run ${newerId}`);
+    await expect(childButtons).toHaveCount(0);expect(parents).toBe(2);expect(children).toBe(4);expect(await page.locator('[data-session-id]').count()).toBe(2);
+    await page.locator(`[data-session-id="${parent.sessionId}"]`).getByRole('button').first().click();await expect(childButtons).toHaveCount(4);
+    writeFileSync(hold,String(stoppedId));await childrenList.getByRole('button',{name:`View Subagent Run ${stoppedId}`,exact:true}).click();await expect.poll(()=>existsSync(entered)).toBe(true);
+    const newerId=ids.find(id=>id!==stoppedId)!;await childrenList.getByRole('button',{name:`View Subagent Run ${newerId}`,exact:true}).click();await expect(page.getByTestId('subagent-details')).toContainText(`Subagent · Run ${newerId}`);
     rmSync(hold,{force:true});await expect.poll(()=>existsSync(released)).toBe(true);expect(await page.evaluate(()=>window.medclaw.request('workspace.read',{}))).toMatchObject({ok:true});await expect(page.getByTestId('subagent-details')).toContainText(`Subagent · Run ${newerId}`);
-    await page.getByRole('button',{name:`View parent Run ${parent.id}`,exact:true}).click();await expect(cards).toHaveCount(4);
-    await cards.first().getByRole('button',{name:`View Subagent Run ${stoppedId}`,exact:true}).click();await expect(page.getByTestId('subagent-details')).toContainText(role.data.description);await expect(page.getByTestId('subagent-details')).not.toContainText('ENGINEERING later role description');
+    await page.getByRole('button',{name:`View parent Run ${parent.id}`,exact:true}).click();await expect(childButtons).toHaveCount(4);
+    await childrenList.getByRole('button',{name:`View Subagent Run ${stoppedId}`,exact:true}).click();await expect(page.getByTestId('subagent-details')).toContainText(role.data.description);await expect(page.getByTestId('subagent-details')).not.toContainText('ENGINEERING later role description');
     for(const runId of ids.filter(id=>id!==stoppedId))expect(await page.evaluate(runId=>window.medclaw.request('run.read',{runId}),runId)).toMatchObject({ok:true,data:{run:{status:'completed',role:{roleId:'general-analyst',description:role.data.description}}}});
-  }finally{rmSync(hold,{force:true});release();try{await desktop?.close();}finally{provider.closeAllConnections();await new Promise<void>(resolve=>provider.close(()=>resolve()));rmSync(root,{recursive:true,force:true});}}
+  }catch(error){console.error('P13 child ownership failed before cleanup:',error);throw error;}
+  finally{rmSync(hold,{force:true});release();try{await desktop?.close();}finally{provider.closeAllConnections();await new Promise<void>(resolve=>provider.close(()=>resolve()));rmSync(root,{recursive:true,force:true});}}
 });
 
 test('p13 completing A role save while viewing B releases management without replacing either draft',async()=>{
@@ -121,14 +134,14 @@ test('p13 completing A role save while viewing B releases management without rep
   const desktop=await launchActualDev(root,dataRoot,undefined,undefined,undefined,observer);
   try{
     const page=desktop.page;await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible({timeout:30000});
-    await page.getByRole('button',{name:'New Session',exact:true}).click();await page.getByRole('button',{name:'Extensions',exact:true}).click();await page.getByRole('button',{name:'Edit agent general-analyst',exact:true}).click();
+    await page.getByRole('button',{name:'New Session',exact:true}).click();await page.getByRole('button',{name:'Extensions',exact:true}).click();await page.getByRole('button',{name:'Manage agents',exact:true}).click();await page.getByRole('button',{name:'Edit agent general-analyst',exact:true}).click();
     const editor=page.getByLabel('Agent content',{exact:true}),aContent=(await editor.inputValue())+'\nENGINEERING A retained draft.\n';await editor.fill(aContent);writeFileSync(hold,'hold committed save reply');await page.getByRole('button',{name:'Save agent',exact:true}).click();
     await expect.poll(()=>existsSync(entered)).toBe(true);expect(readFileSync(join(dataRoot,'subagents/general-analyst.md'),'utf8')).toBe(aContent);
-    await page.getByRole('button',{name:'New Session',exact:true}).click();await page.getByRole('button',{name:'Extensions',exact:true}).click();const newAgent=page.getByRole('button',{name:'New agent',exact:true});await expect(newAgent).toBeDisabled();
+    await page.getByRole('button',{name:'Chat',exact:true}).click();await page.getByRole('button',{name:'New Session',exact:true}).click();await page.getByRole('button',{name:'Extensions',exact:true}).click();await page.getByRole('button',{name:'Manage agents',exact:true}).click();const newAgent=page.getByRole('button',{name:'New agent',exact:true});await expect(newAgent).toBeDisabled();
     rmSync(hold,{force:true});await expect.poll(()=>existsSync(released)).toBe(true);await expect(newAgent).toBeEnabled();await newAgent.click();
     const bContent=(await editor.inputValue())+'\nENGINEERING B unsaved draft.\n';await editor.fill(bContent);
-    await page.locator('[data-session-id="1"]').getByRole('button').first().click();await page.getByRole('button',{name:'Extensions',exact:true}).click();await expect(editor).toHaveValue(aContent);
-    await page.locator('[data-session-id="2"]').getByRole('button').first().click();await page.getByRole('button',{name:'Extensions',exact:true}).click();await expect(editor).toHaveValue(bContent);
+    await page.getByRole('button',{name:'Chat',exact:true}).click();await page.locator('[data-session-id="1"]').getByRole('button').first().click();await page.getByRole('button',{name:'Extensions',exact:true}).click();await page.getByRole('button',{name:'Manage agents',exact:true}).click();await expect(editor).toHaveValue(aContent);
+    await page.getByRole('button',{name:'Chat',exact:true}).click();await page.locator('[data-session-id="2"]').getByRole('button').first().click();await page.getByRole('button',{name:'Extensions',exact:true}).click();await page.getByRole('button',{name:'Manage agents',exact:true}).click();await expect(editor).toHaveValue(bContent);
     expect(readStartupFacts(dataRoot)).toMatchObject({runs:0,calls:0});
   }finally{rmSync(hold,{force:true});await desktop.close();rmSync(root,{recursive:true,force:true});}
 });

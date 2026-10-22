@@ -293,6 +293,8 @@ async function dispatch(request: HostRequest): Promise<unknown> {
     case "model.diagnose": return app.submitProvider(request, "diagnostic");
     case "run.read": return unwrap(await app.runs.read(request.payload));
     case 'context.read': return unwrap(contexts.read(request.payload));
+    case 'resources.catalog.read': return app.resources!.readCatalog();
+    case 'extensions.catalog.read': return app.readExtensionCatalog();
     case 'resources.list': return app.resources!.list(request.payload);
     case 'resources.read': return app.resources!.read(request.payload);
     case 'subagents.list': return app.resources!.listSubagents(request.payload);

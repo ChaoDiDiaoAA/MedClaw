@@ -71,8 +71,8 @@ export async function launchActualDev(temporary: string, dataRoot: string, impor
     writeFileSync(quitRequest, 'quit');
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await Promise.race([exited, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Actual dev Main/Host exit is unconfirmed; retain its isolated root')), 15000); })]);
-      if (!confirmedDevHostStop(dataRoot)) throw new Error('Actual dev Host tree exit is unconfirmed; retain its isolated roots');
+      await Promise.race([exited, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`Actual dev Main/Host exit is unconfirmed; retain its isolated root\n${output}`)), 15000); })]);
+      if (!confirmedDevHostStop(dataRoot)) throw new Error(`Actual dev Host tree exit is unconfirmed; retain its isolated roots\n${output}`);
       writeFileSync(exitConfirmation, 'exited');
     } finally { clearTimeout(timer); }
   };
@@ -88,9 +88,10 @@ export async function launchActualDev(temporary: string, dataRoot: string, impor
     let page = context.pages()[0];
     if (!page) page = await context.waitForEvent('page', { timeout: 15000 });
     await page.waitForLoadState('domcontentloaded');
+    await page.bringToFront();
     return { page, browser, child, async close(expectedExitCode = 0) {
       await confirmExit(); await browser!.close();
-      if (child.exitCode !== expectedExitCode) throw new Error(`Actual dev launcher exited ${child.exitCode}, expected ${expectedExitCode}`);
+      if (child.exitCode !== expectedExitCode) throw new Error(`Actual dev launcher exited ${child.exitCode}, expected ${expectedExitCode}\n${output}`);
     } };
   } catch (error) {
     await confirmExit(); await browser?.close();

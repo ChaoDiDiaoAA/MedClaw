@@ -6,9 +6,9 @@
 
 The current development target is Windows x64 with Bun `1.4.0` and Node.js 24. Business data and model services are prepared separately. Development startup also prepares runtime resources and bundled tools, which can require network access.
 
-**Known clean-install blocker:** `package.json` and the lockfile declare a patch for `@tintinweb/pi-subagents@0.19.0`, but the patch file is absent from tracked source. A maintainer must supply the missing prerequisite before clean dependency installation and full building can be verified. This guide does not claim that an unmodified clean clone currently installs successfully.
+`package.json` declares the tracked [managed subagent patch](../../patches/@tintinweb%252Fpi-subagents@0.19.0.patch) for `@tintinweb/pi-subagents@0.19.0`. Keep it together with the lockfile when installing dependencies. The patch being present does not certify clean-machine installation, packaging or real-model behavior; those checks require their own evidence.
 
-Once that prerequisite is addressed, run from the repository root:
+Run from the repository root:
 
 ```powershell
 bun install --frozen-lockfile
@@ -44,6 +44,8 @@ The local intent model is independent of the main model and disabled by default.
 
 ## Next steps
 
+- [Prompt and Skills](prompts-and-skills.md): optimize prompts, choose input commands and inspect resource readiness.
+- [Read-only subagents](../agents/subagents.md): roles, explicit delegation, parallel work and cancellation.
 - [Data import and queries](data-import.md): package and result semantics.
 - [Evaluation](../evaluation/overview.md): engineering checks, real trials and reports.
 - [Windows packaging and maintenance](../release/windows-packaging.md): installation and backup boundaries.

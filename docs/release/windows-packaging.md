@@ -6,7 +6,7 @@
 
 The current packaging target is Windows x64. The [builder configuration](../../apps/desktop/electron-builder.config.ts) uses Electron `44.5.1` and a per-user NSIS installer. The installer permits choosing a directory, does not request elevation, does not automatically launch after installation, and retains application data on uninstall. Current configuration disables executable signing; do not describe the resulting build as signed.
 
-The declared `@tintinweb/pi-subagents@0.19.0` patch is currently absent from tracked source. Resolve that existing prerequisite before claiming clean dependency installation or a full reproducible build. An existing developer environment and engineering fixtures are not a clean-machine acceptance.
+The declared [managed subagent patch](../../patches/@tintinweb%252Fpi-subagents@0.19.0.patch) for `@tintinweb/pi-subagents@0.19.0` is tracked. Keep the patch and lockfile together for installation. A populated developer environment or the patch being present does not certify clean dependency installation, a reproducible build or clean-machine acceptance.
 
 After dependencies and build prerequisites are available:
 
@@ -16,6 +16,20 @@ bun run package:desktop
 ```
 
 The [build script](../../apps/desktop/build.ts) prepares desktop code, production runtime resources and bundled tools. Electron-builder reads `.build/package-app` and `.build/package-resources/medclaw`; installer output is under `.build/installers`. Runtime-resource preparation can require network access. Build files and installers are local outputs, not business-data backups.
+
+## Runtime versions and upgrades
+
+| Contract | Current value |
+| --- | --- |
+| Host protocol | `medclaw.host/p17-v3` |
+| Database schema | `17` |
+| Pi SDK / managed subagent plugin | `0.87.1` / `0.19.0` |
+
+The installation manifest, desktop and Host must agree on the current protocol and schema. Schema 17 removes the database's single-child index; product admission enforces the four-owned-child limit and required save/release checks. See [the migration](../../packages/storage/src/migrations/017_subagent_parallel.sql) and [subagent behavior](../agents/subagents.md). Preserve a verified backup before upgrading a valuable data root, and use a compatible installation for that root.
+
+Saved restore records accept protocol `p17-v1` or `p17-v2` with schema 16 as well as current records. This preserves the identity of an already completed restore; it does not negotiate an old active Host protocol. Whether an older backup can be restored is decided separately by snapshot validation. Sources: [protocol contracts](../../packages/contracts/src/protocol.ts), [maintenance contracts](../../packages/contracts/src/maintenance.ts).
+
+The package includes built-in roles under `resources/subagents/` and delegation templates under `resources/subagent-prompts/`. User role overrides live under the selected writable data root; installation resources and user overrides have different ownership. See [role management](../agents/subagents.md#manage-role-files).
 
 ## Host ownership and shutdown
 

@@ -197,13 +197,14 @@ MedClaw 在模型调用前检查剩余调用次数、工具次数、执行时间
 
 - **多会话工作：** 创建、切换、改名与删除 Session，在各自历史中继续追问，保留草稿和当前数据选择。
 - **上下文与历史：** 接入 Pi 会话树、历史恢复和压缩，结合产品层上下文快照与交付记录核查执行。
+- **只读子代理：** 使用内置或用户角色委派独立核查，最多同时持有四个子任务，支持单独取消；父 Agent 负责核验和最终回答。见[子代理指南](docs/agents/subagents.zh-CN.md)。
 - **执行观察：** 查看工具调用和运行详情，分别确认停止、必要保存与资源释放的实际状态。
 
 ### 模型与扩展
 
 - **Models：** 浏览模型目录，完成认证，登记自定义供应商与模型，设置默认模型或为当前 Session 选择模型。
 - **Intent model：** 独立配置和核验本地意图模型，启用后在 Chat 中选择意图路由。
-- **Prompt / Skills / Extensions：** 管理任务资源与受信扩展。
+- **Prompt / Skills / Extensions：** 优化提示词并填入聊天草稿，查看有版本资源、工具就绪状态和受信扩展。见[Prompt 与 Skills](docs/guides/prompts-and-skills.zh-CN.md)。
 
 ### 评测与维护
 
@@ -219,7 +220,7 @@ MedClaw 在模型调用前检查剩余调用次数、工具次数、执行时间
 
 开发环境使用 **Windows x64、Bun `1.4.0`、Node.js 24**。首次启动会准备运行资源与随包工具，需要访问相关下载源；业务数据和模型服务分别准备。
 
-> **当前安装前置：** `package.json` 与锁文件声明的一项依赖补丁文件未随仓库提供。干净检出需先由维护者补齐缺失补丁，才能验证依赖安装与完整构建。
+> **依赖与安装：** `package.json` 声明的[受控子代理补丁](patches/@tintinweb%252Fpi-subagents@0.19.0.patch)已纳入 Git，安装时须与锁文件配套保留。干净系统安装、完整构建与真实模型问数仍需独立验证。
 
 补齐前置后，在项目根目录运行：
 
@@ -313,10 +314,10 @@ device_id,device_name,source_submission_id,source_applicant,category,region,snap
 | 命令 | 用途 |
 | --- | --- |
 | `bun run typecheck` | 检查工作区 TypeScript 类型。 |
-| `bun run test:unit` | 运行单元测试。 |
-| `bun run test:integration` | 运行跨模块与 Host 集成测试。 |
-| `bun run test:e2e` | 在终端验证 Host、SDK、工具、SQLite 与产物工作流。 |
-| `bun run test:e2e:desktop` | 在真实 Electron 中检查桌面交互。 |
+| `bun run test:unit -- --stage P13` | 运行指定阶段的单元测试。 |
+| `bun run test:integration -- --stage P13` | 运行指定阶段的跨模块集成测试。 |
+| `bun run test:e2e -- --stage P13` | 在终端验证指定阶段的 Host 与产品工作流。 |
+| `bun run test:e2e:desktop -- --stage P13` | 在真实 Electron 中检查指定阶段的桌面交互。 |
 | `bun run test:eval` | 运行独立评测设施的工程测试。 |
 | `bun run eval:smoke -- --check` | 只读预检 Smoke 配置与材料。 |
 | `bun run eval:full -- --check` | 只读预检 Full 配置与材料。 |
@@ -325,6 +326,8 @@ device_id,device_name,source_submission_id,source_applicant,category,region,snap
 | `bun run eval:upload -- --help` | 查看已有评测归档的上传参数。 |
 | `bun run build:desktop` | 准备桌面、生产运行资源与随包工具。 |
 | `bun run package:desktop` | 构建 Windows x64 NSIS 安装产物。 |
+
+`P13` 是示例，可按改动选择 `P1` 至 `P17`。单元和集成命令必须提供 `--stage`；终端 e2e 和桌面命令省略阶段时默认执行各自全部阶段。使用 `bun run test:e2e:desktop -- --stage P13 --check` 可仅检查运行器与选中文件。详见[开发指南](docs/development/contributing.zh-CN.md)。
 
 首次使用评测时，从[Agent 配置示例](agent-eval/configs/agent.example.json)和[环境配置示例](agent-eval/configs/environment.example)准备对应的私有 `agent.json` 与 `environment` 文件，配置实际 Agent、独立 Judge 及需要使用的平台。已有配置直接检查和修改。
 
@@ -359,7 +362,7 @@ tests/                单元、集成、终端与桌面检查
 ## 🔒 当前限制与数据边界
 
 - **模型效果：** 本地意图识别链路已有工程实现，真实语义效果尚有缺口，需要继续改进与复测；模型身份核验、工程测试通过和实际问数质量分别判断。
-- **安装与能力：** 当前目标为 Windows x64。依赖补丁缺失、干净系统安装、真实模型问数及重启后恢复仍需实际验证；部分已登记意图尚缺数据或执行适配。
+- **安装与能力：** 当前目标为 Windows x64，受控子代理补丁已跟踪。干净系统安装、真实模型问数及重启后恢复仍需实际验证；部分已登记意图尚缺数据或执行适配。
 - **数据流向：** 业务数据、会话与运行记录保存在本机。使用外部模型时，任务所需文本、上下文或工具结果会发送给所选供应商；独立 Judge 和显式平台同步也有各自的数据流。
 - **凭据保护：** Main 使用 Electron `safeStorage` 加密保存凭据；Renderer 通过 Preload 白名单访问能力，已存秘密不返回界面，也不写入普通诊断。
 - **结果口径：** 回答受导入数据、实际日期和字段来源约束；模拟或推导值须保留标识，价格变化本身不能证明变化原因。
@@ -368,7 +371,7 @@ tests/                单元、集成、终端与桌面检查
 
 ## 📚 公开文档
 
-完整的中英文专题导航见[文档目录](docs/README.md)。推荐从[使用入门](docs/guides/getting-started.zh-CN.md)、[意图识别](docs/intent/overview.zh-CN.md)、[系统架构](docs/architecture/overview.zh-CN.md)和[评测说明](docs/evaluation/overview.zh-CN.md)开始；每篇均提供英文版本。
+完整的中英文专题导航见[文档目录](docs/README.md)。推荐从[使用入门](docs/guides/getting-started.zh-CN.md)、[意图识别](docs/intent/overview.zh-CN.md)、[系统架构](docs/architecture/overview.zh-CN.md)和[评测说明](docs/evaluation/overview.zh-CN.md)开始；使用任务资源时阅读[子代理](docs/agents/subagents.zh-CN.md)与[Prompt / Skills](docs/guides/prompts-and-skills.zh-CN.md)。每篇均提供英文版本。
 
 <a id="contributing"></a>
 

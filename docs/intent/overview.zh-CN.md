@@ -54,6 +54,12 @@ flowchart TD
 
 无效结构输出、身份不匹配、网络失败和取消属于执行事实，不是额外语义状态。[路由策略](../../packages/core/src/intent/route-policy.ts)拒绝无效或仍待复核的校验结果。当前策略可将受支持的明确任务转为程序执行计划，包含多查询和依赖；结果保留实际采用条件、日期与依据身份。
 
+## 主 Agent 辅助与明确委派
+
+获准意图任务采用主 Agent 路由时，父任务可以使用[只读子代理](../agents/subagents.zh-CN.md)独立分析。经过校验的查询步骤和最终 Answer 仍属于父任务，子任务指令与输出不能替换已接受的意图参数、QueryContext 或授权。
+
+明确的 `/subagent`、`/medclaw-evidence-review` 和 `/parallel-medclaw-review` 输入使用委派路径，不经过本地意图分类。它们需要新的 Send 和对应可用角色，命令或模板来源与实际子调用分别核查。参见[输入类型](../guides/prompts-and-skills.zh-CN.md#选择输入类型)。
+
 ## 追问与明确条件
 
 [校验器](../../packages/core/src/intent/validate.ts)在获准数据范围中核对实体和约束。用户明确纠正的条件必须保留，只能通过有效的采用上下文继承历史；多个未解决查询对象不能静默变成一个选择范围，交付类任务也不能替换业务查询上下文。

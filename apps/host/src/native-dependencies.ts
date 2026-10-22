@@ -28,7 +28,7 @@ export async function prepareNativeDependencies(config: HostHello): Promise<Nati
   const observations: NativeDependency[] = [];
   for (const name of ['rg', 'fd', 'bash', 'powershell'] as const) {
     try {
-      let path: string, expectedVersion: string | undefined;
+      let path: string, expectedVersion: string | undefined, args = ['--version'];
       if (name === 'rg' || name === 'fd') {
         const binary = manifest.binaries.find(binary => binary.name === name);
         if (!binary) throw new Error();
@@ -49,8 +49,13 @@ export async function prepareNativeDependencies(config: HostHello): Promise<Nati
         path = await realpath(getToolPath(name));
         if (path !== await realpath(target)) throw new Error();
         expectedVersion = binary.version;
-      } else path = await realpath(name === 'bash' ? getShellConfig().shell : getPowerShellConfig().shell);
-      const args = name === 'powershell' ? [...getPowerShellConfig().args, '$PSVersionTable.PSVersion.ToString()'] : ['--version'];
+      } else if (name === 'powershell') {
+        const selected = getPowerShellConfig();
+        // Windows App Execution Aliases can execute while refusing realpath; use the SDK's path and probe it directly.
+        path = selected.shell;
+        if (!isAbsolute(path)) throw new Error();
+        args = [...selected.args, '$PSVersionTable.PSVersion.ToString()'];
+      } else path = await realpath(getShellConfig().shell);
       const { stdout } = await execute(path, args, { windowsHide: true, timeout: 10000, maxBuffer: 65536, encoding: 'utf8' });
       const first = stdout.trim().split(/\r?\n/)[0]!;
       const version = name === 'rg' || name === 'fd' ? /^(?:ripgrep|fd) (\d+\.\d+\.\d+)/.exec(first)?.[1] : first;

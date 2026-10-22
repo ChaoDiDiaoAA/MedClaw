@@ -78,7 +78,7 @@ test.beforeAll(async () => {
   const env: Record<string, string> = { ...Object.fromEntries(Object.entries(process.env).flatMap(([key, value]) => value === undefined ? [] : [[key, value]])), MEDCLAW_HOST_ENTRY: join(root, 'apps/host/src/main.ts'), MEDCLAW_BUN_EXECUTABLE: execFileSync(bun, ['-e', 'process.stdout.write(process.execPath)'], { encoding: 'utf8' }).trim() };
   delete env.ELECTRON_RUN_AS_NODE;
   app = await electron.launch({ executablePath: electronPath, args: ['-r', join(dirname(core), 'lib/server/electron/loader.js'), '-r', seam, join(root, '.build/desktop/main/index.cjs'), '--medclaw-data-root', join(temporary, 'data')], env, timeout: 30000 });
-  page = await app.firstWindow(); await page.setViewportSize({ width: 1440, height: 1000 }); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
+  page = await app.firstWindow(); await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setSize(1920, 1080)); await page.setViewportSize({ width: 1920, height: 1080 }); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
   const configured = await page.evaluate(async baseUrl => {
     const directory = await window.medclaw.request('model.read', {}); if (!directory.ok) throw new Error(directory.error.code);
     const token = await window.medclaw.secretInput({ providerId: 'p5-fixture', purpose: 'custom_api_key', value: 'P5-LOCAL-NONSECRET' }); if (!token.ok) throw new Error(token.error.code);
@@ -156,15 +156,24 @@ test('read failures preserve proven Input states and late queued responses canno
 });
 
 test('frozen model and time changes close queue controls and a Host rejection keeps the edited draft', async () => {
+  const chooseModel = async (id: 'first' | 'second') => {
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Models', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Model directory', exact: true }).click();
+    await page.getByLabel('Search models', { exact: true }).fill('P5 ' + id);
+    await page.getByRole('button', { name: 'Select P5 ' + id, exact: true }).click();
+    await page.getByRole('button', { name: 'Use for this session', exact: true }).click();
+    await page.getByRole('button', { name: 'Chat', exact: true }).click();
+    await expect(page.getByTestId('session-model')).toHaveAttribute('data-model', JSON.stringify(['p5-fixture', id]));
+  };
   const a = await create(), first = gate(); steps = [async () => { first.enter(); await first.response; return 'P5 frozen first'; }, () => 'P5 frozen final'];
   const original = await clickSubmit('P5-frozen-root'); await first.entered; if (!original.runId) throw new Error('Missing root Run'); const rootRun = await readRun(original.runId);
   await chooseMode('steer'); await input().fill('P5-preserve-on-rejection');
-  await page.locator('.reference-fields summary').click(); await page.getByLabel('Reference date', { exact: true }).fill('2026-01-01');
+  if (!await page.getByLabel('Reference date', { exact: true }).isVisible()) await page.getByText('Message options', { exact: true }).click(); await page.getByLabel('Reference date', { exact: true }).fill('2026-01-01');
   await expect(page.getByRole('button', { name: 'Steer', exact: true })).toBeDisabled(); await expect(page.locator('.composer-reason')).toContainText('Restore the original Run reference date');
-  await page.getByLabel('Reference date', { exact: true }).fill(rootRun.referenceDate); await page.getByLabel('Session model', { exact: true }).selectOption(JSON.stringify(['p5-fixture', 'second']));
+  await page.getByLabel('Reference date', { exact: true }).fill(rootRun.referenceDate); await chooseModel('second');
   await expect(page.getByRole('button', { name: 'Steer', exact: true })).toBeDisabled(); await expect(page.locator('.composer-reason')).toContainText('Restore its model');
   await page.getByRole('button', { name: 'Message actions', exact: true }).click(); await expect(page.getByRole('menuitem', { name: 'Steer', exact: true })).toBeDisabled(); await expect(page.getByRole('menuitem', { name: 'Steer', exact: true })).toHaveAttribute('title', /Restore its model/); await page.keyboard.press('Escape'); await expect(page.getByRole('button', { name: 'Message actions', exact: true })).toBeFocused();
-  await page.getByLabel('Session model', { exact: true }).selectOption(JSON.stringify(['p5-fixture', 'first'])); await expect(page.getByRole('button', { name: 'Steer', exact: true })).toBeEnabled();
+  await chooseModel('first'); await expect(page.getByRole('button', { name: 'Steer', exact: true })).toBeEnabled();
   await rules([{ method: 'session.submit', sessionId: a, requestPatch: { expectedRevision: 999999 } }]); await page.getByRole('button', { name: 'Steer', exact: true }).click();
   await expect(page.locator('.error-banner')).toBeVisible(); await expect(input()).toHaveValue('P5-preserve-on-rejection'); await expect(page.getByRole('button', { name: 'Read original submission', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Steer', exact: true })).toBeDisabled(); await expect(page.getByRole('button', { name: 'Message actions', exact: true })).toBeDisabled();

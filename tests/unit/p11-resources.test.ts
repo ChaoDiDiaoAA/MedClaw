@@ -10,6 +10,18 @@ import { dirname, join } from 'node:path';
 import { canonicalRequest } from '../../packages/contracts/src/run';
 import { RESOURCE_LIMITS, type ResourceDefinition } from '../../packages/contracts/src/resources';
 
+test('resource and extension catalogs are read-only Host requests without a Session owner', () => {
+  for (const method of ['resources.catalog.read', 'extensions.catalog.read'] as const) {
+    expect(Object.hasOwn(publicMethodSchemas, method)).toBe(true);
+    const contract = publicMethodSchemas[method];
+    expect(contract.input.safeParse({}).success).toBe(true);
+    expect(contract.input.safeParse({ sessionId: 1 }).success).toBe(false);
+    expect(isReadOnlyMethod(method)).toBe(true);
+    expect(PublicHostRequestSchema.safeParse({ protocolVersion: HOST_PROTOCOL_VERSION, kind: 'request',
+      requestId: 'catalog-read', instanceId: 'host', operationRef: 'catalog-read', method, payload: {} }).success).toBe(true);
+  }
+});
+
 function authorFixture() {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p11-author-')), definitions: ResourceDefinition[] = [];
   const add = (kind: 'prompt' | 'skill', id = 'query', version = 'v1', content = kind === 'skill' ? '---\nname: query\ndescription: ENGINEERING query\n---\nRead facts.\n' : '---\ndescription: ENGINEERING query\n---\nFacts $ARGUMENTS\n', support: Record<string, string> = {}) => {

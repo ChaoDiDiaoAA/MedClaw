@@ -18,7 +18,7 @@ const consumptionVerified = (call: ToolCallView) => call.sdkReturned && !!call.n
 const statusLabel = { created: "Registered", running: "Running", completed: "Completed and saved", failed: "Failure saved", cancelled: "Cancelled and saved" };
 const readingPositions = new Map<string, { following: boolean; top: number; anchor: ReadingAnchor | null; offset: number }>();
 export function RunDetails(props: { inputs?:InputQueueSnapshot|null;cancellingInputs?:number[];onCancelInput?:(input:SessionInput)=>void;onRefreshInputs?:()=>void;onMoreInputs?:()=>void;run: RunView | null; host: HostView; viewSessionId: number | null; tab: DesktopDisplayPreferences["detailTab"]; active: ActiveRunView | null; control: RuntimeControlView | null; events: RunEventProjectionState | null; onResumeGap: () => void; onTab: (tab: DesktopDisplayPreferences["detailTab"]) => void; onClose: () => void; onError: (message: string | null) => void; onRun: (run: RunView) => void; onRetrySaved: () => void; onQuery?: (queryId: number, sessionId: number) => void;onIntentAction?:(run:RunView,mode:IntentAction)=>void;intentActionsDisabled?:boolean }) {
-  const [narrow, setNarrow] = useState(() => window.innerWidth < 1280);
+  const [narrow, setNarrow] = useState(() => !matchMedia("(min-width: 1600px)").matches);
   const [recent, setRecent] = useState<Extract<ReadRunResult, { kind: "recent" }> | null>(null);
   const [children,setChildren]=useState<Extract<ReadRunResult,{kind:'recent'}>|null>(null),childOrder=useRef(0);
   const [readError, setReadError] = useState<string | null>(null);
@@ -87,8 +87,8 @@ export function RunDetails(props: { inputs?:InputQueueSnapshot|null;cancellingIn
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const retryRunId = props.active?.persistencePending ? props.active.runId : props.control?.blockReasons.find(reason => reason.code === "storage_write_failed" && reason.runId)?.runId ?? null;
   useEffect(() => {
-    const media = matchMedia("(max-width: 1279px)");
-    const change = () => setNarrow(media.matches); change(); media.addEventListener("change", change);
+    const media = matchMedia("(min-width: 1600px)");
+    const change = () => setNarrow(!media.matches); change(); media.addEventListener("change", change);
     return () => media.removeEventListener("change", change);
   }, []);
   useEffect(() => { if (narrow) close.current?.focus(); }, [narrow]);

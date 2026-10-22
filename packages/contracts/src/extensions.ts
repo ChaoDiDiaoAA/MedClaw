@@ -42,6 +42,8 @@ export const FrozenExtensionSummarySchema = z.strictObject({ ...frozenFields, so
   .refine(frozen => (frozen.selection.extension === null) === (frozen.source === null));
 export const ExtensionDescriptorSchema = z.strictObject({ ref: ExtensionRefSchema, source: z.literal('first_party'), sdkVersion: z.literal('0.87.1'), entry: z.literal('index.ts'),
   hooks: ExtensionManifestSchema.shape.hooks, tools: ExtensionManifestSchema.shape.tools, commands: ExtensionManifestSchema.shape.commands });
+export const ExtensionsCatalogReadResultSchema = z.strictObject({ available: ExtensionDescriptorSchema.nullable(), diagnostics: z.array(AppErrorSchema).max(8) });
+export type ExtensionsCatalogReadResult = z.infer<typeof ExtensionsCatalogReadResultSchema>;
 export const ExtensionsReadInputSchema = z.discriminatedUnion('source', [z.strictObject({ source: z.literal('selection'), sessionId: PositiveIdSchema }),
   z.strictObject({ source: z.literal('run'), runId: PositiveIdSchema })]);
 export const ExtensionsSelectInputSchema = z.strictObject({ sessionId: PositiveIdSchema, expectedConfigVersion: ConfigVersionSchema, selection: ExtensionSelectionSchema });

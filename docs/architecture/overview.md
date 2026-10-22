@@ -16,6 +16,9 @@ flowchart TD
     APP --> PI[Pi runtime adapter]
     PI --> MODEL[Configured main model]
     PI --> QUERY
+    PI --> CHILD[Owned read-only child executions]
+    CHILD --> MODEL
+    CHILD -->|Allowed reading tools| QUERY
     QUERY --> STORE[(SQLite and local artifacts)]
     APP --> STORE
     MAIN --> EVAL[Independent evaluation processes]
@@ -46,6 +49,12 @@ Context selection, resource discovery, actual reads, delivery to a model, and ad
 The intent model is configured independently of the main Agent. Rules may resolve an input without a model request; other inputs use structured classification and at most one requested review. Validation checks actual entities, explicit constraints, coverage and capabilities before routing. Current policy can compile supported single or dependent tasks into program query steps. See [intent recognition](../intent/overview.md) for statuses and configuration.
 
 The main Agent uses Pi for the Agent Loop, model access, native tools, history and resources. Product code adds scope, budgets, cancellation, business tools and persistence checks. Neither a Skill instruction nor a model-proposed call expands an admitted permission.
+
+## Delegation and captured resources
+
+The Host supplies built-in and user role sources to `Application`. Input admission captures the available role bodies and resource versions, then the Pi adapter binds an actual parent `Agent` ToolCall to a child identity before child execution. Children have independent native histories and read-only tool subsets. At most four child executions can remain owned, sharing the root budget and deadline. A result-save or release gap keeps ownership occupied. See [subagents](../agents/subagents.md) for management, cancellation and evidence checks.
+
+Prompt optimization uses a separate Provider Run. **Use in chat** only inserts the resulting text into a confirmed draft. Skills, versioned prompt templates, role files and extension commands retain distinct contracts; configuration-preview readiness and the accepted Run's tool scope also have distinct meanings. Later edits do not rewrite captured Run resources. See [Prompt and Skills](../guides/prompts-and-skills.md).
 
 ## Ownership and failure boundaries
 

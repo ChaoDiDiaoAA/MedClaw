@@ -5,12 +5,40 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createServer, type ServerResponse } from 'node:http';
 import { MainSettings, atomicWriteJson } from '../../apps/desktop/src/main/settings';
-import { bunExecutable, launchActualDev, readStartupFacts } from '../fixtures/desktop-dev';
+import { bunExecutable, confirmedDevHostStop, launchActualDev, readStartupFacts } from '../fixtures/desktop-dev';
 import { EvaluationControlViewSchema } from '../../packages/contracts/src/evaluation';
 import { HostViewSchema } from '../../packages/contracts/src/model';
 import { ExportCopyReceiptSchema, type StoredExport } from '../../packages/contracts/src/export';
 
 type MissingProof = 'stopConfirmed' | 'saveConfirmed' | 'controllerExited';
+
+test('Main ignores a queued renderer subscription after its window is destroyed', async () => {
+  test.setTimeout(90000);
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'medclaw-closed-subscription-'))), dataRoot = join(root, 'data');
+  const observer = join(root, 'closed-subscription.cjs'), result = join(root, 'closed-subscription.json');
+  writeFileSync(observer, `module.exports=({app,ipcMain})=>{
+    app.on('browser-window-created',(_,window)=>{
+      const sender=window.webContents,senderFrame=sender.mainFrame;
+      window.once('closed',()=>{
+        const failures=[],listeners=ipcMain.listeners('medclaw:subscribe');
+        for(const listener of listeners)try{listener({sender,senderFrame});}catch(error){failures.push(error.message);}
+        require('fs').writeFileSync(${JSON.stringify(result)},JSON.stringify({destroyed:window.isDestroyed(),listeners:listeners.length,failures}));
+      });
+    });
+  };`);
+  const desktop = await launchActualDev(root, dataRoot, undefined, undefined, undefined, observer);
+  let closed = false, passed = false;
+  try {
+    await expect(desktop.page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
+    await desktop.close(); closed = true;
+    expect(JSON.parse(readFileSync(result, 'utf8'))).toEqual({ destroyed: true, listeners: 1, failures: [] });
+    expect(confirmedDevHostStop(dataRoot)).toBe(true);
+    passed = true;
+  } finally {
+    if (!closed) await desktop.close();
+    if (passed && existsSync(join(root, 'dev-exit-confirmed')) && root.startsWith(realpathSync(tmpdir()) + sep)) rmSync(root, { recursive: true, force: true });
+  }
+});
 
 async function evaluationExitFixture(field: MissingProof) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'MedClaw 退出证明-'))), dataRoot = join(root, '用户 数据'), configs = join(root, 'evaluation-configs');
@@ -322,7 +350,8 @@ for (const kind of ['create', 'restore'] as const) test('P17 actual Main retains
   };`);
   const observed = (path: string): Record<string, unknown> | null => { try { return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>; } catch { return null; } };
   const requestQuit = () => { const nonce = crypto.randomUUID(); writeFileSync(quitPath, nonce); return nonce; };
-  let desktop: Awaited<ReturnType<typeof launchActualDev>> | undefined, pending: Promise<unknown> | undefined, failed = false;
+  let desktop: Awaited<ReturnType<typeof launchActualDev>> | undefined,
+    pending: Promise<{ ok: true; data: unknown } | { ok: false; error: { code: string; operationRef?: string } }> | undefined, failed = false;
   try {
     const running = await launchActualDev(root, dataRoot, undefined, undefined, undefined, observer); desktop = running;
     const { page } = running;
@@ -339,6 +368,8 @@ for (const kind of ['create', 'restore'] as const) test('P17 actual Main retains
     }
     const selection = await page.evaluate(input => window.medclaw.request('backup.select', input.payload, input.operationRef), { payload: { purpose: kind }, operationRef });
     if (!selection.ok || !selection.data) throw new Error('ENGINEERING original maintenance authorization unavailable');
+    let requestResult: { state: 'pending' | 'settled' | 'rejected'; ok: boolean | null; error: { code: string } | null; operationRef: string; at: string } =
+      { state: 'pending', ok: null, error: null, operationRef, at: new Date().toISOString() };
     if (kind === 'create') {
       if (!selection.data.destinationToken) throw new Error('ENGINEERING backup destination token missing');
       pending = page.evaluate(input => window.medclaw.request('backup.create', input.payload, input.operationRef), { payload: { destinationToken: selection.data.destinationToken }, operationRef });
@@ -346,8 +377,27 @@ for (const kind of ['create', 'restore'] as const) test('P17 actual Main retains
       if (!selection.data.sourceToken || !selection.data.targetRootToken) throw new Error('ENGINEERING restore tokens missing');
       pending = page.evaluate(input => window.medclaw.request('backup.restore', input.payload, input.operationRef), { payload: { sourceToken: selection.data.sourceToken, targetRootToken: selection.data.targetRootToken }, operationRef });
     }
-    void pending.catch(() => {});
-    await expect.poll(() => observed(capturePath)).not.toBeNull(); const captured = observed(capturePath)!;
+    void pending.then(result => {
+      requestResult = { state: 'settled', ok: result.ok, error: result.ok ? null : { code: result.error.code },
+        operationRef: result.ok ? operationRef : result.error.operationRef ?? operationRef, at: new Date().toISOString() };
+      console.log('P17_MAINTENANCE_REQUEST_RESULT ' + JSON.stringify(requestResult));
+    }, () => {
+      requestResult = { state: 'rejected', ok: null, error: null, operationRef, at: new Date().toISOString() };
+      console.log('P17_MAINTENANCE_REQUEST_RESULT ' + JSON.stringify(requestResult));
+    });
+    try {
+      await expect.poll(() => {
+        const capture = observed(capturePath);
+        if (!capture && (requestResult.state === 'rejected' || requestResult.state === 'settled' && requestResult.ok === false)) {
+          throw new Error('ENGINEERING maintenance request ended before worker capture: ' + JSON.stringify(requestResult));
+        }
+        return capture;
+      }).not.toBeNull();
+    } catch (error) {
+      console.log('P17_MAINTENANCE_CAPTURE_REQUEST ' + JSON.stringify({ ...requestResult, observedAt: new Date().toISOString() }));
+      throw error;
+    }
+    const captured = observed(capturePath)!;
     expect(captured).toMatchObject({ pid: expect.any(Number), instanceId: expect.any(String), requestId: expect.any(String), operationRef, action, held: 1, delivered: false });
     expect(await page.evaluate(() => window.medclaw.request('host.read', {}))).toMatchObject({ ok: true, data: { instanceId: beforeHost.data.instanceId, state: 'stopped', canStart: true } });
     const firstQuit = requestQuit(); await expect.poll(() => observed(quitSeen)?.command).toBe(firstQuit);
@@ -394,7 +444,7 @@ for (const kind of ['create', 'restore'] as const) test('P17 actual Main retains
   }
 });
 
-test('P17 actual Main exits with failure after SDK cancellation cannot save its final facts and retains the original root', async ({}) => {
+test('P17 actual Main exits with failure after SDK cancellation cannot save its final facts and retains the original root', async ({}, info) => {
   test.setTimeout(120000);
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'MedClaw 保存失败-'))), dataRoot = join(root, '用户 数据');
   const observer = join(root, 'main-observer.cjs'), hostEntry = join(root, 'host-entry.ts'), fault = join(root, 'fail-final-save');
@@ -471,7 +521,17 @@ test('P17 actual Main exits with failure after SDK cancellation cannot save its 
     await expect.poll(() => existsSync(failedSave)).toBe(true);
     expect(JSON.parse(readFileSync(failedSave, 'utf8')).runId).toBe(second.data.runId);
     await expect.poll(() => streams.size).toBe(0);
-    await expect.poll(() => running.child.exitCode, { timeout: 30000 }).toBe(1);
+    try { await expect.poll(() => running.child.exitCode, { timeout: 30000 }).toBe(1); }
+    catch (error) {
+      try {
+        await info.attach('save-failure-launcher-state', { body: JSON.stringify({ pid: running.child.pid ?? null,
+          exitCode: running.child.exitCode, signalCode: running.child.signalCode }, null, 2), contentType: 'application/json' });
+        for (const [name, path] of [['save-failure-main-exit', exitSeen], ['save-failure-host-notice', hostNotice]]) {
+          if (existsSync(path!)) await info.attach(name!, { body: readFileSync(path!), contentType: 'application/json' });
+        }
+      } catch (attachmentError) { console.error('P17_MAIN_SAVE_FAILURE_EXIT_EVIDENCE_UNCONFIRMED', attachmentError); }
+      throw error;
+    }
     expect(JSON.parse(readFileSync(exitSeen, 'utf8')).code).toBe(1);
     const stopped = HostViewSchema.parse(JSON.parse(readFileSync(hostNotice, 'utf8')));
     expect(stopped).toMatchObject({ instanceId: oldHost.data.instanceId, state: 'failed', canStart: true,
@@ -488,7 +548,11 @@ test('P17 actual Main exits with failure after SDK cancellation cannot save its 
         await desktop.close(code);
       }
     }
-    catch (error) { if (!failed) throw error; console.log('P17_MAIN_SAVE_FAILURE_CLEANUP_UNCONFIRMED'); }
+    catch (error) {
+      if (!failed) throw error;
+      const detail = error instanceof Error ? error.stack ?? error.message : String(error);
+      console.error('P17_MAIN_SAVE_FAILURE_CLEANUP_UNCONFIRMED', detail.replaceAll('LOCAL-FIXTURE-ONLY', '<REDACTED>'));
+    }
     finally {
       for (const response of streams) response.destroy();
       await new Promise<void>(resolve => server.close(() => resolve()));

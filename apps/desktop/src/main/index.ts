@@ -49,7 +49,7 @@ function startDesktop(): void {
     if (notice.type === "provider.preview") lastPreview = frame;
     if (notice.type === "provider.settled" || notice.type === "provider.persistence_failed") lastPreview = null;
     if (notice.type === "host.status" && notice.host.state !== "ready") lastPreview = null;
-    if (window && !window.isDestroyed()) window.webContents.send("medclaw:notice", frame);
+    if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send("medclaw:notice", frame);
   };
   const host = new HostController({ dataRoot, hostEntry: launchPaths.hostEntry, bunExecutable: launchPaths.bunExecutable,
     resourceRoot: launchPaths.resourceRoot, installManifestPath: launchPaths.installManifestPath,
@@ -100,7 +100,7 @@ function startDesktop(): void {
   const startupFailure = (stage: string) => { runtimeLog.add(stage); errors.add(safeError('host_start_failed')); };
   void app.whenReady().then(async () => {
     runtimeLog.add('desktop_startup');
-    window = new BrowserWindow({ width: 1440, height: 900, minWidth: 1100, minHeight: 720, backgroundColor: "#faf9f6", title: "MedClaw", webPreferences: { preload: launchPaths.preloadEntry, contextIsolation: true, sandbox: true, nodeIntegration: false } });
+    window = new BrowserWindow({ width: 1440, height: 900, minWidth: 1100, minHeight: 720, backgroundColor: "#F5F6F8", title: "MedClaw", webPreferences: { preload: launchPaths.preloadEntry, contextIsolation: true, sandbox: true, nodeIntegration: false } });
     window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
     window.webContents.on("will-navigate", event => event.preventDefault());
     window.webContents.on('preload-error', () => startupFailure('preload_failed'));
@@ -117,12 +117,15 @@ function startDesktop(): void {
     void evaluation.initialize().then(() => {
       const control = evaluation.read(); notify({ type: 'eval.status', controllerInstanceId: control.controllerInstanceId, executionId: control.executionId, sequence: control.sequence, control });
     }).catch(() => errors.add(safeError('host_start_failed')));
-    ipcMain.on("medclaw:subscribe", event => { if (window && event.sender.id === window.webContents.id && event.senderFrame === event.sender.mainFrame) {
-      event.sender.send("medclaw:notice", { type: "host.status", host: host.read(), instanceId: host.read().instanceId });
+    ipcMain.on("medclaw:subscribe", event => {
+      if (!window || window.isDestroyed() || event.sender.isDestroyed()) return;
+      const target = window.webContents;
+      if (target.isDestroyed() || event.sender !== target || event.senderFrame !== target.mainFrame) return;
+      target.send("medclaw:notice", { type: "host.status", host: host.read(), instanceId: host.read().instanceId });
       const control = evaluation.read();
-      if (control.sequence > 0) event.sender.send('medclaw:notice', { type: 'eval.status', controllerInstanceId: control.controllerInstanceId, executionId: control.executionId, sequence: control.sequence, control, instanceId: null });
-      if (lastPreview) event.sender.send("medclaw:notice", lastPreview);
-    } });
+      if (control.sequence > 0) target.send('medclaw:notice', { type: 'eval.status', controllerInstanceId: control.controllerInstanceId, executionId: control.executionId, sequence: control.sequence, control, instanceId: null });
+      if (lastPreview) target.send("medclaw:notice", lastPreview);
+    });
     runtimeLog.add('renderer_load_start');
     try { await window.loadFile(launchPaths.rendererEntry); }
     catch { startupFailure('renderer_load_failed'); return; }

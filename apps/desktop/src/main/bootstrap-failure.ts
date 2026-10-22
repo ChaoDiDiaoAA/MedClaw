@@ -19,10 +19,13 @@ export function openBootstrapFailure(input: { shell: { preloadEntry: string; ren
   const errors = new ErrorLog('main'); errors.add(failure);
   let window: BrowserWindow | null = null;
   const fail = () => { try { dialog.showErrorBox('MedClaw', errorMessage(failure)); } finally { app.exit(1); } };
-  const trusted = (event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent) => window !== null && !window.isDestroyed()
-    && event.sender.id === window.webContents.id && event.senderFrame === event.sender.mainFrame;
+  const trusted = (event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent) => {
+    if (!window || window.isDestroyed() || event.sender.isDestroyed()) return false;
+    const contents = window.webContents;
+    return !contents.isDestroyed() && event.sender.id === contents.id && event.senderFrame === event.sender.mainFrame;
+  };
   void app.whenReady().then(async () => {
-    window = new BrowserWindow({ width: 1440, height: 900, minWidth: 1100, minHeight: 720, backgroundColor: '#faf9f6', title: 'MedClaw',
+    window = new BrowserWindow({ width: 1440, height: 900, minWidth: 1100, minHeight: 720, backgroundColor: '#F5F6F8', title: 'MedClaw',
       webPreferences: { preload: input.shell.preloadEntry, contextIsolation: true, sandbox: true, nodeIntegration: false } });
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     window.webContents.on('will-navigate', event => event.preventDefault());

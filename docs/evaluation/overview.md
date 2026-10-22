@@ -29,6 +29,14 @@ Review each layer of the [intent pipeline](../intent/overview.md): rule outcome;
 
 Examples include `mc-v1-intent-resolve` and `mc-v1-intent-clarify-region`. Engineering tests cover schemas, bounded review and route behavior. Real evaluation of the fixed official 0.8B model must inspect actual requests and outcomes, including ambiguous expressions, explicit corrections and unsupported tasks. Metadata inspection does not measure semantic accuracy, and this documentation supplies no unmeasured accuracy rate.
 
+## Agent and resource engineering checks
+
+For [subagents](../agents/subagents.md), check the original parent call and child identities, role snapshots across edits, four owned children and fifth-call rejection, independent cancellation, shared budgets, required persistence and release. Confirm whether child output was returned, delivered to a later parent request and actually adopted; a configured role is not an execution result.
+
+For [Prompt and Skills](../guides/prompts-and-skills.md), check the optimization's original Provider Run, unknown-result readback, cancellation and save recovery, and draft insertion without a Chat send. Verify each slash-command source and owner, readiness comparison basis, actual reads and provider delivery separately from instruction adherence. Real usefulness and prompt improvements require their own model trials.
+
+Relevant engineering examples include [parallel runtime](../../tests/integration/p13-parallel-runtime.test.ts), [role snapshots](../../tests/integration/p13-role-run-freeze.test.ts), [desktop role workflows](../../tests/e2e/p13-subagent-roles.spec.ts) and [Prompt optimizer interactions](../../tests/e2e/p11-prompt-workbench.spec.ts). Use the stage-specific commands in [development](../development/contributing.md); passing fixtures do not change dataset or real-model quality conclusions.
+
 ## Reports and comparisons
 
 Use saved Case/Trial and execution identities when locating originals. Inspect final facts, tool choices, arguments, source use, latency, recovery and unknown states separately. Repeated trials support success-rate, pass@k and variability analysis only under compatible conditions and with their actual denominators and gaps retained. Judge failure or required missing evidence can leave a result undecidable.

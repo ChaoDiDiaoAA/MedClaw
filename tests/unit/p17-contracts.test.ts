@@ -14,6 +14,8 @@ const at = '2026-10-16T00:00:00.000Z';
 test('dependency startup diagnostics accept only fixed reasons and discard arbitrary stderr', () => {
   expect(parseHostStartupFailure('MedClaw Host terminated: native_dependencies/host_dependency_unavailable/dependency_rg_unavailable.'))
     .toMatchObject({ phase: 'native_dependencies', error: { code: 'host_dependency_unavailable', reason: 'dependency_rg_unavailable' } });
+  expect(parseHostStartupFailure('MedClaw Host terminated: native_dependencies/host_dependency_unavailable/dependency_powershell_unavailable.'))
+    .toMatchObject({ phase: 'native_dependencies', error: { code: 'host_dependency_unavailable', reason: 'dependency_powershell_unavailable' } });
   for (const line of ['MedClaw Host terminated: native_dependencies/host_dependency_unavailable/private_path.',
     'MedClaw Host terminated: writer_lock/host_stop_unconfirmed/dependency_rg_unavailable.',
     'MedClaw Host terminated: native_dependencies/host_dependency_unavailable/dependency_rg_unavailable. secret']) expect(parseHostStartupFailure(line)).toBe(null);

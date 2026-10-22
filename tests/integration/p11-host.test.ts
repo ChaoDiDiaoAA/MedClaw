@@ -10,7 +10,8 @@ import { HostController } from '../../apps/desktop/src/main/host-controller';
 import { MainSettings, atomicWriteJson } from '../../apps/desktop/src/main/settings';
 import { MainCredentials, SecretInputs } from '../../apps/desktop/src/main/credentials';
 import { PublishedSettingsSchema } from '../../packages/contracts/src/model';
-import { ResourceListSchema, ResourceSelectionReceiptSchema, ResourceTextSchema, type ResourceSelection } from '../../packages/contracts/src/resources';
+import { ResourceCatalogReadResultSchema, ResourceListSchema, ResourceSelectionReceiptSchema, ResourceTextSchema, type ResourceSelection } from '../../packages/contracts/src/resources';
+import { ExtensionsCatalogReadResultSchema } from '../../packages/contracts/src/extensions';
 import { safeError, type Result } from '../../packages/contracts/src/error';
 import type { PublicMethod, PublicPayload, PublicReturn } from '../../packages/contracts/src/protocol';
 
@@ -74,6 +75,15 @@ async function setup() {
 
 hostTest('p11 real Main Preload Host publish per-session choices without authentication or model side effects', async () => {
   const f = await setup(); try {
+    const before = f.settings.read();
+    const catalog = ResourceCatalogReadResultSchema.parse(unwrap(await f.client.request('resources.catalog.read', {})));
+    expect(catalog.items).toHaveLength(17); expect(catalog.items.filter(item => item.ref.kind === 'skill')).toHaveLength(16);
+    expect(catalog.items.every(item => !Object.hasOwn(item, 'enabled'))).toBe(true); expect(catalog.catalogError).toBeNull();
+    expect(catalog).not.toHaveProperty('sessionId'); expect(catalog).not.toHaveProperty('selection');
+    const extensions = ExtensionsCatalogReadResultSchema.parse(unwrap(await f.client.request('extensions.catalog.read', {})));
+    expect(extensions).toMatchObject({ available: { ref: { id: 'tool-audit', version: 'v1' }, source: 'first_party' }, diagnostics: [] });
+    expect(extensions).not.toHaveProperty('selection'); expect(extensions).not.toHaveProperty('live'); expect(extensions).not.toHaveProperty('assembly');
+    expect(f.settings.read()).toEqual(before); expect(f.commits).toEqual([]);
     const list = ResourceListSchema.parse(unwrap(await f.client.request('resources.list', { source: 'selection', sessionId: f.first })));
     expect(list.items).toHaveLength(17);
     const skills = list.items.filter(item => item.ref.kind === 'skill'), added = skills.filter(item => item.ref.id !== 'query');

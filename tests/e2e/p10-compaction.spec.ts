@@ -1,10 +1,10 @@
 import {expect,test} from '@playwright/test';
 import {mkdtempSync,rmSync,writeFileSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
-import {join,resolve} from 'node:path';
+import {basename,join,relative,resolve} from 'node:path';
 import {createServer} from 'node:http';
 import {execFileSync} from 'node:child_process';
-import {createStartupPackage,launchActualDev,bunExecutable} from '../fixtures/desktop-dev';
+import {createStartupPackage,launchActualDev,bunExecutable,confirmedDevHostStop} from '../fixtures/desktop-dev';
 
 test('p10 actual desktop saves native compaction, preserves drafts, cancels and restores, and reads original facts after restart',async({},testInfo)=>{
   test.setTimeout(180000);
@@ -27,6 +27,7 @@ test('p10 actual desktop saves native compaction, preserves drafts, cancels and 
   await new Promise<void>(done=>provider.listen(0,'127.0.0.1',done));
   const sql=(query:string,write=false)=>JSON.parse(execFileSync(bunExecutable,['-e',`import{Database}from'bun:sqlite';const db=new Database(${JSON.stringify(join(dataRoot,'data/app.sqlite'))},${write?'{create:true,strict:true}':'{readonly:true}'});${write?`db.exec('PRAGMA foreign_keys=ON');db.exec(${JSON.stringify(query)});console.log('null');`:`console.log(JSON.stringify(db.query(${JSON.stringify(query)}).all()));`}db.close();`],{cwd:resolve('.'),encoding:'utf8'}));
   let desktop:Awaited<ReturnType<typeof launchActualDev>>|undefined;
+  const failures:unknown[]=[];let closed=false;
   try {
     desktop=await launchActualDev(root,dataRoot,source,undefined,entry);let page=desktop.page;
     await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible({timeout:30000});
@@ -43,8 +44,10 @@ test('p10 actual desktop saves native compaction, preserves drafts, cancels and 
     await page.getByRole('button',{name:'Chat',exact:true}).click();
     let panel=page.getByTestId('session-compaction');
     const idle=async()=>{await expect.poll(async()=>{const r=await page.evaluate(()=>window.medclaw.request('run.control.read',{}));return r.ok&&r.data.acceptingNewRuns;},{timeout:15000}).toBe(true);};
-    const send=async(text:string)=>{await page.getByLabel('Message text',{exact:true}).fill(text);await expect(page.getByRole('button',{name:'Send',exact:true})).toBeEnabled();await page.getByRole('button',{name:'Send',exact:true}).click();await expect.poll(()=>received.some(r=>JSON.stringify(r.messages).includes(text))).toBe(true);await idle();};
-    const compact=async()=>{await expect(panel.getByRole('button',{name:'Compact context',exact:true})).toBeEnabled();await panel.getByRole('button',{name:'Compact context',exact:true}).click();};
+    const chat=async()=>{await page.getByRole('navigation',{name:'Main navigation'}).getByRole('button',{name:'Chat',exact:true}).click();};
+    const runtime=async()=>{await page.getByRole('button',{name:'Settings',exact:true}).click();await page.getByRole('navigation',{name:'Settings tasks'}).getByRole('button',{name:'Runtime',exact:true}).click();};
+    const send=async(text:string)=>{await chat();await page.getByLabel('Message text',{exact:true}).fill(text);await expect(page.getByRole('button',{name:'Send',exact:true})).toBeEnabled();await page.getByRole('button',{name:'Send',exact:true}).click();await expect.poll(()=>received.some(r=>JSON.stringify(r.messages).includes(text))).toBe(true);await idle();};
+    const compact=async()=>{await runtime();if(!await panel.getByRole('button',{name:'Compact context',exact:true}).isVisible())await panel.getByText('Context tools',{exact:true}).click();await expect(panel.getByRole('button',{name:'Compact context',exact:true})).toBeEnabled();await panel.getByRole('button',{name:'Compact context',exact:true}).click();};
     await page.getByLabel('Message text',{exact:true}).fill('ENGINEERING retained draft');
     const empty=sql('SELECT storage_version FROM sessions WHERE id=1');await compact();await expect(panel).toContainText('Compaction · no_op');await idle();
     expect(received).toHaveLength(0);expect(sql('SELECT storage_version FROM sessions WHERE id=1')).toEqual(empty);
@@ -53,6 +56,7 @@ test('p10 actual desktop saves native compaction, preserves drafts, cancels and 
     const before=sql('SELECT id FROM runs'),answers=sql('SELECT id FROM answers'),inputs=sql('SELECT id FROM session_inputs');
     writeFileSync(dropNotice,'ENGINEERING lost progress');await compact();await expect(panel).toContainText('Compaction · completed',{timeout:15000});await idle();rmSync(dropNotice);
     await expect(panel.locator('dl')).toContainText('Native generatedYesNative savedYesCan continueYes');
+    await chat();
     await expect(page.getByTestId('chat-native-messages')).toContainText('ENGINEERING native summary Shanghai');
     await expect(page.getByLabel('Message text',{exact:true})).toHaveValue('ENGINEERING retained draft');
     expect(sql('SELECT id FROM runs')).toEqual(before);expect(sql('SELECT id FROM answers')).toEqual(answers);expect(sql('SELECT id FROM session_inputs')).toEqual(inputs);
@@ -65,7 +69,7 @@ test('p10 actual desktop saves native compaction, preserves drafts, cancels and 
     sql("CREATE TRIGGER p10_receipt_fault BEFORE INSERT ON business_events WHEN NEW.type='session_compaction_finished' BEGIN SELECT RAISE(ABORT,'ENGINEERING save failure'); END;",true);
     await compact();await expect(panel).toContainText('Compaction · unconfirmed · blocked',{timeout:15000});await expect(panel.locator('dl')).toContainText('Native generatedYesNative savedNoCan continueNo');expect(sql('SELECT current_leaf_id,storage_version FROM sessions WHERE id=1')).toEqual(savedPosition);
     const failureCount=received.length;sql('DROP TRIGGER p10_receipt_fault',true);await panel.getByRole('button',{name:'Restore compaction session',exact:true}).click();await idle();await expect(panel).toContainText('Compaction · failed');expect(received).toHaveLength(failureCount);expect(sql('SELECT current_leaf_id,storage_version FROM sessions WHERE id=1')).toEqual(savedPosition);
-    const count=received.length;await page.getByRole('button',{name:'Settings',exact:true}).click();await page.getByRole('button',{name:'Restart Host',exact:true}).click();await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible({timeout:30000});await page.getByRole('button',{name:'Chat',exact:true}).click();
+    const count=received.length;await page.getByRole('button',{name:'Settings',exact:true}).click();await page.getByRole('button',{name:'Runtime',exact:true}).click();await page.getByRole('button',{name:'Restart Host',exact:true}).click();await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible({timeout:30000});await page.getByRole('button',{name:'Chat',exact:true}).click();
     await expect(panel).toContainText('Compaction · failed');expect(received).toHaveLength(count);
     writeFileSync(auto,'ENGINEERING auto threshold');await send('ENGINEERING automatic '+ 'w'.repeat(500));
     expect(JSON.stringify(received.findLast(value=>JSON.stringify(value.messages).includes('ENGINEERING automatic')&&JSON.stringify(value.messages).includes('MedClaw trusted runtime feedback'))?.messages)).toContain('ENGINEERING native summary Shanghai');
@@ -73,10 +77,19 @@ test('p10 actual desktop saves native compaction, preserves drafts, cancels and 
     const autoCalls=sql("SELECT run_id,input_id,json_extract(model_json,'$.compaction.nativeEntryId') native_id FROM model_calls WHERE kind='compaction' AND run_id IS NOT NULL");expect(autoCalls.length).toBeGreaterThan(0);for(const call of autoCalls)expect(call).toMatchObject({run_id:expect.any(Number),input_id:null,native_id:expect.any(String)});
     // Full window restart discovers the original manual operation through session.read.
     const committed=sql("SELECT * FROM business_events WHERE type='session_compaction_finished'"),requestCount=received.length;
-    await desktop.close();desktop=await launchActualDev(join(root,'restart'),dataRoot,source,undefined,entry);page=desktop.page;panel=page.getByTestId('session-compaction');await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible({timeout:30000});
+    await desktop.close();desktop=await launchActualDev(join(root,'restart'),dataRoot,source,undefined,entry);page=desktop.page;panel=page.getByTestId('session-compaction');await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible({timeout:30000});await runtime();
     await expect(panel).toContainText('Compaction · failed');await panel.getByRole('button',{name:'Read original compaction',exact:true}).click();expect(sql("SELECT * FROM business_events WHERE type='session_compaction_finished'")).toEqual(committed);expect(received).toHaveLength(requestCount);
     await page.screenshot({path:testInfo.outputPath('p10-compaction.png'),fullPage:true});
-  } finally {
-    releaseSummary();try{await desktop?.close();}finally{provider.closeAllConnections();await new Promise<void>(done=>provider.close(()=>done()));rmSync(root,{recursive:true,force:true});}
+  } catch(error) { failures.push(error); } finally {
+    releaseSummary();
+    try { await desktop?.close();closed=desktop!==undefined; } catch(error) { failures.push(error); }
+    finally {
+      try { try { provider.closeAllConnections(); } finally { await new Promise<void>(done=>provider.close(()=>done())); } }
+      catch(error) { failures.push(error); }
+    }
   }
+  if(failures.length){console.log('P10 failure root retained:',root);throw failures.length===1?failures[0]:new AggregateError(failures,'P10 body or shutdown failed; isolated root retained: '+root);}
+  const target=resolve(root),within=relative(resolve(tmpdir()),target);
+  if(!closed||!within||within.startsWith('..')||within.includes(':')||!basename(target).startsWith('medclaw-p10-desktop-')||!existsSync(join(target,'dev-exit-confirmed'))||!existsSync(join(target,'restart/dev-exit-confirmed'))||!confirmedDevHostStop(dataRoot))throw new Error('P10 cleanup requires confirmed desktop and Host exit within its isolated temporary root: '+target);
+  rmSync(target,{recursive:true,force:true});
 });

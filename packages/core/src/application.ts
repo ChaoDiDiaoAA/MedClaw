@@ -14,7 +14,7 @@ import { ResourceService } from './resources/resource-service';
 import type { SubagentRoleSource } from '@medclaw/contracts/subagent';
 import { InputCommandsListInputSchema, InputCommandsListSchema, type InputCommandsListInput, type InputCommandsList, type ResourceSource } from '../../contracts/src/resources';
 import { ExtensionsReadResultSchema, type ExtensionsReadResult } from '../../contracts/src/protocol';
-import { ExtensionsReadInputSchema, ExtensionsCommandInputSchema, type ExtensionsReadInput, type ExtensionsCommandInput } from '../../contracts/src/extensions';
+import { ExtensionsCatalogReadResultSchema, ExtensionsReadInputSchema, ExtensionsCommandInputSchema, type ExtensionsReadInput, type ExtensionsCommandInput } from '../../contracts/src/extensions';
 import type { ExportServicePort } from '../../contracts/src/export';
 
 type Login = { view: AuthAttemptView; abort: AbortController; pending?: { id: string; allowedIds: string[] | null; resolve: (value: string) => void; reject: (reason: unknown) => void }; task: Promise<void> };
@@ -64,6 +64,12 @@ export class Application<Resolved extends ResolvedProviderSelection = ResolvedPr
     if(session.kind!=='user')throw safeError('access_denied');
     if(session.deletedAt!==null)throw safeError('input_invalid',undefined,{reason:'session_deleted'});
     return session;
+  }
+  async readExtensionCatalog() {
+    let available = null; const diagnostics: AppError[] = [];
+    try { available = await this.agent?.readExtensionDescriptor?.() ?? null; }
+    catch { diagnostics.push(safeError('extension_unavailable')); }
+    return ExtensionsCatalogReadResultSchema.parse({ available, diagnostics });
   }
   async readExtensions(value: ExtensionsReadInput): Promise<ExtensionsReadResult> {
     const input=ExtensionsReadInputSchema.parse(value);

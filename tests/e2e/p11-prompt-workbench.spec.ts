@@ -51,7 +51,15 @@ async function begin(page: Page, text = '请优化我的查询提示，保持原
 }
 
 test('p11 workbench uses one published Provider request and copies/uses only the complete editable result across navigation', async ({ page }) => {
-  await page.goto(url); await page.getByLabel('Requirements (optional)', { exact: true }).fill('Keep identifiers and evidence requirements.');
+  await page.goto(url);
+  await expect(page.getByLabel('Original prompt', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('Optimized prompt', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('Requirements (optional)', { exact: true })).toBeHidden();
+  await page.getByText('Editing requirements', { exact: true }).click(); await page.getByLabel('Requirements (optional)', { exact: true }).fill('Keep identifiers and evidence requirements.');
+  await page.getByText('Editing requirements', { exact: true }).click();
+  await expect(page.getByLabel('Requirements (optional)', { exact: true })).toBeHidden();
+  await page.getByText('Editing requirements', { exact: true }).click();
+  await expect(page.getByLabel('Requirements (optional)', { exact: true })).toHaveValue('Keep identifiers and evidence requirements.');
   const operationRef = await begin(page), request = (await requests(page, 'model.request'))[0]!;
   expect(request.input.model).toEqual({ provider: 'test-provider', modelId: 'model-1', expectedConfigVersion: '7' });
   expect(Object.keys(request.input).sort()).toEqual(['model', 'referenceDate', 'text', 'timezone']);

@@ -29,6 +29,14 @@ bun run eval:full -- --check
 
 示例包括 `mc-v1-intent-resolve` 和 `mc-v1-intent-clarify-region`。工程测试检查 Schema、有界复核和路由行为；固定官方 0.8B 模型的真实评测须检查真实请求与结果，包括歧义表达、明确纠正和不支持任务。元信息核验不测语义准确率，本页不提供未实测准确率。
 
+## Agent 与资源工程核验
+
+[子代理](../agents/subagents.zh-CN.md)应检查原父调用与子任务身份、编辑前后的角色快照、四个占用子任务及第五次调用拒绝、独立取消、共享预算、必要保存和释放。子结果已返回、已交付给后续父请求和实际被采用分别确认；角色配置不是执行结果。
+
+[Prompt 与 Skills](../guides/prompts-and-skills.zh-CN.md)应检查优化的原 Provider Run、未知结果查回、取消与保存恢复，以及仅填入草稿而未发送 Chat。斜杠命令来源与所有者、就绪比较依据、实际读取和供应商交付分别核验，不混同指令遵循。真实委派收益和提示词改进需要各自的模型试验。
+
+工程示例包括[并行运行](../../tests/integration/p13-parallel-runtime.test.ts)、[角色快照](../../tests/integration/p13-role-run-freeze.test.ts)、[桌面角色流程](../../tests/e2e/p13-subagent-roles.spec.ts)与[Prompt 优化交互](../../tests/e2e/p11-prompt-workbench.spec.ts)。阶段命令见[开发指南](../development/contributing.zh-CN.md)，夹具通过不改变数据集或真实模型质量结论。
+
 ## 报告与比较
 
 通过已保存的 Case、Trial 和执行身份定位原件，分别检查最终事实、工具选择、参数、来源使用、延迟、恢复和未知状态。重复试验仅在条件兼容、保留真实分母和缺口时支持成功率、pass@k 与波动分析。Judge 失败或必要依据缺失可能使结果不可判定。

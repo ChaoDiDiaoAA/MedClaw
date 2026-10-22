@@ -6,9 +6,9 @@
 
 当前开发目标为 Windows x64，使用 Bun `1.4.0` 与 Node.js 24。业务数据和模型服务单独准备。开发启动还会准备运行资源与随包工具，可能需要访问下载源。
 
-**已知干净安装阻碍：** `package.json` 与锁文件声明了 `@tintinweb/pi-subagents@0.19.0` 的补丁，但已跟踪源码缺少对应文件。需要维护者补齐前置，才能核验干净依赖安装与完整构建。本指南不声称当前干净克隆已经能够直接安装成功。
+`package.json` 声明的 `@tintinweb/pi-subagents@0.19.0` [受控子代理补丁](../../patches/@tintinweb%252Fpi-subagents@0.19.0.patch)已随源码跟踪，安装依赖时须与锁文件配套保留。补丁存在不代表干净机器安装、打包或真实模型行为已经通过，这些检查需要独立证据。
 
-前置处理后，在仓库根目录执行：
+在仓库根目录执行：
 
 ```powershell
 bun install --frozen-lockfile
@@ -44,6 +44,8 @@ bun run dev:desktop --data-root ..\medclaw-sandbox
 
 ## 后续阅读
 
+- [Prompt 与 Skills](prompts-and-skills.zh-CN.md)：优化提示词、选择输入命令和核查资源就绪状态。
+- [只读子代理](../agents/subagents.zh-CN.md)：角色、明确委派、并行与取消。
 - [数据导入与查询](data-import.zh-CN.md)：数据包和结果口径。
 - [评测](../evaluation/overview.zh-CN.md)：工程检查、真实试验和报告。
 - [Windows 打包与维护](../release/windows-packaging.zh-CN.md)：安装和备份边界。

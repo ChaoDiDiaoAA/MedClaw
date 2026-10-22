@@ -6,23 +6,29 @@
 
 ## 基础与工作台
 
-当前样式使用 Segoe UI / Microsoft YaHei UI、14 像素基础字号、浅暖背景、克制边框和红色强调色。复用 `--surface`、`--muted`、`--line`、`--accent` 等现有 CSS 变量，不建立平行变量体系。按钮区分主要、安静、危险和禁用状态，键盘焦点具有可见轮廓。
+当前样式使用 Segoe UI / Microsoft YaHei UI、14 像素基础字号、中性背景、克制边框和玫红强调色，样式表定义浅色与深色变量组。复用 `--canvas`、`--surface`、`--muted`、`--line`、`--accent` 等现有 CSS 变量，不建立平行变量体系。按钮区分主要、安静、危险和禁用状态，键盘焦点具有可见轮廓。
 
-工作台包含可折叠导航、主工作区和可选详情栏。滚动归属于相应页面或面板，长标签、身份标识和错误应换行，不能遮挡必要操作。
+工作台包含可折叠导航、主工作区和可选详情栏。主对话承担连续阅读，详细事实和高级操作放入对应任务区域、折叠区或详情栏。滚动归属于相应页面或面板，长标签、身份标识和错误应换行，不能遮挡必要操作。
 
 ## 导航与页面模式
 
 | 区域 | 当前入口 |
 | --- | --- |
-| Chat | 会话、消息路由、模型选择、输入与执行状态 |
+| Chat | 会话、消息路由、模型选择、输入、执行状态和子任务卡片 |
 | Data Workspace | 数据根、导入预览、批次选择与删除 |
 | Query History | 采用条件、已保存结果、依据与显式导出 |
 | Models | 供应商和模型配置，以及独立 Intent model 面板 |
-| Prompt / Skills / Extensions | 产品资源与扩展管理 |
+| Prompt | 提示词优化、已保存结果核查、复制和填入 Chat 草稿 |
+| Skills | 可搜索的资源目录、版本、依赖声明和就绪状态 |
+| Extensions | 只读 Agent 管理与受信扩展控制 |
 | Evaluation | 独立评测控制与结果查看 |
 | Settings | 应用设置、诊断与维护 |
 
 中英文文档都保留实际页面标签，便于在产品中定位。意图模型设置与 Chat 的 **Message routing** 是两个不同入口，参见[意图配置](../intent/configuration.zh-CN.md)。
+
+导航分为 **Work**（Chat、Data Workspace、Query History）、**Models & Resources**（Models、Prompt、Skills、Extensions）和 **Quality**（Evaluation），**Settings** 与 Host 状态位于导航底部。页面按任务组织操作；Settings 分为 **General**、**Runtime**、**Backup and restore**、**Support**，以及可用时的 **Business prompt** 区域。
+
+目录浏览与 Session 配置是不同状态。没有已确认 Session 时，可读目录不代表可以执行 Session 选择、角色编辑或任务，应保留对应的空状态、不可用原因和诊断。斜杠菜单区分 Skills、Subagents、Prompt Templates 与 Extension Commands，见[Prompt 与 Skills](../guides/prompts-and-skills.zh-CN.md)。子任务卡片与已记录角色详情见[子代理](../agents/subagents.zh-CN.md)。
 
 ## 状态与交互规则
 

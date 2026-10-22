@@ -30,7 +30,7 @@ export function ResourceInput(props:{host:HostView;source:ResourceSourceInput|nu
   const open=query&&dismissed!==props.value&&!!data;
   function choose(index:number){const candidate=candidates[index];if(!open||!candidate?.available)return;props.onChange(candidate.command.replace(/\s+$/,'')+' ');input.current?.focus();}
   return <>
-    <label className="sr-only" htmlFor="message-text">Message text</label><textarea id="message-text" ref={input} value={props.value} disabled={props.disabled} placeholder="Type a message…"
+    <label className="sr-only" htmlFor="message-text">Message text</label><textarea id="message-text" rows={1} ref={input} value={props.value} disabled={props.disabled} placeholder="Type a message…"
       aria-controls={open?'resource-commands':undefined} aria-expanded={open} aria-autocomplete="list" aria-activedescendant={open&&active>=0?'resource-command-'+active:undefined}
       onChange={e=>props.onChange(e.target.value)} onKeyDown={e=>{
         if(e.nativeEvent.isComposing||e.keyCode===229)return;

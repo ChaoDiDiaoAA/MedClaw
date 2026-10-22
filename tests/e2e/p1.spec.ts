@@ -37,6 +37,8 @@ async function launchDesktop() {
       return result;});`);
   app = await electron.launch({ executablePath: electronPath, args: [...electronTestWindowArgs,"-r", loader, '-r', eventSeam, join(root, ".build/desktop/main/index.cjs"), "--medclaw-data-root", dataRoot], env, timeout: 30000 });
   page = await app.firstWindow();
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setSize(1920, 1080));
+  await page.setViewportSize({ width: 1920, height: 1080 });
   await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().forEach(window=>window.webContents.setBackgroundThrottling(false)));
   const startupErrors: string[] = [];
   const onError = (error: Error) => startupErrors.push(error.message);
@@ -47,6 +49,7 @@ async function launchDesktop() {
 }
 async function chooseSessionModel(name: string) {
   await page.getByRole("button", { name: "Models", exact: true }).click();
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Model directory', exact: true }).click();
   await page.getByLabel("Search models").fill(name);
   await page.getByRole("button", { name: "Select " + name, exact: true }).click();
   await page.getByRole("button", { name: "Use for this session", exact: true }).click();
@@ -112,9 +115,14 @@ test("actual Electron custom model publishes, calls once, stops and reads the or
   test.setTimeout(60000);
   await page.getByRole("button", { name: "Models", exact: true }).click();
   await expect(page.getByLabel("Search models")).toBeVisible();
-  await page.getByLabel("Provider", { exact: true }).selectOption("openai");
+  await expect(page.getByRole('heading', { name: 'API keys and provider sign-in', exact: true })).toBeHidden();
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Providers', exact: true }).click();
+  await page.getByLabel("Provider to authenticate", { exact: true }).selectOption("openai");
   await page.getByRole("button", { name: "Sign in with API Key", exact: true }).click();
   const auth = page.getByRole("dialog", { name: "Provider sign-in", exact: true });
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Model directory', exact: true }).click();
+  await expect(auth).toBeVisible();
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Providers', exact: true }).click();
   await auth.locator('input[type="password"]').focus();
   await page.keyboard.press("Escape");
   await page.getByRole("alertdialog", { name: "Confirm authentication cancellation", exact: true }).getByRole("button", { name: "Confirm authentication cancellation", exact: true }).click();
@@ -125,10 +133,17 @@ test("actual Electron custom model publishes, calls once, stops and reads the or
   await expect(auth).toContainText("completed");
   await page.getByRole("button", { name: "Read authentication status", exact: true }).click();
   await expect(page.getByText("Authentication status: Authentication available", { exact: true })).toBeVisible();
-  await page.getByLabel("Provider", { exact: true }).selectOption("");
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Providers', exact: true }).click();
+  await page.getByLabel("Provider to authenticate", { exact: true }).selectOption("");
   expect(requests).toHaveLength(0);
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Providers', exact: true }).click();
+  await page.getByRole("button", { name: "New definition", exact: true }).click();
   await page.getByLabel("Provider ID").fill("p1-ui-fixture");
   await page.getByLabel("Provider name").fill("P1 UI fixture");
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Model directory', exact: true }).click();
+  await expect(page.getByLabel('Provider name', { exact: true })).toBeHidden();
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Providers', exact: true }).click();
+  await expect(page.getByLabel('Provider name', { exact: true })).toHaveValue('P1 UI fixture');
   await page.getByLabel("Base URL").fill(baseUrl);
   await page.getByLabel("Native API").selectOption("openai-completions");
   await page.getByLabel("Model ID", { exact: true }).fill("fixture");
@@ -140,6 +155,7 @@ test("actual Electron custom model publishes, calls once, stops and reads the or
   await page.getByRole("button", { name: "Save custom definition" }).click();
   await expect(page.getByText("Custom definition published", { exact: true })).toBeVisible();
   await expect(page.getByLabel("New API Key")).toHaveValue("");
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Model directory', exact: true }).click();
   await page.getByLabel("Search models").fill("UI fixture model");
   await page.getByRole("button", { name: "Select UI fixture model" }).click();
   await page.getByRole("button", { name: "Set as default model" }).click();
@@ -151,7 +167,9 @@ test("actual Electron custom model publishes, calls once, stops and reads the or
   await page.getByLabel("Message text").fill(firstText);
   await expect.poll(async () => (await page.getByLabel("Message text").inputValue()).length).toBe(firstText.length);
   await page.getByRole("button", { name: "Send", exact: true }).click();
-  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("run-save-status")).toHaveText("Saved");
+  await expect(page.getByTestId("run-save-status")).toBeAttached();
+  await expect(page.getByTestId("run-save-status")).toBeHidden();
   const firstHistory = await page.evaluate(() => window.medclaw.request("session.messages.read", { sessionId: 1 }));
   if (!firstHistory.ok) throw new Error("Expected native messages for the original saved Run");
   const firstReplyId = firstHistory.data.items.find(item => item.runId === 1 && item.displayRole === "assistant")?.nativeEntryId;
@@ -201,7 +219,7 @@ test("actual Electron custom model publishes, calls once, stops and reads the or
   await page.getByRole("button", { name: "View run details" }).click();
   await page.getByRole("tab", { name: "Run details" }).click();
   await expect(page.getByText("logical_request", { exact: false })).toBeVisible();
-  await page.screenshot({ path: test.info().outputPath("desktop-1440.png") });
+  await page.screenshot({ path: test.info().outputPath("desktop-wide-1920.png") });
   const publicReplies = await page.evaluate(async () => Promise.all([
     window.medclaw.request("run.read", { runId: 2 }),
     window.medclaw.request("model.custom.read", {}),
@@ -271,8 +289,8 @@ test("draft survives navigation, IME Enter does not send, narrow drawer returns 
   expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport.width);
   await page.screenshot({ path: test.info().outputPath("desktop-minimum-text-200.png") });
   await page.evaluate(() => { document.documentElement.style.fontSize = ""; });
-  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setSize(1440, 900));
-  await page.setViewportSize({width:1440,height:900});
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setSize(1920, 1080));
+  await page.setViewportSize({width:1920,height:1080});
   const frames = await page.evaluate(async () => {
     const end = performance.now() + 300; let count = 0;
     await new Promise<void>(resolve => { const frame = (at: number) => { count++; if (at < end) requestAnimationFrame(frame); else resolve(); }; requestAnimationFrame(frame); });
@@ -285,6 +303,7 @@ test("custom definition updates all models and persisted Unicode output pages re
   test.setTimeout(60000);
   const before = requests.length;
   await page.getByRole("button", { name: "Models", exact: true }).click();
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Providers', exact: true }).click();
   await page.getByRole("button", { name: /Edit P1 UI fixture/ }).click();
   await expect(page.getByLabel("New API Key")).toHaveValue("");
   await page.getByLabel("Model name", { exact: true }).fill("UI fixture model updated");
@@ -302,6 +321,7 @@ test("custom definition updates all models and persisted Unicode output pages re
   await second.getByLabel("Output rate", { exact: true }).fill("0.2");
   await page.getByRole("button", { name: "Save custom definition" }).click();
   await expect(page.getByText("Custom definition published", { exact: true })).toBeVisible();
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Model directory', exact: true }).click();
   await page.getByLabel("Search models").fill("UI fixture model updated");
   await page.getByRole("button", { name: "Select UI fixture model updated", exact: true }).click();
   await page.getByRole("button", { name: "Set as default model" }).click();
@@ -315,12 +335,14 @@ test("custom definition updates all models and persisted Unicode output pages re
   if (!directory.ok) throw new Error("Expected the configured model directory");
   await input.fill("long output");
   await chooseSessionModel("Second fixture model");
-  await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p1-ui-fixture", "fixture-second"]));
+  await expect(page.getByTestId("session-model")).toHaveAttribute('data-model', JSON.stringify(["p1-ui-fixture", "fixture-second"]));
   await expect(input).toHaveValue("long output");
   expect(await page.evaluate(() => window.medclaw.request("model.read", {}))).toMatchObject({ ok: true, data: { configVersion: directory.data.configVersion, selection: directory.data.selection } });
   expect(requests).toHaveLength(before);
   await page.getByRole("button", { name: "Send", exact: true }).click();
-  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("run-save-status")).toHaveText("Saved");
+  await expect(page.getByTestId("run-save-status")).toBeAttached();
+  await expect(page.getByTestId("run-save-status")).toBeHidden();
   await expect.poll(() => requests.length).toBe(before + 1);
   expect(requests.at(-1)!.model).toBe("fixture-second");
   const saved = await page.evaluate(() => window.medclaw.request("run.read", { runId: 3 }));
@@ -330,7 +352,7 @@ test("custom definition updates all models and persisted Unicode output pages re
   if (savedCall.kind !== 'main') throw new Error('Expected a main Pi call');
   expect(savedCall.model.modelId).toBe("fixture-second");
   await chooseSessionModel("UI fixture model updated");
-  await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p1-ui-fixture", "fixture"]));
+  await expect(page.getByTestId("session-model")).toHaveAttribute('data-model', JSON.stringify(["p1-ui-fixture", "fixture"]));
   const unchanged = await page.evaluate(() => window.medclaw.request("run.read", { runId: 1 }));
   expect(unchanged).toEqual(original);
   expect(await page.evaluate(() => window.medclaw.request("run.read", { runId: 3 }))).toEqual(saved);
@@ -345,12 +367,13 @@ test("custom definition updates all models and persisted Unicode output pages re
   try {
     await expect.poll(() => lockOutput).toContain("LOCKED");
     await page.getByRole("button", { name: "Models", exact: true }).click();
+    await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Model directory', exact: true }).click();
     await page.getByLabel("Search models").fill("Second fixture model");
     await page.getByRole("button", { name: "Select Second fixture model", exact: true }).click();
     await page.getByRole("button", { name: "Set as default model", exact: true }).click();
     await expect(page.getByRole("alert")).toContainText("The configuration has not been confirmed saved");
     await page.getByRole("button", { name: "Chat", exact: true }).click();
-    await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p1-ui-fixture", "fixture"]));
+    await expect(page.getByTestId("session-model")).toHaveAttribute('data-model', JSON.stringify(["p1-ui-fixture", "fixture"]));
     await expect(input).toHaveValue("draft survives failed model publication");
     expect(await page.evaluate(() => window.medclaw.request("model.read", {}))).toMatchObject(published.ok ? { ok: true, data: { configVersion: published.data.configVersion, selection: published.data.selection } } : published);
     expect(requests).toHaveLength(before + 1);
@@ -375,6 +398,7 @@ test("reopening Electron restores published custom models, preferences and runs 
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByLabel("Open run details").check();
   await page.getByLabel("Default details tab").selectOption("runtime");
+  await page.getByRole('navigation', { name: 'Settings tasks' }).getByRole('button', { name: 'General', exact: true }).click();
   await page.getByRole("button", { name: "Save display preferences", exact: true }).click();
   await expect(page.getByText("Display preferences published", { exact: true })).toBeVisible();
   const before = requests.length;
@@ -386,6 +410,7 @@ test("reopening Electron restores published custom models, preferences and runs 
   await expect(page.getByTestId("saved-output")).toContainText("你好😀");
   await expect(page.getByLabel("Message text")).toHaveValue("");
   await page.getByRole("button", { name: "Models", exact: true }).click();
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Providers', exact: true }).click();
   await page.getByRole("button", { name: /Edit P1 UI fixture/ }).click();
   await expect(page.getByLabel("New API Key")).toHaveValue("");
   const modelDefinitions = page.locator("fieldset").filter({ has: page.getByLabel("Model ID", { exact: true }) });
@@ -400,16 +425,22 @@ test("Host stop leaves local preferences and partial diagnostics reachable", asy
   test.setTimeout(45000);
   const before = requests.length;
   await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings tasks' }).getByRole('button', { name: 'Runtime', exact: true }).click();
   await page.getByRole("button", { name: "Stop Host", exact: true }).click();
   await expect(page.getByText("Host stopped", { exact: true }).first()).toBeVisible();
+  await page.getByRole('navigation', { name: 'Settings tasks' }).getByRole('button', { name: 'Support', exact: true }).click();
+  await page.locator('summary').filter({ hasText: /^Diagnostics and support$/ }).click();
+  await page.getByRole('navigation', { name: 'Settings tasks' }).getByRole('button', { name: 'Support', exact: true }).click();
   await page.getByRole("button", { name: "Read diagnostics", exact: true }).click();
   await expect(page.getByText("Diagnostics partially available; missing sources: host", { exact: true })).toBeVisible();
+  await page.getByRole('navigation', { name: 'Settings tasks' }).getByRole('button', { name: 'General', exact: true }).click();
   await expect(page.getByRole("button", { name: "Save display preferences", exact: true })).toBeEnabled();
   expect(await page.locator("body").innerText()).not.toContain("P1-UI-SECRET-CANARY");
+  await page.getByRole('navigation', { name: 'Settings tasks' }).getByRole('button', { name: 'General', exact: true }).click();
   await page.getByRole("button", { name: "Start Host", exact: true }).click();
   // Historical diagnostic entries also say "Host ready". Confirm the current
   // lifecycle panel so an old log cannot stand in for this restart's readiness.
-  await expect(page.locator('.panel').filter({ has: page.getByRole('heading', { name: 'Host', exact: true }) }).getByText("Host ready", { exact: true })).toBeVisible();
+  await expect(page.locator('.settings-host-row').getByText("Host ready", { exact: true })).toBeVisible();
   const restarted = await page.evaluate(() => window.medclaw.request('host.read', {}));
   expect(restarted.ok && restarted.data.state).toBe('ready');
   expect(requests).toHaveLength(before);
@@ -422,15 +453,19 @@ test("policy rollback publishes a new version, preserves history, and rejects an
   const original = await page.evaluate(() => window.medclaw.request("model.config.read", {}));
   const history = await page.evaluate(() => window.medclaw.request("run.read", { recent: true }));
   if (!original.ok || !history.ok || history.data.kind !== "recent") throw new Error(`Expected published configuration and saved history (configuration=${original.ok ? 'ok' : original.error.code}, history=${history.ok ? history.data.kind : history.error.code})`);
+  await page.getByRole('navigation', { name: 'Settings tasks' }).getByRole('button', { name: 'Runtime', exact: true }).click();
+  await page.getByRole('button', { name: 'Edit request policy', exact: true }).click();
   await page.getByLabel("Run timeout (milliseconds)").fill("2000");
   await page.getByRole("button", { name: "Publish request policy", exact: true }).click();
   await expect(page.getByText("Request policy published; applies to the next run", { exact: true })).toBeVisible();
   const updated = await page.evaluate(() => window.medclaw.request("model.config.read", {}));
   if (!updated.ok) throw new Error("Expected updated policy");
   expect(updated.data.policy.timeoutMs).toBe(2000);
+  await page.getByRole('button', { name: 'Previous configuration', exact: true }).click();
   await page.getByRole("button", { name: "Roll back to previous configuration", exact: true }).click();
   await page.getByRole("alertdialog", { name: "Confirm configuration rollback", exact: true }).getByRole("button", { name: "Confirm rollback publication", exact: true }).click();
   await expect(page.getByText("Rollback configuration published", { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Edit request policy', exact: true }).click();
   await expect(page.getByLabel("Run timeout (milliseconds)")).toHaveValue(String(original.data.policy.timeoutMs));
   const rolledBack = await page.evaluate(() => window.medclaw.request("model.config.read", {}));
   const after = await page.evaluate(() => window.medclaw.request("run.read", { recent: true }));
@@ -454,7 +489,7 @@ test("policy rollback publishes a new version, preserves history, and rejects an
   const frozen = await page.evaluate(runId => window.medclaw.request("run.read", { runId }), activeRunId);
   await page.getByLabel("Message text").fill("draft kept during model switch");
   await chooseSessionModel("Second fixture model");
-  await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p1-ui-fixture", "fixture-second"]));
+  await expect(page.getByTestId("session-model")).toHaveAttribute('data-model', JSON.stringify(["p1-ui-fixture", "fixture-second"]));
   await expect(page.getByLabel("Message text")).toHaveValue("draft kept during model switch");
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
   await page.getByLabel("Message text").press("Enter");
@@ -464,6 +499,8 @@ test("policy rollback publishes a new version, preserves history, and rejects an
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   const activeVersion = await page.evaluate(() => window.medclaw.request("model.config.read", {}));
   if (!activeVersion.ok) throw new Error("Expected active configuration version");
+  await page.getByRole('navigation', { name: 'Settings tasks' }).getByRole('button', { name: 'Runtime', exact: true }).click();
+  await page.getByRole('button', { name: 'Previous configuration', exact: true }).click();
   await page.getByRole("button", { name: "Roll back to previous configuration", exact: true }).click();
   await page.getByRole("alertdialog", { name: "Confirm configuration rollback", exact: true }).getByRole("button", { name: "Confirm rollback publication", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText("An operation is still running");
@@ -505,7 +542,9 @@ test("streaming preserves an upward scroll and a busy draft until return latest"
   await latest.click();
   await expect.poll(() => messages.evaluate(element => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(64);
   await expect(latest).not.toBeVisible();
-  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("run-save-status")).toHaveText("Saved");
+  await expect(page.getByTestId("run-save-status")).toBeAttached();
+  await expect(page.getByTestId("run-save-status")).toBeHidden();
   await expect(input).toHaveValue("next draft kept while busy");
   await expect(send).toBeEnabled();
   expect(requests).toHaveLength(before + 1);
@@ -550,7 +589,9 @@ test("a real SQLite lock preserves the draft and retries only original saved fac
     expect(await exited).toBe(0);
     if (!(await page.getByRole("button", { name: "Close run details", exact: true }).isVisible())) await page.getByRole("button", { name: "View run details", exact: true }).click();
     await page.getByRole("button", { name: "Retry save", exact: true }).click();
-    await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+    await expect(page.getByTestId("run-save-status")).toHaveText("Saved");
+    await expect(page.getByTestId("run-save-status")).toBeAttached();
+    await expect(page.getByTestId("run-save-status")).toBeHidden();
     const saved = await page.evaluate(id => window.medclaw.request("run.read", { runId: id }), runId);
     expect(saved).toMatchObject({ ok: true, data: { kind: "one", run: { id: runId, status: "completed", output: { text: "你好😀 OK" }, calls: [{ state: "completed", sdkStopReason: "stop" }] } } });
     expect(await page.evaluate(() => window.medclaw.request("run.active", {}))).toEqual({ ok: true, data: null });
@@ -577,7 +618,8 @@ test("repeated authentication cancellation and Host restarts release owned resou
   expect(listeners).toBe(1);
   for (let round = 0; round < 3; round++) {
     await page.getByRole("button", { name: "Models", exact: true }).click();
-    await page.getByLabel("Provider", { exact: true }).selectOption("openai");
+    await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Providers', exact: true }).click();
+    await page.getByLabel("Provider to authenticate", { exact: true }).selectOption("openai");
     await page.getByRole("button", { name: "Sign in with API Key", exact: true }).click();
     const auth = page.getByRole("dialog", { name: "Provider sign-in", exact: true });
     await expect(auth.locator('input[type="password"]')).toBeVisible();
@@ -601,6 +643,7 @@ test("repeated authentication cancellation and Host restarts release owned resou
     const host = await page.evaluate(() => window.medclaw.request("host.read", {}));
     expect(host).toMatchObject({ ok: true, data: { instanceId: old.instanceId, state: "ready" } });
     await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.getByRole('navigation', { name: 'Settings tasks' }).getByRole('button', { name: 'Runtime', exact: true }).click();
     await page.getByRole("button", { name: "Restart Host", exact: true }).click();
     await expect.poll(async () => {
       const current = await page.evaluate(() => window.medclaw.request("host.read", {}));

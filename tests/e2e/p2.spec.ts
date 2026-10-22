@@ -47,7 +47,7 @@ test.beforeAll(async () => {
         else delete state.active[p.subscriptionId];}
       return result;});`);
   app = await electron.launch({ executablePath: electronPath, args: ["-r", join(dirname(core), "lib/server/electron/loader.js"), '-r', eventSeam, join(root, ".build/desktop/main/index.cjs"), "--medclaw-data-root", dataRoot], env, timeout: 30000 });
-  page = await app.firstWindow(); await expect(page.getByText("Host ready", { exact: true }).first()).toBeVisible({ timeout: 30000 });
+  page = await app.firstWindow(); await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setSize(1920, 1080)); await page.setViewportSize({ width: 1920, height: 1080 }); await expect(page.getByText("Host ready", { exact: true }).first()).toBeVisible({ timeout: 30000 });
   const configured = await page.evaluate(async baseUrl => {
     const directory = await window.medclaw.request("model.read", {}); if (!directory.ok) throw new Error("setup directory: " + directory.error.code);
     const token = await window.medclaw.secretInput({ providerId: "p2-ui", purpose: "custom_api_key", value: "P2-UI-FIXTURE-SECRET" }); if (!token.ok) throw new Error("setup token: " + token.error.code);
@@ -66,6 +66,14 @@ test.afterAll(async () => { await app?.close(); if (server) await new Promise<vo
 const input = () => page.getByLabel("Message text", { exact: true });
 async function sessionTitle(id: number) { const value = await page.evaluate(sessionId => window.medclaw.request('session.read', { sessionId }), id); if (!value.ok || !value.data) throw new Error('Missing Session title'); return value.data.session.title; }
 async function select(id: number) { await page.locator(`.session-row[data-session-id="${id}"]`).locator('button[aria-pressed]').click(); await expect(page.getByTestId("current-session")).toContainText(await sessionTitle(id)); }
+async function chooseSessionModel(name: string) {
+  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole("button", { name: "Models", exact: true }).click();
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Model directory', exact: true }).click();
+  await page.getByLabel("Search models").fill(name);
+  await page.getByRole("button", { name: "Select " + name, exact: true }).click();
+  await page.getByRole("button", { name: "Use for this session", exact: true }).click();
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
+}
 async function send(text: string) {
   const original = await page.evaluate(async () => {
     const workspace = await window.medclaw.request("workspace.read", {}); if (!workspace.ok || !workspace.data.sessionId) throw Error("Missing selected Session");
@@ -78,7 +86,9 @@ async function send(text: string) {
     if (!runs.ok || runs.data.kind !== "recent") return false;
     const run = runs.data.runs[0]; return run?.kind === "agent" && run.clientSequence === original.sequence && run.status === "completed";
   }, original)).toBe(true);
-  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("run-save-status")).toHaveText("Saved");
+  await expect(page.getByTestId("run-save-status")).toBeAttached();
+  await expect(page.getByTestId("run-save-status")).toBeHidden();
   const facts = await page.evaluate(async () => {
     const workspace = await window.medclaw.request("workspace.read", {}); if (!workspace.ok || !workspace.data.sessionId) throw Error("Missing selected Session");
     const runs = await window.medclaw.request("run.read", { recent: true, sessionId: workspace.data.sessionId, limit: 1 });
@@ -100,31 +110,34 @@ test("New Session and A/B navigation preserve independent drafts", async () => {
   await page.getByRole("button", { name: "New Session", exact: true }).click(); await expect(page.getByTestId("current-session")).toContainText("New Session 1");
   await expect(page.getByRole("heading", { name: "Start a conversation", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "View run details", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Manage models", exact: true })).toBeVisible();
+  await expect(page.getByRole('navigation', { name: 'Main navigation' }).getByRole("button", { name: "Models", exact: true })).toBeVisible();
   await expect(input()).toHaveAttribute("placeholder", "Type a message…");
   await expect(page.getByText("Shift+Enter for a new line", { exact: true })).toBeVisible();
-  await expect(page.locator(".reference-fields summary")).toHaveText("Message time context");
-  await expect(page.locator(".sidebar-note")).toContainText("Each session keeps its context during this app session.");
+  await expect(page.locator('.composer-bottom > details.composer-routing > summary')).toHaveText('Message options');
+  await expect(page.locator(".session-sidebar-note")).toBeVisible();
+  await expect(page.locator(".session-sidebar-note")).toContainText("Each conversation keeps its own context. Review saved runs for the details.");
   await expect(page.getByText(/^Model for next message:/)).toHaveCount(0);
   await input().fill("First line\nSecond line\nThird line");
   await expect.poll(() => input().evaluate(element => element.scrollHeight - element.clientHeight)).toBe(0);
   await input().fill("中文输入😀"); await expect(input()).toHaveValue("中文输入😀");
   await page.screenshot({ path: test.info().outputPath("desktop-english-chat.png") });
-  const picker = page.getByRole("combobox", { name: "Session model", exact: true });
-  await expect(picker).toBeVisible();
-  await expect(picker.getByRole("option", { name: "P2 first · p2-ui / first", exact: true })).toHaveCount(1);
-  await expect(picker.getByRole("option", { name: "P2 second · p2-ui / second", exact: true })).toHaveCount(1);
-  await expect(picker.locator("option").filter({ hasText: "p2-unconfigured" })).toHaveCount(0);
-  await input().fill("A draft");
-  await page.getByRole("button", { name: "Manage models", exact: true }).click(); await page.getByLabel("Search models").fill("P2 unconfigured");
-  await page.getByRole("button", { name: "Select P2 unconfigured", exact: true }).click(); await page.getByRole("button", { name: "Use for this session", exact: true }).click();
+  const model = page.getByTestId("session-model");
+  await expect(model).toBeVisible();
+  await expect(model).toHaveAttribute('data-model', JSON.stringify(["p2-ui", "first"]));
+  await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveCount(0);
+  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole("button", { name: "Models", exact: true }).click();
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Model directory', exact: true }).click();
+  await page.getByLabel("Search models").fill("P2 ");
+  await expect(page.getByRole("button", { name: "Select P2 first", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Select P2 second", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Chat", exact: true }).click();
-  await expect(picker).toHaveValue("");
-  await expect(picker.locator("option").filter({ hasText: "p2-unconfigured" })).toHaveCount(0);
-  await expect(page.getByTestId("session-model")).toHaveText("The selected model is unavailable. Select a configured model.");
+  await input().fill("A draft");
+  await chooseSessionModel("P2 unconfigured");
+  await expect(model).toHaveAttribute('data-model', JSON.stringify(["p2-unconfigured", "missing-key"]));
+  await expect(page.locator('.composer-reason')).toHaveText("Authenticate the provider first");
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
   await expect(input()).toHaveValue("A draft");
-  await picker.selectOption({ label: "P2 first · p2-ui / first" });
+  await chooseSessionModel("P2 first");
   await page.getByRole("button", { name: "New Session", exact: true }).click(); await expect(page.getByTestId("current-session")).toContainText("New Session 2");
   await input().fill("B draft"); await select(1); await expect(input()).toHaveValue("A draft"); await select(2); await expect(input()).toHaveValue("B draft");
   expect(requests).toHaveLength(0);
@@ -140,27 +153,31 @@ test("A→B→A native HTTP inputs prove history isolation and continuing dialog
 test("Models session choice changes only A; global default publication is a separate action", async () => {
   const before = await page.evaluate(() => window.medclaw.request("model.read", {}));
   if (!before.ok) throw new Error("directory unavailable");
-  await page.getByRole("button", { name: "Manage models", exact: true }).click(); await page.getByLabel("Search models").fill("P2 second");
+  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole("button", { name: "Models", exact: true }).click();
+  await page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Model directory', exact: true }).click();
+  await page.getByLabel("Search models").fill("P2 second");
+  await expect(page.getByRole('navigation', { name: 'Model tasks' }).getByRole('button', { name: 'Model directory', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByRole('heading', { name: 'Custom providers and models', exact: true })).toBeHidden();
   await page.getByRole("button", { name: "Select P2 second", exact: true }).click(); await page.getByRole("button", { name: "Use for this session", exact: true }).click();
-  await page.getByRole("button", { name: "Chat", exact: true }).click(); await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p2-ui", "second"]));
+  await page.getByRole("button", { name: "Chat", exact: true }).click(); await expect(page.getByTestId("session-model")).toHaveAttribute('data-model', JSON.stringify(["p2-ui", "second"]));
   const after = await page.evaluate(() => window.medclaw.request("model.read", {}));
   if (!after.ok) throw new Error("directory unavailable");
   expect(after.data.configVersion).toBe(before.data.configVersion); expect(after.data.selection).toEqual(before.data.selection);
-  await select(2); await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p2-ui", "first"])); await select(1); await send("A with changed model");
+  await select(2); await expect(page.getByTestId("session-model")).toHaveAttribute('data-model', JSON.stringify(["p2-ui", "first"])); await select(1); await send("A with changed model");
   expect(requests.at(-1)!.model).toBe("second"); expect(JSON.stringify(requests.at(-1)!.messages)).toContain("A unique history");
-  await page.getByRole("button", { name: "Manage models", exact: true }).click(); await page.getByRole("button", { name: "Set as default model", exact: true }).click();
+  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole("button", { name: "Models", exact: true }).click(); await page.getByRole("button", { name: "Set as default model", exact: true }).click();
   await expect(page.getByText("Default model published", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Chat", exact: true }).click(); await page.getByRole("button", { name: "New Session", exact: true }).click();
-  await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p2-ui", "second"])); await select(2); await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p2-ui", "first"]));
+  await expect(page.getByTestId("session-model")).toHaveAttribute('data-model', JSON.stringify(["p2-ui", "second"])); await select(2); await expect(page.getByTestId("session-model")).toHaveAttribute('data-model', JSON.stringify(["p2-ui", "first"]));
 });
-test("Chat model selection preserves drafts and B while the next A request uses the chosen model", async () => {
+test("Models session selection preserves drafts and B while the next A request uses the chosen model", async () => {
   const before = await page.evaluate(() => window.medclaw.request("model.read", {}));
   if (!before.ok) throw new Error("directory unavailable");
   await select(1); await input().fill("A inline model choice");
-  await page.getByRole("combobox", { name: "Session model", exact: true }).selectOption({ label: "P2 first · p2-ui / first" });
+  await chooseSessionModel("P2 first");
   await expect(input()).toHaveValue("A inline model choice");
-  await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p2-ui", "first"]));
-  await select(2); await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p2-ui", "first"]));
+  await expect(page.getByTestId("session-model")).toHaveAttribute('data-model', JSON.stringify(["p2-ui", "first"]));
+  await select(2); await expect(page.getByTestId("session-model")).toHaveAttribute('data-model', JSON.stringify(["p2-ui", "first"]));
   await select(1); await expect(input()).toHaveValue("A inline model choice");
   await send("A inline model choice");
   expect(requests.at(-1)!.model).toBe("first");
@@ -171,8 +188,8 @@ test("Chat model selection preserves drafts and B while the next A request uses 
 test("running A can be browsed from B without losing B draft or retargeting Stop", async () => {
   await select(1); const before = requests.length; await input().fill("slow A"); await page.getByRole("button", { name: "Send", exact: true }).click();
   await expect.poll(() => requests.length).toBe(before + 1);
-  await page.getByRole("combobox", { name: "Session model", exact: true }).selectOption({ label: "P2 second · p2-ui / second" });
-  await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p2-ui", "second"]));
+  await chooseSessionModel("P2 second");
+  await expect(page.getByTestId("session-model")).toHaveAttribute('data-model', JSON.stringify(["p2-ui", "second"]));
   const running = await page.evaluate(() => window.medclaw.request("run.read", { recent: true, sessionId: 1, limit: 1 }));
   expect(running).toMatchObject({ ok: true, data: { kind: "recent", runs: [{ model: { modelId: "first" } }] } });
   if (!running.ok || running.data.kind !== 'recent') throw new Error('Missing actual running A');
@@ -238,14 +255,14 @@ test("a late directory read initializes the empty Session model without overwrit
   await page.evaluate(() => window.modelReadGate.release());
   const directory = await page.evaluate(() => window.medclaw.request("model.read", {}));
   if (!directory.ok || !directory.data.selection) throw new Error("model unavailable");
-  await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify([directory.data.selection.provider, directory.data.selection.modelId]));
+  await expect(page.getByTestId("session-model")).toHaveAttribute('data-model', JSON.stringify([directory.data.selection.provider, directory.data.selection.modelId]));
   await expect(input()).toHaveValue("draft typed before model directory");
   const alternative = directory.data.selection.modelId === "first" ? "second" : "first";
-  await page.getByRole("combobox", { name: "Session model", exact: true }).selectOption({ label: `P2 ${alternative} · p2-ui / ${alternative}` });
-  await page.getByRole("button", { name: "Manage models", exact: true }).click();
+  await chooseSessionModel(`P2 ${alternative}`);
+  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole("button", { name: "Models", exact: true }).click();
   await page.getByRole("button", { name: "Reload published directory", exact: true }).click();
   await page.getByRole("button", { name: "Chat", exact: true }).click();
-  await expect(page.getByRole("combobox", { name: "Session model", exact: true })).toHaveValue(JSON.stringify(["p2-ui", alternative]));
+  await expect(page.getByTestId("session-model")).toHaveAttribute('data-model', JSON.stringify(["p2-ui", alternative]));
   await expect(input()).toHaveValue("draft typed before model directory");
 });
 declare global { interface Window { harness: { show(id: number, instance?: string): void; count(): number; resolve(): void; saved(): number; diagnostics(): void } } }

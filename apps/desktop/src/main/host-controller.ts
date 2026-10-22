@@ -110,7 +110,7 @@ export class HostController {
   }
   refreshStopProof(): Promise<void> {
     if (this.child) return Promise.resolve();
-    this.checkingStop ??= this.readStopProof().finally(() => { this.checkingStop = null; });
+    this.checkingStop ??= this.readStopProof().finally(() => { this.checkingStop = null; this.status(); });
     return this.checkingStop;
   }
   private async readStopProof(): Promise<void> {
@@ -288,7 +288,7 @@ export class HostController {
         this.view.shutdown = { executionStopped: null, requiredPersistenceComplete: null, databaseClosed: null, processTreeStopped: null, error: null,
           ...this.view.shutdown, processExited: true };
         if (!stopped && !failed) this.diagnostic(error);
-        this.options.onExit?.(instanceId); await this.refreshStopProof(); this.status();
+        this.options.onExit?.(instanceId); await this.refreshStopProof();
       }
       done();
     })().catch(() => { this.diagnostic(safeError('host_stop_unconfirmed')); done(); }); }));

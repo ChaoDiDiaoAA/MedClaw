@@ -5,7 +5,7 @@ import type { DiagnosticsView, DesktopPayload, DesktopReturn } from "../../../..
 type Categories = NonNullable<DesktopPayload<'diagnostics.export'>['categories']>;
 type SupportChoice = NonNullable<DesktopReturn<'diagnostics.selectDestination'>> & { operationRef: string; categories: Categories; attempted: boolean };
 
-export function Diagnostics(props: { onError: (message: string | null) => void; exportAvailable?: boolean }) {
+export function Diagnostics(props: { onError: (message: string | null) => void; exportAvailable?: boolean; visible?: boolean }) {
   const [view, setView] = useState<DiagnosticsView | null>(null);
   const [trace, setTrace] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -59,20 +59,31 @@ export function Diagnostics(props: { onError: (message: string | null) => void; 
       else props.onError('No original support result is available; the operation remains unconfirmed.');
     } finally { setSupportBusy(false); }
   }
-  return <section className="panel diagnostics" aria-labelledby="diagnostics-title">
+  return <section className="diagnostics" hidden={props.visible === false && !loading && !supportBusy && !support && !receipt && !view && props.exportAvailable !== false} aria-labelledby="diagnostics-title">
+    <div className="task-surface" hidden={props.visible === false}>
     <div className="section-heading"><h2 id="diagnostics-title">Diagnostics</h2><button disabled={loading || supportBusy} onClick={() => void read()}>{loading ? "Reading…" : "Read diagnostics"}</button></div>
-    <label className="checkbox-label"><input type="checkbox" checked={trace} disabled={supportBusy || support?.attempted} onChange={event => { setTrace(event.target.checked); if (support) setSupport({ ...support, categories: categories(event.target.checked) }); }} />Include in-memory call stage summaries</label>
-    <p className="muted">Diagnostics include bounded safe summaries. Main status remains available when Host is unreachable. Read again to refresh this snapshot.</p>
-    <p className="muted">Support bundles contain versions, safe stage summaries and errors. Program paths are reduced to file names; credentials, database contents and model text are excluded.</p>
-    {props.exportAvailable === false && <p role="status">Repair application startup before selecting or exporting a support bundle.</p>}
+    <p className="muted">Read application status or save a support bundle.</p>
     <div className="actions"><button disabled={props.exportAvailable === false || supportBusy || loading} onClick={() => void chooseSupport()}>Choose support destination</button><button disabled={props.exportAvailable === false || supportBusy || loading || !support || support.attempted} onClick={() => void exportSupport()}>Export support bundle</button><button disabled={props.exportAvailable === false || supportBusy || loading} onClick={() => void readSupport()}>Read original support bundle</button></div>
+    </div>
+    {props.exportAvailable === false && <p role="status">Repair application startup before selecting or exporting a support bundle.</p>}
+    {(loading || supportBusy) && <p role="status">{supportBusy ? 'Checking the original support operation…' : 'Reading diagnostic sources…'}</p>}
     {support && <><p>{support.displayName}</p><p className="muted">Original support operation: {support.operationRef}</p></>}
     {receipt && <p role="status">Support bundle completion receipt · {receipt.bytes} bytes · {receipt.partial ? 'Partial diagnostic sources' : 'All diagnostic sources available'}. This receipt describes the saved file.</p>}
     {view && <>
       <p role="status">{view.partial ? `Diagnostics partially available; missing sources: ${view.missingSources.join(", ")}` : "All diagnostic sources available"}</p>
+    </>}
+    <div className="diagnostic-entries">
+      {view?.entries.filter(entry => entry.error || entry.category === 'errors').map((entry, index) => <article key={index}><span className="tiny muted">{entry.at} · {entry.source} · {entry.category}{entry.runId ? ` · Run ${entry.runId}` : ""}</span><p>{entry.error ? errorMessage(entry.error) : entry.message}</p>{entry.error && <p className="error-text">{entry.error.code} · {errorMessage(entry.error)}</p>}</article>)}
+      <details className="advanced-section" hidden={props.visible === false}><summary>Diagnostics and support</summary>
+      <label className="checkbox-label"><input type="checkbox" checked={trace} disabled={supportBusy || support?.attempted} onChange={event => { setTrace(event.target.checked); if (support) setSupport({ ...support, categories: categories(event.target.checked) }); }} />Include in-memory call stage summaries</label>
+      <p className="muted">Diagnostics include bounded safe summaries. Main status remains available when Host is unreachable. Read again to refresh this snapshot.</p>
+      <p className="muted">Support bundles contain versions, safe stage summaries and errors. Program paths are reduced to file names; credentials, database contents and model text are excluded.</p>
+      {view && <>
       <dl className="facts"><dt>Host snapshot</dt><dd>{view.host.state} · {view.host.instanceId ?? "No instance"}</dd></dl>
       {view.dependencies?.length ? <div className="table-scroll"><table aria-label="Selected tool dependencies"><thead><tr><th>Tool</th><th>Selected program</th><th>Version</th><th>Source</th></tr></thead><tbody>{view.dependencies.map(dependency => <tr key={dependency.name}><td>{dependency.name}</td><td>{dependency.path}</td><td>{dependency.version}</td><td>{dependency.source === 'installed_bundle' ? 'Application bundle' : 'SDK standard discovery'}</td></tr>)}</tbody></table></div> : <p className="muted">Tool selection is unavailable in this diagnostic snapshot.</p>}
-      <div className="diagnostic-entries">{!view.entries.length && <p className="muted">No in-memory summaries to display.</p>}{view.entries.map((entry, index) => <article key={index}><span className="tiny muted">{entry.at} · {entry.source} · {entry.category}{entry.runId ? ` · Run ${entry.runId}` : ""}</span><p>{entry.error ? errorMessage(entry.error) : entry.message}</p>{entry.error && <p className="error-text">{entry.error.code} · {errorMessage(entry.error)}</p>}</article>)}</div>
-    </>}
+      {!view.entries.length && <p className="muted">No in-memory summaries to display.</p>}{view.entries.filter(entry => !entry.error && entry.category !== 'errors').map((entry, index) => <article key={index}><span className="tiny muted">{entry.at} · {entry.source} · {entry.category}{entry.runId ? ` · Run ${entry.runId}` : ""}</span><p>{entry.message}</p></article>)}
+      </>}
+      </details>
+    </div>
   </section>;
 }

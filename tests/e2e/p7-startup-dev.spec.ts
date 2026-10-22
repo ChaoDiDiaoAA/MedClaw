@@ -40,6 +40,7 @@ test('S01/S06/S07/S08 actual dev starts unconfigured, reads unauthenticated prov
     await expect(page.getByRole('button', { name: 'Confirm import', exact: true })).toBeEnabled();
     await page.getByRole('button', { name: 'Confirm import', exact: true }).click();
     await expect.poll(async () => { const result = await page.evaluate(() => window.medclaw.request('data.read', {})); return result.ok ? result.data.batchCount : null; }).toBe(1);
+    await page.getByRole('button', { name: 'Chat', exact: true }).click();
     await page.getByRole('button', { name: 'New Session', exact: true }).click();
     await expect.poll(() => readStartupFacts(dataRoot).sessions.length).toBe(1);
     await page.getByRole('button', { name: 'Chat', exact: true }).click();
@@ -113,7 +114,7 @@ test('S03 actual dev reports a real migration failure and permits explicit recov
     setFixtureMigrationChecksum(dataRoot, original);
     await page.getByRole('button', { name: 'Start Host', exact: true }).click();
     await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
-    await expect(page.getByRole('button', { name: 'New Session', exact: true })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'New Session', exact: true, includeHidden: true })).toBeEnabled();
     const recovered = readStartupFacts(dataRoot);
     expect(recovered.runs).toBe(0); expect(recovered.calls).toBe(0);
     await testInfo.attach('failure-recovery-facts', { body: JSON.stringify({ failed: failed.data, diagnostic: diagnostic.data, recovered }), contentType: 'application/json' });

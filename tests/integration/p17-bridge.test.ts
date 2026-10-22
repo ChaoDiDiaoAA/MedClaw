@@ -43,7 +43,11 @@ function bridgeTest(name: string, body: () => Promise<void>) {
 
 bridgeTest('P17 bootstrap shell accepts only its own main frame and fails safely on preload errors', async () => {
   const root = mkdtempSync(join(tmpdir(), 'medclaw-p17-bootstrap-')), subscriptions = new Map<string, (...args: any[]) => any>(), windowEvents = new Map<string, (...args: any[]) => any>();
-  const exits: number[] = [], boxes: unknown[][] = [], notices: unknown[][] = [], mainFrame = {}, sender = { id: 31, mainFrame, send: (...args: unknown[]) => notices.push(args) };
+  let windowDestroyed = false, senderDestroyed = false, contentsDestroyed = false;
+  const exits: number[] = [], boxes: unknown[][] = [], notices: unknown[][] = [], mainFrame = {}, sender = {
+    get id() { if (senderDestroyed) throw new Error('Object has been destroyed'); return 31; },
+    mainFrame, isDestroyed: () => senderDestroyed, send: (...args: unknown[]) => notices.push(args),
+  };
   const electronVersion = Object.getOwnPropertyDescriptor(process.versions, 'electron');
   let loaded!: () => void, locked = false, nativeChoices = 0;
   const ready = new Promise<void>(resolve => { loaded = resolve; });
@@ -52,9 +56,14 @@ bridgeTest('P17 bootstrap shell accepts only its own main frame and fails safely
   mock.module(createRequire(new URL('../../apps/desktop/package.json', import.meta.url)).resolve('electron'), () => ({
     app: { hasSingleInstanceLock: () => locked, setPath: (_name: string, value: string) => expect(value).toBe(root), requestSingleInstanceLock: () => { locked = true; return true; }, whenReady: async () => {}, on: (name: string, callback: (...args: any[]) => any) => subscriptions.set('app:' + name, callback), exit: (code: number) => exits.push(code), quit() {} },
     BrowserWindow: class {
-      webContents = { ...sender, setWindowOpenHandler: (callback: () => unknown) => expect(callback()).toEqual({ action: 'deny' }), on: (name: string, callback: (...args: any[]) => any) => windowEvents.set(name, callback) };
+      private contents = { ...sender,
+        get id() { if (contentsDestroyed) throw new Error('Object has been destroyed'); return 31; },
+        isDestroyed: () => contentsDestroyed,
+        setWindowOpenHandler: (callback: () => unknown) => expect(callback()).toEqual({ action: 'deny' }), on: (name: string, callback: (...args: any[]) => any) => windowEvents.set(name, callback),
+      };
+      get webContents() { if (windowDestroyed) throw new Error('Object has been destroyed'); return this.contents; }
       constructor(options: unknown) { expect(options).toMatchObject({ webPreferences: { preload: shell.preloadEntry, contextIsolation: true, sandbox: true, nodeIntegration: false } }); }
-      isDestroyed() { return false; }
+      isDestroyed() { return windowDestroyed; }
       async loadFile(path: string) { expect(path).toBe(shell.rendererEntry); loaded(); }
     },
     ipcMain: { handle: (name: string, callback: (...args: any[]) => any) => handlers.set(name, callback), on: (name: string, callback: (...args: any[]) => any) => subscriptions.set(name, callback) },
@@ -82,6 +91,14 @@ bridgeTest('P17 bootstrap shell accepts only its own main frame and fails safely
     expect(request('host.read', { unexpected: true })).toMatchObject({ ok: false, error: { code: 'invalid_argument' } });
     subscriptions.get('medclaw:subscribe')!({ sender, senderFrame: {} }); expect(notices).toHaveLength(0);
     subscriptions.get('medclaw:subscribe')!({ sender, senderFrame: mainFrame }); expect(notices).toMatchObject([['medclaw:notice', { type: 'host.status', instanceId: null, host: { state: 'failed' } }]]);
+    for (const destroyed of ['sender', 'contents', 'window'] as const) {
+      senderDestroyed = destroyed === 'sender'; contentsDestroyed = destroyed === 'contents'; windowDestroyed = destroyed === 'window';
+      expect(() => subscriptions.get('medclaw:subscribe')!({ sender, senderFrame: mainFrame })).not.toThrow();
+      expect(notices).toHaveLength(1);
+      expect(request('host.read')).toMatchObject({ ok: false, error: { code: 'access_denied' } });
+      expect(request('diagnostics.read', { categories: ['errors'] })).toMatchObject({ ok: false, error: { code: 'access_denied' } });
+    }
+    senderDestroyed = false; contentsDestroyed = false; windowDestroyed = false;
     let prevented = false; windowEvents.get('will-navigate')!({ preventDefault: () => { prevented = true; } }); expect(prevented).toBe(true);
     windowEvents.get('preload-error')!(); expect(boxes).toHaveLength(1); expect(exits).toEqual([1]);
     expect(JSON.stringify(boxes)).not.toContain(root);

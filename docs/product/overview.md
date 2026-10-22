@@ -24,6 +24,12 @@ The main workflow is **import → select scope → ask or specify conditions →
 
 See [intent recognition](../intent/overview.md) for supported and disabled task families, [data import](../guides/data-import.md) for the accepted input, and [evaluation](../evaluation/overview.md) for evidence boundaries.
 
+## Agents and task resources
+
+[Read-only subagents](../agents/subagents.md) provide named roles, user overrides and up to four owned child executions. Child histories are independent; budgets, scope and responsibility for the final answer remain controlled by the parent. Stop, result persistence, SDK delivery and adoption are separate facts.
+
+[Prompt and Skills](../guides/prompts-and-skills.md) explains prompt optimization, draft insertion, versioned templates, slash-command groups and required-tool readiness. Optimization makes a main-model request; using the result in Chat only fills a draft. Matching a Skill's required tools does not grant permissions or certify that its instructions were followed.
+
 ## Local storage and external processing
 
 Business data, sessions, and run records are stored locally. A configured external model receives the text, context, and tool results required for its requests. An independent Judge and explicitly requested platform synchronization have separate data flows. Local-first storage does not mean every model request stays on the device.
@@ -32,6 +38,6 @@ The Electron Main process protects stored credentials with `safeStorage`; the re
 
 ## Current readiness
 
-The local intent model is fixed to the official `qwen3.5:0.8b`. Metadata inspection and engineering tests do not certify its semantic accuracy. Some taxonomy entries remain disabled because data or execution adapters are missing. The declared subagent dependency patch is currently absent from the tracked source, so clean dependency installation and packaging cannot be claimed to work without that prerequisite.
+The local intent model is fixed to the official `qwen3.5:0.8b`. Metadata inspection and engineering tests do not certify its semantic accuracy. Some taxonomy entries remain disabled because data or execution adapters are missing. The managed subagent dependency patch is tracked; clean installation, packaging and real-provider behavior still require independent verification.
 
 Read [getting started](../guides/getting-started.md), [architecture](../architecture/overview.md), and [Windows packaging](../release/windows-packaging.md) before selecting a deployment or verification path. This page reports capabilities and limits, not a completed release acceptance.

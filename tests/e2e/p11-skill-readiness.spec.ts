@@ -47,12 +47,13 @@ test('p11 Skill filters distinguish readiness, enablement and invalid resources 
   await expect(page.getByTestId('resource-row')).toHaveCount(7);
   await expect(row(page, 'query')).toContainText('2/2 capabilities');
   await expect(row(page, 'partial')).toContainText('1/2 capabilities');
-  await expect(row(page, 'partial')).toContainText('Missing read_data_scope');
+  await expect(row(page, 'partial').getByLabel('Disable partial')).toBeEnabled();
+  await row(page,'partial').getByRole('button',{name:'partial',exact:true}).click();await expect(row(page, 'partial')).toContainText('Missing read_data_scope');
   await expect(row(page, 'unavailable')).toContainText('0/2 capabilities');
   await expect(row(page, 'no-requirements')).toContainText('No requirements');
   await expect(row(page, 'legacy')).toContainText('Unknown');
   await page.getByRole('button', { name: 'Ready', exact: true }).click();
-  await expect(page.getByTestId('resource-row')).toHaveCount(2);
+  await expect(page.getByTestId('resource-row')).toHaveCount(3);
   await expect(row(page, 'broken')).toHaveCount(0);
   await page.getByRole('button', { name: 'Partial', exact: true }).click();
   await expect(page.getByTestId('resource-row')).toHaveCount(4);
@@ -68,6 +69,16 @@ test('p11 Skill filters distinguish readiness, enablement and invalid resources 
   expect(await requests(page, 'model.request')).toHaveLength(0);
 });
 
+test('p11 unmet requirements block enabling while a saved unavailable Skill can still be disabled',async({page})=>{
+  await page.goto(url);
+  await reply(page,'resources.list',{ok:true,data:list([item('partial',undefined,['read'],false),item('unavailable',undefined,[],false)])});
+  await expect(page.getByRole('switch',{name:'Enable partial',exact:true})).toBeDisabled();
+  await expect(page.getByRole('switch',{name:'Enable unavailable',exact:true})).toBeDisabled();
+  await page.getByRole('button',{name:'Refresh resources',exact:true}).click();
+  await reply(page,'resources.list',{ok:true,data:list([item('partial',undefined,['read'],true)])});
+  await expect(page.getByRole('switch',{name:'Disable partial',exact:true})).toBeEnabled();
+});
+
 test('p11 Skill names open metadata and only selected versions allow body reads; stale detail results are ignored', async ({ page }) => {
   await page.goto(url); await reply(page, 'resources.list', { ok: true, data: list() });
   await expect(page.getByRole('button', { name: 'Read query SKILL.md', exact: true })).toHaveCount(0);
@@ -77,7 +88,7 @@ test('p11 Skill names open metadata and only selected versions allow body reads;
   await page.getByRole('button', { name: 'disabled', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Read disabled SKILL.md', exact: true })).toBeDisabled();
   await reply(page, 'resources.read', { ok: true, data: { source: 'selection', sessionId: 1, configVersion: '1', resourceRef: ref('query'), file: 'SKILL.md', content: 'STALE_QUERY_BODY', bytes: 16 } });
-  await expect(page.getByTestId('resource-panel')).not.toContainText('STALE_QUERY_BODY');
+  await expect(page.getByTestId('resource-panel').filter({visible:true})).not.toContainText('STALE_QUERY_BODY');
   await page.getByRole('button', { name: 'query', exact: true }).click();
   await page.getByRole('button', { name: 'Read query SKILL.md', exact: true }).click();
   const content = '<script>ENGINEERING literal</script>';
@@ -89,16 +100,16 @@ test('p11 Skill names open metadata and only selected versions allow body reads;
 
 test('p11 disabling preserves matching counts and waits for confirmed configuration rather than an optimistic toggle', async ({ page }) => {
   await page.goto(url); const original = list(); await reply(page, 'resources.list', { ok: true, data: original });
-  await page.getByRole('button', { name: 'Disable query', exact: true }).click();
+  await page.getByRole('switch', { name: 'Disable query', exact: true }).click();
   expect((await requests(page, 'resources.select'))[0]!.input).toMatchObject({ sessionId: 1, expectedConfigVersion: '1' });
   await reply(page, 'resources.select', { ok: false, error: { code: 'config_version_conflict' } });
-  await expect(page.getByRole('button', { name: 'Disable query', exact: true })).toBeVisible();
+  await expect(page.getByRole('switch', { name: 'Disable query', exact: true })).toBeVisible();
   await expect(row(page, 'query')).toContainText('2/2 capabilities');
-  await page.getByRole('button', { name: 'Disable query', exact: true }).click();
+  await page.getByRole('switch', { name: 'Disable query', exact: true }).click();
   const updated = list(original.items.map(value => value.ref.id === 'query' ? { ...value, enabled: false } : value), '2');
   await reply(page, 'resources.select', { ok: true, data: { sessionId: 1, configVersion: '2', selection: updated.selection } });
   await reply(page, 'resources.list', { ok: true, data: updated });
-  await expect(page.getByRole('button', { name: 'Enable query', exact: true })).toBeVisible();
+  await expect(page.getByRole('switch', { name: 'Enable query', exact: true })).toBeVisible();
   await expect(row(page, 'query')).toContainText('2/2 capabilities');
   expect(await page.evaluate(() => Reflect.get(globalThis, '__published'))).toBe(1);
 });

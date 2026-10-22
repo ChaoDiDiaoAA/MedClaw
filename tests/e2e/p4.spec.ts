@@ -49,7 +49,15 @@ async function streamTarget(runId: number) {
 async function create() { await page.getByRole('button', { name: 'New Session', exact: true }).click(); const w = await page.evaluate(() => window.medclaw.request('workspace.read', {})); if (!w.ok || !w.data.sessionId) throw new Error('No selected session'); await expect(page.getByTestId('current-session')).toContainText(await sessionTitle(w.data.sessionId)); const s = await page.evaluate(id => window.medclaw.request('session.read', { sessionId: id }), w.data.sessionId); if (!s.ok || !s.data) throw new Error('No session'); return s.data.session; }
 async function sessionTitle(id: number) { const value = await page.evaluate(sessionId => window.medclaw.request('session.read', { sessionId }), id); if (!value.ok || !value.data) throw new Error('Missing Session title'); return value.data.session.title; }
 async function select(id: number) { await page.locator(`.session-row[data-session-id="${id}"]`).locator('button[aria-pressed]').click(); await expect(page.getByTestId('current-session')).toContainText(await sessionTitle(id)); }
-async function refresh() { await region().getByRole('button', { name: 'Refresh messages', exact: true }).click(); }
+async function refresh() {
+  const retry = region().getByRole('button', { name: 'Read messages again', exact: true });
+  if (await retry.isVisible()) await retry.click();
+  else {
+    const navigation = page.getByRole('navigation', { name: 'Main navigation' });
+    await navigation.getByRole('button', { name: 'Models', exact: true }).click();
+    await navigation.getByRole('button', { name: 'Chat', exact: true }).click();
+  }
+}
 
 // T06 scripts observe the actual loopback wire. Raw requests are never persisted.
 type WireMessage = { role: string; content?: unknown; tool_call_id?: string; tool_calls?: { id: string; function: { name: string; arguments: string } }[] };
@@ -76,7 +84,7 @@ async function messages(sessionId: number, leafId: string | null = null, limit =
   if (!result.ok) throw new Error(result.error.code); return result.data;
 }
 async function idle() { await expect.poll(async () => { const control = await page.evaluate(() => window.medclaw.request('run.control.read', {})); return control.ok && control.data.acceptingNewRuns && !control.data.activeRootRun && inFlight === 0; }).toBe(true); }
-async function reference() { if (!await page.locator('.reference-fields').evaluate(element => (element as HTMLDetailsElement).open)) await page.locator('.reference-fields summary').click(); await page.getByLabel('Reference date', { exact: true }).fill('2026-01-02'); await page.getByLabel('Time zone', { exact: true }).fill('Asia/Shanghai'); }
+async function reference() { if (!await page.getByLabel('Reference date', { exact: true }).isVisible()) await page.getByText('Message options', { exact: true }).click(); await page.getByLabel('Reference date', { exact: true }).fill('2026-01-02'); await page.getByLabel('Time zone', { exact: true }).fill('Asia/Shanghai'); }
 async function send(text: string) {
   await idle(); await reference(); const before = (await accepted()).length;
   const workspace = await page.evaluate(() => window.medclaw.request('workspace.read', {})); if (!workspace.ok) throw new Error('No Workspace');
@@ -85,15 +93,17 @@ async function send(text: string) {
   const origin = (await accepted())[before]!; expect(origin.sessionId).toBe(workspace.data.sessionId); expect(origin.batchIds).toEqual(workspace.data.batchRefs.map(batch => batch.id));
   await idle(); const run = await readRun(origin.runId);
   expect(run).toMatchObject({ kind: 'agent', sessionId: origin.sessionId, clientSequence: origin.clientSequence, status: 'completed', persistence: 'committed', referenceDate: origin.referenceDate, timezone: origin.timezone }); expect(run.answerRef).not.toBeNull();
-  await expect(page.getByText('Saved', { exact: true })).toBeVisible(); return { origin, run };
+  await expect(page.getByTestId('run-save-status')).toHaveText('Saved'); await expect(page.getByTestId('run-save-status')).toBeAttached(); await expect(page.getByTestId('run-save-status')).toBeHidden(); return { origin, run };
 }
 function saveEvidence(name: string, value: unknown) { mkdirSync(evidenceDirectory, { recursive: true }); writeFileSync(join(evidenceDirectory, name + '.json'), JSON.stringify(value, null, 2)); }
 async function shot(name: string) { mkdirSync(evidenceDirectory, { recursive: true }); await page.screenshot({ path: join(evidenceDirectory, name + '.png'), fullPage: true }); }
 async function messageShots(name: string, native: SessionMessagePage) {
-  if (await page.locator('.reference-fields').evaluate(element => (element as HTMLDetailsElement).open)) await page.locator('.reference-fields summary').click();
+  if (await page.getByLabel('Reference date', { exact: true }).isVisible()) await page.getByText('Message options', { exact: true }).click();
   await refresh();
   for (const [index, item] of native.items.filter(item => item.displayRole === 'user' || item.displayRole === 'assistant').entries()) {
-    const article = region().locator(`[data-native-entry-id="${item.nativeEntryId}"]`); await expect(article).toBeVisible();
+    const article = region().locator(`[data-native-entry-id="${item.nativeEntryId}"]`);
+    if (!item.text?.trim()) { await expect(article).toBeAttached(); await expect(article).toBeHidden(); continue; }
+    await expect(article).toBeVisible();
     await article.locator('.answer-text').evaluate(element => element.scrollIntoView({ block: 'center' }));
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve()))); await shot(`${name}-message-${index + 1}`);
   }
@@ -207,7 +217,7 @@ test.beforeAll(async () => {
   const env: Record<string, string> = { ...Object.fromEntries(Object.entries(process.env).flatMap(([key, value]) => value === undefined ? [] : [[key, value]])), MEDCLAW_HOST_ENTRY: hostEntry, MEDCLAW_BUN_EXECUTABLE: execFileSync(bun, ['-e', 'process.stdout.write(process.execPath)'], { encoding: 'utf8' }).trim() };
   delete env.ELECTRON_RUN_AS_NODE;
   app = await electron.launch({ executablePath: electronPath, args: ['-r', join(dirname(core), 'lib/server/electron/loader.js'), '-r', seam, join(root, '.build/desktop/main/index.cjs'), '--medclaw-data-root', join(temporary, 'data')], env, timeout: 30000 });
-  page = await app.firstWindow(); await page.setViewportSize({ width: 1440, height: 900 }); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
+  page = await app.firstWindow(); await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setSize(1920, 1080)); await page.setViewportSize({ width: 1920, height: 1080 }); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
   await app.evaluate(({ dialog }, path) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [path] }); }, join(temporary, 'source'));
   const configured = await page.evaluate(async baseUrl => {
     const directory = await window.medclaw.request('model.read', {}); if (!directory.ok) throw new Error(directory.error.code);
@@ -318,7 +328,7 @@ test('chat message pages reject late session, host and leaf replies', async () =
   await rules([{ method: 'session.messages.read', sessionId: a.id, leafId: null, project: projection(a.id, a.nativeSessionId, 'leaf-two', [entry('same-1', 'Repeated text'), entry('same-2', 'Repeated text')], 'cursor-two') }]);
   await refresh(); await expect(region().locator('[data-native-entry-id]')).toHaveCount(2); await release('old-leaf'); await expect(region()).not.toContainText('OLD LEAF'); await expect(region()).not.toContainText('Old captured leaf'); await expect(region()).toContainText('leaf-two');
   await rules([{ method: 'session.messages.read', sessionId: a.id, hold: 'old-error', project: { ok: false, error: { code: 'native_state_invalid', category: 'session', message: 'Old error', retryable: false } } }]); await refresh(); await entered('old-error');
-  await rules([{ method: 'session.messages.read', sessionId: a.id, hold: 'current-loading', project: projection(a.id, a.nativeSessionId, 'empty-projection', [], 'hidden-cursor') }]); await refresh(); await entered('current-loading'); await release('old-error'); await expect(region().getByRole('status')).toContainText('Reading native messages'); await expect(region().getByRole('alert')).toHaveCount(0); await release('current-loading'); await expect(region()).toContainText('More native entries');
+  await rules([{ method: 'session.messages.read', sessionId: a.id, hold: 'current-loading', project: projection(a.id, a.nativeSessionId, 'empty-projection', [], 'hidden-cursor') }]); await refresh(); await entered('current-loading'); await release('old-error'); await expect(region().getByRole('status')).toContainText('Reading messages'); await expect(region().getByRole('alert')).toHaveCount(0); await release('current-loading'); await expect(region()).toContainText('More native entries');
   await rules([{ method: 'session.messages.read', sessionId: a.id, leafId: 'empty-projection', project: projection(a.id, a.nativeSessionId, 'empty-projection', [entry('visible', 'Visible after omitted page')]) }]); await region().getByRole('button', { name: 'Load more messages' }).click(); await expect(region()).toContainText('Visible after omitted page');
   expect((await calls()).filter(call => call.method === 'session.messages.read' && call.leafId === 'empty-projection').at(-1)).toMatchObject({ sessionId: a.id, afterEntryId: 'hidden-cursor' });
   await input().fill('Draft survives failed message read'); await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled(); await rules([{ method: 'session.messages.read', sessionId: a.id, project: { ok: false, error: { code: 'native_state_invalid', category: 'session', message: 'Current failure', retryable: false } } }]); await refresh(); await expect(region().getByRole('alert')).toContainText('Message history read failed'); await expect(region()).toContainText('Visible after omitted page'); await expect(input()).toHaveValue('Draft survives failed message read'); await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled(); await expect(region().getByRole('button', { name: 'Create new session', exact: true })).toBeVisible();
@@ -336,12 +346,13 @@ test('chat message pages reject late session, host and leaf replies', async () =
   const host = await page.evaluate(() => window.medclaw.request('host.read', {})); if (!host.ok || !host.data.instanceId) throw new Error('No host');
   expect(await page.evaluate(instanceId => window.medclaw.request('host.restart', { expectedInstanceId: instanceId }), host.data.instanceId)).toMatchObject({ ok: true });
   await expect(region()).toContainText('Saved history'); await release('old-host'); await expect(region()).not.toContainText('OLD HOST TEXT'); await expect(region()).not.toContainText('HOST OLD'); expect(httpCount).toBe(readHttpBefore);
-  expect(await page.evaluate(sessionId => window.medclaw.request('session.messages.read', { sessionId, leafId: null, afterEntryId: null, limit: 50 }), a.id)).toMatchObject({ ok: true, data: {source:'sqlite_history'} }); expect(httpCount).toBe(readHttpBefore);
+  const restartedHistory = await page.evaluate(sessionId => window.medclaw.request('session.messages.read', { sessionId, leafId: null, afterEntryId: null, limit: 50 }), a.id);
+  expect(restartedHistory, JSON.stringify(restartedHistory)).toMatchObject({ ok: true, data: {source:'sqlite_history'} }); expect(httpCount).toBe(readHttpBefore);
 });
 
 // Binding Stop and tool reads to the displayed B instead of the original active A breaks this test.
 test('viewing B while A runs preserves B draft and keeps Stop and tool results on A', async () => {
-  const a = await create(), b = await create(); await input().fill('B previously saved message'); await page.getByRole('button', { name: 'Send', exact: true }).click(); await expect(page.getByText('Saved', { exact: true })).toBeVisible(); await select(a.id); const before = httpCount;
+  const a = await create(), b = await create(); await input().fill('B previously saved message'); await page.getByRole('button', { name: 'Send', exact: true }).click(); await expect(page.getByTestId('run-save-status')).toHaveText('Saved'); await expect(page.getByTestId('run-save-status')).toBeAttached(); await expect(page.getByTestId('run-save-status')).toBeHidden(); await select(a.id); const before = httpCount;
   await input().fill('slow A tool'); await page.getByRole('button', { name: 'Send', exact: true }).click(); await expect.poll(() => httpCount).toBe(before + 2); await expect(temporaryAnswer()).toHaveText('P4 temporary reply');
   const active = await page.evaluate(() => window.medclaw.request('run.active', {})); if (!active.ok || !active.data) throw new Error('No active run'); const runId = active.data.runId;
   const original = await page.evaluate(runId => window.medclaw.request('run.read', { runId }), runId); if (!original.ok || original.data.kind !== 'one' || !original.data.run || original.data.run.kind !== 'agent') throw new Error('No original run');
@@ -392,11 +403,16 @@ test('viewing B while A runs preserves B draft and keeps Stop and tool results o
 // Scroll following must not resume on a page read, hidden-page update, or temporary preview.
 test('temporary output and saved messages remain separate while scrolling', async () => {
   const a = await create(); const before = httpCount;
-  await input().fill('short saved message'); await page.getByRole('button', { name: 'Send', exact: true }).click(); await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  await input().fill('short saved message'); await page.getByRole('button', { name: 'Send', exact: true }).click(); await expect(page.getByTestId('run-save-status')).toHaveText('Saved'); await expect(page.getByTestId('run-save-status')).toBeAttached(); await expect(page.getByTestId('run-save-status')).toBeHidden();
   const native = await page.evaluate(id => window.medclaw.request('session.messages.read', { sessionId: id, leafId: null, afterEntryId: null, limit: 50 }), a.id); if (!native.ok) throw new Error('No native messages');
   const rows = Array.from({ length: 50 }, (_, index) => { const text = 'Historical native text ' + index + '\n' + 'Synthetic line\n'.repeat(8); return entry('history-' + index, text, index === 0 ? { textInfo: { totalChars: text.length + 100, truncated: true, redacted: true } } : {}); });
   await rules([{ method: 'session.messages.read', sessionId: a.id, project: projection(a.id, a.nativeSessionId, 'scroll-leaf', rows, 'scroll-cursor') }]); await refresh(); await expect(region().locator('[data-native-entry-id]')).toHaveCount(50); await expect(region()).toContainText('Native memory'); await expect(region()).not.toContainText('Saved'); await expect(page.getByTestId('run-output')).toHaveCount(0); await expect(page.locator('.messages')).toContainText('Native history page incomplete');
+  const nativeHeading = region().getByRole('heading', { name: /^Native memory · Session /, includeHidden: true });
+  await expect(nativeHeading).toBeAttached(); await expect(nativeHeading).toBeHidden();
+  await expect(region().locator('.message-origin')).toBeAttached(); await expect(region().locator('.message-origin')).toBeHidden();
   await expect(region()).toContainText('Native message display truncated'); await expect(region()).toContainText('Unsafe native fields omitted');
+  const omitted = region().getByText('Unsafe native fields omitted.', { exact: true });
+  await expect(omitted).toBeAttached(); await expect(omitted).toBeHidden();
   await page.locator('.messages').evaluate(element => { element.scrollTop = 200; element.dispatchEvent(new Event('scroll')); }); await expect(page.getByRole('button', { name: 'New content · Back to latest', exact: true })).toBeVisible();
   const beforePagination = await nativeReadingAnchor();
   await rules([{ method: 'session.messages.read', sessionId: a.id, leafId: 'scroll-leaf', project: projection(a.id, a.nativeSessionId, 'scroll-leaf', [entry('tail', 'Native tail')]) }]); await region().getByRole('button', { name: 'Load more messages' }).click(); await expect(region().locator('[data-native-entry-id]')).toHaveCount(51);
@@ -408,12 +424,13 @@ test('temporary output and saved messages remain separate while scrolling', asyn
   await page.getByRole('button', { name: 'Chat', exact: true }).click(); await page.getByRole('button', { name: 'New content · Back to latest', exact: true }).click(); await expect.poll(() => page.locator('.messages').evaluate(element => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(2);
   await input().fill('slow A scroll'); await page.getByRole('button', { name: 'Send', exact: true }).click(); await expect.poll(() => httpCount).toBe(before + 3); await expect(temporaryAnswer()).toHaveText('P4 temporary reply'); await expect(page.getByTestId('temporary-run-area')).toContainText('Temporary output'); await expect(page.getByTestId('temporary-run-area')).not.toContainText('Saved');
   const previewReadsBefore = (await calls()).length;
+  const facts = await page.evaluate(async () => ({ host: await window.medclaw.request('host.read', {}), active: await window.medclaw.request('run.active', {}) })); if (!facts.host.ok || !facts.active.ok || !facts.active.data) throw new Error('Missing original preview target');
   // P6 may refresh the native page while reconnecting its display subscription. Keep
   // this scroll-only safe page projection stable until this scenario releases it.
   await rules([{ method: 'session.messages.read', sessionId: a.id, persistent: true, group: 'scroll-preview-page', project: projection(a.id, a.nativeSessionId, 'preview-scroll-leaf', rows) }]); await refresh(); await expect(region().locator('[data-native-entry-id]')).toHaveCount(50);
-  await page.locator('.messages').evaluate(element => { element.scrollTop = 200; element.dispatchEvent(new Event('scroll')); }); await expect(page.getByRole('button', { name: 'New content · Back to latest', exact: true })).toBeVisible();
-  const facts = await page.evaluate(async () => ({ host: await window.medclaw.request('host.read', {}), active: await window.medclaw.request('run.active', {}) })); if (!facts.host.ok || !facts.active.ok || !facts.active.data) throw new Error('Missing original preview target');
+  await expect(region()).toContainText('preview-scroll-leaf'); await expect(region().getByText('Reading messages…', { exact: true })).toHaveCount(0);
   const previewTarget = await streamTarget(facts.active.data.runId); expect(previewTarget.snapshot.sessionId).toBe(a.id);
+  await page.locator('.messages').evaluate(element => { element.scrollTop = 200; element.dispatchEvent(new Event('scroll')); }); await expect(page.getByRole('button', { name: 'New content · Back to latest', exact: true })).toBeVisible();
   expect(await page.locator('.messages').evaluate(element => element.scrollTop), 'reading position before the injected preview').toBeCloseTo(200, 0);
   const currentSnapshot = { ...previewTarget.snapshot, revision: previewTarget.snapshot.revision + 100, phase: 'streaming' as const, blocks: [{ contentIndex: 0, text: 'New temporary preview while reading' }], totalChars: 'New temporary preview while reading'.length + 1, truncated: true };
   await app.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0]!.webContents.send('medclaw:notice', { type: 'event.stream', instanceId: value.instanceId, subscriptionId: value.subscriptionId, snapshot: value.snapshot }), { ...previewTarget, snapshot: currentSnapshot }); await expect(temporaryAnswer()).toHaveText('New temporary preview while reading'); expect(await page.locator('.messages').evaluate(element => element.scrollTop)).toBeCloseTo(200, 0); await expect(region()).not.toContainText('New temporary preview');
@@ -425,12 +442,14 @@ test('temporary output and saved messages remain separate while scrolling', asyn
   const tool = page.getByTestId('tool-call-details'); await expect(tool.locator('dt:has-text("SDK result status") + dd')).toHaveText('Unknown; SDK receipt unconfirmed'); await expect(tool).toContainText('Model consumption: Unknown'); await expect(tool.locator('dt:has-text("Native output truncated") + dd')).toHaveText('Unknown'); await expect(tool).toContainText('Command exit code: Unknown'); await expect(tool).not.toContainText('INTERNAL-WRAPPER-VERSION');
   await app.evaluate(() => { (globalThis as MainGlobal).__p4Gate.toolProjection = 'truncated'; }); await page.getByRole('button', { name: 'Refresh tools', exact: true }).click(); await expect(tool.locator('dt:has-text("Native output truncated") + dd')).toHaveText('Yes'); await expect(tool).toContainText('Model consumption: Unknown');
   await app.evaluate(() => { (globalThis as MainGlobal).__p4Gate.toolProjection = 'verified'; }); await page.getByRole('button', { name: 'Refresh tools', exact: true }).click(); await expect(tool.locator('dt:has-text("Model consumption") + dd')).toContainText('Included in model call old-call'); await expect(tool.locator('dt:has-text("Native output truncated") + dd')).toHaveText('No');
-  const evidence = join(root, '.build/p4-messages'); mkdirSync(evidence, { recursive: true }); await page.screenshot({ path: join(evidence, 't04-1440x900.png') });
+  const evidence = join(root, '.build/p4-messages'); mkdirSync(evidence, { recursive: true }); await page.screenshot({ path: join(evidence, 't04-wide-1920x1080.png') });
   await page.setViewportSize({ width: 1100, height: 720 }); await expect(page.getByRole('dialog', { name: 'Run details', exact: true })).toBeVisible(); await page.screenshot({ path: join(evidence, 't04-1100x720.png') }); await page.setViewportSize({ width: 760, height: 720 });
   const close = page.getByRole('button', { name: 'Close run details', exact: true }); await close.focus(); await page.keyboard.press('Shift+Tab'); await expect(page.getByRole('dialog', { name: 'Run details', exact: true })).toContainText('Native memory'); expect(await page.getByRole('dialog').evaluate(element => element.contains(document.activeElement))).toBe(true); await page.screenshot({ path: join(evidence, 't04-narrow-drawer.png') }); await page.keyboard.press('Escape'); await expect(page.getByRole('button', { name: 'View run details', exact: true })).toBeFocused(); await page.screenshot({ path: join(evidence, 't04-narrow-focus.png') });
-  await page.setViewportSize({ width: 1100, height: 720 }); await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.webContents.insertCSS('html { font-size: 28px !important; }')); expect(await page.evaluate(() => getComputedStyle(document.documentElement).fontSize)).toBe('28px'); await page.getByRole('button', { name: 'View run details', exact: true }).click(); await expect(close).toBeVisible(); await page.screenshot({ path: join(evidence, 't04-200pct-css.png') }); await close.click();
+  await page.setViewportSize({ width: 1100, height: 720 }); const fontStyle = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.webContents.insertCSS('html { font-size: 28px !important; }')); expect(await page.evaluate(() => getComputedStyle(document.documentElement).fontSize)).toBe('28px'); await page.getByRole('button', { name: 'View run details', exact: true }).click(); await expect(close).toBeVisible(); await page.screenshot({ path: join(evidence, 't04-200pct-css.png') }); await close.click();
   const sendButton = page.getByRole('button', { name: 'Send', exact: true }); await sendButton.scrollIntoViewIfNeeded(); const sendBounds = await sendButton.boundingBox(); expect(sendBounds).not.toBeNull(); expect(sendBounds!.x + sendBounds!.width).toBeLessThanOrEqual(1100); expect(sendBounds!.y + sendBounds!.height).toBeLessThanOrEqual(720); await page.screenshot({ path: join(evidence, 't04-200pct-css-chat.png') });
   await page.getByRole('button', { name: 'Stop generating', exact: true }).click(); await expect(page.getByText('Cancelled and saved', { exact: true })).toBeVisible(); expect(httpCount).toBe(before + 3);
+  await app.evaluate(({ BrowserWindow }, key) => BrowserWindow.getAllWindows()[0]!.webContents.removeInsertedCSS(key), fontStyle);
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setSize(1920, 1080)); await page.setViewportSize({ width: 1920, height: 1080 });
 });
 
 async function showRun(runId: number) { await page.getByRole('button', { name: 'View run details', exact: true }).click(); await page.getByRole('tab', { name: 'Run details', exact: true }).click(); await page.getByRole('button', { name: `View Run ${runId}`, exact: true }).click(); }
@@ -450,7 +469,7 @@ test('A queries Zhejiang changes, follows up, corrects the manufacturer and keep
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click(); await page.getByRole('button', { name: 'Choose snapshot directory', exact: true }).click(); await expect(page.getByTestId('import-state')).toHaveText('ready');
   await page.getByRole('button', { name: 'Confirm import', exact: true }).click(); await expect(page.getByTestId('import-state')).toHaveText('imported'); await expect(page.getByTestId('import-result')).toContainText('8 accepted rows');
   await page.getByRole('button', { name: 'Select batches on this page', exact: true }).click(); await page.getByRole('button', { name: 'Apply 2 selected batches', exact: true }).click(); await page.getByRole('button', { name: 'Chat', exact: true }).click();
-  if (!await page.locator('.reference-fields').evaluate(element => (element as HTMLDetailsElement).open)) await page.locator('.reference-fields summary').click();
+  if (!await page.getByLabel('Reference date', { exact: true }).isVisible()) await page.getByText('Message options', { exact: true }).click();
   await page.getByRole('button', { name: 'Use data defaults', exact: true }).click();
   const w = await page.evaluate(() => window.medclaw.request('workspace.read', {})); if (!w.ok) throw new Error('No Workspace'); const batchIds = w.data.batchRefs.map(batch => batch.id); expect(batchIds).toHaveLength(2); expect(w.data.deviceIds).toEqual([]);
   const queries: Record<string, QueryReceipt> = {}, scopes: ScopeReceipt[] = [], next = gate();
@@ -568,6 +587,9 @@ test('actual same-text submissions, cursors and native structural omission remai
   const structural = await messages(seeded.id), dto = JSON.stringify(structural); expect(dto).not.toContain('STRUCTURE-CANARY'); for (const key of ['thinkingSignature', 'textSignature', 'base64', 'command', 'details']) expect(dto).not.toContain(key); expect(Buffer.byteLength(dto)).toBeLessThanOrEqual(3 * 1024 * 1024);
   const seededAnswer = structural.items.find(item => item.displayRole === 'assistant'); expect(seededAnswer).toMatchObject({ text: 'x'.repeat(8191), textInfo: { totalChars: 8194, truncated: true, redacted: true } }); expect(structural.items.find(item => item.displayRole === 'tool_result')).toMatchObject({ text: null, toolCallRef: 'seeded-read', textInfo: { redacted: true } });
   await refresh(); await expect(region()).toContainText('Native message display truncated'); await expect(region()).toContainText('Unsafe native fields omitted'); await expect(region()).not.toContainText('STRUCTURE-CANARY'); expect(await region().ariaSnapshot()).not.toContain('STRUCTURE-CANARY');
+  const omitted = region().getByText('Unsafe native fields omitted.', { exact: true });
+  await expect(omitted).toHaveCount(2);
+  for (const notice of await omitted.all()) { await expect(notice).toBeAttached(); await expect(notice).toBeHidden(); }
   const preserved = JSON.parse(readFileSync(join(temporary, 'seed-observed.json'), 'utf8')); expect(preserved).toEqual({ nativeSessionId: seeded.nativeSessionId, unchanged: true }); expect(httpCount).toBe(readBefore); await shot('actual-structure-test-only');
   saveEvidence('same-text-and-safe-reads', { controlledProvider: true, physicalCalls: httpCount - before, sameText: [one.origin, two.origin], nativeSessionId: nativeA.nativeSessionId, leafId: nativeA.leafId, distinctUserEntries: users.map(item => ({ nativeEntryId: item.nativeEntryId, runId: item.runId })), cursorErrors: [invalid.ok ? null : { code: invalid.error.code, reason: invalid.error.reason }, badLeaf.ok ? null : { code: badLeaf.error.code, reason: badLeaf.error.reason }], paginationCount: paged.length, readPhysicalDelta: httpCount - readBefore, logicalIds: [one, two, bRun].flatMap(record => record.run.calls.map(call => call.callId)), structuralFixture: { testOnly: true, sentToModel: false, nativeSessionId: seeded.nativeSessionId, unchanged: preserved.unchanged, dtoBytes: Buffer.byteLength(dto), leafId: structural.leafId, nativeEntryIds: structural.items.map(item => item.nativeEntryId) } });
 });

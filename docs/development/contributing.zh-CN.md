@@ -4,7 +4,7 @@
 
 ## 工程与前置条件
 
-当前开发路径使用 Windows x64、Bun `1.4.0` 与 Node.js 24。干净安装前先阅读[使用入门](../guides/getting-started.zh-CN.md)中的既有依赖补丁缺失问题，已有依赖目录不能证明干净安装就绪。
+当前开发路径使用 Windows x64、Bun `1.4.0` 与 Node.js 24。受控子代理依赖补丁已跟踪，按[使用入门](../guides/getting-started.zh-CN.md)与锁文件配套保留。已有依赖目录不能证明干净安装就绪。
 
 | 目录 | 职责 |
 | --- | --- |
@@ -12,7 +12,7 @@
 | `packages/contracts`、`packages/core` | 共享契约、应用与领域行为 |
 | `packages/runtime-pi`、`packages/intent-ollama` | 主 Agent 接入与独立本地意图客户端 |
 | `packages/storage`、`packages/logging` | 持久化、迁移与诊断投影 |
-| `resources` | 产品 Prompt、Skills 与受信扩展 |
+| `resources` | 产品 Prompt、Skills、子代理角色与模板、受信扩展 |
 | `agent-eval`、`tests` | 独立评测与工程验证 |
 
 修改边界前阅读[系统架构](../architecture/overview.zh-CN.md)和[意图识别](../intent/overview.zh-CN.md)。数据制作核验所需的公开语义见[行为契约](../architecture/behavior-contracts.zh-CN.md)。
@@ -25,13 +25,15 @@
 | --- | --- |
 | `bun run dev:desktop` | 准备开发资源并启动桌面 |
 | `bun run typecheck` | 工作区 TypeScript 检查 |
-| `bun run test:unit` | 单元测试 |
-| `bun run test:integration` | 集成测试 |
-| `bun run test:e2e` | 终端产品与 Host 工作流检查 |
-| `bun run test:e2e:desktop` | Electron 桌面交互检查 |
+| `bun run test:unit -- --stage P13` | 指定阶段的单元测试 |
+| `bun run test:integration -- --stage P13` | 指定阶段的集成测试 |
+| `bun run test:e2e -- --stage P13` | 指定阶段的终端产品与 Host 工作流检查 |
+| `bun run test:e2e:desktop -- --stage P13` | 指定阶段的 Electron 桌面交互检查 |
 | `bun run test:eval` | 评测设施工程测试 |
 | `bun run build:desktop` | 准备桌面与随包生产资源 |
 | `bun run package:desktop` | 构建 Windows x64 安装包 |
+
+`P13` 是示例，应按改动选择 `P1` 至 `P17`。单元与集成命令必须提供 `--stage`，省略时返回 Usage，不运行测试。终端 e2e 与桌面命令省略阶段时，默认执行各自发现的全部阶段；它们支持 `--check`，例如 `bun run test:e2e:desktop -- --stage P13 --check`，仅列出选中文件并检查运行器，不执行测试，也不证明应用或模型就绪。参见[测试运行器](../../tests/run.ts)。
 
 选择能够覆盖实际变更、调用方、持久化状态和取消路径的验证。确定性夹具与真实服务检查分别报告。端到端或模型评测前检查前置；外部请求可能计费并传输任务材料，见[评测说明](../evaluation/overview.zh-CN.md)。
 

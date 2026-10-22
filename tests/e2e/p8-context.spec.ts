@@ -25,6 +25,7 @@ test('p8 actual desktop shows original materials and delivery evidence across Se
   try {
     const importDirectory=join(temporary,'source package');createStartupPackage(importDirectory);
     desktop = await launchActualDev(temporary,dataRoot,importDirectory); const {page} = desktop;
+    await page.setViewportSize({width:1920,height:1080});
     await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible({timeout:30000});
     const configured = await page.evaluate(async baseUrl => {
       const directory = await window.medclaw.request('model.read',{});if(!directory.ok) throw new Error(directory.error.code);
@@ -59,6 +60,7 @@ test('p8 actual desktop shows original materials and delivery evidence across Se
     const pending=await page.evaluate(async()=>{const recent=await window.medclaw.request('run.read',{recent:true});if(!recent.ok||recent.data.kind!=='recent')throw new Error('No run');const run=await window.medclaw.request('run.read',{runId:recent.data.runs[0]!.id});if(!run.ok||run.data.kind!=='one'||!run.data.run)throw new Error('No call');return window.medclaw.request('context.read',{callId:run.data.run.calls[0]!.callId});});
     expect(pending).toMatchObject({ok:true,data:{kind:'snapshot',evidence:'unconfirmed',deliveries:[],snapshot:{workspaceContext:{selection:selected.selection}}}});
     await page.getByRole('button',{name:'Data Workspace',exact:true}).click();
+    await page.getByRole('button',{name:'Edit selection',exact:true}).click();
     await page.getByRole('button',{name:'Clear selection',exact:true}).click();
     await expect(page.getByTestId('confirmed-selection')).toHaveCount(0);
     await expect.poll(async()=>{const current=await page.evaluate(()=>window.medclaw.request('workspace.read',{}));return current.ok && current.data.selection === null;}).toBe(true);
@@ -92,7 +94,7 @@ test('p8 actual desktop shows original materials and delivery evidence across Se
     const after = readStartupFacts(dataRoot);expect(after.runs).toBe(before.runs);expect(after.calls).toBe(before.calls);expect(received).toHaveLength(4);
     await testInfo.attach('context-desktop-evidence',{body:JSON.stringify({original,requests:received.length,before:{runs:before.runs,calls:before.calls},after:{runs:after.runs,calls:after.calls},accessibility:await panel.ariaSnapshot()}),contentType:'application/json'});
     await page.keyboard.press('Escape');await expect(page.getByRole('dialog',{name:'Run details',exact:true})).toHaveCount(0);
-    await page.evaluate(()=>{document.body.style.zoom='1';});await page.setViewportSize({width:1400,height:1000});
+    await page.evaluate(()=>{document.body.style.zoom='1';});await page.setViewportSize({width:1920,height:1080});
     const databasePath=join(dataRoot,'data/app.sqlite');
     execFileSync('bun',['-e',`import{Database}from'bun:sqlite';const db=new Database(Bun.argv[1]);db.exec("CREATE TRIGGER p8_desktop_delivery_fault BEFORE INSERT ON context_deliveries BEGIN SELECT RAISE(ABORT,'fixture delivery save failure'); END;");db.close();`,databasePath],{cwd:resolve('.'),stdio:'pipe'});
     await page.getByLabel('Message text',{exact:true}).fill('Show original delivery save failure.');await page.getByRole('button',{name:'Send',exact:true}).click();

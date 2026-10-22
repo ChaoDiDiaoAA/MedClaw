@@ -70,6 +70,12 @@ export const ResourceItemSchema = z.strictObject({ ref: ResourceRefSchema, name:
   enabled: z.boolean(), availability: z.enum(['ready', 'missing', 'conflict', 'invalid', 'dependency_missing', 'content_changed']), disableModelInvocation: z.boolean().nullable(),
   files: z.array(fileMetadata).max(RESOURCE_LIMITS.files), requiredTools: names.nullable(), requiredExtensions: names.nullable(), diagnostics: z.array(ResourceDiagnosticSchema).max(256), readiness: SkillReadinessSchema.optional() });
 export type ResourceItem = z.infer<typeof ResourceItemSchema>;
+export const ResourceCatalogItemSchema = ResourceItemSchema.omit({ enabled: true });
+export type ResourceCatalogItem = z.infer<typeof ResourceCatalogItemSchema>;
+export const ResourceCatalogReadResultSchema = z.strictObject({ configVersion: ConfigVersionSchema,
+  items: z.array(ResourceCatalogItemSchema).max(RESOURCE_LIMITS.catalog), diagnostics: z.array(ResourceDiagnosticSchema).max(1000), catalogError: AppErrorSchema.nullable() })
+  .refine(value => new TextEncoder().encode(JSON.stringify(value)).byteLength <= RESOURCE_LIMITS.replyBytes, 'Resource reply exceeds JSON budget');
+export type ResourceCatalogReadResult = z.infer<typeof ResourceCatalogReadResultSchema>;
 const sourceSelection = z.strictObject({ source: z.literal('selection'), sessionId: PositiveIdSchema });
 const sourceRun = z.strictObject({ source: z.literal('run'), runId: PositiveIdSchema });
 export const ResourceSourceInputSchema = z.discriminatedUnion('source', [sourceSelection, sourceRun]);

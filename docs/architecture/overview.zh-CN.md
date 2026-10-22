@@ -16,6 +16,9 @@ flowchart TD
     APP --> PI[Pi 运行适配]
     PI --> MODEL[配置的主模型]
     PI --> QUERY
+    PI --> CHILD[受控只读子执行]
+    CHILD --> MODEL
+    CHILD -->|获准读取工具| QUERY
     QUERY --> STORE[(SQLite 与本地文件)]
     APP --> STORE
     MAIN --> EVAL[独立评测进程]
@@ -46,6 +49,12 @@ flowchart TD
 意图模型与主 Agent 分别配置。规则可以在不调用模型的情况下解决请求；其他请求经过结构化分类，必要时最多复核一次。路由前，程序检查真实实体、明确条件、数据覆盖与实际能力。当前策略可把受支持的单项或有依赖任务编译为程序查询步骤。状态与配置见[意图识别](../intent/overview.zh-CN.md)。
 
 主 Agent 使用 Pi 的 Agent Loop、模型访问、原生工具、历史和资源能力。产品代码增加范围、预算、取消、业务工具和保存检查。Skill 指令和模型提出的调用都不能扩大已获准权限。
+
+## 委派与资源快照
+
+Host 将内置与用户角色来源交给 `Application`。输入获准时捕获可用角色原文与资源版本，Pi 适配在子执行前把真实父 `Agent` ToolCall 绑定到子任务身份。子任务有独立原生历史和只读工具子集，最多同时持有四个子执行，共享根预算与截止时间。结果保存或释放存在缺口时继续占位。管理、取消和依据核查见[子代理](../agents/subagents.zh-CN.md)。
+
+Prompt 优化使用独立 Provider Run，**Use in chat** 只把结果填入已确认草稿。Skills、有版本的 Prompt 模板、角色文件和扩展命令各有契约；配置预览的就绪状态与获准 Run 的工具范围也有不同含义。后续修改不会改写已捕获的 Run 资源。参见[Prompt 与 Skills](../guides/prompts-and-skills.zh-CN.md)。
 
 ## 所有权与失败边界
 

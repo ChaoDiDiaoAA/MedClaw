@@ -31,7 +31,7 @@ async function entered(id: string) { await expect.poll(() => app.evaluate((_, id
 async function release(id: string) { await app.evaluate((_, id) => { (globalThis as MainGlobal).__p7Gate.pending[id]?.(); }, id); }
 async function calls() { return app.evaluate(() => (globalThis as MainGlobal).__p7Gate.calls); }
 async function accepted() { return app.evaluate(() => (globalThis as MainGlobal).__p7Gate.accepted); }
-async function create() { await page.getByRole('button', { name: 'New Session', exact: true }).click(); const w = await page.evaluate(() => window.medclaw.request('workspace.read', {})); if (!w.ok || !w.data.sessionId) throw new Error('Missing Session'); await expect(page.getByTestId('current-session')).toContainText(await sessionTitle(w.data.sessionId)); return w.data.sessionId; }
+async function create() { await page.getByRole('button', { name: 'Chat', exact: true }).click(); await page.getByRole('button', { name: 'New Session', exact: true }).click(); const w = await page.evaluate(() => window.medclaw.request('workspace.read', {})); if (!w.ok || !w.data.sessionId) throw new Error('Missing Session'); await expect(page.getByTestId('current-session')).toContainText(await sessionTitle(w.data.sessionId)); return w.data.sessionId; }
 async function sessionTitle(id: number) { const value = await page.evaluate(sessionId => window.medclaw.request('session.read', { sessionId }), id); if (!value.ok || !value.data) throw new Error('Missing Session title'); return value.data.session.title; }
 async function select(id: number) { await page.locator(`.session-row[data-session-id="${id}"]`).locator('button[aria-pressed]').click(); await expect(page.getByTestId('current-session')).toContainText(await sessionTitle(id)); }
 async function idle() { await expect.poll(async () => { const value = await page.evaluate(() => window.medclaw.request('run.control.read', {})); return value.ok && value.data.acceptingNewRuns && value.data.activeRootRun === null; }).toBe(true); }
@@ -107,7 +107,7 @@ test.beforeAll(async () => {
   const env: Record<string, string> = { ...Object.fromEntries(Object.entries(process.env).flatMap(([key, value]) => value === undefined ? [] : [[key, value]])), MEDCLAW_HOST_ENTRY: hostEntry, MEDCLAW_BUN_EXECUTABLE: execFileSync(bun, ['-e', 'process.stdout.write(process.execPath)'], { encoding: 'utf8' }).trim() };
   delete env.ELECTRON_RUN_AS_NODE;
   app = await electron.launch({ executablePath: electronPath, args: [...electronTestWindowArgs,'-r', join(dirname(core), 'lib/server/electron/loader.js'), '-r', seam, join(root, '.build/desktop/main/index.cjs'), '--medclaw-data-root', join(temporary, 'data')], env, timeout: 30000 });
-  page = await app.firstWindow(); await page.setViewportSize({ width: 1440, height: 1000 }); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
+  page = await app.firstWindow(); await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setSize(1920, 1080)); await page.setViewportSize({ width: 1920, height: 1080 }); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
   await app.evaluate(({dialog},path)=>{dialog.showOpenDialog=async()=>({canceled:false,filePaths:[path]});},join(temporary,'source'));
   const configured = await page.evaluate(async baseUrl => {
     const directory = await window.medclaw.request('model.read', {}); if (!directory.ok) throw new Error(directory.error.code);
@@ -133,7 +133,7 @@ async function drop(types:string[]){await app.evaluate((_,types)=>{(globalThis a
 async function events(runId:number){const result=await page.evaluate(runId=>window.medclaw.request('event.read',{runId,afterSequence:0,limit:100}),runId);if(!result.ok)throw new Error(result.error.code);return result.data;}
 async function runtimeTab(){if(!await page.getByRole('tab',{name:'Run details',exact:true}).count())await page.getByRole('button',{name:'View run details',exact:true}).click();await page.getByRole('tab',{name:'Run details',exact:true}).click();await expect(page.getByRole('tab',{name:'Run details',exact:true})).toHaveAttribute('aria-selected','true');await page.getByRole('button',{name:'Refresh recent runs',exact:true}).click();}
 async function assertTimeline(runId:number){await runtimeTab();const facts=await events(runId);await expect(timeline()).toHaveAttribute('data-run-id',String(runId));await expect(timeline()).toHaveAttribute('data-cursor',String(facts.range.lastSequence));expect(await timeline().locator('[data-event-sequence]').evaluateAll(nodes=>nodes.map(n=>Number(n.getAttribute('data-event-sequence'))))).toEqual(facts.events.map(e=>e.sequence));return facts;}
-async function settled(text:string){await create();steps=[()=>({text})];const accepted=await clickSubmit(text);if(!accepted.runId)throw new Error('Missing Run');await idle();await expect(page.getByText('Saved',{exact:true})).toBeVisible();return {...accepted,runId:accepted.runId};}
+async function settled(text:string){await create();steps=[()=>({text})];const accepted=await clickSubmit(text);if(!accepted.runId)throw new Error('Missing Run');await idle();await expect(page.getByTestId('run-save-status')).toHaveText('Saved');await expect(page.getByTestId('run-save-status')).toBeAttached();await expect(page.getByTestId('run-save-status')).toBeHidden();return {...accepted,runId:accepted.runId};}
 function receipt(wire:Wire,id:string):Record<string,unknown>{const returned=wire.messages.filter(m=>m.role==='tool'&&m.tool_call_id===id);expect(returned).toHaveLength(1);return JSON.parse(String(returned[0]!.content));}
 
 
@@ -150,7 +150,12 @@ test('A11 New Session holds the shared selection gate and retains the current dr
   await page.getByRole('button', { name: 'New Session', exact: true }).click(); await entered('create-selection');
   await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Apply 0 selected batches', exact: true })).toBeDisabled();
+  await expect(page.getByText('No imported data', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Apply 0 selected batches', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Edit selection', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Apply devices', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Apply devices', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Edit selection', exact: true }).click();
   await release('create-selection');
   await expect.poll(() => page.evaluate(async () => { const w = await window.medclaw.request('workspace.read', {}); return w.ok ? w.data.sessionId : null; })).not.toBe(original);
   await page.getByRole('button', { name: 'Chat', exact: true }).click(); await select(original);
@@ -168,14 +173,27 @@ test('A08 definite restore failure can be explicitly verified in the same Host i
   const host = await page.evaluate(() => window.medclaw.request('host.read', {}));
   await expect(page.locator(`.session-row[data-session-id="${existing}"]`).locator('button[aria-pressed]')).toBeDisabled();
   await page.evaluate(() => window.medclaw.request('workspace.read', {}));
-  await expect(page.getByRole('button', { name: 'Apply 0 selected batches', exact: true })).toBeDisabled();
+  await expect(page.getByText('No imported data', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Apply 0 selected batches', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Edit selection', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Apply devices', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Apply devices', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Edit selection', exact: true }).click();
   await page.getByRole('button', { name: 'Chat', exact: true }).click();
-  await page.locator('.chat-data-context > summary').click();
+  await expect(page.locator('.chat-data-context')).toHaveJSProperty('hidden', true);
+  await expect(page.getByText('Selection unconfirmed', { exact: true }).filter({visible:true})).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Verify saved selection', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Verify saved selection', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'Verify saved selection', exact: true }).click();
   await expect.poll(async () => (await calls()).filter(call => call.method === 'workspace.restore').length).toBe(before + 1);
   await expect(page.getByText('Selection unconfirmed', { exact: true })).toHaveCount(0);
   expect(await page.evaluate(() => window.medclaw.request('host.read', {}))).toEqual(host);
+  if (!await page.locator('.chat-data-context').isVisible()) await page.getByText('Message options', { exact: true }).click();
+  await page.locator('.chat-data-context').getByLabel('Selected device IDs', { exact: true }).fill('-1');
+  await page.locator('.chat-data-context').getByRole('button', { name: 'Apply devices', exact: true }).click();
+  await page.getByText('Message options', { exact: true }).click();
+  await expect(page.locator('.chat-data-context')).toHaveJSProperty('hidden', true);
+  await expect(page.getByText('Enter distinct positive device IDs, separated by commas.', { exact: true })).toBeVisible();
   save('A08-manual-verify', { calls: await calls(), host, workspace: sql('SELECT * FROM workspace'), physical });
 });
 
@@ -217,6 +235,7 @@ test('A03 device and change choices use saved stable identities and server versi
   await page.getByRole('button', { name: `Select change ${event.id}`, exact: true }).click();
   await expect(page.getByTestId('confirmed-selection').last()).toContainText(`change:${event.id}`);
   expect(JSON.parse(sql('SELECT selection_json FROM workspace')[0].selection_json)).toMatchObject({ kind: 'change', targetId: String(event.id), rowKey: `change:${event.id}` });
+  await page.getByRole('button', { name: 'Edit selection', exact: true }).click();
   await page.getByRole('button', { name: 'Clear selection', exact: true }).click();
   expect(sql('SELECT selection_json FROM workspace')[0].selection_json).toBeNull();
   save('A03-data-selection', { device, workspace: sql('SELECT * FROM workspace'), physical });
@@ -233,8 +252,11 @@ test('A10 unknown selection remains locked after read until explicit Host restar
   await expect(page.getByRole('button', { name: 'Apply 0 selected batches', exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Verify saved selection', exact: true })).toHaveCount(0);
   expect((await calls()).filter(call => call.method === 'workspace.update')).toHaveLength(before + 1);
+  await page.getByRole('button', { name: 'Chat', exact: true }).click();
+  await expect(page.locator('.chat-data-context')).toHaveJSProperty('hidden', true);
+  await expect(page.getByRole('region', { name: 'Data selection', exact: true }).filter({visible:true}).getByText('Verify status in Settings and restart the Host.', { exact: true })).toBeVisible();
   const oldHost = await page.evaluate(() => window.medclaw.request('host.read', {}));
-  await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('button', { name: 'Restart Host', exact: true }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('button',{name:'Runtime',exact:true}).click();await page.getByRole('button', { name: 'Restart Host', exact: true }).click();
   await expect.poll(async () => { const host = await page.evaluate(() => window.medclaw.request('host.read', {})); return host.ok && oldHost.ok && host.data.state === 'ready' && host.data.instanceId !== oldHost.data.instanceId; }, { timeout: 30000 }).toBe(true);
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Apply 0 selected batches', exact: true })).toBeEnabled();
@@ -255,7 +277,7 @@ test('A12 viewing B keeps the running A ownership, frozen Input and Stop target'
   await expect(page.getByTestId('running-session')).toContainText(`Run ${acceptedA.runId}`);
   await expect(page.getByTestId('stop-target')).toContainText(`Session ${original.sessionId}`);
   await expect(page.getByTestId('chat-scroll')).not.toContainText('A owns this live answer.');
-  if (!await page.locator('.chat-data-context').evaluate(element => (element as HTMLDetailsElement).open)) await page.locator('.chat-data-context > summary').click();
+  if (!await page.locator('.chat-data-context').isVisible()) await page.getByText('Message options', { exact: true }).click();
   await expect(page.getByTestId('frozen-input-context')).toContainText(`Input ${acceptedA.inputId}`);
   await expect(page.getByTestId('frozen-input-context')).toContainText(`Query ${original.queryId}`);
   await runtimeTab(); await page.getByRole('button', { name: `View Run ${original.runId}`, exact: true }).click();
@@ -265,7 +287,14 @@ test('A12 viewing B keeps the running A ownership, frozen Input and Stop target'
   await page.getByRole('button', { name: `Read original Query ${original.queryId}`, exact: true }).first().click();
   await expect(page.getByTestId('query-results')).toBeVisible(); expect(sql('SELECT * FROM workspace')[0]).toEqual(before);
   await page.getByRole('button', { name: 'Chat', exact: true }).click();
-  await page.getByRole('button', { name: 'Stop generating', exact: true }).click(); held.release(); await idle();
+  try {
+    await page.getByRole('button', { name: 'Stop generating', exact: true }).click();
+    await expect.poll(async () => {
+      const saved = await readRun(acceptedA.runId!);
+      return saved.id === acceptedA.runId && saved.sessionId === original.sessionId && saved.cancelRequestedAt !== null;
+    }).toBe(true);
+  } finally { held.release(); }
+  await idle();
   const stops = (await calls()).filter(call => call.method === 'run.cancel').slice(-1); expect(stops[0].payload.runId).toBe(acceptedA.runId);
   const fact = await readRun(acceptedA.runId!); expect(fact).toMatchObject({ sessionId: original.sessionId, status: 'cancelled' });
   expect(sql(`SELECT count(*) AS n FROM runs WHERE session_id=${b}`)[0].n).toBe(0);
@@ -277,6 +306,7 @@ test('A12 viewing B keeps the running A ownership, frozen Input and Stop target'
 test('A14 old Query and Evidence replies cannot replace a newer independent detail target', async () => {
   await page.getByRole('button', { name: 'Chat', exact: true }).click(); const a = await savedQuery();
   const viewA = await page.evaluate(queryId => window.medclaw.request('query.read', { queryId }), a.queryId); if (!viewA.ok) throw Error(viewA.error.code);
+  await page.getByRole('button', { name: 'Back to query history', exact: true }).click();
   await rules([{ method: 'query.read', hold: 'old-query-reply' }]);
   await page.getByRole('button', { name: `Read Query ${a.queryId} from Run ${a.runId}`, exact: true }).click(); await entered('old-query-reply');
   await page.getByRole('button', { name: 'Chat', exact: true }).click(); const b = await savedQuery();
@@ -286,7 +316,7 @@ test('A14 old Query and Evidence replies cannot replace a newer independent deta
   const viewB = await page.evaluate(queryId => window.medclaw.request('query.read', { queryId }), b.queryId); if (!viewB.ok) throw Error(viewB.error.code);
   await rules([{ method: 'evidence.read', hold: 'old-evidence-reply' }]);
   await page.getByRole('button', { name: `Read evidence ${viewB.data.page.evidenceIds[0]}`, exact: true }).click(); await entered('old-evidence-reply');
-  await select(a.sessionId); await page.getByRole('button', { name: `Read Query ${a.queryId} from Run ${a.runId}`, exact: true }).click();
+  await page.getByRole('button', { name: 'Chat', exact: true }).click(); await select(a.sessionId); await page.getByRole('button', { name: 'Query History', exact: true }).click(); await page.getByRole('button', { name: `Read Query ${a.queryId} from Run ${a.runId}`, exact: true }).click();
   await page.getByRole('button', { name: `Read evidence ${viewA.data.page.evidenceIds[0]}`, exact: true }).click();
   await expect(page.getByRole('heading', { name: `Evidence ${viewA.data.page.evidenceIds[0]}`, exact: true })).toBeVisible();
   const final = sql('SELECT * FROM workspace')[0]; await release('old-evidence-reply');
@@ -302,7 +332,7 @@ test('A13 nonempty saved selection restores once after explicit Host restart wit
   await expect.poll(() => sql('SELECT active_query_id FROM workspace')[0].active_query_id).toBe(original.queryId);
   const before = sql('SELECT * FROM workspace')[0], models = physical, count = sql('SELECT count(*) AS n FROM runs')[0].n, restores = (await calls()).filter(call => call.method === 'workspace.restore').length;
   const old = await page.evaluate(() => window.medclaw.request('host.read', {}));
-  await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('button', { name: 'Restart Host', exact: true }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('button',{name:'Runtime',exact:true}).click();await page.getByRole('button', { name: 'Restart Host', exact: true }).click();
   await expect.poll(async () => { const host = await page.evaluate(() => window.medclaw.request('host.read', {})); return host.ok && old.ok && host.data.state === 'ready' && host.data.instanceId !== old.data.instanceId; }, { timeout: 30000 }).toBe(true);
   await expect.poll(async () => (await calls()).filter(call => call.method === 'workspace.restore').length).toBe(restores + 1);
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click(); await expect(page.getByTestId('confirmed-selection').last()).toContainText(view.data.page.rowKeys[0]!);
@@ -452,6 +482,7 @@ test('A11 rejected selection receipt preserves the latest Session intent until e
   await expect(page.getByRole('button', { name: `Confirm Session ${b}`, exact: true })).toBeDisabled();
   expect((await calls()).filter(call => call.method === 'session.select')).toHaveLength(before + 1);
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click(); await page.getByRole('button', { name: 'Verify saved selection', exact: true }).click();
+  await page.getByRole('button', { name: 'Chat', exact: true }).click();
   await expect(page.getByRole('button', { name: `Confirm Session ${b}`, exact: true })).toBeEnabled();
   expect(sql('SELECT active_session_id FROM workspace')[0].active_session_id).toBe(a);
   await page.getByRole('button', { name: `Confirm Session ${b}`, exact: true }).click();
@@ -480,20 +511,21 @@ test('A10 truly slow restore stays locked after late commit and cannot be unlock
   await page.getByRole('button', { name: 'New Session', exact: true }).click(); await expect(page.getByRole('button', { name: 'Recover original creation', exact: true })).toBeEnabled();
   writeFileSync(join(temporary, 'hold-restore'), 'hold');
   const beforeCalls = (await calls()).filter(call => call.method === 'workspace.restore').length;
-  await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('button', { name: 'Restart Host', exact: true }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('button',{name:'Runtime',exact:true}).click();await page.getByRole('button', { name: 'Restart Host', exact: true }).click();
   await expect.poll(() => existsSync(join(temporary, 'entered-restore')),{timeout:15000}).toBe(true);
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click();
   await expect(page.getByText('Verify status in Settings and restart the Host.', { exact: true }).last()).toBeVisible({ timeout: 15000 });
-  await expect(page.getByRole('button', { name: 'Recover original creation', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Recover original creation', exact: true, includeHidden: true })).toBeDisabled();
   rmSync(join(temporary, 'hold-restore')); const read = await page.evaluate(() => window.medclaw.request('workspace.read', {}));
   expect(read.ok).toBe(true); await notifyConfigChanged();
   await expect(page.getByRole('button', { name: 'Apply 2 selected batches', exact: true })).toBeDisabled();
   expect((await calls()).filter(call => call.method === 'workspace.restore')).toHaveLength(beforeCalls + 1);
   const runs = sql('SELECT count(*) AS n FROM runs')[0].n, models = physical;
   expect(await page.evaluate(() => window.medclaw.request('host.read', {}))).toMatchObject({ ok: true, data: { state: 'ready', error: null } });
-  await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('button', { name: 'Restart Host', exact: true }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('button',{name:'Runtime',exact:true}).click();await page.getByRole('button', { name: 'Restart Host', exact: true }).click();
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Apply 2 selected batches', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Chat', exact: true }).click();
   await page.getByRole('button', { name: 'Recover original creation', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Recover original creation', exact: true })).toHaveCount(0);
   expect(sql('SELECT count(*) AS n FROM runs')[0].n).toBe(runs); expect(physical).toBe(models);
@@ -524,6 +556,6 @@ test('A14 minimum window, keyboard row selection and 200 percent zoom keep table
   const png = await app.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].webContents.capturePage()).toPNG().toString('base64'));
   writeFileSync(join(evidence, 'A14-minimum-zoom-keyboard.png'), Buffer.from(png, 'base64'));
   save('A14-accessible-layout', { geometry, selectedBounds, configuredViewport: page.viewportSize(), actualViewport: await page.evaluate(() => ({ width: innerWidth, height: innerHeight, devicePixelRatio })), zoomFactor: await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.getZoomFactor()), query, workspace: sql('SELECT * FROM workspace') });
-  await app.evaluate(({ BrowserWindow }) => { const win = BrowserWindow.getAllWindows()[0]; win.webContents.setZoomFactor(1); win.setSize(1440, 1000); }); await page.setViewportSize({ width: 1440, height: 1000 });
+  await app.evaluate(({ BrowserWindow }) => { const win = BrowserWindow.getAllWindows()[0]; win.webContents.setZoomFactor(1); win.setSize(1920, 1080); }); await page.setViewportSize({ width: 1920, height: 1080 });
   await page.getByRole('button', { name: 'Expand navigation', exact: true }).click();
 });

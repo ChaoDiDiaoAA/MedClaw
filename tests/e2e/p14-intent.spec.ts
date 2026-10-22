@@ -84,7 +84,9 @@ test('p14 actual Models verifies and independently publishes the stock local int
     await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible({timeout:30000});
     const before=await page.evaluate(()=>window.medclaw.request('model.read',{}));expect(before.ok).toBe(true);
     await page.getByRole('button',{name:'Models',exact:true}).click();
-    const panel=page.getByRole('region',{name:'Intent model',exact:true});await expect(panel).toBeVisible();
+    const panel=page.getByRole('region',{name:'Intent model',exact:true});
+    await page.getByRole('navigation',{name:'Model tasks'}).getByRole('button',{name:'Local routing',exact:true}).click();
+    await expect(panel).toBeVisible();
     await panel.getByLabel('Ollama URL',{exact:true}).fill(`http://127.0.0.1:${(server.address() as {port:number}).port}`);
     await panel.getByRole('button',{name:'Verify local model',exact:true}).click();
     await expect(panel.getByText('Observed model:',{exact:false})).toContainText('qwen3.5:0.8b');
@@ -121,15 +123,24 @@ test('p14 actual Models verifies and independently publishes the stock local int
   }
 });
 
-test('p14 actual Chat freezes explicit routing, defaults only new drafts and saves real program history',async()=>{
-  test.setTimeout(180000);
+test('p14 actual Chat freezes explicit routing, defaults only new drafts and saves real program history',async({},info)=>{
+  // This scenario spans multiple independent Runs; UI actions, requests and exit confirmation retain their own limits.
+  test.setTimeout(420000);
   const root=mkdtempSync(join(tmpdir(),'medclaw-p14-chat-')),dataRoot=join(root,'data'),source=join(root,'source');createStartupPackage(source);
   const replayControl=join(root,'replay-control.json'),replayPages=join(root,'replay-pages.json'),replayObserver=join(root,'replay-observer.cjs');
+  const submissionObservations=join(root,'submission-observations.json');writeFileSync(submissionObservations,'[]');
   writeFileSync(replayControl,JSON.stringify({sourceId:null,hold:false,loseSubmitText:null}));writeFileSync(replayPages,'[]');
-  writeFileSync(replayObserver,`const {ipcMain}=require('electron'),fs=require('fs'),handle=ipcMain.handle.bind(ipcMain),pages=[];let lost=false;
+  writeFileSync(replayObserver,`const {ipcMain}=require('electron'),fs=require('fs'),handle=ipcMain.handle.bind(ipcMain),pages=[],submissions=[];let lost=false;
     const control=()=>JSON.parse(fs.readFileSync(${JSON.stringify(replayControl)},'utf8'));
+    const observeSubmission=(phase,envelope,result)=>{const input=envelope.payload;submissions.push({at:new Date().toISOString(),phase,method:envelope.method,
+      operationRef:envelope.operationRef,sessionId:input.sessionId,clientSequence:input.clientSequence,mode:input.mode,expectedModelVersion:input.model?.expectedConfigVersion??null,
+      publishedConfigVersion:JSON.parse(fs.readFileSync(${JSON.stringify(join(dataRoot,'data','settings.json'))},'utf8')).configVersion,
+      ...(result?{ok:result.ok,inputId:result.ok?result.data?.inputId??null:null,runId:result.ok?result.data?.runId??null:null,errorCode:result.ok?null:result.error?.code??null}:{})});
+      fs.writeFileSync(${JSON.stringify(submissionObservations)},JSON.stringify(submissions));};
     ipcMain.handle=(channel,listener)=>handle(channel,async(event,envelope)=>{
-      const result=await listener(event,envelope);if(channel!=='medclaw:request')return result;const input=envelope.payload,c=control();
+      const observed=channel==='medclaw:request'&&envelope.method==='session.submit';if(observed)observeSubmission('start',envelope);
+      let result;try{result=await listener(event,envelope);}catch(error){if(observed)observeSubmission('throw',envelope);throw error;}
+      if(channel!=='medclaw:request')return result;const input=envelope.payload,c=control();if(observed)observeSubmission('reply',envelope,result);
       if(envelope.method==='run.read'&&input.runId===c.sourceId&&input.inputLimit===65536){
         const part=result.ok&&result.data?.kind==='one'?result.data.run?.inputPage:null;
         pages.push({at:new Date().toISOString(),offset:input.inputOffset,ok:result.ok,errorCode:result.ok?null:result.error?.code,
@@ -165,9 +176,16 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
     const delta={role:'assistant',content:'ENGINEERING explicit main answer'};
     response.end(`data: ${JSON.stringify({id:'ENGINEERING',model:'fixture',choices:[{index:0,delta,finish_reason:'stop'}]})}\n\ndata: [DONE]\n\n`);
   });
-  await new Promise<void>(done=>server.listen(0,'127.0.0.1',done));let desktop:Awaited<ReturnType<typeof launchActualDev>>|undefined;
+  await new Promise<void>(done=>server.listen(0,'127.0.0.1',done));let desktop:Awaited<ReturnType<typeof launchActualDev>>|undefined,passed=false;
+  const failures:unknown[]=[];
   try{
     desktop=await launchActualDev(root,dataRoot,source,undefined,undefined,replayObserver);const page=desktop.page,url=`http://127.0.0.1:${(server.address() as {port:number}).port}`;
+    page.setDefaultTimeout(15000);
+    const newSession=async()=>{
+      const button=page.getByRole('button',{name:'New Session',exact:true});
+      await button.click();await expect(button).toBeEnabled();
+    };
+    await page.setViewportSize({width:1920,height:1080});
     await expect(page.getByText('Host ready',{exact:true}).first()).toBeVisible({timeout:30000});
     const configured=await page.evaluate(async baseUrl=>{
       const directory=await window.medclaw.request('model.read',{});if(!directory.ok)throw new Error(directory.error.code);
@@ -176,16 +194,17 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
         definition:{providerId:'p14-fixture',name:'ENGINEERING Chat',api:'openai-completions',baseUrl:baseUrl+'/v1',models:[{id:'fixture',name:'ENGINEERING Chat',input:['text'],reasoning:false,contextWindow:32768,maxTokens:1024,outputLimitConfirmed:true,pricingKnown:false,cost:null}]}});
       if(!saved.ok)throw new Error(saved.error.code);return window.medclaw.request('model.configure',{provider:'p14-fixture',modelId:'fixture',expectedConfigVersion:saved.data.configVersion});
     },url);expect(configured.ok).toBe(true);
-    await page.getByRole('button',{name:'Models',exact:true}).click();await page.getByRole('button',{name:'Reload published directory',exact:true}).click();
-    await page.getByRole('button',{name:'New Session',exact:true}).click();
+    await page.getByRole('button',{name:'Models',exact:true}).click();await page.getByRole('navigation',{name:'Model tasks'}).getByRole('button',{name:'Model directory',exact:true}).click();await page.getByRole('button',{name:'Reload published directory',exact:true}).click();
+    await page.getByRole('button',{name:'Chat',exact:true}).click();
+    await newSession();
     const routing=page.getByLabel('Message routing',{exact:true});await expect(routing).toHaveValue('main_agent');
     const enabled=await page.evaluate(async({url,model})=>{
       const config=await window.medclaw.request('model.config.read',{});if(!config.ok)throw new Error(config.error.code);
       return window.medclaw.request('model.intent.configure',{expectedConfigVersion:config.data.configVersion,intentModel:{...model,enabled:true,baseUrl:url,verifiedEvidenceRef:'ENGINEERING controlled protocol reference'}});
     },{url,model:DEFAULT_INTENT_MODEL});expect(enabled.ok).toBe(true);
-    await page.getByRole('button',{name:'Models',exact:true}).click();await page.getByRole('button',{name:'Reload published directory',exact:true}).click();
+    await page.getByRole('button',{name:'Models',exact:true}).click();await page.getByRole('navigation',{name:'Model tasks'}).getByRole('button',{name:'Model directory',exact:true}).click();await page.getByRole('button',{name:'Reload published directory',exact:true}).click();
     await expect(page.getByLabel('Enable intent routing',{exact:true})).toBeChecked();await page.getByRole('button',{name:'Chat',exact:true}).click();
-    await expect(routing).toHaveValue('main_agent');await page.getByRole('button',{name:'New Session',exact:true}).click();await expect(routing).toHaveValue('intent');
+    await expect(routing).toHaveValue('main_agent');await newSession();await expect(routing).toHaveValue('intent');
     await page.getByRole('button',{name:'Data Workspace',exact:true}).click();await page.getByRole('button',{name:'Choose snapshot directory',exact:true}).click();
     await expect(page.getByRole('button',{name:'Confirm import',exact:true})).toBeEnabled();await page.getByRole('button',{name:'Confirm import',exact:true}).click();
     await page.getByLabel('Select batch 1',{exact:true}).check();await page.getByRole('button',{name:'Apply 1 selected batches',exact:true}).click();
@@ -226,12 +245,15 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
     await expect(verification).toContainText('BASIC_INFO');await expect(verification).toContainText('Program validation: valid');
     await page.setViewportSize({width:760,height:920});
     await expect(intentPanel).toBeVisible();expect(await intentPanel.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
-    const artifacts=join(process.cwd(),'.build','p14-desktop-artifacts');mkdirSync(artifacts,{recursive:true});await page.screenshot({path:join(artifacts,'intent-recognition-narrow.png'),fullPage:true});
-    await page.getByRole('button',{name:'Close run details',exact:true}).click();await page.setViewportSize({width:1440,height:1000});review=false;
-    await routing.selectOption('main_agent');await message.fill('ENGINEERING explicit main message');await send.click();
+    const artifacts=join(process.cwd(),'.build','p14-desktop-artifacts');mkdirSync(artifacts,{recursive:true});
+    await test.step('Capture the visible narrow query conditions',async()=>{
+      await page.screenshot({path:join(artifacts,'intent-recognition-narrow.png'),timeout:15000});
+    });
+    await page.getByRole('button',{name:'Close run details',exact:true}).click();await page.setViewportSize({width:1920,height:1080});review=false;
+    if(!await routing.isVisible())await page.getByText('Message options',{exact:true}).click();await routing.selectOption('main_agent');await message.fill('ENGINEERING explicit main message');await send.click();
     await expect.poll(()=>mainRequests.length,{timeout:30000}).toBe(1);expect(intentRequests).toHaveLength(3);
     await expect(page.getByTestId('chat-native-messages')).toContainText('ENGINEERING explicit main answer');
-    const previous=(await recent())!;failIntent=true;await routing.selectOption('intent');const failedText='列出浙江2026-01-01的器械清单';
+    const previous=(await recent())!;failIntent=true;if(!await routing.isVisible())await page.getByText('Message options',{exact:true}).click();await routing.selectOption('intent');const failedText='列出浙江2026-01-01的器械清单';
     await message.fill(failedText);await send.click();
     await expect.poll(async()=>{const run=await recent();return run&&run.id!==previous.id&&run.status==='failed';},{timeout:30000}).toBe(true);
     await expect(message).toHaveValue(failedText);expect(intentRequests).toHaveLength(4);expect(mainRequests).toHaveLength(1);
@@ -249,16 +271,18 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
     const retried=(await recent())!;expect(intentRequests).toHaveLength(5);expect(mainRequests).toHaveLength(1);await expect(message).toHaveValue(failedText);
     await expect(intentPanel.getByRole('button',{name:'Review query conditions',exact:true})).toBeEnabled();
     await intentPanel.getByRole('button',{name:'Review query conditions',exact:true}).click();
+    await expect(page.getByRole('heading',{name:'Query History',level:1,exact:true})).toBeVisible();
     await expect(page.getByRole('alert').filter({hasText:'Review and confirm query conditions'})).toBeVisible();
     expect((await recent())!.id).toBe(retried.id);expect(intentRequests).toHaveLength(5);expect(mainRequests).toHaveLength(1);
     await page.getByRole('button',{name:'Close run details',exact:true}).click();failIntent=false;
+    await page.getByRole('button',{name:'Chat',exact:true}).click();
     for(const scenario of [
       {mode:'missing' as const,calls:1,text:'列出浙江新增的器械记录',status:'NEED_PARAMETERS',explanation:'Provide the missing parameters to resolve this task.'},
       {mode:'ood' as const,calls:1,text:'写一首诗',status:'OUT_OF_SCOPE',explanation:'This request is outside the registered medical-device tasks.'},
       {mode:'unsupported' as const,calls:1,text:'分析为什么价格发生变化',status:'UNSUPPORTED_DATA',explanation:'The current data or tools do not support this task.'},
       {mode:'ambiguous' as const,calls:2,text:'请查询医疗器械相关信息',status:'AMBIGUOUS',explanation:'Clarify the intended task using the recorded question and options.'},
     ]){
-      outcome=scenario.mode;await page.getByRole('button',{name:'New Session',exact:true}).click();await expect(routing).toHaveValue('intent');
+      outcome=scenario.mode;await newSession();await expect(routing).toHaveValue('intent');
       const prior=(await recent())!.id,count=intentRequests.length;await message.fill(scenario.text);await send.click();
       await expect.poll(async()=>{const run=await recent();return run&&run.id!==prior&&run.status==='completed';},{timeout:30000}).toBe(true);
       expect(intentRequests).toHaveLength(count+scenario.calls);expect(mainRequests).toHaveLength(1);
@@ -280,13 +304,16 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
       }
       await page.getByRole('button',{name:'Close run details',exact:true}).click();
     }
-    outcome='resolved';await page.getByRole('button',{name:'New Session',exact:true}).click();
+    outcome='resolved';await newSession();
     const longTask='ENGINEERING original task. '.repeat(3000),prior=(await recent())!.id,beforeIntent=intentRequests.length;
-    await message.fill(longTask);await send.click();
-    await expect.poll(async()=>{const run=await recent();return run&&run.id!==prior&&run.status==='failed';},{timeout:30000}).toBe(true);
-    const longSource=(await recent())!;expect(intentRequests).toHaveLength(beforeIntent);
-    const preview=await page.evaluate(inputId=>window.medclaw.request('session.readInput',{inputId}),longSource.inputId!);
-    expect(preview).toMatchObject({ok:true,data:{textInfo:{truncated:true,totalChars:longTask.length}}});
+    const longSource=await test.step('Original long task: fill, submit and read the saved preview',async()=>{
+      await message.fill(longTask);await expect(send).toBeEnabled();await send.click();
+      await expect.poll(async()=>{const run=await recent();return run&&run.id!==prior&&run.status==='failed';},{timeout:30000}).toBe(true);
+      const saved=(await recent())!;expect(intentRequests).toHaveLength(beforeIntent);
+      const preview=await page.evaluate(inputId=>window.medclaw.request('session.readInput',{inputId}),saved.inputId!);
+      expect(preview).toMatchObject({ok:true,data:{textInfo:{truncated:true,totalChars:longTask.length}}});
+      return saved;
+    });
     await page.getByRole('button',{name:'View run details',exact:true}).click();await page.getByRole('tab',{name:'Conditions',exact:true}).click();
     await expect(intentPanel.getByRole('button',{name:'Retry recognition',exact:true})).toBeEnabled();
     await test.step('Original task first page: editing the draft cancels the reread',async()=>{
@@ -317,7 +344,7 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
     expect(tail).toMatchObject({ok:true,data:{kind:'one',run:{inputPage:{text:longTask.slice(65536),totalChars:longTask.length,nextOffset:null}}}});
     expect(intentRequests).toHaveLength(beforeIntent);expect(mainRequests).toHaveLength(1);
     await page.getByRole('button',{name:'Close run details',exact:true}).click();
-    await page.getByRole('button',{name:'New Session',exact:true}).click();failIntent=true;
+    await newSession();failIntent=true;
     const unknownText='ENGINEERING lost acceptance reply',unknownPrior=(await recent())!.id;
     writeFileSync(replayControl,JSON.stringify({sourceId:longSource.id,hold:false,loseSubmitText:unknownText}));
     await message.fill(unknownText);await send.click();
@@ -330,14 +357,14 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
     await expect(intentPanel.getByRole('button',{name:'Retry recognition',exact:true})).toBeEnabled();
     expect((await recent())!.id).toBe(unknownRun);expect(intentRequests).toHaveLength(beforeIntent+1);expect(mainRequests).toHaveLength(1);
     await page.getByRole('button',{name:'Close run details',exact:true}).click();failIntent=false;outcome='resolved';
-    await page.getByRole('button',{name:'New Session',exact:true}).click();
+    await newSession();
     await expect(page.getByRole('button',{name:'New Session',exact:true})).toBeEnabled();
     await message.fill('查询2026-01-01在浙江的全部医疗器械。');await send.click();
     await expect.poll(async()=>{const run=await recent();return run&&run.id!==unknownRun&&run.status==='completed';},{timeout:30000}).toBe(true);
     const originalConditionRun=(await recent())!,a=originalConditionRun.sessionId!;
     const originalCondition=await page.evaluate(sessionId=>window.medclaw.request('session.read',{sessionId}),a);
     if(!originalCondition.ok||!originalCondition.data?.currentQueryContext)throw new Error('Missing actual original query condition');
-    await page.getByRole('button',{name:'New Session',exact:true}).click();
+    await newSession();
     await expect(page.getByRole('button',{name:'New Session',exact:true})).toBeEnabled();
     const otherWorkspace=await page.evaluate(()=>window.medclaw.request('workspace.read',{}));
     if(!otherWorkspace.ok||!otherWorkspace.data.sessionId)throw new Error('Missing other Session');const b=otherWorkspace.data.sessionId;
@@ -374,7 +401,13 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
       await expect(send).toBeDisabled();await expect(page.getByRole('button',{name:'Message actions',exact:true})).toHaveCount(0);
       await expect(page.getByRole('region',{name:'Current query conditions',exact:true})).toHaveCount(0);
       await expect(page.getByTestId('stop-target')).toContainText(`Run ${blocked.runId}`);
-      await page.getByRole('button',{name:'Stop generating',exact:true}).click();holdIntentStage=null;blocked.release();
+      try{
+        await page.getByRole('button',{name:'Stop generating',exact:true}).click();
+        await expect.poll(async()=>{
+          const saved=await page.evaluate(runId=>window.medclaw.request('run.read',{runId}),blocked.runId);
+          return saved.ok&&saved.data.kind==='one'&&!!saved.data.run&&saved.data.run.id===blocked.runId&&saved.data.run.cancelRequestedAt!==null;
+        },{timeout:30000}).toBe(true);
+      }finally{holdIntentStage=null;blocked.release();}
       await expect.poll(async()=>{const gate=await page.evaluate(()=>window.medclaw.request('run.control.read',{}));return gate.ok&&gate.data.acceptingNewRuns&&gate.data.activeRootRun===null;},{timeout:30000}).toBe(true);
       const stopped=await page.evaluate(runId=>window.medclaw.request('intent.read',{runId}),blocked.runId);
       expect(stopped).toMatchObject({ok:true,data:{decision:null,execution:{runStatus:'cancelled',queryIds:[],answerId:null,requiredPersistenceComplete:true}}});
@@ -403,10 +436,60 @@ test('p14 actual Chat freezes explicit routing, defaults only new drafts and sav
     await expect(page.getByTestId('chat-native-messages')).toContainText('Step s2');
     expect(await page.evaluate(sessionId=>window.medclaw.request('session.read',{sessionId}),a))
       .toMatchObject({ok:true,data:{currentQueryContext:originalCondition.data.currentQueryContext}});
+    passed=true;
+  }catch(error){
+    failures.push(error);
+    if(desktop){
+      let evidenceTimer:ReturnType<typeof setTimeout>|undefined;
+      try{
+        await info.attach('p14-session-submit-observations',{path:submissionObservations,contentType:'application/json'});
+        const diagnostic=desktop.page.evaluate(async()=>{
+          const field=document.getElementById('message-text'),send=document.querySelector('.message-actions > button.primary');
+          const routing=document.querySelector('select[aria-label="Message routing"]');
+          const ui={message:field instanceof HTMLTextAreaElement?{length:field.value.length,trimmedLength:field.value.trim().length,disabled:field.disabled}:null,
+            send:send instanceof HTMLButtonElement?{label:send.textContent,disabled:send.disabled,title:send.title}:null,
+            routing:routing instanceof HTMLSelectElement?{value:routing.value,disabled:routing.disabled}:null,
+            originalSubmissionVisible:[...document.querySelectorAll('button')].some(button=>button.textContent?.trim()==='Read original submission'&&button.getClientRects().length>0)};
+          const [recentResult,control,workspace]=await Promise.all([
+            window.medclaw.request('run.read',{recent:true,limit:1}),
+            window.medclaw.request('run.control.read',{}),
+            window.medclaw.request('workspace.read',{}),
+          ]);
+          const session=workspace.ok&&workspace.data.sessionId!==null?await window.medclaw.request('session.read',{sessionId:workspace.data.sessionId}):null;
+          const run=recentResult.ok&&recentResult.data.kind==='recent'?recentResult.data.runs[0]:null;
+          const runError=run?.error,cleanup=run?.cleanupSummary;
+          return {
+            ui,workspace:workspace.ok?{sessionId:workspace.data.sessionId,revision:workspace.data.revision}:{error:workspace.error.code},
+            session:session?.ok&&session.data?{id:session.data.session.id,status:session.data.session.status,
+              nextSubmissionSequence:session.data.session.nextSubmissionSequence,historyAvailable:session.data.history.available,
+              runtimeAvailability:session.data.runtime.availability,inputRunId:session.data.session.inputControl?.runId??null}:session&&!session.ok?{error:session.error.code}:null,
+            recentRun:run?{id:run.id,status:run.status,error:runError?{code:runError.code,reason:runError.reason??null}:null,
+              cleanup:cleanup?{executionStarted:cleanup.executionStarted,stopConfirmed:cleanup.stopConfirmed,
+                requiredPersistenceComplete:cleanup.requiredPersistenceComplete,inputsSettled:cleanup.inputsSettled,
+                resourcesReleased:cleanup.resourcesReleased,unconfirmedCount:cleanup.unconfirmedCount,secondaryErrorCount:cleanup.secondaryErrorCount}:null}:null,
+            recentReadError:recentResult.ok?null:recentResult.error.code,
+            control:control.ok?{instanceId:control.data.instanceId,acceptingNewRuns:control.data.acceptingNewRuns,
+              activeRunId:control.data.activeRootRun?.runId??null,blockReasons:control.data.blockReasons.map(item=>item.code)}:{error:control.error.code},
+          };
+        });
+        const facts=await Promise.race([diagnostic,new Promise<never>((_,reject)=>{evidenceTimer=setTimeout(()=>reject(new Error('P14 failure evidence read timed out')),5000);})]);
+        await info.attach('p14-actual-chat-failed-run-state',{body:JSON.stringify(facts,null,2),contentType:'application/json'});
+      }catch(attachmentError){console.error('P14_FAILURE_EVIDENCE_UNAVAILABLE',attachmentError instanceof Error?attachmentError.message:'Diagnostic attachment unavailable');}
+      finally{clearTimeout(evidenceTimer);}
+    }
   }finally{
-    for(const blocked of blockedIntents)blocked.release();
-    writeFileSync(replayControl,JSON.stringify({sourceId:null,hold:false,loseSubmitText:null}));
-    await desktop?.close();server.closeAllConnections();await new Promise<void>(done=>server.close(()=>done()));
-    const inside=relative(tmpdir(),root);if((!desktop||existsSync(join(root,'dev-exit-confirmed')))&&inside&&!inside.startsWith('..')&&!inside.includes(':'))rmSync(root,{recursive:true,force:true});
+    try{
+      for(const blocked of blockedIntents)blocked.release();
+      writeFileSync(replayControl,JSON.stringify({sourceId:null,hold:false,loseSubmitText:null}));
+      await desktop?.close();
+    }catch(error){failures.push(error);}
+    finally{
+      try{server.closeAllConnections();await new Promise<void>(done=>server.close(()=>done()));}
+      catch(error){failures.push(error);}
+    }
+    const inside=relative(tmpdir(),root);
+    if(passed&&!failures.length&&desktop&&existsSync(join(root,'dev-exit-confirmed'))&&inside.startsWith('medclaw-p14-chat-')&&!inside.startsWith('..')&&!inside.includes(':'))rmSync(root,{recursive:true,force:true});
+    else console.log('P14 actual Chat root retained: '+root);
   }
+  if(failures.length)throw failures.length===1?failures[0]:new AggregateError(failures,'P14 actual Chat body or cleanup failed: '+root);
 });

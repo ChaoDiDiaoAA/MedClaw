@@ -21,7 +21,9 @@ async function savedNativeReply(inputText: string) {
     const runs = await window.medclaw.request('run.read', { recent: true, sessionId: workspace.data.sessionId, limit: 1 });
     return runs.ok && runs.data.kind === 'recent' && runs.data.runs[0]?.inputText === inputText && runs.data.runs[0].status === 'completed';
   }, inputText)).toBe(true);
-  await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  await expect(page.getByTestId('run-save-status')).toHaveText('Saved');
+  await expect(page.getByTestId('run-save-status')).toBeAttached();
+  await expect(page.getByTestId('run-save-status')).toBeHidden();
   const entryId = await page.evaluate(async () => {
     const workspace = await window.medclaw.request('workspace.read', {}); if (!workspace.ok || !workspace.data.sessionId) throw Error('Missing selected Session');
     const runs = await window.medclaw.request('run.read', { recent: true, sessionId: workspace.data.sessionId, limit: 1 });
@@ -119,7 +121,9 @@ test.beforeAll(async () => {
     });
   `);
   app = await electron.launch({ executablePath: electronPath, args: [...electronTestWindowArgs,'-r', join(dirname(core), 'lib/server/electron/loader.js'), '-r', delayedImport, join(root, '.build/desktop/main/index.cjs'), '--medclaw-data-root', join(temporary, 'data')], env, timeout: 30000 });
-  page = await app.firstWindow(); await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().forEach(window=>window.webContents.setBackgroundThrottling(false))); await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
+  page = await app.firstWindow(); await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().forEach(window=>window.webContents.setBackgroundThrottling(false)));
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setSize(1920, 1080)); await page.setViewportSize({ width: 1920, height: 1080 });
+  await expect(page.getByText('Host ready', { exact: true }).first()).toBeVisible({ timeout: 30000 });
   await app.evaluate(({ dialog }, source) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [source] }); }, join(temporary, 'source'));
   const configured = await page.evaluate(async baseUrl => {
     const directory = await window.medclaw.request('model.read', {}); if (!directory.ok) throw new Error(directory.error.code);
@@ -138,6 +142,8 @@ test.afterAll(async () => {
 
 test('P3 Settings publishes configurable Agent budgets with the existing policy version', async () => {
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Runtime', exact: true }).click();
+  if (await page.getByRole('button', { name: 'Edit request policy', exact: true }).getAttribute('aria-expanded') !== 'true') await page.getByRole('button', { name: 'Edit request policy', exact: true }).click();
   for (const name of ['RunBudget', 'LLM request', 'Tool result']) await expect(page.getByRole('group', { name, exact: true })).toBeVisible();
   await expect(page.getByLabel('Tool call budget', { exact: true })).toHaveValue('24');
   await expect(page.getByLabel('Model call budget', { exact: true })).toHaveValue('12');
@@ -166,6 +172,8 @@ test('P3 Settings publishes configurable Agent budgets with the existing policy 
   expect(conflict).toMatchObject({ ok: false, error: { code: 'invalid_argument' } });
   await page.reload();
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Runtime', exact: true }).click();
+  if (await page.getByRole('button', { name: 'Edit request policy', exact: true }).getAttribute('aria-expanded') !== 'true') await page.getByRole('button', { name: 'Edit request policy', exact: true }).click();
   await expect(page.getByLabel('Tool call budget', { exact: true })).toHaveValue('80');
   await expect(page.getByLabel('Result text limit (UTF-8 bytes)', { exact: true })).toHaveValue('2048');
   await page.getByLabel('Run timeout (milliseconds)', { exact: true }).fill('120000');
@@ -184,6 +192,7 @@ test('P3 imports the authorized directory, applies batches and preserves the cha
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click();
   await page.getByRole('button', { name: 'Choose snapshot directory', exact: true }).click(); await expect(page.getByTestId('import-state')).toHaveText('ready');
   await expect(page.getByText('2 batches', { exact: false }).first()).toBeVisible();
+  await page.getByRole('button', { name: 'Recover an operation', exact: true }).click();
   const originalOperation = await page.getByLabel('Import operation ID', { exact: true }).inputValue();
   await app.evaluate(() => { (globalThis as typeof globalThis & { __p3DelayedImport: { enabled: boolean } }).__p3DelayedImport.enabled = true; });
   await page.getByRole('button', { name: 'Confirm import', exact: true }).click(); await expect(page.getByTestId('import-state')).toHaveText('imported');
@@ -199,7 +208,10 @@ test('P3 imports the authorized directory, applies batches and preserves the cha
   await page.getByRole('button', { name: 'Read batch 2 changes', exact: true }).click(); await expect(page.getByTestId('data-rows')).toContainText('Ratio: -0.2');
   await page.getByRole('button', { name: 'Select batches on this page', exact: true }).click(); await page.getByRole('button', { name: 'Apply 2 selected batches', exact: true }).click();
   await page.getByRole('button', { name: 'Chat', exact: true }).click(); await expect(page.getByLabel('Message text', { exact: true })).toHaveValue('Draft survives data selection');
-  await expect(page.getByText('Data for next message · 2 batches', { exact: true })).toBeVisible();
+  if (!await page.locator('.chat-data-context').isVisible()) await page.getByText('Message options', { exact: true }).click();
+  const dataSummary = page.locator('.chat-data-context .context-selection-summary');
+  await expect(dataSummary).toHaveText(/^2 selected batches(?: ·.*)?$/);
+  await expect(dataSummary).toBeVisible();
 });
 test('P3 actual business tool creates a saved query with inspectable source evidence', async () => {
   await app.evaluate(() => { (globalThis as typeof globalThis & { __p3DelayedImport: { catalogDelayMs: number } }).__p3DelayedImport.catalogDelayMs = 500; });
@@ -209,13 +221,13 @@ test('P3 actual business tool creates a saved query with inspectable source evid
   await expect(page.getByLabel('Reference date', { exact: true })).toHaveValue('2026-01-02');
   await expect(page.getByLabel('Time zone', { exact: true })).toHaveValue('Asia/Shanghai');
   await app.evaluate(() => { (globalThis as typeof globalThis & { __p3DelayedImport: { catalogDelayMs: number } }).__p3DelayedImport.catalogDelayMs = 0; });
-  await page.locator('.reference-fields summary').click();
+  if (!await page.getByLabel('Reference date', { exact: true }).isVisible()) await page.getByText('Message options', { exact: true }).click();
   await expect(page.getByTestId('data-time-defaults')).toContainText('2026-01-02');
   await page.getByRole('button', { name: 'Use data defaults', exact: true }).click();
   await expect(page.getByLabel('Reference date', { exact: true })).toHaveValue('2026-01-02');
   await expect(page.getByLabel('Time zone', { exact: true })).toHaveValue('Asia/Shanghai');
   await page.getByLabel('Reference date', { exact: true }).fill('2026-01-01');
-  await page.locator('.reference-fields').screenshot({ path: test.info().outputPath('p3-reference-date-override.png') });
+  await page.locator('.composer-routing').screenshot({ path: test.info().outputPath('p3-reference-date-override.png') });
   await page.getByLabel('Message text', { exact: true }).fill('Query fixture data'); await page.getByRole('button', { name: 'Send', exact: true }).click();
   await savedNativeReply('Query fixture data');
   const savedRun = await page.evaluate(() => window.medclaw.request('run.read', { recent: true, sessionId: 1, limit: 1 }));
@@ -242,12 +254,15 @@ test('P3 actual business tool creates a saved query with inspectable source evid
   await expect(interpretation.getByTestId('query-data-dates')).toHaveText('2026-01-01');
   await expect(interpretation.getByTestId('query-interpretation')).toContainText('2026-01-01');
   await page.getByRole('button', { name: 'Read evidence 1', exact: true }).click(); await expect(page.getByRole('heading', { name: 'Evidence 1', exact: true })).toBeVisible();
+  await page.getByLabel('Query evidence').locator('summary').filter({ hasText: /^Source references$/ }).first().click();
   await expect(page.getByLabel('Query evidence')).toContainText('synthetic'); await expect(page.getByLabel('Query evidence')).toContainText('original.csv');
+  await page.getByRole('button', { name: 'New query', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Run query', exact: true })).toBeEnabled();
   await app.evaluate(() => { (globalThis as typeof globalThis & { __p3DelayedImport: { catalogDefaultsUnknown: boolean } }).__p3DelayedImport.catalogDefaultsUnknown = true; });
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click();
   await page.getByRole('button', { name: 'Refresh imported data', exact: true }).click();
   await page.getByRole('button', { name: 'Chat', exact: true }).click();
+  if (!await page.getByLabel('Reference date', { exact: true }).isVisible()) await page.getByText('Message options', { exact: true }).click();
   await expect(page.getByTestId('data-time-defaults-missing')).toBeVisible();
   await page.getByRole('button', { name: 'New Session', exact: true }).click();
   await expect(page.getByTestId('current-session')).toContainText('New Session 3');
@@ -266,6 +281,7 @@ test('P3 actual business tool creates a saved query with inspectable source evid
   await page.getByRole('button', { name: 'Data Workspace', exact: true }).click();
   await page.getByRole('button', { name: 'Refresh imported data', exact: true }).click();
   await page.getByRole('button', { name: 'Chat', exact: true }).click();
+  if (!await page.getByLabel('Reference date', { exact: true }).isVisible()) await page.getByText('Message options', { exact: true }).click();
   await expect(page.getByTestId('data-time-defaults')).toBeVisible();
 });
 test('P3 actual native write has separate execution, SDK delivery and model-consumption facts', async () => {
@@ -300,11 +316,13 @@ test('P3 query dates and quantities remain explicit across stale snapshots, resu
     await page.getByLabel('Message text', { exact: true }).fill('Hold date query scope'); await page.getByRole('button', { name: 'Send', exact: true }).click();
     await dateQueryGate.entered;
     await page.getByRole('button', { name: 'Query History', exact: true }).click();
+    await page.getByRole('button', { name: 'New query', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Run query', exact: true })).toBeDisabled();
     dateQueryGate.release();
     await expect.poll(async()=>{const active=await page.evaluate(()=>window.medclaw.request('run.active',{}));return active.ok&&active.data===null;}).toBe(true);
     await expect(page.getByRole('button', { name: 'Run query', exact: true })).toBeEnabled();
     await expect(page.getByLabel('Start date', { exact: true })).toHaveCount(0);
+    await page.getByRole('button', { name: 'New query', exact: true }).click();
     await page.getByLabel('On date', { exact: true }).fill('2026-01-01');
     await page.getByRole('button', { name: 'Run query', exact: true }).click();
     const result = page.getByLabel('Saved query result', { exact: true });
@@ -324,14 +342,17 @@ test('P3 query dates and quantities remain explicit across stale snapshots, resu
     await expect(evidence.getByRole('row')).toHaveCount(6);
     await expect(evidence.getByTestId('query-quantity')).toHaveText('105 records');
     await expect(evidence).toContainText('Showing 5 evidence snapshots');
+    await page.getByRole('button', { name: 'New query', exact: true }).click();
     await page.getByLabel('On date', { exact: true }).fill('');
     await page.getByRole('button', { name: 'Run query', exact: true }).click();
     await expect(result.getByTestId('query-requested-date')).toHaveText('2026-01-02');
     await expect(result.getByTestId('query-data-dates')).toHaveText('2026-01-02');
+    await page.getByRole('button', { name: 'New query', exact: true }).click();
     await page.getByRole('combobox', { name: 'Status', exact: true }).selectOption('active');
     await page.getByRole('button', { name: 'Run query', exact: true }).click();
     await expect(result.getByTestId('query-quantity')).toHaveText('104 records');
     await expect(result.getByTestId('query-interpretation')).toContainText('active');
+    await page.getByRole('button', { name: 'New query', exact: true }).click();
     await page.getByRole('combobox', { name: 'Snapshot mode', exact: true }).selectOption('as_of');
     await page.getByLabel('As of date', { exact: true }).fill('2026-01-03');
     await page.getByRole('button', { name: 'Run query', exact: true }).click();
@@ -345,14 +366,17 @@ test('P3 query dates and quantities remain explicit across stale snapshots, resu
     await page.getByRole('button', { name: 'Close run details', exact: true }).click();
     await result.getByTestId('query-interpretation').scrollIntoViewIfNeeded();
     await page.screenshot({ path: test.info().outputPath('p3-query-date-quantity.png') });
+    await page.getByRole('button', { name: 'New query', exact: true }).click();
     await page.getByRole('combobox', { name: 'Snapshot mode', exact: true }).selectOption('exact_date');
     await page.getByRole('button', { name: 'Run query', exact: true }).click();
     await expect(page.getByRole('alert').filter({ hasText: 'Required dates or predecessor batches are missing' })).toBeVisible();
     await expect(result.getByTestId('query-quantity')).toHaveText('104 records');
+    await page.getByRole('button', { name: 'New query', exact: true }).click();
     await page.getByRole('combobox', { name: 'Query kind', exact: true }).selectOption('trend');
     await expect(result.getByTestId('query-snapshot-selection')).toHaveText('Latest on or before requested date');
     await expect(page.getByLabel('Start date', { exact: true })).toBeVisible();
     await expect(page.getByLabel('End date (exclusive)', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'New query', exact: true }).click();
     await page.getByRole('combobox', { name: 'Query kind', exact: true }).selectOption('changes');
     await expect(page.getByLabel('Start date', { exact: true })).toBeVisible();
     await expect(page.getByLabel('End date (exclusive)', { exact: true })).toBeVisible();
@@ -364,6 +388,7 @@ test('P3 query dates and quantities remain explicit across stale snapshots, resu
 
 test('P3 active and saved Runs retain frozen budgets while Settings changes apply to the next Run', async () => {
   test.setTimeout(60000);
+  await page.getByRole('button',{name:'Chat',exact:true}).click();
   await page.getByRole('button',{name:'New Session',exact:true}).click();
   let markEntered!: () => void, release!: () => void;
   dateQueryGate = { entered: new Promise<void>(resolve => { markEntered = resolve; }), reply: new Promise<void>(resolve => { release = resolve; }), markEntered: () => markEntered(), release: () => release() };
@@ -380,6 +405,8 @@ test('P3 active and saved Runs retain frozen budgets while Settings changes appl
     await expect(page.getByTestId('run-agent-policy')).toContainText('24');
     await expect(page.getByTestId('run-budget-summary')).toContainText('1 used');
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('button', { name: 'Runtime', exact: true }).click();
+  if (await page.getByRole('button', { name: 'Edit request policy', exact: true }).getAttribute('aria-expanded') !== 'true') await page.getByRole('button', { name: 'Edit request policy', exact: true }).click();
     await page.getByLabel('Tool call budget', { exact: true }).fill('80');
     await page.getByRole('button', { name: 'Publish request policy', exact: true }).click();
     await expect(page.getByRole('status').filter({ hasText: 'Request policy published; applies to the next run' })).toBeVisible();
@@ -401,6 +428,8 @@ test('P3 active and saved Runs retain frozen budgets while Settings changes appl
     if (!original.ok || original.data.kind !== 'one' || original.data.run?.kind !== 'agent') throw new Error('Missing saved frozen Run');
     expect(original.data.run.control?.agentPolicy?.maxToolCalls).toBe(24);
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('button', { name: 'Runtime', exact: true }).click();
+    if (await page.getByRole('button', { name: 'Edit request policy', exact: true }).getAttribute('aria-expanded') !== 'true') await page.getByRole('button', { name: 'Edit request policy', exact: true }).click();
     await page.getByLabel('Tool call budget', { exact: true }).fill('24');
     await page.getByRole('button', { name: 'Publish request policy', exact: true }).click();
     await expect(page.getByRole('status').filter({ hasText: 'Request policy published; applies to the next run' })).toBeVisible();

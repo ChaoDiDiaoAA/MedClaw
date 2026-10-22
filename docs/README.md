@@ -8,6 +8,7 @@ Public documentation for users, result reviewers, and contributors. Chinese and 
 
 - 首次使用 / First use: 产品概览 → 使用入门 → 数据导入。
 - 意图识别 / Intent recognition: 识别流程 → 本地模型配置 → 评测与限制。
+- Agent 与资源 / Agents and resources: Prompt 与 Skills → 只读子代理 → 执行与依据核查。
 - 开发维护 / Development: 系统架构 → 行为契约 → 开发指南 → Windows 打包。
 
 | 专题 / Topic | 简体中文 | English |
@@ -17,6 +18,8 @@ Public documentation for users, result reviewers, and contributors. Chinese and 
 | 数据 / Data | [数据导入与查询](guides/data-import.zh-CN.md) | [Data import and queries](guides/data-import.md) |
 | 意图识别 / Intent | [识别流程](intent/overview.zh-CN.md) | [Recognition pipeline](intent/overview.md) |
 | 意图配置 / Intent setup | [配置与排查](intent/configuration.zh-CN.md) | [Configuration and troubleshooting](intent/configuration.md) |
+| 子代理 / Subagents | [只读子代理](agents/subagents.zh-CN.md) | [Read-only subagents](agents/subagents.md) |
+| Prompt 与 Skills / Prompt and Skills | [使用与核查](guides/prompts-and-skills.zh-CN.md) | [Usage and verification](guides/prompts-and-skills.md) |
 | 架构 / Architecture | [系统架构](architecture/overview.zh-CN.md) | [System architecture](architecture/overview.md) |
 | 契约 / Contracts | [公开行为契约](architecture/behavior-contracts.zh-CN.md) | [Public behavior contracts](architecture/behavior-contracts.md) |
 | 开发 / Development | [开发与贡献](development/contributing.zh-CN.md) | [Development and contributing](development/contributing.md) |
